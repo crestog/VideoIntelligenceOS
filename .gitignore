@@ -1,0 +1,12 @@
+__pycache__/
+archive/
+DataLake/
+huggingface_cache/
+*.db
+*.db-journal
+*.db-wal
+*.session
+*.session-journal
+cloudflared
+ui_state.txt
+model_logs.txt
