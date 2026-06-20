@@ -69,7 +69,7 @@ MODEL_REGISTRY = {
 
 if __name__ == "__main__":
     print("🚀 Model Manager Booting: Auto-queueing all 7 foundational models...")
-    for model in MODEL_REGISTRY.keys(): 
+    for model in ["yolo", "whisper", "dinov2", "siglip", "clip", "raft", "easyocr"]: 
         push_job("QUEUE_MODELS", {"model_name": model})
     
     while True:

@@ -27,8 +27,13 @@ def run_with_watchdog(command, prefix, is_engine):
         print(f"\n⚠️ [WATCHDOG] {prefix} process crashed. Rebooting in 3 seconds...", flush=True)
         time.sleep(3)
 
+print("🧹 [SYSTEM] Sweeping Zombie Processes...", flush=True)
+os.system("pkill -9 ffmpeg > /dev/null 2>&1 || true")
+os.system("pkill -9 ffprobe > /dev/null 2>&1 || true")
+os.system("pkill -9 cloudflared > /dev/null 2>&1 || true")
+
 print("🗄️ [SYSTEM] Booting Message Broker...", flush=True)
-os.system("service redis-server start > /dev/null 2>&1")
+os.system("redis-server --daemonize yes --appendonly yes")
 
 print("\n🚀 IGNITING VIDEO INTELLIGENCE OS...\n" + "="*50, flush=True)
 

@@ -29,14 +29,7 @@ def custom_print(*args, **kwargs):
     kwargs['flush'] = True
     builtins.print(f"[{time.strftime('%H:%M:%S')}]", *args, **kwargs)
 
-# --- SYSTEM CLEANUP ON SHUTDOWN ---
-def terminate_zombies():
-    custom_print("🧹 Sweeping orphaned processes...")
-    os.system("pkill -9 ffmpeg > /dev/null 2>&1")
-    os.system("pkill -9 ffprobe > /dev/null 2>&1")
-    os.system("pkill -9 cloudflared > /dev/null 2>&1")
-atexit.register(terminate_zombies)
-terminate_zombies()
+# Zombie cleanup migrated to boot.py for safety.
 
 # --- CREDENTIALS ---
 API_ID = 37392880
@@ -139,6 +132,8 @@ def extract_num(pattern, text):
     match = re.search(pattern, text)
     return int(match.group(1).replace(",", "").strip()) if match else 0
 
+ffmpeg_semaphore = asyncio.Semaphore(2)
+
 async def ensure_web_safe(video_path):
     try:
         proc = await asyncio.create_subprocess_exec('ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', video_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -153,7 +148,8 @@ async def ensure_web_safe(video_path):
             custom_print(f"⚡ Instant Remux: 100% Quality Retention & FastStart...")
             conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c', 'copy', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         
-        await conv_proc.communicate()
+        async with ffmpeg_semaphore:
+            await conv_proc.communicate()
         if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
             os.replace(temp_path, video_path)
     except Exception as e: 
@@ -191,7 +187,14 @@ async def background_downloader():
             await asyncio.sleep(10)
             return
 
+    import shutil
     while True:
+        free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
+        if free_gb < 5:
+            GLOBAL_STATUS = f"⚠️ Storage Critical ({free_gb:.1f}GB left) - Pausing"
+            await asyncio.sleep(60)
+            continue
+
         if not SCAN_TRIGGER.is_set():
             GLOBAL_STATUS = "💤 Idling. Background queue is empty."
             while not SCAN_TRIGGER.is_set():
