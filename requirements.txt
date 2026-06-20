@@ -8,3 +8,5 @@ redis
 faster-whisper
 transformers
 psutil
+ultralytics
+easyocr
