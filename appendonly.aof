@@ -1,0 +1,838 @@
+*2
+$6
+SELECT
+$1
+0
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$22
+{"model_name": "yolo"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$25
+{"model_name": "whisper"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$24
+{"model_name": "dinov2"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$24
+{"model_name": "siglip"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$22
+{"model_name": "clip"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$22
+{"model_name": "raft"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$25
+{"model_name": "easyocr"}
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1240, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1240.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1238, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1238.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1236, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1236.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1234, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1234.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1232, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1232.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1230, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1230.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1228, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1228.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1226, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1226.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1224, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1224.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1222, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1222.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1220, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1220.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1218, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1218.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1216, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1216.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1214, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1214.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1212, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1212.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1210, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1210.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1208, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1208.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1206, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1206.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1204, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1204.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1202, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1202.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1200, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1200.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1198, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1198.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1196, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1196.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1194, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1194.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1192, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1192.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1190, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1190.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1188, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1188.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1186, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1186.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1184, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1184.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1182, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1182.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1180, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1180.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1178, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1178.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1176, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1176.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1174, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1174.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1172, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1172.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1170, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1170.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1168, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1168.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1166, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1166.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1164, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1164.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1162, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1162.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1160, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1160.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1158, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1158.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1156, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1156.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1154, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1154.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1152, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1152.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1150, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1150.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1148, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1148.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1146, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1146.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1144, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1144.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1142, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1142.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1140, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1140.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1138, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1138.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1136, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1136.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1134, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1134.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1132, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1132.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1130, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1130.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1128, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1128.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1126, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1126.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1124, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1124.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1122, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1122.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1120, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1120.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1118, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1118.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1116, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1116.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1114, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1114.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1112, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1112.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1110, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1110.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1108, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1108.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1106, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1106.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1104, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1104.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1102, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1102.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1100, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1100.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1098, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1098.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1096, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1096.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1094, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1094.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1092, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1092.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1090, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1090.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1088, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1088.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1086, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1086.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1084, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1084.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1082, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1082.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1080, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1080.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1078, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1078.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1076, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1076.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1074, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1074.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1072, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1072.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1070, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1070.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1068, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1068.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1066, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1066.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1064, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1064.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1062, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1062.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1060, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1060.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1058, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1058.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1056, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1056.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1054, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1054.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1052, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1052.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1050, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1050.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1048, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1048.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1046, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1046.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1044, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1044.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1042, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1042.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1040, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1040.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1038, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1038.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1036, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1036.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1034, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1034.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1032, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1032.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1030, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1030.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_VISION
+$86
+{"msg_id": 1028, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1028.mp4"}

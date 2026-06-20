@@ -10,3 +10,4 @@ transformers
 psutil
 ultralytics
 easyocr
+aiosqlite
