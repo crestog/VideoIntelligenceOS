@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pyrogram
+tgcrypto
+pandas
+nest-asyncio
+redis
+faster-whisper
+transformers
+psutil
