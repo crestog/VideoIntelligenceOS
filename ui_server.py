@@ -238,7 +238,9 @@ async def background_downloader():
                     conn.close()
                     await asyncio.sleep(2)
                 except FloodWait as e: await asyncio.sleep(e.value)
-                except Exception as e: pass
+                except Exception as e: 
+                    custom_print(f"⚠️ Scan Network Error: {str(e)[:50]}")
+                    await asyncio.sleep(5)
 
             while True:
                 conn = sqlite3.connect(DB_PATH, timeout=20)
@@ -290,13 +292,21 @@ async def background_downloader():
                     conn.commit()
                     conn.close()
                     push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video})
+                    
+                    # 🛑 CRITICAL FIX: Non-blocking speed limit (prevents Telegram bans)
+                    await asyncio.sleep(4)
 
-                except FloodWait as e: await asyncio.sleep(e.value)
+                except FloodWait as e: 
+                    custom_print(f"⚠️ FloodWait: Sleeping for {e.value}s")
+                    await asyncio.sleep(e.value + 2)
                 except Exception as e:
+                    custom_print(f"⚠️ Network Error on #{target_vid}: {str(e)[:50]}")
                     conn = sqlite3.connect(DB_PATH, timeout=20)
                     conn.execute("UPDATE posts SET status = 'Error' WHERE video_id = ?", (target_vid,))
                     conn.commit()
                     conn.close()
+                    # 🛑 CRITICAL FIX: 15s backoff breaks the infinite "Broken pipe" crash loop
+                    await asyncio.sleep(15)
 
         except Exception as e:
             GLOBAL_STATUS = f"❌ Worker Error: {str(e)[:50]}"
