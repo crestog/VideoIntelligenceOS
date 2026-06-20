@@ -10,3 +10,7 @@ huggingface_cache/
 cloudflared
 ui_state.txt
 model_logs.txt
+yolo11x.pt
+setup_logs.txt
+yolo11x.pt
+setup_logs.txt

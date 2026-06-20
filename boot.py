@@ -2,43 +2,43 @@ import os
 import sys
 import subprocess
 import threading
+import time
 
 def stream_logs(pipe, prefix, is_engine=False):
-    """Reads output from a background process and prints it live with zero latency."""
     for line in iter(pipe.readline, ''):
-        # Professional Logging Filter
         if is_engine and ("Loading weights:" in line or "%|" in line):
             continue
-            
-        # Force immediate screen render
         print(f"{prefix} {line}", end="", flush=True)
+
+def run_with_watchdog(command, prefix, is_engine):
+    """Ensures the process stays alive forever. Restarts it if it crashes."""
+    while True:
+        process = subprocess.Popen(
+            command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            text=True,
+            bufsize=1
+        )
+        stream_logs(process.stdout, prefix, is_engine)
+        process.wait()
+        
+        # If it reaches here, the process crashed.
+        print(f"\n⚠️ [WATCHDOG] {prefix} process crashed. Rebooting in 3 seconds...", flush=True)
+        time.sleep(3)
 
 print("🗄️ [SYSTEM] Booting Message Broker...", flush=True)
 os.system("service redis-server start > /dev/null 2>&1")
 
 print("\n🚀 IGNITING VIDEO INTELLIGENCE OS...\n" + "="*50, flush=True)
 
-p_model = subprocess.Popen(
-    ["python", "-u", "model_manager.py"], 
-    stdout=subprocess.PIPE, 
-    stderr=subprocess.STDOUT, 
-    text=True,
-    bufsize=1 # Line buffered
-)
-threading.Thread(target=stream_logs, args=(p_model.stdout, "🤖 [ENGINE]", True), daemon=True).start()
-
-p_ui = subprocess.Popen(
-    ["python", "-u", "ui_server.py"], 
-    stdout=subprocess.PIPE, 
-    stderr=subprocess.STDOUT, 
-    text=True,
-    bufsize=1 # Line buffered
-)
-threading.Thread(target=stream_logs, args=(p_ui.stdout, "🖥️ [UI]", False), daemon=True).start()
+# Launch workers via Watchdog Threads
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"], "🖥️ [UI]", False), daemon=True).start()
 
 try:
-    p_ui.wait()
+    # Keep main orchestrator alive indefinitely
+    while True:
+        time.sleep(100)
 except KeyboardInterrupt:
-    print("\n🛑 [SYSTEM] Shutting down OS...", flush=True)
-    p_ui.terminate()
-    p_model.terminate()
+    print("\n🛑 [SYSTEM] Manual Shutdown Initiated.")
