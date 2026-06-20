@@ -229,20 +229,22 @@ async def background_downloader():
                     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
                         for msg in msgs:
                             if getattr(msg, 'empty', False) or not (msg.video or (msg.document and 'video' in str(msg.document.mime_type))): continue
-                            text = msg.caption if msg.caption else ""
-                            cat_name = extract_text(r"📁 Category:\s*(.+)", text)
-                            creator_name = extract_text(r"👤 Creator:\s*(.+)", text)
-                            likes = extract_num(r"❤️ Likes:\s*([\d,]+)", text)
-                            cap_match = re.search(r"📝 Caption:\n(.*?)(?=\n🔗 Link:|$)", text, re.DOTALL)
-                            clean_caption = cap_match.group(1).strip() if cap_match else ""
-    
-                            await conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat_name,))
-                                async with conn.execute("SELECT id FROM categories WHERE name = ?", (cat_name,)) as cursor:
-                                    cat_id = (await cursor.fetchone())[0]
-                                await conn.execute("INSERT OR IGNORE INTO creators (username) VALUES (?)", (creator_name,))
-                                async with conn.execute("SELECT id FROM creators WHERE username = ?", (creator_name,)) as cursor:
-                                    creator_id = (await cursor.fetchone())[0]
-                                await conn.execute("INSERT OR IGNORE INTO posts (video_id, category_id, creator_id, likes, caption, status) VALUES (?, ?, ?, ?, ?, ?)", (msg.id, cat_id, creator_id, likes, clean_caption, "Metadata_Only"))
+                            text = msg.caption if msg.caption else ''
+                            cat_name = extract_text(r'📁 Category:\s*(.+)', text)
+                            creator_name = extract_text(r'👤 Creator:\s*(.+)', text)
+                            likes = extract_num(r'❤️ Likes:\s*([\d,]+)', text)
+                            cap_match = re.search(r'📝 Caption:\n(.*?)(?=\n🔗 Link:|$)', text, re.DOTALL)
+                            clean_caption = cap_match.group(1).strip() if cap_match else ''
+
+                            await conn.execute('INSERT OR IGNORE INTO categories (name) VALUES (?)', (cat_name,))
+                            async with conn.execute('SELECT id FROM categories WHERE name = ?', (cat_name,)) as cursor:
+                                cat_row = await cursor.fetchone()
+                                cat_id = cat_row[0] if cat_row else 1
+                            await conn.execute('INSERT OR IGNORE INTO creators (username) VALUES (?)', (creator_name,))
+                            async with conn.execute('SELECT id FROM creators WHERE username = ?', (creator_name,)) as cursor:
+                                creator_row = await cursor.fetchone()
+                                creator_id = creator_row[0] if creator_row else 1
+                            await conn.execute('INSERT OR IGNORE INTO posts (video_id, category_id, creator_id, likes, caption, status) VALUES (?, ?, ?, ?, ?, ?)', (msg.id, cat_id, creator_id, likes, clean_caption, 'Metadata_Only'))
                         await conn.commit()
                     await asyncio.sleep(2)
                 except FloodWait as e: await asyncio.sleep(e.value)
