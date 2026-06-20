@@ -1,7 +1,4 @@
 
-!pip install -q fastapi uvicorn pyrogram tgcrypto pandas nest-asyncio
-!apt-get update -y && apt-get install -y ffmpeg
-!wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared
 
 import os
 import sqlite3
