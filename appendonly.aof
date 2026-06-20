@@ -836,3 +836,87 @@ $12
 QUEUE_VISION
 $86
 {"msg_id": 1028, "path": "/kaggle/working/Insta-Vault/DataLake/videos/video_1028.mp4"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$22
+{"model_name": "yolo"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$25
+{"model_name": "whisper"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$24
+{"model_name": "dinov2"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$24
+{"model_name": "siglip"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$22
+{"model_name": "clip"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$22
+{"model_name": "raft"}
+*3
+$5
+RPUSH
+$12
+QUEUE_MODELS
+$25
+{"model_name": "easyocr"}
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
+*2
+$4
+LPOP
+$12
+QUEUE_MODELS
