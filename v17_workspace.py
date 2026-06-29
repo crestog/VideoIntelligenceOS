@@ -11,6 +11,60 @@ FLAG_DIR = '/kaggle/working/Insta-Vault/DataLake/_Flagged_Dataset'
 DB_PATH = '/kaggle/working/Insta-Vault/DataLake/lake.db'
 KAGGLE_LOGS = ["[SYSTEM] V17 Workspace Booted & Synced with DataLake."]
 
+os.makedirs(VIDEO_DIR, exist_ok=True)
+os.makedirs(THUMB_DIR, exist_ok=True)
+os.makedirs(FLAG_DIR, exist_ok=True)
+
+# ==========================================
+# CRITICAL FIX: DB Initialization & Auto-Migration
+# ==========================================
+def sync_v17_database():
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS videos 
+                     (msg_id INTEGER PRIMARY KEY, folder_id TEXT, title TEXT, 
+                      frames INTEGER, duration_sec REAL, duration_str TEXT, 
+                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT)''')
+        
+        legacy_folders = glob.glob(os.path.join(VIDEO_DIR, 'frames_*'))
+        migrated = 0
+        for f in legacy_folders:
+            folder_id = os.path.basename(f)
+            msg_id_str = folder_id.replace('frames_', '')
+            if not msg_id_str.isdigit(): continue
+            msg_id = int(msg_id_str)
+            
+            c.execute("SELECT 1 FROM videos WHERE msg_id=?", (msg_id,))
+            if c.fetchone(): continue
+            
+            frames = sorted(glob.glob(os.path.join(f, "frame_*.jpg")))
+            count = len(frames)
+            if count == 0: continue
+            
+            try: ts_end = float(os.path.basename(frames[-1]).split('_ts_')[1].replace('s.jpg', ''))
+            except: ts_end = 0.0
+            
+            mp4_path = os.path.join(VIDEO_DIR, f"video_{msg_id}.mp4")
+            file_size_mb = os.path.getsize(mp4_path) / (1024*1024) if os.path.exists(mp4_path) else 0.0
+            
+            c.execute('''INSERT INTO videos 
+                         (msg_id, folder_id, title, frames, duration_sec, duration_str, thumb, first_frame, file_size_mb, abs_path) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (msg_id, folder_id, f"Video #{msg_id}", count, ts_end, f"{ts_end:.1f}s", f"/thumbs/{folder_id}.jpg", f"/data/{folder_id}/{os.path.basename(frames[0])}", file_size_mb, f))
+            migrated += 1
+            
+        conn.commit()
+        conn.close()
+        if migrated > 0: KAGGLE_LOGS.append(f"✅ Auto-recovered {migrated} datasets.")
+    except Exception as e:
+        KAGGLE_LOGS.append(f"❌ DB Sync Failed: {e}")
+
+sync_v17_database()
+
+# ==========================================
+# ROUTES & FRONTEND
+# ==========================================
 @v17_router.get("/api/database")
 def get_database():
     try:
