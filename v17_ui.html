@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html><body><div id="app"><h1>V17 Workspace Active</h1><div id="grid"></div></div>
+<script>
+async function load() {
+    const res = await fetch('/api/database');
+    const data = await res.json();
+    document.getElementById('grid').innerHTML = data.folders.length ? 'Videos Loaded' : 'No Videos Yet';
+}
+load();
+</script></body></html>

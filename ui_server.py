@@ -271,6 +271,8 @@ async def background_downloader():
 # 3. FASTAPI SETUP & HIGH-FIDELITY ENDPOINTS
 # ==========================================
 app = FastAPI()
+from v17_router import v17_router
+app.include_router(v17_router)
 
 # ⚠️ CRITICAL FIX: Ensure folders exist BEFORE mounting to fix Thumbnails
 os.makedirs(VIDEO_DIR, exist_ok=True)
