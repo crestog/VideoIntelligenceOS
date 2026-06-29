@@ -325,6 +325,13 @@ async def background_downloader():
 # 3. FASTAPI SETUP & HIGH-FIDELITY ENDPOINTS
 # ==========================================
 app = FastAPI()
+from v17_workspace import v17_router
+app.include_router(v17_router)
+try:
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/data", StaticFiles(directory="/kaggle/working/Insta-Vault/DataLake/videos"), name="v17_data")
+    app.mount("/thumbs", StaticFiles(directory="/kaggle/working/Insta-Vault/DataLake/.thumbnails"), name="v17_thumbs")
+except Exception: pass
 from frame_routes import frame_router
 app.include_router(frame_router)
 os.makedirs(VIDEO_DIR, exist_ok=True)
@@ -450,7 +457,8 @@ async def analyze_ui(id: str = "", t: str = ""):
             <hr style='border-color:#333; margin: 20px 0;'/>
             <p style='color:#888; font-style:italic;'>Multi-modal analysis engines standing by...</p>
         </div>
-    </body>
+        <a href="/v17" target="_blank" style="position: fixed; bottom: 24px; right: 24px; z-index: 99999; padding: 14px 24px; background: #0ea5e9; color: white; border-radius: 50px; text-decoration: none; font-weight: bold; box-shadow: 0 4px 20px rgba(0,0,0,0.8); border: 1px solid #7dd3fc; font-family: sans-serif; transition: 0.2s;">🎬 Launch V17 Workspace</a>
+</body>
     </html>
     """
 
@@ -1166,7 +1174,8 @@ async def serve_ui():
             init();
             searchExplore();
         </script>
-    </body>
+        <a href="/v17" target="_blank" style="position: fixed; bottom: 24px; right: 24px; z-index: 99999; padding: 14px 24px; background: #0ea5e9; color: white; border-radius: 50px; text-decoration: none; font-weight: bold; box-shadow: 0 4px 20px rgba(0,0,0,0.8); border: 1px solid #7dd3fc; font-family: sans-serif; transition: 0.2s;">🎬 Launch V17 Workspace</a>
+</body>
     </html>
     """
     return HTMLResponse(content=html_content)
