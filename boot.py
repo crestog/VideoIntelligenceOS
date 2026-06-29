@@ -40,6 +40,7 @@ print("\n🚀 IGNITING VIDEO INTELLIGENCE OS...\n" + "="*50, flush=True)
 # Launch workers via Watchdog Threads
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"], "🖥️ [UI]", False), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"], "🎞️ [CV-ENGINE]", False), daemon=True).start()
 
 try:
     # Keep main orchestrator alive indefinitely
