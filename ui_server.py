@@ -325,6 +325,8 @@ async def background_downloader():
 # 3. FASTAPI SETUP & HIGH-FIDELITY ENDPOINTS
 # ==========================================
 app = FastAPI()
+from frame_routes import frame_router
+app.include_router(frame_router)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
 @app.get("/videos/{video_name}")
