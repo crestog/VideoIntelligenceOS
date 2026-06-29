@@ -17,7 +17,7 @@ def get_database():
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM frame_videos ORDER BY msg_id DESC")
+        c.execute("SELECT * FROM videos ORDER BY msg_id DESC")
         rows = c.fetchall()
         conn.close()
         payload = []
