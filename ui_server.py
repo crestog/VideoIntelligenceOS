@@ -442,6 +442,7 @@ async def analyze_ui(id: str = "", t: str = ""):
     return f"""
     <html>
     <body style='background:#050505; color:white; font-family:sans-serif; padding:50px; text-align:center;'>
+    <a href="/frames" target="_blank" style="position: fixed; bottom: 24px; right: 24px; z-index: 99999; padding: 14px 24px; background: #0ea5e9; color: white; border-radius: 50px; text-decoration: none; font-weight: bold; box-shadow: 0 4px 20px rgba(0,0,0,0.8); border: 1px solid #7dd3fc; font-family: sans-serif; transition: 0.2s;">🎬 Launch V17 Workspace</a>
         <h2 style='color:#00e5ff; margin-bottom: 10px;'>🔍 Pattern Recognition Module</h2>
         <div style='background:#111; padding:30px; border-radius:16px; border:1px solid #333; display:inline-block; text-align:left;'>
             <p style='font-size:18px;'><b>Video ID:</b> {id}</p>
@@ -584,6 +585,7 @@ async def serve_ui():
         </style>
     </head>
     <body>
+    <a href="/frames" target="_blank" style="position: fixed; bottom: 24px; right: 24px; z-index: 99999; padding: 14px 24px; background: #0ea5e9; color: white; border-radius: 50px; text-decoration: none; font-weight: bold; box-shadow: 0 4px 20px rgba(0,0,0,0.8); border: 1px solid #7dd3fc; font-family: sans-serif; transition: 0.2s;">🎬 Launch V17 Workspace</a>
         <div id="toast-container"></div>
 
         <div class="tabs">
