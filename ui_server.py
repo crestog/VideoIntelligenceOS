@@ -293,6 +293,32 @@ app.include_router(v17_router)
 
 @app.get("/api/status")
 def get_status(): return {"status": GLOBAL_STATUS}
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws_mgr.connect(ws)
+    async def push_status():
+        last_s = ""
+        while True:
+            gs = globals().get("GLOBAL_STATUS", "")
+            if gs != last_s:
+                last_s = gs
+                try: await ws.send_json({"type":"status", "message":gs})
+                except: break
+            await asyncio.sleep(0.2)
+    t = asyncio.create_task(push_status())
+    try:
+        while True: await ws.receive_text()
+    except WebSocketDisconnect:
+        t.cancel()
+        ws_mgr.disconnect(ws)
+
+@app.post("/api/prioritize/{video_id}")
+def prioritize_video(video_id: int):
+    target_video = os.path.join(VIDEO_DIR, f"video_{video_id}.mp4")
+    if os.path.exists(target_video):
+        push_job("QUEUE_VISION", {"msg_id": video_id, "path": target_video})
+    return {"success": True}
 @app.post("/api/scan")
 def trigger_scan(category: str = None):
     global CATEGORY_QUEUE
