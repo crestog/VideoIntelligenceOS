@@ -1,6 +1,8 @@
 import os, sqlite3, aiosqlite, redis, re, builtins, time, asyncio, urllib.request, json, uvicorn, threading, subprocess
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+import logging
+import aiofiles
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
 from pyrogram.errors import FloodWait
@@ -10,9 +12,30 @@ from v17_backend import v17_router
 
 nest_asyncio.apply()
 
+logger = logging.getLogger("VIOS")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', '%H:%M:%S'))
+    logger.addHandler(ch)
+
+class WsManager:
+    def __init__(self): self.clients = []
+    async def connect(self, ws: WebSocket): await ws.accept(); self.clients.append(ws)
+    def disconnect(self, ws: WebSocket): self.clients.remove(ws)
+    async def broadcast(self, msg: dict):
+        for c in self.clients.copy():
+            try: await c.send_json(msg)
+            except: pass
+ws_mgr = WsManager()
+
 def custom_print(*args, **kwargs):
-    kwargs['flush'] = True
-    builtins.print(f"[{time.strftime('%H:%M:%S')}]", *args, **kwargs)
+    msg = " ".join(map(str, args))
+    logger.info(msg)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(ws_mgr.broadcast({"type": "log", "message": f"[{time.strftime('%H:%M:%S')}] {msg}"}))
+    except: pass
 
 # --- CREDENTIALS ---
 API_ID = 37392880
