@@ -261,10 +261,11 @@ async def background_downloader():
                         await conn.execute("UPDATE posts SET local_video_path = ?, status = 'Harvested' WHERE video_id = ?", (target_video, target_vid))
                         await conn.commit()
 
+                    is_active_cat = bool(CATEGORY_QUEUE and target_cat_name == CATEGORY_QUEUE[0])
                     if REDIS_CACHE and REDIS_CACHE.sadd("PROCESSED_VIDEOS_SET", target_vid):
-                        push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video})
+                        push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video}, is_priority=is_active_cat)
                     elif not REDIS_CACHE:
-                        push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video})
+                        push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video}, is_priority=is_active_cat)
                     
                     await asyncio.sleep(4)
 
