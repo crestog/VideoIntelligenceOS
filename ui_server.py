@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 import nest_asyncio
-from queue_manager import push_job
+from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
 from v17_backend import v17_router
 
 nest_asyncio.apply()
@@ -293,19 +293,32 @@ app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="main_videos")
 app.include_router(v17_router)
 
 @app.get("/api/status")
-def get_status(): return {"status": GLOBAL_STATUS}
+def get_status():
+    try:
+        metrics = get_queue_metrics("QUEUE_VISION")
+    except:
+        metrics = {}
+    return {"status": GLOBAL_STATUS, "queue": metrics}
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws_mgr.connect(ws)
     async def push_status():
         last_s = ""
+        tick = 0
         while True:
             gs = globals().get("GLOBAL_STATUS", "")
             if gs != last_s:
                 last_s = gs
                 try: await ws.send_json({"type":"status", "message":gs})
                 except: break
+            # Broadcast queue metrics every 5 seconds (25 × 0.2s)
+            tick += 1
+            if tick % 25 == 0:
+                try:
+                    m = get_queue_metrics("QUEUE_VISION")
+                    await ws.send_json({"type": "queue", "data": m})
+                except: pass
             await asyncio.sleep(0.2)
     t = asyncio.create_task(push_status())
     try:
@@ -317,9 +330,27 @@ async def ws_endpoint(ws: WebSocket):
 @app.post("/api/prioritize/{video_id}")
 def prioritize_video(video_id: int):
     target_video = os.path.join(VIDEO_DIR, f"video_{video_id}.mp4")
-    if os.path.exists(target_video):
-        push_job("QUEUE_VISION", {"msg_id": video_id, "path": target_video})
-    return {"success": True}
+    if not os.path.exists(target_video):
+        return {"success": False, "message": "Video file not found on disk"}
+    # Clear from dedup set so it can be re-processed
+    if REDIS_CACHE:
+        REDIS_CACHE.srem("PROCESSED_VIDEOS_SET", video_id)
+    push_job("QUEUE_VISION", {"msg_id": video_id, "path": target_video}, is_priority=True)
+    return {"success": True, "message": f"Video #{video_id} queued with PRIORITY"}
+
+@app.get("/api/queue")
+def api_queue_metrics():
+    """Full queue system observability endpoint."""
+    try:
+        return get_queue_metrics()
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/queue/replay-dlq")
+def api_replay_dlq():
+    """Move all dead-lettered jobs back to the default queue for reprocessing."""
+    count = replay_dlq("QUEUE_VISION")
+    return {"replayed": count, "message": f"Replayed {count} dead-lettered jobs"}
 @app.post("/api/scan")
 def trigger_scan(category: str = None):
     global CATEGORY_QUEUE
