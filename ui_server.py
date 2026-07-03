@@ -9,6 +9,8 @@ from pyrogram.errors import FloodWait
 import nest_asyncio
 from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
 from v17_backend import v17_router
+from admin_backend import admin_router
+from config import BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR
 
 nest_asyncio.apply()
 
@@ -43,17 +45,8 @@ API_HASH = "4037344084ae998be2cdaee3192bd8f8"
 BOT_TOKEN = "8269867642:AAH76B2_aFbqc6OqNiCAm-NenTTmG_SWavU"
 CHANNEL_ID = -1003762735924
 
-# --- DIRECTORY ROUTING ---
-BASE_DIR = '/kaggle/working/Insta-Vault'
-LAKE_DIR = os.path.join(BASE_DIR, 'DataLake')
-DB_PATH = os.path.join(LAKE_DIR, 'lake.db')
-VIDEO_DIR = os.path.join(LAKE_DIR, 'videos')
+# --- DIRECTORY ROUTING (from config.py) ---
 SESSION_PATH = os.path.join(LAKE_DIR, 'bot_session')
-STATE_FILE = os.path.join(LAKE_DIR, 'state.txt')
-
-os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(os.path.join(LAKE_DIR, '.thumbnails'), exist_ok=True)
-os.makedirs(os.path.join(LAKE_DIR, '_Flagged_Dataset'), exist_ok=True)
 
 for j_file in [f"{SESSION_PATH}.session-journal", f"{DB_PATH}-journal", f"{DB_PATH}-wal"]:
     if os.path.exists(j_file):
@@ -293,6 +286,7 @@ app.mount("/thumbs", StaticFiles(directory=os.path.join(LAKE_DIR, '.thumbnails')
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="main_videos")
 
 app.include_router(v17_router)
+app.include_router(admin_router)
 
 @app.get("/api/status")
 def get_status():
@@ -300,7 +294,14 @@ def get_status():
         metrics = get_queue_metrics("QUEUE_VISION")
     except:
         metrics = {}
-    return {"status": GLOBAL_STATUS, "queue": metrics}
+    # Disk usage
+    try:
+        import shutil
+        disk = shutil.disk_usage(LAKE_DIR)
+        free_gb = f"{disk.free / (1024**3):.1f} GB"
+    except:
+        free_gb = "N/A"
+    return {"status": GLOBAL_STATUS, "queue": metrics, "disk_free": free_gb}
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):

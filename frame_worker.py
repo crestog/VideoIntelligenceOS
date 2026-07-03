@@ -23,24 +23,17 @@ import time
 import shutil
 import redis as redis_lib
 from queue_manager import claim_job, ack_job, fail_job
+from config import VIDEO_DIR, THUMB_DIR, DB_PATH, QUEUE_VISION, DISK_PAUSE_THRESHOLD_GB, DISK_WARN_THRESHOLD_GB
+from logger import vios_log
 
-# ═══════════════════════════════════════════════════════════
-# ENVIRONMENT PATHS
-# ═══════════════════════════════════════════════════════════
-BASE_DIR  = '/kaggle/working/Insta-Vault'
-LAKE_DIR  = os.path.join(BASE_DIR, 'DataLake')
-VIDEO_DIR = os.path.join(LAKE_DIR, 'videos')
-THUMB_DIR = os.path.join(LAKE_DIR, '.thumbnails')
-DB_PATH   = os.path.join(LAKE_DIR, 'lake.db')
-
-QUEUE_NAME = "QUEUE_VISION"
+QUEUE_NAME = QUEUE_VISION
 
 
 # ═══════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] 🎞️ [CV-ENGINE] {msg}", flush=True)
+    vios_log(msg, "CV", "INFO")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -72,11 +65,11 @@ def extract_video_data(video_path, msg_id):
 
     # ── Disk Space Guard ──
     free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-    while free_gb < 0.5:
+    while free_gb < DISK_PAUSE_THRESHOLD_GB:
         log(f"⏸️ Disk space low ({free_gb:.1f}GB) — pausing extraction, waiting for space...")
         time.sleep(30)
         free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-    if free_gb < 1.5:
+    if free_gb < DISK_WARN_THRESHOLD_GB:
         log(f"⚠️ Disk: {free_gb:.1f} GB available — LOW SPACE WARNING")
     else:
         log(f"💾 Disk: {free_gb:.1f} GB available")
@@ -214,6 +207,16 @@ def run_worker():
             continue
 
         if not job:
+            # Check if paused by Admin panel
+            try:
+                r = redis_lib.Redis(host='localhost', port=6379, decode_responses=True, socket_timeout=1)
+                if r.get('CV_PAUSED') == '1':
+                    log('⏸️ Paused by Admin — waiting...')
+                    while r.get('CV_PAUSED') == '1':
+                        time.sleep(5)
+                    log('▶️ Resumed by Admin')
+            except:
+                pass
             continue
 
         # Unwrap payload from job envelope

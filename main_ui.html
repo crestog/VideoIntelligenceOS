@@ -86,6 +86,7 @@
         <button class="tab-btn active" onclick="switchTab('reels')">📱 View Reels</button>
         <button class="tab-btn" onclick="switchTab('explore')">🔍 Explore DB</button>
         <button class="tab-btn" onclick="switchTab('v17_workspace')">🎬 V17 Workspace</button>
+        <button class="tab-btn" onclick="switchTab('admin')">🛡️ Admin</button>
     </div>
 
     <div id="reels" class="tab-content active">
@@ -127,6 +128,7 @@
                 <span class="qs-item">⚙️ <span class="qs-val" id="qs-processing">—</span> processing</span>
                 <span class="qs-item">✅ <span class="qs-val" id="qs-completed">—</span> done</span>
                 <span class="qs-item">❌ <span class="qs-val" id="qs-dead">—</span> failed</span>
+                <span class="qs-item">💾 <span class="qs-val" id="qs-disk">—</span> free</span>
             </div>
         </div>
     </div>
@@ -153,6 +155,10 @@
 
     <div id="v17_workspace" class="tab-content" style="height: 84vh; padding: 0;">
         <iframe src="/v17" style="width: 100%; height: 100%; border: none; border-radius: 18px; background: #0f172a; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></iframe>
+    </div>
+
+    <div id="admin" class="tab-content" style="height: 84vh; padding: 0;">
+        <iframe src="/admin" style="width: 100%; height: 100%; border: none; border-radius: 18px; background: #030303; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></iframe>
     </div>
 
     <script>
@@ -194,7 +200,7 @@
         }
 
         async function init() { loadCategories(); const stateRes = await fetch('/api/state'); const stateData = await stateRes.json(); currentIndex = stateData.index || 0; await fetchPlaylist(currentPlayingCat); setInterval(updateStatus, 1500); setInterval(autoSyncFeed, 3000); }
-        async function updateStatus() { const res = await fetch('/api/status'); const data = await res.json(); document.getElementById('live-status').innerText = data.status; if (data.queue && data.queue.QUEUE_VISION) { const q = data.queue.QUEUE_VISION; document.getElementById('qs-pending').textContent = q.pending_total; document.getElementById('qs-processing').textContent = q.processing; document.getElementById('qs-completed').textContent = q.total_completed; document.getElementById('qs-dead').textContent = q.total_dead; } }
+        async function updateStatus() { const res = await fetch('/api/status'); const data = await res.json(); document.getElementById('live-status').innerText = data.status; if (data.queue && data.queue.QUEUE_VISION) { const q = data.queue.QUEUE_VISION; document.getElementById('qs-pending').textContent = q.pending_total; document.getElementById('qs-processing').textContent = q.processing; document.getElementById('qs-completed').textContent = q.total_completed; document.getElementById('qs-dead').textContent = q.total_dead; } if(data.disk_free) { const el = document.getElementById('qs-disk'); if(el) el.textContent = data.disk_free; } }
         async function loadCategories() { const res = await fetch('/api/categories'); const data = await res.json(); populateCustomDropdown(data.categories, data.queue); }
         async function fetchPlaylist(category) { const res = await fetch(`/api/playlist?category=${encodeURIComponent(category)}`); const data = await res.json(); currentPlaylist = data.playlist; loadVideo(currentIndex); }
         function preloadNextVideo(index) { clearGhostMemory(); if (index + 1 < currentPlaylist.length) { const nextVidFile = currentPlaylist[index + 1].filename; ghostPlayer.src = "/videos/" + nextVidFile; ghostPlayer.load(); } }
