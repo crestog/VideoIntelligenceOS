@@ -12,5 +12,6 @@ ui_state.txt
 model_logs.txt
 yolo11x.pt
 setup_logs.txt
-yolo11x.pt
-setup_logs.txt
+appendonly.aof
+dump.rdb
+*.rdb

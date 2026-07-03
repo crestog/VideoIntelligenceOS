@@ -67,6 +67,7 @@ async def serve_v17_ui():
 
 @v17_router.get("/api/database")
 def get_database():
+    sync_v17_database()  # Re-sync on every request to pick up newly processed frames
     try:
         conn = sqlite3.connect(DB_PATH, timeout=20)
         conn.row_factory = sqlite3.Row

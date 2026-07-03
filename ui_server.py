@@ -264,8 +264,10 @@ async def background_downloader():
                     is_active_cat = bool(CATEGORY_QUEUE and target_cat_name == CATEGORY_QUEUE[0])
                     if REDIS_CACHE and REDIS_CACHE.sadd("PROCESSED_VIDEOS_SET", target_vid):
                         push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video}, is_priority=is_active_cat)
+                        custom_print(f"📤 Queued #{target_vid} for CV Engine ({'🔴 PRIORITY' if is_active_cat else '⚪ DEFAULT'})")
                     elif not REDIS_CACHE:
                         push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video}, is_priority=is_active_cat)
+                        custom_print(f"📤 Queued #{target_vid} for CV Engine (no Redis)")
                     
                     await asyncio.sleep(4)
 

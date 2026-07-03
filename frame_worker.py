@@ -72,9 +72,14 @@ def extract_video_data(video_path, msg_id):
 
     # ── Disk Space Guard ──
     free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-    if free_gb < 2:
-        raise RuntimeError(f"Disk space critical: {free_gb:.1f}GB remaining — need at least 2GB")
-    log(f"💾 Disk: {free_gb:.1f} GB available")
+    while free_gb < 0.5:
+        log(f"⏸️ Disk space low ({free_gb:.1f}GB) — pausing extraction, waiting for space...")
+        time.sleep(30)
+        free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
+    if free_gb < 1.5:
+        log(f"⚠️ Disk: {free_gb:.1f} GB available — LOW SPACE WARNING")
+    else:
+        log(f"💾 Disk: {free_gb:.1f} GB available")
 
     # ── Open Video Stream ──
     folder_id = f"frames_{msg_id}"
