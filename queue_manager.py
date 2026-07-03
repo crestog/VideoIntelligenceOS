@@ -31,7 +31,15 @@ import uuid
 # ═══════════════════════════════════════════════════════════
 # CONNECTION POOL
 # ═══════════════════════════════════════════════════════════
-redis_pool = redis.ConnectionPool(host='localhost', port=6379, decode_responses=True)
+redis_pool = redis.ConnectionPool(
+    host='localhost',
+    port=6379,
+    decode_responses=True,
+    socket_timeout=30,          # Must be > any blpop timeout (max 5s)
+    socket_connect_timeout=5,   # Connection establishment timeout
+    retry_on_timeout=True,      # Auto-retry on transient socket timeouts
+    health_check_interval=15,   # Keep-alive ping every 15s
+)
 
 def get_redis():
     return redis.Redis(connection_pool=redis_pool)

@@ -21,6 +21,7 @@ import cv2
 import sqlite3
 import time
 import shutil
+import redis as redis_lib
 from queue_manager import claim_job, ack_job, fail_job
 
 # ═══════════════════════════════════════════════════════════
@@ -196,7 +197,16 @@ def run_worker():
     total_frames = 0
 
     while True:
-        job, job_raw = claim_job(QUEUE_NAME, timeout=5)
+        try:
+            job, job_raw = claim_job(QUEUE_NAME, timeout=5)
+        except (redis_lib.exceptions.TimeoutError, redis_lib.exceptions.ConnectionError, OSError) as e:
+            log(f"⚠️ Redis connection issue: {type(e).__name__} — retrying in 3s...")
+            time.sleep(3)
+            continue
+        except Exception as e:
+            log(f"⚠️ Unexpected queue error: {type(e).__name__}: {e} — retrying in 3s...")
+            time.sleep(3)
+            continue
 
         if not job:
             continue
