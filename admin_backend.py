@@ -72,7 +72,7 @@ def serve_admin_ui():
             content="<h1>admin_ui.html not found</h1>", status_code=404
         )
     except Exception as exc:
-        vios_log(f"Error serving admin UI: {exc}", "admin", "error")
+        vios_log(f"Error serving admin UI: {exc}", "ADMIN", "ERROR")
         return HTMLResponse(
             content=f"<h1>Internal error</h1><pre>{exc}</pre>", status_code=500
         )
@@ -129,7 +129,7 @@ def get_disk_usage():
         return _disk_cache
 
     except Exception as exc:
-        vios_log(f"Error computing disk usage: {exc}", "admin", "error")
+        vios_log(f"Error computing disk usage: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -160,10 +160,16 @@ def get_categories():
         rows = cur.fetchall()
         conn.close()
 
-        # Fetch active list from Redis
-        r = get_redis()
-        active_raw = r.get("ADMIN_ACTIVE_CATEGORIES") if r else None
-        active_list: list[str] = json.loads(active_raw) if active_raw else []
+        # Fetch active list from Redis (with error resilience)
+        active_list: list[str] = []
+        try:
+            r = get_redis()
+            if r:
+                active_raw = r.get("ADMIN_ACTIVE_CATEGORIES")
+                if active_raw:
+                    active_list = json.loads(active_raw)
+        except Exception:
+            pass
         active_set = set(active_list)
 
         categories = []
@@ -194,7 +200,7 @@ def get_categories():
         return {"categories": categories}
 
     except Exception as exc:
-        vios_log(f"Error fetching categories: {exc}", "admin", "error")
+        vios_log(f"Error fetching categories: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -219,12 +225,12 @@ async def activate_categories(request: Request):
 
         r.set("ADMIN_ACTIVE_CATEGORIES", json.dumps(cat_list))
         vios_log(
-            f"Active categories updated: {cat_list}", "admin", "info"
+            f"Active categories updated: {cat_list}", "ADMIN", "INFO"
         )
         return {"ok": True, "active_categories": cat_list}
 
     except Exception as exc:
-        vios_log(f"Error activating categories: {exc}", "admin", "error")
+        vios_log(f"Error activating categories: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -300,7 +306,7 @@ async def storage_preview(request: Request):
         }
 
     except Exception as exc:
-        vios_log(f"Error in storage preview: {exc}", "admin", "error")
+        vios_log(f"Error in storage preview: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -342,8 +348,8 @@ async def storage_cleanup(request: Request):
                     deleted_frame_folders += 1
                     vios_log(
                         f"Deleted frames dir: frames_{msg_id} ({_bytes_to_gb(size)} GB)",
-                        "admin",
-                        "info",
+                        "ADMIN",
+                        "INFO",
                     )
 
             # --- video mp4 ---
@@ -357,8 +363,8 @@ async def storage_cleanup(request: Request):
                     deleted_msg_ids.append(msg_id)
                     vios_log(
                         f"Deleted video: video_{msg_id}.mp4 ({_bytes_to_gb(size)} GB)",
-                        "admin",
-                        "info",
+                        "ADMIN",
+                        "INFO",
                     )
 
         # --- Database cleanup ---
@@ -382,8 +388,8 @@ async def storage_cleanup(request: Request):
             conn.close()
             vios_log(
                 f"DB cleanup: removed {len(deleted_msg_ids)} video rows, reset post statuses",
-                "admin",
-                "info",
+                "ADMIN",
+                "INFO",
             )
 
         # Invalidate disk cache
@@ -397,7 +403,7 @@ async def storage_cleanup(request: Request):
         }
 
     except Exception as exc:
-        vios_log(f"Error in storage cleanup: {exc}", "admin", "error")
+        vios_log(f"Error in storage cleanup: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -432,7 +438,7 @@ def system_health():
         }
 
     except Exception as exc:
-        vios_log(f"Error in system health check: {exc}", "admin", "error")
+        vios_log(f"Error in system health check: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -446,7 +452,7 @@ def get_logs():
         logs = get_recent_logs(200)
         return {"logs": logs}
     except Exception as exc:
-        vios_log(f"Error fetching logs: {exc}", "admin", "error")
+        vios_log(f"Error fetching logs: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -461,10 +467,10 @@ def queue_pause():
         if r is None:
             return JSONResponse({"error": "Redis unavailable"}, status_code=503)
         r.set("CV_PAUSED", "1")
-        vios_log("CV queue PAUSED via admin panel", "admin", "info")
+        vios_log("CV queue PAUSED via admin panel", "ADMIN", "INFO")
         return {"ok": True, "paused": True}
     except Exception as exc:
-        vios_log(f"Error pausing queue: {exc}", "admin", "error")
+        vios_log(f"Error pausing queue: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -479,8 +485,8 @@ def queue_resume():
         if r is None:
             return JSONResponse({"error": "Redis unavailable"}, status_code=503)
         r.delete("CV_PAUSED")
-        vios_log("CV queue RESUMED via admin panel", "admin", "info")
+        vios_log("CV queue RESUMED via admin panel", "ADMIN", "INFO")
         return {"ok": True, "paused": False}
     except Exception as exc:
-        vios_log(f"Error resuming queue: {exc}", "admin", "error")
+        vios_log(f"Error resuming queue: {exc}", "ADMIN", "ERROR")
         return JSONResponse({"error": str(exc)}, status_code=500)

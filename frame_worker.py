@@ -157,15 +157,29 @@ def extract_video_data(video_path, msg_id):
         c.execute('''CREATE TABLE IF NOT EXISTS videos
                      (msg_id INTEGER PRIMARY KEY, folder_id TEXT, title TEXT,
                       frames INTEGER, duration_sec REAL, duration_str TEXT,
-                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT)''')
+                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT,
+                      created_at REAL)''')
 
-        c.execute('''INSERT OR REPLACE INTO videos
+        # Migration: add created_at column if missing
+        try:
+            c.execute("SELECT created_at FROM videos LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE videos ADD COLUMN created_at REAL")
+
+        now = time.time()
+        c.execute('''INSERT INTO videos
                      (msg_id, folder_id, title, frames, duration_sec, duration_str,
-                      thumb, first_frame, file_size_mb, abs_path)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      thumb, first_frame, file_size_mb, abs_path, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(msg_id) DO UPDATE SET
+                      folder_id=excluded.folder_id, title=excluded.title,
+                      frames=excluded.frames, duration_sec=excluded.duration_sec,
+                      duration_str=excluded.duration_str, thumb=excluded.thumb,
+                      first_frame=excluded.first_frame, file_size_mb=excluded.file_size_mb,
+                      abs_path=excluded.abs_path''',
                   (msg_id, folder_id, f"Video #{msg_id}", current_frame, actual_duration,
                    f"{actual_duration:.1f}s", f"/thumbs/{folder_id}.jpg",
-                   f"/data/{folder_id}/frame_00000_ts_0.000s.jpg", file_size_mb, frames_dir))
+                   f"/data/{folder_id}/frame_00000_ts_0.000s.jpg", file_size_mb, frames_dir, now))
         conn.commit()
         conn.close()
         log(f"💾 DB committed: ID={msg_id} | {current_frame} frames | {actual_duration:.1f}s | {file_size_mb:.1f}MB")

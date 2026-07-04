@@ -319,7 +319,13 @@ function closeModal(){$('confirm-modal').classList.remove('active');}
 async function executeCleanup(){
   closeModal();
   const d=await api('/api/admin/storage/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(previewData)});
-  if(d){showToast('Cleanup completed successfully','success');previewData=null;$('exec-cleanup-btn').disabled=true;$('preview-box').style.display='none';loadDisk();loadCategories().then(renderCleanupList);}
+  if(d){
+    showToast(`Cleanup complete — freed ${(d.freed_gb||0).toFixed(2)} GB`,'success');
+    previewData=null;$('exec-cleanup-btn').disabled=true;$('preview-box').style.display='none';
+    loadDisk();
+    await loadCategories();
+    renderCleanupList();
+  }
 }
 
 /* ── 4. System Monitor ── */
@@ -351,15 +357,24 @@ async function loadLogs(){
   const resp=await api('/api/admin/logs');if(!resp||!resp.logs)return;
   const logs=resp.logs;
   const el=$('admin-logs');
-  el.innerHTML=logs.map(l=>`<div class="log-line ${(l.level||'INFO').toLowerCase()}"><span class="ts">${l.timestamp||''}</span> <span class="sub">[${l.subsystem||'SYS'}]</span> <span class="msg">${l.message||l}</span></div>`).join('');
+  el.innerHTML=logs.map(l=>{
+    const level=(l.level||'INFO').toUpperCase();
+    return `<div class="log-line ${level}"><span class="ts">[${l.ts||''}]</span> <span class="sub">[${l.subsystem||'SYS'}]</span> <span class="msg">${l.message||''}</span></div>`;
+  }).join('');
+  el.scrollTop=el.scrollHeight;
 }
 
 /* ── Init ── */
-document.addEventListener('DOMContentLoaded',()=>{
-  loadDisk();loadCategories().then(renderCleanupList);loadSystem();loadLogs();
+document.addEventListener('DOMContentLoaded',async ()=>{
+  loadDisk();
+  await loadCategories();
+  renderCleanupList();
+  loadSystem();
+  loadLogs();
   setInterval(loadDisk,5000);
   setInterval(loadLogs,3000);
   setInterval(loadSystem,10000);
+  setInterval(async()=>{await loadCategories();renderCleanupList();},15000);
 });
 </script>
 </body>

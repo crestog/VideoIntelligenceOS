@@ -108,14 +108,13 @@ async def ensure_web_safe(video_path):
         codec = stdout.decode().strip().split('\n')[0].lower()
         temp_path = video_path + ".tmp.mp4"
 
-        if codec and codec not in ['h264', 'av1', 'hevc', 'h265']:
-            custom_print(f"⚙️ FFmpeg Codec Upgrade ({codec}) -> Lossless CRF 17")
-            conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '17', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        else:
-            custom_print(f"⚡ Instant Remux: 100% Quality Retention & FastStart...")
-            conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c', 'copy', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        
         async with ffmpeg_semaphore:
+            if codec and codec not in ['h264', 'av1', 'hevc', 'h265']:
+                custom_print(f"⚙️ FFmpeg Codec Upgrade ({codec}) -> Lossless CRF 17")
+                conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '17', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            else:
+                custom_print(f"⚡ Instant Remux: 100% Quality Retention & FastStart...")
+                conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c', 'copy', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await conv_proc.communicate()
         if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
             os.replace(temp_path, video_path)
@@ -157,7 +156,7 @@ async def background_downloader():
     import shutil
     while True:
         free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-        if free_gb < 5:
+        if free_gb < 1.0:
             GLOBAL_STATUS = f"⚠️ Storage Critical ({free_gb:.1f}GB left) - Pausing"
             await asyncio.sleep(60)
             continue
@@ -167,6 +166,19 @@ async def background_downloader():
             while not SCAN_TRIGGER.is_set(): await asyncio.sleep(1)
 
         SCAN_TRIGGER.clear()
+
+        # ── Sync CATEGORY_QUEUE from Admin Panel's Redis key ──
+        try:
+            if REDIS_CACHE:
+                admin_cats_raw = REDIS_CACHE.get("ADMIN_ACTIVE_CATEGORIES")
+                if admin_cats_raw:
+                    admin_cats = json.loads(admin_cats_raw)
+                    if isinstance(admin_cats, list) and admin_cats != CATEGORY_QUEUE:
+                        CATEGORY_QUEUE = admin_cats
+                        custom_print(f"📂 Admin category sync: {CATEGORY_QUEUE}")
+        except Exception:
+            pass
+
         GLOBAL_STATUS = "⚡ Running Flash Metadata Scan across Telegram..."
         custom_print("⚡ Scanning Telegram for new Posts...")
 

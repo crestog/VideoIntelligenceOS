@@ -31,10 +31,24 @@ def sync_v17_database():
         c.execute('''CREATE TABLE IF NOT EXISTS videos 
                      (msg_id INTEGER PRIMARY KEY, folder_id TEXT, title TEXT, 
                       frames INTEGER, duration_sec REAL, duration_str TEXT, 
-                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT)''')
+                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT,
+                      created_at REAL)''')
+        
+        # Migration: add created_at column if missing (existing DBs)
+        try:
+            c.execute("SELECT created_at FROM videos LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE videos ADD COLUMN created_at REAL")
+            # Backfill: use msg_id as a proxy for creation order
+            c.execute("UPDATE videos SET created_at = msg_id WHERE created_at IS NULL")
+            conn.commit()
+        
+        # Backfill any NULL created_at values
+        c.execute("UPDATE videos SET created_at = CAST(msg_id AS REAL) WHERE created_at IS NULL")
         
         legacy_folders = glob.glob(os.path.join(VIDEO_DIR, 'frames_*'))
         migrated = 0
+        now = time.time()
         for f in legacy_folders:
             folder_id = os.path.basename(f)
             msg_id_str = folder_id.replace('frames_', '')
@@ -60,10 +74,10 @@ def sync_v17_database():
             file_size_mb = os.path.getsize(mp4_path) / (1024 * 1024) if os.path.exists(mp4_path) else 0.0
             
             c.execute('''INSERT INTO videos 
-                         (msg_id, folder_id, title, frames, duration_sec, duration_str, thumb, first_frame, file_size_mb, abs_path) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         (msg_id, folder_id, title, frames, duration_sec, duration_str, thumb, first_frame, file_size_mb, abs_path, created_at) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                       (msg_id, folder_id, f"Video #{msg_id}", count, ts_end, f"{ts_end:.1f}s",
-                       f"/thumbs/{folder_id}.jpg", f"/data/{folder_id}/{os.path.basename(frames[0])}", file_size_mb, f))
+                       f"/thumbs/{folder_id}.jpg", f"/data/{folder_id}/{os.path.basename(frames[0])}", file_size_mb, f, now))
             migrated += 1
             
         conn.commit()
@@ -100,24 +114,25 @@ def get_database():
         c = conn.cursor()
         
         # Join videos with posts+categories to get category name
-        # v.rowid = SQLite insertion order = download order to Kaggle
+        # Use created_at DESC for reliable download order (rowid is unstable with INSERT OR REPLACE)
         c.execute("""
-            SELECT v.rowid as download_order, v.*, 
+            SELECT v.created_at as download_ts, v.*, 
                    COALESCE(cat.name, 'Uncategorized') as category
             FROM videos v
             LEFT JOIN posts p ON v.msg_id = p.video_id
             LEFT JOIN categories cat ON p.category_id = cat.id
-            ORDER BY v.rowid DESC
+            ORDER BY v.created_at DESC
         """)
         rows = c.fetchall()
         conn.close()
         
         payload = []
-        for r in rows:
+        for idx, r in enumerate(rows):
             d = dict(r)
             d["id"] = d["folder_id"]
             d["numeric_id"] = d["msg_id"]
-            d["download_order"] = d["download_order"]
+            d["download_order"] = len(rows) - idx  # Higher = more recent
+            d["download_ts"] = d.get("download_ts") or d.get("created_at") or 0
             d["duration"] = d["duration_str"]
             d["size"] = f"{d['file_size_mb']:.1f} MB"
             # category is already included from the JOIN
