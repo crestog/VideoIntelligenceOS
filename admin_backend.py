@@ -406,14 +406,16 @@ async def storage_cleanup(request: Request):
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.get("/api/admin/system")
 def system_health():
-    """Check Redis connectivity and return queue metrics."""
+    """Check Redis connectivity, queue metrics, and CV pause state."""
     try:
         redis_online = False
+        cv_paused = False
         try:
             r = get_redis()
             if r is not None:
                 r.ping()
                 redis_online = True
+                cv_paused = r.get("CV_PAUSED") == "1"
         except Exception:
             redis_online = False
 
@@ -425,6 +427,7 @@ def system_health():
 
         return {
             "redis_online": redis_online,
+            "cv_paused": cv_paused,
             "queue_metrics": queue_metrics,
         }
 

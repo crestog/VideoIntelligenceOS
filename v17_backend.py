@@ -100,13 +100,14 @@ def get_database():
         c = conn.cursor()
         
         # Join videos with posts+categories to get category name
+        # v.rowid = SQLite insertion order = download order to Kaggle
         c.execute("""
-            SELECT v.*, 
+            SELECT v.rowid as download_order, v.*, 
                    COALESCE(cat.name, 'Uncategorized') as category
             FROM videos v
             LEFT JOIN posts p ON v.msg_id = p.video_id
             LEFT JOIN categories cat ON p.category_id = cat.id
-            ORDER BY v.msg_id DESC
+            ORDER BY v.rowid DESC
         """)
         rows = c.fetchall()
         conn.close()
@@ -116,6 +117,7 @@ def get_database():
             d = dict(r)
             d["id"] = d["folder_id"]
             d["numeric_id"] = d["msg_id"]
+            d["download_order"] = d["download_order"]
             d["duration"] = d["duration_str"]
             d["size"] = f"{d['file_size_mb']:.1f} MB"
             # category is already included from the JOIN

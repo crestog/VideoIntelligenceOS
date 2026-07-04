@@ -179,7 +179,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 <script>
 /* ── Helpers ── */
 const $=id=>document.getElementById(id);
-const API='';
 let enginePaused=false, previewData=null;
 
 function showToast(msg,type='info'){
@@ -190,34 +189,34 @@ function showToast(msg,type='info'){
 }
 
 async function api(path,opts={}){
-  try{const r=await fetch(API+path,opts);if(!r.ok)throw new Error(r.statusText);return r.json();}
+  try{const r=await fetch(path,opts);if(!r.ok)throw new Error(r.statusText);return r.json();}
   catch(e){showToast(`API error: ${e.message}`,'error');return null;}
 }
 
-function gb(bytes){return(bytes/1073741824).toFixed(1)+' GB';}
-function mb(bytes){return(bytes/1048576).toFixed(1)+' MB';}
-
 /* ── 1. Disk Dashboard ── */
+/* Backend returns: { total_gb, used_gb, free_gb, breakdown: { videos_gb, frames_gb, thumbnails_gb, other_gb } } */
 async function loadDisk(){
   const d=await api('/api/admin/disk');if(!d)return;
-  const pct=((d.used/d.total)*100).toFixed(1);
+  const pct=((d.used_gb/d.total_gb)*100).toFixed(1);
   const bar=$('disk-bar');
   bar.style.width=pct+'%';
   bar.className='progress-bar '+(pct<60?'green':pct<80?'yellow':'red');
-  $('disk-label').textContent=`${gb(d.used)} / ${gb(d.total)} Used (${pct}%)`;
-  $('stat-videos').textContent=gb(d.videos||0);
-  $('stat-frames').textContent=gb(d.frames||0);
-  $('stat-thumbs').textContent=gb(d.thumbnails||0);
-  $('stat-free').textContent=gb(d.free||0);
+  $('disk-label').textContent=`${d.used_gb.toFixed(1)} GB / ${d.total_gb.toFixed(1)} GB Used (${pct}%)`;
+  const b=d.breakdown||{};
+  $('stat-videos').textContent=(b.videos_gb||0).toFixed(1)+' GB';
+  $('stat-frames').textContent=(b.frames_gb||0).toFixed(1)+' GB';
+  $('stat-thumbs').textContent=(b.thumbnails_gb||0).toFixed(1)+' GB';
+  $('stat-free').textContent=d.free_gb.toFixed(1)+' GB';
 }
 
 /* ── 2. Category Control ── */
+/* Backend returns: { categories: [{ id, name, video_count, frame_count, disk_usage_mb, is_active, queue_position }] } */
 let allCategories=[];
 async function loadCategories(){
-  const d=await api('/api/admin/categories');if(!d)return;
-  allCategories=d;
-  renderActive(d.filter(c=>c.active));
-  renderAvailable(d.filter(c=>!c.active));
+  const resp=await api('/api/admin/categories');if(!resp||!resp.categories)return;
+  allCategories=resp.categories;
+  renderActive(allCategories.filter(c=>c.is_active));
+  renderAvailable(allCategories.filter(c=>!c.is_active));
 }
 
 function renderActive(list){
@@ -226,7 +225,7 @@ function renderActive(list){
   el.innerHTML='';
   list.forEach((c,i)=>{
     const div=document.createElement('div');div.className='cat-item';div.draggable=true;div.dataset.name=c.name;
-    div.innerHTML=`<span class="grip">≡</span><span class="rank">${i+1}</span><span class="cat-name">${c.name}</span><span class="badge">${c.video_count||0} vids</span><span class="badge">${mb(c.disk_usage||0)}</span><button class="remove-btn" onclick="deactivate('${c.name}')" title="Remove">×</button>`;
+    div.innerHTML=`<span class="grip">≡</span><span class="rank">${i+1}</span><span class="cat-name">${c.name}</span><span class="badge">${c.video_count||0} vids</span><span class="badge">${(c.disk_usage_mb||0).toFixed(1)} MB</span><button class="remove-btn" onclick="deactivate('${c.name}')" title="Remove">×</button>`;
     div.addEventListener('dragstart',handleDragStart);
     div.addEventListener('dragover',handleDragOver);
     div.addEventListener('dragenter',handleDragEnter);
@@ -272,46 +271,47 @@ async function saveCategories(){
 }
 
 function deactivate(name){
-  allCategories.forEach(c=>{if(c.name===name)c.active=false;});
-  renderActive(allCategories.filter(c=>c.active));
-  renderAvailable(allCategories.filter(c=>!c.active));
+  allCategories.forEach(c=>{if(c.name===name)c.is_active=false;});
+  renderActive(allCategories.filter(c=>c.is_active));
+  renderAvailable(allCategories.filter(c=>!c.is_active));
   saveCategories();
 }
 
 async function activateSelected(){
   const checked=[...$('available-list').querySelectorAll('input:checked')].map(i=>i.value);
   if(!checked.length){showToast('Select categories first','warn');return;}
-  allCategories.forEach(c=>{if(checked.includes(c.name))c.active=true;});
-  renderActive(allCategories.filter(c=>c.active));
-  renderAvailable(allCategories.filter(c=>!c.active));
+  allCategories.forEach(c=>{if(checked.includes(c.name))c.is_active=true;});
+  renderActive(allCategories.filter(c=>c.is_active));
+  renderAvailable(allCategories.filter(c=>!c.is_active));
   saveCategories();
 }
 
 /* ── 3. Storage Cleanup ── */
 function renderCleanupList(){
   const el=$('cleanup-list');el.innerHTML='';
-  allCategories.filter(c=>c.active).forEach(c=>{
+  allCategories.forEach(c=>{
     const div=document.createElement('div');div.className='cleanup-item';
-    div.innerHTML=`<input type="checkbox" value="${c.name}" checked><span>${c.name}</span><span class="badge">${c.frame_count||0} frames</span><span class="badge">${mb(c.disk_usage||0)}</span>`;
+    div.innerHTML=`<input type="checkbox" value="${c.name}"><span>${c.name}</span><span class="badge">${c.frame_count||0} frames</span><span class="badge">${(c.disk_usage_mb||0).toFixed(1)} MB</span>`;
     el.appendChild(div);
   });
 }
 
 async function previewCleanup(){
   const cats=[...$('cleanup-list').querySelectorAll('input:checked')].map(i=>i.value);
+  if(!cats.length){showToast('Select categories first','warn');return;}
   const body={categories:cats,delete_frames:$('del-frames').checked,delete_videos:$('del-videos').checked};
   const d=await api('/api/admin/storage/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(!d)return;
   previewData={...body,...d};
   const box=$('preview-box');
   box.style.display='block';
-  box.textContent=`Would free ${gb(d.bytes_to_free||0)} — ${d.video_count||0} videos, ${d.frame_folders||0} frame folders`;
+  box.textContent=`Would free ${(d.would_free_gb||0).toFixed(2)} GB — ${d.affected_videos||0} videos, ${d.affected_frame_folders||0} frame folders`;
   $('exec-cleanup-btn').disabled=false;
 }
 
 function confirmCleanup(){
   if(!previewData)return;
-  $('modal-msg').textContent=`Are you sure? This will permanently delete ${gb(previewData.bytes_to_free||0)} of data.`;
+  $('modal-msg').textContent=`Are you sure? This will permanently delete ${(previewData.would_free_gb||0).toFixed(2)} GB of data.`;
   $('confirm-modal').classList.add('active');
 }
 function closeModal(){$('confirm-modal').classList.remove('active');}
@@ -319,17 +319,19 @@ function closeModal(){$('confirm-modal').classList.remove('active');}
 async function executeCleanup(){
   closeModal();
   const d=await api('/api/admin/storage/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(previewData)});
-  if(d){showToast('Cleanup completed successfully','success');previewData=null;$('exec-cleanup-btn').disabled=true;$('preview-box').style.display='none';loadDisk();loadCategories();}
+  if(d){showToast('Cleanup completed successfully','success');previewData=null;$('exec-cleanup-btn').disabled=true;$('preview-box').style.display='none';loadDisk();loadCategories().then(renderCleanupList);}
 }
 
 /* ── 4. System Monitor ── */
+/* Backend /api/admin/system returns: { redis_online, cv_paused, queue_metrics: { QUEUE_VISION: { pending_total, processing, total_completed, dead_letter, ... } } } */
 async function loadSystem(){
-  const d=await api('/api/admin/queue/status');if(!d)return;
-  $('q-pending').textContent=d.pending??0;
-  $('q-processing').textContent=d.processing??0;
-  $('q-completed').textContent=d.completed??0;
-  $('q-failed').textContent=d.failed??0;
-  enginePaused=!!d.paused;
+  const d=await api('/api/admin/system');if(!d)return;
+  const qv=(d.queue_metrics&&d.queue_metrics.QUEUE_VISION)||{};
+  $('q-pending').textContent=qv.pending_total??0;
+  $('q-processing').textContent=qv.processing??0;
+  $('q-completed').textContent=qv.total_completed??0;
+  $('q-failed').textContent=qv.dead_letter??0;
+  enginePaused=!!d.cv_paused;
   const btn=$('pause-btn');
   if(enginePaused){btn.textContent='▶ Resume CV Engine';btn.className='btn btn-green';}
   else{btn.textContent='⏸ Pause CV Engine';btn.className='btn btn-yellow-outline';}
@@ -338,13 +340,18 @@ async function loadSystem(){
 async function toggleEngine(){
   const endpoint=enginePaused?'/api/admin/queue/resume':'/api/admin/queue/pause';
   const d=await api(endpoint,{method:'POST'});
-  if(d!==null){showToast(enginePaused?'CV Engine resumed':'CV Engine paused','success');loadSystem();}
+  if(d!==null){
+    showToast(enginePaused?'CV Engine resumed':'CV Engine paused','success');
+    loadSystem();
+  }
 }
 
+/* Backend /api/admin/logs returns: { logs: [ { timestamp, subsystem, level, message }, ... ] } */
 async function loadLogs(){
-  const d=await api('/api/admin/logs');if(!d||!Array.isArray(d))return;
+  const resp=await api('/api/admin/logs');if(!resp||!resp.logs)return;
+  const logs=resp.logs;
   const el=$('admin-logs');
-  el.innerHTML=d.map(l=>`<div class="log-line ${l.level||'INFO'}"><span class="ts">${l.timestamp||''}</span> <span class="sub">[${l.subsystem||'SYS'}]</span> <span class="msg">${l.message||''}</span></div>`).join('');
+  el.innerHTML=logs.map(l=>`<div class="log-line ${(l.level||'INFO').toLowerCase()}"><span class="ts">${l.timestamp||''}</span> <span class="sub">[${l.subsystem||'SYS'}]</span> <span class="msg">${l.message||l}</span></div>`).join('');
 }
 
 /* ── Init ── */
