@@ -1,17 +1,15 @@
-__pycache__/
-archive/
-DataLake/
-huggingface_cache/
-*.db
-*.db-journal
-*.db-wal
-*.session
-*.session-journal
-cloudflared
-ui_state.txt
-model_logs.txt
-yolo11x.pt
-setup_logs.txt
-appendonly.aof
-dump.rdb
-*.rdb
+# v0 sandbox internal files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+
+# Environment variables
+.env*.local
+
+# Common ignores
+node_modules
+.next/
+.DS_Store

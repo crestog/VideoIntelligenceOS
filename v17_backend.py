@@ -31,7 +31,38 @@ def sync_v17_database():
         c.execute('''CREATE TABLE IF NOT EXISTS videos 
                      (msg_id INTEGER PRIMARY KEY, folder_id TEXT, title TEXT, 
                       frames INTEGER, duration_sec REAL, duration_str TEXT, 
-                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT)''')
+                      thumb TEXT, first_frame TEXT, file_size_mb REAL, abs_path TEXT,
+                      created_at REAL)''')
+        
+        # Migration: add created_at column if missing (existing DBs)
+        try:
+            c.execute("SELECT created_at FROM videos LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE videos ADD COLUMN created_at REAL")
+            conn.commit()
+
+        # Backfill NULL created_at from the frame folder's mtime — a REAL
+        # epoch timestamp that reflects actual download/extraction time.
+        # (The old code mixed msg_id values with epoch times in the same
+        # column, which broke 'Latest Downloaded' sorting entirely.)
+        c.execute("SELECT msg_id, abs_path FROM videos WHERE created_at IS NULL")
+        for row_msg_id, row_path in c.fetchall():
+            try:
+                ts = os.path.getmtime(row_path) if row_path and os.path.exists(row_path) else 0.0
+            except OSError:
+                ts = 0.0
+            c.execute("UPDATE videos SET created_at = ? WHERE msg_id = ?", (ts, row_msg_id))
+
+        # Repair legacy rows where msg_id was written into created_at
+        # (msg_ids are tiny compared to any modern epoch timestamp).
+        c.execute("SELECT msg_id, abs_path FROM videos WHERE created_at < 1000000000")
+        for row_msg_id, row_path in c.fetchall():
+            try:
+                ts = os.path.getmtime(row_path) if row_path and os.path.exists(row_path) else 0.0
+            except OSError:
+                ts = 0.0
+            if ts > 0:
+                c.execute("UPDATE videos SET created_at = ? WHERE msg_id = ?", (ts, row_msg_id))
         
         legacy_folders = glob.glob(os.path.join(VIDEO_DIR, 'frames_*'))
         migrated = 0
@@ -58,12 +89,20 @@ def sync_v17_database():
             
             mp4_path = os.path.join(VIDEO_DIR, f"video_{msg_id}.mp4")
             file_size_mb = os.path.getsize(mp4_path) / (1024 * 1024) if os.path.exists(mp4_path) else 0.0
-            
+
+            # Use the folder's real mtime — NOT a shared "now" value, which
+            # previously gave every recovered folder the same timestamp and
+            # made 'Latest Downloaded' ordering random.
+            try:
+                folder_ts = os.path.getmtime(f)
+            except OSError:
+                folder_ts = time.time()
+
             c.execute('''INSERT INTO videos 
-                         (msg_id, folder_id, title, frames, duration_sec, duration_str, thumb, first_frame, file_size_mb, abs_path) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         (msg_id, folder_id, title, frames, duration_sec, duration_str, thumb, first_frame, file_size_mb, abs_path, created_at) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                       (msg_id, folder_id, f"Video #{msg_id}", count, ts_end, f"{ts_end:.1f}s",
-                       f"/thumbs/{folder_id}.jpg", f"/data/{folder_id}/{os.path.basename(frames[0])}", file_size_mb, f))
+                       f"/thumbs/{folder_id}.jpg", f"/data/{folder_id}/{os.path.basename(frames[0])}", file_size_mb, f, folder_ts))
             migrated += 1
             
         conn.commit()
@@ -100,24 +139,25 @@ def get_database():
         c = conn.cursor()
         
         # Join videos with posts+categories to get category name
-        # v.rowid = SQLite insertion order = download order to Kaggle
+        # Use created_at DESC for reliable download order (rowid is unstable with INSERT OR REPLACE)
         c.execute("""
-            SELECT v.rowid as download_order, v.*, 
+            SELECT v.created_at as download_ts, v.*, 
                    COALESCE(cat.name, 'Uncategorized') as category
             FROM videos v
             LEFT JOIN posts p ON v.msg_id = p.video_id
             LEFT JOIN categories cat ON p.category_id = cat.id
-            ORDER BY v.rowid DESC
+            ORDER BY v.created_at DESC, v.msg_id DESC
         """)
         rows = c.fetchall()
         conn.close()
         
         payload = []
-        for r in rows:
+        for idx, r in enumerate(rows):
             d = dict(r)
             d["id"] = d["folder_id"]
             d["numeric_id"] = d["msg_id"]
-            d["download_order"] = d["download_order"]
+            d["download_order"] = len(rows) - idx  # Higher = more recent
+            d["download_ts"] = d.get("download_ts") or d.get("created_at") or 0
             d["duration"] = d["duration_str"]
             d["size"] = f"{d['file_size_mb']:.1f} MB"
             # category is already included from the JOIN

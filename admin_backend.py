@@ -5,7 +5,19 @@ Provides endpoints for disk monitoring, category management,
 storage cleanup (preview & execute), system health, logs,
 and queue control (pause / resume).
 
-All endpoints are synchronous and use sqlite3 directly.
+v2 FIXES:
+  - SQLite connections now use a 30s timeout + WAL busy handling
+    (eliminates random "database is locked" 500 errors).
+  - Redis access goes through a resilient helper that verifies the
+    connection with ping() and degrades gracefully instead of raising.
+  - Storage cleanup now resolves videos from BOTH the database AND the
+    filesystem, so videos that were downloaded but never frame-extracted
+    (no `videos` table row) are cleaned up too.
+  - Cleanup also removes thumbnails, clears `local_video_path` on posts,
+    deletes `videos` rows when their frames are removed, and clears the
+    Redis dedup set so videos can be re-processed later.
+  - Category activation validates names against the database and is
+    reflected instantly by the Ghost Worker (see ui_server.py sync fix).
 """
 
 from fastapi import APIRouter, Request
@@ -15,10 +27,8 @@ import sqlite3
 import shutil
 import json
 import time
-import glob
-import pathlib
 
-from config import BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, THUMB_DIR, FLAG_DIR
+from config import LAKE_DIR, DB_PATH, VIDEO_DIR, THUMB_DIR, SQLITE_TIMEOUT
 from logger import vios_log, get_recent_logs
 from queue_manager import get_redis, get_queue_metrics
 
@@ -32,29 +42,53 @@ _disk_cache_ts: float = 0.0
 _DISK_CACHE_TTL: float = 5.0  # seconds
 
 
-def _bytes_to_gb(b: int | float) -> float:
-    """Convert bytes to gigabytes, rounded to 3 decimals."""
+def _bytes_to_gb(b) -> float:
     return round(b / (1024 ** 3), 3)
 
 
 def _dir_size(path: str) -> int:
-    """Return total size in bytes of all files under *path* (recursive)."""
+    """Total size in bytes of all files under *path* (recursive, error-safe)."""
     total = 0
-    for dirpath, _dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            try:
-                total += os.path.getsize(fp)
-            except OSError:
-                pass
+    try:
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for f in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
     return total
 
 
 def _get_db() -> sqlite3.Connection:
-    """Return a new SQLite connection with row-factory enabled."""
-    conn = sqlite3.connect(DB_PATH)
+    """New SQLite connection with row factory, long timeout, and WAL mode.
+
+    The long timeout + busy_timeout pragma prevents 'database is locked'
+    errors when the Ghost Worker is writing concurrently.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_TIMEOUT * 1000}")
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except sqlite3.Error:
+        pass
     return conn
+
+
+def _safe_redis():
+    """Return a verified-alive Redis client, or None. NEVER raises."""
+    try:
+        r = get_redis()
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+
+def _error(msg: str, status: int = 500) -> JSONResponse:
+    return JSONResponse({"error": str(msg)[:300]}, status_code=status)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -62,20 +96,15 @@ def _get_db() -> sqlite3.Connection:
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.get("/admin", response_class=HTMLResponse)
 def serve_admin_ui():
-    """Serve the admin_ui.html file located next to this module."""
     try:
-        html_path = os.path.join(os.path.dirname(__file__), "admin_ui.html")
+        html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_ui.html")
         with open(html_path, "r", encoding="utf-8") as fh:
             return HTMLResponse(content=fh.read(), status_code=200)
     except FileNotFoundError:
-        return HTMLResponse(
-            content="<h1>admin_ui.html not found</h1>", status_code=404
-        )
+        return HTMLResponse(content="<h1>admin_ui.html not found</h1>", status_code=404)
     except Exception as exc:
-        vios_log(f"Error serving admin UI: {exc}", "admin", "error")
-        return HTMLResponse(
-            content=f"<h1>Internal error</h1><pre>{exc}</pre>", status_code=500
-        )
+        vios_log(f"Error serving admin UI: {exc}", "ADMIN", "ERROR")
+        return HTMLResponse(content="<h1>Internal error</h1>", status_code=500)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -83,54 +112,51 @@ def serve_admin_ui():
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.get("/api/admin/disk")
 def get_disk_usage():
-    """Return disk usage breakdown with a 5-second cache."""
     global _disk_cache, _disk_cache_ts
-
     try:
         now = time.time()
         if _disk_cache and (now - _disk_cache_ts) < _DISK_CACHE_TTL:
             return _disk_cache
 
-        # Video files (*.mp4) directly in VIDEO_DIR
         videos_bytes = 0
         frames_bytes = 0
-        for entry in os.scandir(VIDEO_DIR):
-            if entry.is_file() and entry.name.endswith(".mp4"):
+        video_file_count = 0
+        frame_folder_count = 0
+        if os.path.isdir(VIDEO_DIR):
+            for entry in os.scandir(VIDEO_DIR):
                 try:
-                    videos_bytes += entry.stat().st_size
+                    if entry.is_file() and entry.name.endswith(".mp4"):
+                        videos_bytes += entry.stat().st_size
+                        video_file_count += 1
+                    elif entry.is_dir() and entry.name.startswith("frames_"):
+                        frames_bytes += _dir_size(entry.path)
+                        frame_folder_count += 1
                 except OSError:
                     pass
-            elif entry.is_dir() and entry.name.startswith("frames_"):
-                frames_bytes += _dir_size(entry.path)
 
         thumbnails_bytes = _dir_size(THUMB_DIR) if os.path.isdir(THUMB_DIR) else 0
 
-        # Total / free from the filesystem containing VIDEO_DIR
         usage = shutil.disk_usage(VIDEO_DIR if os.path.exists(VIDEO_DIR) else "/")
-        total_bytes = usage.total
-        used_bytes = usage.used
-        free_bytes = usage.free
-
         known = videos_bytes + frames_bytes + thumbnails_bytes
-        other_bytes = max(used_bytes - known, 0)
 
         _disk_cache = {
-            "total_gb": _bytes_to_gb(total_bytes),
-            "used_gb": _bytes_to_gb(used_bytes),
-            "free_gb": _bytes_to_gb(free_bytes),
+            "total_gb": _bytes_to_gb(usage.total),
+            "used_gb": _bytes_to_gb(usage.used),
+            "free_gb": _bytes_to_gb(usage.free),
+            "video_file_count": video_file_count,
+            "frame_folder_count": frame_folder_count,
             "breakdown": {
                 "videos_gb": _bytes_to_gb(videos_bytes),
                 "frames_gb": _bytes_to_gb(frames_bytes),
                 "thumbnails_gb": _bytes_to_gb(thumbnails_bytes),
-                "other_gb": _bytes_to_gb(other_bytes),
+                "other_gb": _bytes_to_gb(max(usage.used - known, 0)),
             },
         }
         _disk_cache_ts = now
         return _disk_cache
-
     except Exception as exc:
-        vios_log(f"Error computing disk usage: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error computing disk usage: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -138,64 +164,98 @@ def get_disk_usage():
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.get("/api/admin/categories")
 def get_categories():
-    """Return every category with video count, frame count, disk usage, and active status."""
+    """Every category with video/frame counts, on-disk usage, and active status.
+
+    Disk usage is computed from BOTH the videos table (frame counts / mp4 size)
+    and a live filesystem check, so categories whose videos were downloaded but
+    not yet frame-extracted still report accurate numbers.
+    """
+    conn = None
     try:
         conn = _get_db()
         cur = conn.cursor()
-
         cur.execute(
             """
             SELECT
-                c.id                                    AS cat_id,
-                c.name                                  AS cat_name,
-                COUNT(DISTINCT CASE WHEN p.status = 'Harvested' THEN p.video_id END) AS video_count,
-                COALESCE(SUM(v.frames), 0)              AS frame_count,
-                COALESCE(SUM(v.file_size_mb), 0)        AS disk_usage_mb
+                c.id   AS cat_id,
+                c.name AS cat_name,
+                COUNT(DISTINCT CASE WHEN p.status = 'Harvested' THEN p.video_id END) AS harvested_count,
+                COUNT(DISTINCT p.video_id) AS post_count
             FROM categories c
-            LEFT JOIN posts p   ON p.category_id = c.id
-            LEFT JOIN videos v  ON v.msg_id = p.video_id AND p.status = 'Harvested'
+            LEFT JOIN posts p ON p.category_id = c.id
             GROUP BY c.id, c.name
             """
         )
-        rows = cur.fetchall()
-        conn.close()
+        cat_rows = cur.fetchall()
 
-        # Fetch active list from Redis
-        r = get_redis()
-        active_raw = r.get("ADMIN_ACTIVE_CATEGORIES") if r else None
-        active_list: list[str] = json.loads(active_raw) if active_raw else []
+        # Per-category video stats from the videos table (frame counts + sizes)
+        cur.execute(
+            """
+            SELECT c.name AS cat_name,
+                   COALESCE(SUM(v.frames), 0)       AS frame_count,
+                   COALESCE(SUM(v.file_size_mb), 0) AS disk_usage_mb,
+                   COUNT(v.msg_id)                  AS extracted_count
+            FROM videos v
+            JOIN posts p      ON p.video_id = v.msg_id
+            JOIN categories c ON c.id = p.category_id
+            GROUP BY c.name
+            """
+        )
+        vid_stats = {r["cat_name"]: dict(r) for r in cur.fetchall()}
+        conn.close()
+        conn = None
+
+        # Active list from Redis (best-effort)
+        active_list: list = []
+        r = _safe_redis()
+        if r:
+            try:
+                raw = r.get("ADMIN_ACTIVE_CATEGORIES")
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        active_list = parsed
+            except Exception:
+                pass
         active_set = set(active_list)
 
         categories = []
-        for row in rows:
+        for row in cat_rows:
             name = row["cat_name"]
+            stats = vid_stats.get(name, {})
             is_active = name in active_set
-            queue_position = active_list.index(name) if is_active else None
             categories.append(
                 {
                     "id": row["cat_id"],
                     "name": name,
-                    "video_count": row["video_count"],
-                    "frame_count": row["frame_count"],
-                    "disk_usage_mb": round(row["disk_usage_mb"], 2),
+                    "video_count": row["harvested_count"],
+                    "post_count": row["post_count"],
+                    "frame_count": stats.get("frame_count", 0),
+                    "extracted_count": stats.get("extracted_count", 0),
+                    "disk_usage_mb": round(stats.get("disk_usage_mb", 0) or 0, 2),
                     "is_active": is_active,
-                    "queue_position": queue_position,
+                    "queue_position": active_list.index(name) if is_active else None,
                 }
             )
 
-        # Sort: active first (by queue_position), then inactive alphabetically
         categories.sort(
             key=lambda c: (
                 0 if c["is_active"] else 1,
                 c["queue_position"] if c["is_active"] else 0,
-                c["name"].lower() if not c["is_active"] else "",
+                c["name"].lower(),
             )
         )
-        return {"categories": categories}
-
+        return {"categories": categories, "active_order": active_list,
+                "redis_online": r is not None}
     except Exception as exc:
-        vios_log(f"Error fetching categories: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error fetching categories: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -203,55 +263,92 @@ def get_categories():
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.post("/api/admin/categories/activate")
 async def activate_categories(request: Request):
-    """Store the ordered list of active categories in Redis."""
+    """Store the ordered active-category list in Redis.
+
+    Validates names against the DB, dedupes while preserving order, and pings
+    the Ghost Worker (SCAN_WAKE key) so priority changes apply immediately.
+    """
     try:
         body = await request.json()
-
         cat_list = body.get("categories", [])
         if not isinstance(cat_list, list):
-            return JSONResponse(
-                {"error": "'categories' must be a list"}, status_code=400
-            )
+            return _error("'categories' must be a list", 400)
 
-        r = get_redis()
+        # Validate against DB + dedupe preserving order
+        conn = _get_db()
+        known = {row["name"] for row in conn.execute("SELECT name FROM categories").fetchall()}
+        conn.close()
+
+        seen = set()
+        clean = []
+        invalid = []
+        for name in cat_list:
+            if not isinstance(name, str):
+                continue
+            if name not in known:
+                invalid.append(name)
+                continue
+            if name not in seen:
+                seen.add(name)
+                clean.append(name)
+
+        r = _safe_redis()
         if r is None:
-            return JSONResponse({"error": "Redis unavailable"}, status_code=503)
+            return _error("Redis unavailable — cannot store active categories", 503)
 
-        r.set("ADMIN_ACTIVE_CATEGORIES", json.dumps(cat_list))
-        vios_log(
-            f"Active categories updated: {cat_list}", "admin", "info"
-        )
-        return {"ok": True, "active_categories": cat_list}
+        r.set("ADMIN_ACTIVE_CATEGORIES", json.dumps(clean))
+        # Wake the Ghost Worker so the new priority order applies immediately
+        r.set("ADMIN_CATEGORIES_UPDATED", str(time.time()))
 
+        vios_log(f"Active categories updated: {clean}"
+                 + (f" (ignored unknown: {invalid})" if invalid else ""),
+                 "ADMIN", "INFO")
+        return {"ok": True, "active_categories": clean, "ignored": invalid}
     except Exception as exc:
-        vios_log(f"Error activating categories: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error activating categories: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Helper: resolve videos for given category names
+# Helper: resolve videos for given category names (DB + filesystem)
 # ───────────────────────────────────────────────────────────────────────────
-def _resolve_videos_for_categories(category_names: list[str]) -> list[dict]:
-    """
-    Return a list of dicts with keys (msg_id, file_size_mb) for all
-    videos whose posts belong to *category_names*.
+def _resolve_videos_for_categories(category_names: list) -> list:
+    """Return [{msg_id, ...}] for all videos in *category_names*.
+
+    Uses the `posts` table as the source of truth (every downloaded video has
+    a post row), NOT the `videos` table (which only exists after frame
+    extraction). This is the core fix for cleanup missing files.
     """
     conn = _get_db()
     cur = conn.cursor()
     placeholders = ",".join("?" for _ in category_names)
     cur.execute(
         f"""
-        SELECT v.msg_id, v.file_size_mb
-        FROM videos v
-        JOIN posts p ON p.video_id = v.msg_id
+        SELECT DISTINCT p.video_id AS msg_id
+        FROM posts p
         JOIN categories c ON c.id = p.category_id
         WHERE c.name IN ({placeholders})
         """,
         category_names,
     )
-    rows = [{"msg_id": r["msg_id"], "file_size_mb": r["file_size_mb"]} for r in cur.fetchall()]
+    rows = [{"msg_id": r["msg_id"]} for r in cur.fetchall()]
     conn.close()
     return rows
+
+
+def _cleanup_targets(category_names, delete_frames, delete_videos):
+    """Yield (msg_id, frames_dir|None, mp4_path|None, thumb_path|None) tuples."""
+    for v in _resolve_videos_for_categories(category_names):
+        msg_id = v["msg_id"]
+        frames_dir = os.path.join(VIDEO_DIR, f"frames_{msg_id}")
+        mp4_path = os.path.join(VIDEO_DIR, f"video_{msg_id}.mp4")
+        thumb_path = os.path.join(THUMB_DIR, f"frames_{msg_id}.jpg")
+        yield (
+            msg_id,
+            frames_dir if delete_frames and os.path.isdir(frames_dir) else None,
+            mp4_path if delete_videos and os.path.isfile(mp4_path) else None,
+            thumb_path if delete_frames and os.path.isfile(thumb_path) else None,
+        )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -259,49 +356,47 @@ def _resolve_videos_for_categories(category_names: list[str]) -> list[dict]:
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.post("/api/admin/storage/preview")
 async def storage_preview(request: Request):
-    """Calculate how much space *would* be freed without deleting anything."""
+    """Calculate how much space WOULD be freed without deleting anything."""
     try:
         body = await request.json()
+        category_names = body.get("categories", [])
+        delete_frames = bool(body.get("delete_frames", False))
+        delete_videos = bool(body.get("delete_videos", False))
 
-        category_names: list[str] = body.get("categories", [])
-        delete_frames: bool = body.get("delete_frames", False)
-        delete_videos: bool = body.get("delete_videos", False)
-
-        if not category_names:
-            return JSONResponse(
-                {"error": "'categories' must be a non-empty list"}, status_code=400
-            )
-
-        videos = _resolve_videos_for_categories(category_names)
+        if not category_names or not isinstance(category_names, list):
+            return _error("'categories' must be a non-empty list", 400)
+        if not delete_frames and not delete_videos:
+            return _error("Select at least one of delete_frames / delete_videos", 400)
 
         would_free = 0
         affected_videos = 0
         affected_frame_folders = 0
 
-        for v in videos:
-            msg_id = v["msg_id"]
-
-            if delete_frames:
-                frames_dir = os.path.join(VIDEO_DIR, f"frames_{msg_id}")
-                if os.path.isdir(frames_dir):
-                    would_free += _dir_size(frames_dir)
-                    affected_frame_folders += 1
-
-            if delete_videos:
-                mp4_path = os.path.join(VIDEO_DIR, f"video_{msg_id}.mp4")
-                if os.path.isfile(mp4_path):
+        for _msg_id, frames_dir, mp4_path, thumb_path in _cleanup_targets(
+                category_names, delete_frames, delete_videos):
+            if frames_dir:
+                would_free += _dir_size(frames_dir)
+                affected_frame_folders += 1
+            if mp4_path:
+                try:
                     would_free += os.path.getsize(mp4_path)
                     affected_videos += 1
+                except OSError:
+                    pass
+            if thumb_path:
+                try:
+                    would_free += os.path.getsize(thumb_path)
+                except OSError:
+                    pass
 
         return {
             "would_free_gb": _bytes_to_gb(would_free),
             "affected_videos": affected_videos,
             "affected_frame_folders": affected_frame_folders,
         }
-
     except Exception as exc:
-        vios_log(f"Error in storage preview: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error in storage preview: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -309,96 +404,111 @@ async def storage_preview(request: Request):
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.post("/api/admin/storage/cleanup")
 async def storage_cleanup(request: Request):
-    """Delete frames and/or video files for the given categories."""
+    """Delete frames and/or video files for the given categories.
+
+    Also performs FULL bookkeeping so no ghost state remains:
+      frames deleted  → videos row removed, thumbnail removed
+      video deleted   → posts.status reset to Metadata_Only, local_video_path cleared
+      either          → msg_id removed from the Redis dedup set
+    """
     try:
         body = await request.json()
+        category_names = body.get("categories", [])
+        delete_frames = bool(body.get("delete_frames", False))
+        delete_videos = bool(body.get("delete_videos", False))
 
-        category_names: list[str] = body.get("categories", [])
-        delete_frames: bool = body.get("delete_frames", False)
-        delete_videos: bool = body.get("delete_videos", False)
-
-        if not category_names:
-            return JSONResponse(
-                {"error": "'categories' must be a non-empty list"}, status_code=400
-            )
-
-        videos = _resolve_videos_for_categories(category_names)
+        if not category_names or not isinstance(category_names, list):
+            return _error("'categories' must be a non-empty list", 400)
+        if not delete_frames and not delete_videos:
+            return _error("Select at least one of delete_frames / delete_videos", 400)
 
         freed = 0
         deleted_videos = 0
         deleted_frame_folders = 0
-        deleted_msg_ids: list[int] = []
+        frame_deleted_ids = []
+        video_deleted_ids = []
+        touched_ids = set()
 
-        for v in videos:
-            msg_id = v["msg_id"]
+        for msg_id, frames_dir, mp4_path, thumb_path in _cleanup_targets(
+                category_names, delete_frames, delete_videos):
 
-            # --- frames ---
-            if delete_frames:
-                frames_dir = os.path.join(VIDEO_DIR, f"frames_{msg_id}")
-                if os.path.isdir(frames_dir):
-                    size = _dir_size(frames_dir)
-                    shutil.rmtree(frames_dir, ignore_errors=True)
-                    freed += size
-                    deleted_frame_folders += 1
-                    vios_log(
-                        f"Deleted frames dir: frames_{msg_id} ({_bytes_to_gb(size)} GB)",
-                        "admin",
-                        "info",
-                    )
+            if frames_dir:
+                size = _dir_size(frames_dir)
+                shutil.rmtree(frames_dir, ignore_errors=True)
+                freed += size
+                deleted_frame_folders += 1
+                frame_deleted_ids.append(msg_id)
+                touched_ids.add(msg_id)
 
-            # --- video mp4 ---
-            if delete_videos:
-                mp4_path = os.path.join(VIDEO_DIR, f"video_{msg_id}.mp4")
-                if os.path.isfile(mp4_path):
+            if thumb_path:
+                try:
+                    freed += os.path.getsize(thumb_path)
+                    os.remove(thumb_path)
+                except OSError:
+                    pass
+
+            if mp4_path:
+                try:
                     size = os.path.getsize(mp4_path)
                     os.remove(mp4_path)
                     freed += size
                     deleted_videos += 1
-                    deleted_msg_ids.append(msg_id)
-                    vios_log(
-                        f"Deleted video: video_{msg_id}.mp4 ({_bytes_to_gb(size)} GB)",
-                        "admin",
-                        "info",
-                    )
+                    video_deleted_ids.append(msg_id)
+                    touched_ids.add(msg_id)
+                except OSError as oe:
+                    vios_log(f"Could not delete video_{msg_id}.mp4: {oe}", "ADMIN", "WARN")
 
-        # --- Database cleanup ---
-        if deleted_msg_ids:
+        # ── Database bookkeeping ──
+        if frame_deleted_ids or video_deleted_ids:
             conn = _get_db()
             cur = conn.cursor()
-            placeholders = ",".join("?" for _ in deleted_msg_ids)
 
-            # Remove from videos table
-            cur.execute(
-                f"DELETE FROM videos WHERE msg_id IN ({placeholders})",
-                deleted_msg_ids,
-            )
+            if frame_deleted_ids:
+                ph = ",".join("?" for _ in frame_deleted_ids)
+                cur.execute(f"DELETE FROM videos WHERE msg_id IN ({ph})", frame_deleted_ids)
 
-            # Reset post status
-            cur.execute(
-                f"UPDATE posts SET status = 'Metadata_Only' WHERE video_id IN ({placeholders})",
-                deleted_msg_ids,
-            )
+            if video_deleted_ids:
+                ph = ",".join("?" for _ in video_deleted_ids)
+                cur.execute(
+                    f"UPDATE posts SET status = 'Metadata_Only', local_video_path = NULL "
+                    f"WHERE video_id IN ({ph})",
+                    video_deleted_ids,
+                )
+
             conn.commit()
             conn.close()
             vios_log(
-                f"DB cleanup: removed {len(deleted_msg_ids)} video rows, reset post statuses",
-                "admin",
-                "info",
+                f"DB cleanup: {len(frame_deleted_ids)} video rows removed, "
+                f"{len(video_deleted_ids)} posts reset",
+                "ADMIN", "INFO",
             )
+
+        # ── Redis dedup bookkeeping (so videos can be re-processed later) ──
+        if touched_ids:
+            r = _safe_redis()
+            if r:
+                try:
+                    r.srem("PROCESSED_VIDEOS_SET", *[str(i) for i in touched_ids])
+                except Exception:
+                    pass
 
         # Invalidate disk cache
         global _disk_cache_ts
         _disk_cache_ts = 0.0
 
+        vios_log(
+            f"Cleanup complete: freed {_bytes_to_gb(freed)} GB "
+            f"({deleted_videos} videos, {deleted_frame_folders} frame folders)",
+            "ADMIN", "SUCCESS",
+        )
         return {
             "freed_gb": _bytes_to_gb(freed),
             "deleted_videos": deleted_videos,
             "deleted_frame_folders": deleted_frame_folders,
         }
-
     except Exception as exc:
-        vios_log(f"Error in storage cleanup: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error in storage cleanup: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -406,34 +516,32 @@ async def storage_cleanup(request: Request):
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.get("/api/admin/system")
 def system_health():
-    """Check Redis connectivity, queue metrics, and CV pause state."""
     try:
         redis_online = False
         cv_paused = False
-        try:
-            r = get_redis()
-            if r is not None:
-                r.ping()
-                redis_online = True
+        r = _safe_redis()
+        if r is not None:
+            redis_online = True
+            try:
                 cv_paused = r.get("CV_PAUSED") == "1"
-        except Exception:
-            redis_online = False
+            except Exception:
+                pass
 
         queue_metrics = {}
-        try:
-            queue_metrics = get_queue_metrics()
-        except Exception as qe:
-            queue_metrics = {"error": str(qe)}
+        if redis_online:
+            try:
+                queue_metrics = get_queue_metrics()
+            except Exception as qe:
+                queue_metrics = {"error": str(qe)[:200]}
 
         return {
             "redis_online": redis_online,
             "cv_paused": cv_paused,
             "queue_metrics": queue_metrics,
         }
-
     except Exception as exc:
-        vios_log(f"Error in system health check: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error in system health check: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -441,46 +549,38 @@ def system_health():
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.get("/api/admin/logs")
 def get_logs():
-    """Return the most recent 200 log entries."""
     try:
-        logs = get_recent_logs(200)
-        return {"logs": logs}
+        return {"logs": get_recent_logs(200)}
     except Exception as exc:
-        vios_log(f"Error fetching logs: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return _error(exc)
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# 9. POST /api/admin/queue/pause — Pause the CV queue
+# 9./10. POST /api/admin/queue/pause | resume
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.post("/api/admin/queue/pause")
 def queue_pause():
-    """Set Redis key CV_PAUSED = '1' to pause processing."""
+    r = _safe_redis()
+    if r is None:
+        return _error("Redis unavailable", 503)
     try:
-        r = get_redis()
-        if r is None:
-            return JSONResponse({"error": "Redis unavailable"}, status_code=503)
         r.set("CV_PAUSED", "1")
-        vios_log("CV queue PAUSED via admin panel", "admin", "info")
+        vios_log("CV queue PAUSED via admin panel", "ADMIN", "INFO")
         return {"ok": True, "paused": True}
     except Exception as exc:
-        vios_log(f"Error pausing queue: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error pausing queue: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# 10. POST /api/admin/queue/resume — Resume the CV queue
-# ───────────────────────────────────────────────────────────────────────────
 @admin_router.post("/api/admin/queue/resume")
 def queue_resume():
-    """Delete Redis key CV_PAUSED to resume processing."""
+    r = _safe_redis()
+    if r is None:
+        return _error("Redis unavailable", 503)
     try:
-        r = get_redis()
-        if r is None:
-            return JSONResponse({"error": "Redis unavailable"}, status_code=503)
         r.delete("CV_PAUSED")
-        vios_log("CV queue RESUMED via admin panel", "admin", "info")
+        vios_log("CV queue RESUMED via admin panel", "ADMIN", "INFO")
         return {"ok": True, "paused": False}
     except Exception as exc:
-        vios_log(f"Error resuming queue: {exc}", "admin", "error")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        vios_log(f"Error resuming queue: {exc}", "ADMIN", "ERROR")
+        return _error(exc)

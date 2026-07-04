@@ -3,6 +3,11 @@ VIOS Configuration — Single Source of Truth
 
 All paths, constants, queue names, and thresholds.
 Every module imports from here instead of defining its own paths.
+
+BASE_DIR resolution order:
+  1. VIOS_BASE_DIR environment variable (explicit override)
+  2. /kaggle/working/Insta-Vault  (default Kaggle deployment path)
+  3. ./Insta-Vault relative to this file (local development fallback)
 """
 
 import os
@@ -10,14 +15,23 @@ import os
 # ═══════════════════════════════════════════════════════════
 # FILESYSTEM PATHS
 # ═══════════════════════════════════════════════════════════
-BASE_DIR   = '/kaggle/working/Insta-Vault'
-LAKE_DIR   = os.path.join(BASE_DIR, 'DataLake')
-DB_PATH    = os.path.join(LAKE_DIR, 'lake.db')
-VIDEO_DIR  = os.path.join(LAKE_DIR, 'videos')
-THUMB_DIR  = os.path.join(LAKE_DIR, '.thumbnails')
-FLAG_DIR   = os.path.join(LAKE_DIR, '_Flagged_Dataset')
+_KAGGLE_DEFAULT = '/kaggle/working/Insta-Vault'
+
+if os.environ.get('VIOS_BASE_DIR'):
+    BASE_DIR = os.environ['VIOS_BASE_DIR']
+elif os.path.isdir('/kaggle/working'):
+    BASE_DIR = _KAGGLE_DEFAULT
+else:
+    # Local development fallback — keeps the same layout relative to the repo
+    BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Insta-Vault')
+
+LAKE_DIR    = os.path.join(BASE_DIR, 'DataLake')
+DB_PATH     = os.path.join(LAKE_DIR, 'lake.db')
+VIDEO_DIR   = os.path.join(LAKE_DIR, 'videos')
+THUMB_DIR   = os.path.join(LAKE_DIR, '.thumbnails')
+FLAG_DIR    = os.path.join(LAKE_DIR, '_Flagged_Dataset')
 SESSION_DIR = os.path.join(LAKE_DIR, 'bot_session')
-STATE_FILE = os.path.join(LAKE_DIR, 'state.txt')
+STATE_FILE  = os.path.join(LAKE_DIR, 'state.txt')
 
 # ═══════════════════════════════════════════════════════════
 # QUEUE NAMES
@@ -28,17 +42,22 @@ QUEUE_MODELS = 'QUEUE_MODELS'
 # ═══════════════════════════════════════════════════════════
 # WORKER CONFIGURATION
 # ═══════════════════════════════════════════════════════════
-MAX_RETRIES              = 3       # Retry attempts before dead-lettering
+MAX_RETRIES              = 3      # Retry attempts before dead-lettering
 DISK_PAUSE_THRESHOLD_GB  = 0.5    # CV engine pauses below this
 DISK_WARN_THRESHOLD_GB   = 1.5    # CV engine warns below this
 DISK_DL_PAUSE_GB         = 1.0    # Ghost Worker pauses downloads below this
 BATCH_FRAME_COUNT        = 200    # Frames per binary batch fetch in V17
 
 # ═══════════════════════════════════════════════════════════
+# SQLITE — shared connection settings (prevents "database is locked")
+# ═══════════════════════════════════════════════════════════
+SQLITE_TIMEOUT = 30  # seconds; ALL sqlite3.connect calls must pass this
+
+# ═══════════════════════════════════════════════════════════
 # REDIS
 # ═══════════════════════════════════════════════════════════
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
+REDIS_HOST = os.environ.get('VIOS_REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.environ.get('VIOS_REDIS_PORT', 6379))
 
 # ═══════════════════════════════════════════════════════════
 # ENSURE DIRECTORIES EXIST

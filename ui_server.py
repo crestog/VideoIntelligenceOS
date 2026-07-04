@@ -60,6 +60,47 @@ except: REDIS_CACHE = None
 SCAN_TRIGGER = threading.Event()
 SCAN_TRIGGER.set()
 
+# ── Live category-queue sync (Admin Panel ⇄ Ghost Worker) ──
+# The admin panel writes ADMIN_ACTIVE_CATEGORIES + bumps ADMIN_CATEGORIES_UPDATED.
+# We track the last-seen update stamp so changes apply MID-CYCLE (not just at
+# the start of a scan), fixing the "category control not working" bug.
+_LAST_CAT_SYNC_STAMP = ""
+
+def sync_category_queue(force=False):
+    """Refresh CATEGORY_QUEUE from Redis. Cheap: only re-parses when the
+    admin panel bumped ADMIN_CATEGORIES_UPDATED (or when force=True)."""
+    global CATEGORY_QUEUE, _LAST_CAT_SYNC_STAMP
+    if not REDIS_CACHE:
+        return
+    try:
+        stamp = REDIS_CACHE.get("ADMIN_CATEGORIES_UPDATED") or ""
+        if not force and stamp == _LAST_CAT_SYNC_STAMP:
+            return
+        _LAST_CAT_SYNC_STAMP = stamp
+        raw = REDIS_CACHE.get("ADMIN_ACTIVE_CATEGORIES")
+        new_queue = json.loads(raw) if raw else []
+        if isinstance(new_queue, list) and new_queue != CATEGORY_QUEUE:
+            CATEGORY_QUEUE = new_queue
+            custom_print(f"📂 Admin category sync: {CATEGORY_QUEUE or '(cleared)'}")
+            # Wake the downloader so a new priority applies instantly
+            SCAN_TRIGGER.set()
+    except Exception:
+        pass
+
+def persist_category_queue():
+    """Write the worker's local queue state back to Redis so the admin panel
+    always reflects reality (fixes the stale one-way sync)."""
+    global _LAST_CAT_SYNC_STAMP
+    if not REDIS_CACHE:
+        return
+    try:
+        REDIS_CACHE.set("ADMIN_ACTIVE_CATEGORIES", json.dumps(CATEGORY_QUEUE))
+        stamp = str(time.time())
+        REDIS_CACHE.set("ADMIN_CATEGORIES_UPDATED", stamp)
+        _LAST_CAT_SYNC_STAMP = stamp
+    except Exception:
+        pass
+
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -108,14 +149,13 @@ async def ensure_web_safe(video_path):
         codec = stdout.decode().strip().split('\n')[0].lower()
         temp_path = video_path + ".tmp.mp4"
 
-        if codec and codec not in ['h264', 'av1', 'hevc', 'h265']:
-            custom_print(f"⚙️ FFmpeg Codec Upgrade ({codec}) -> Lossless CRF 17")
-            conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '17', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        else:
-            custom_print(f"⚡ Instant Remux: 100% Quality Retention & FastStart...")
-            conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c', 'copy', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        
         async with ffmpeg_semaphore:
+            if codec and codec not in ['h264', 'av1', 'hevc', 'h265']:
+                custom_print(f"⚙️ FFmpeg Codec Upgrade ({codec}) -> Lossless CRF 17")
+                conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '17', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            else:
+                custom_print(f"⚡ Instant Remux: 100% Quality Retention & FastStart...")
+                conv_proc = await asyncio.create_subprocess_exec('ffmpeg', '-y', '-i', video_path, '-c', 'copy', '-movflags', '+faststart', temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await conv_proc.communicate()
         if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
             os.replace(temp_path, video_path)
@@ -157,7 +197,7 @@ async def background_downloader():
     import shutil
     while True:
         free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-        if free_gb < 5:
+        if free_gb < 1.0:
             GLOBAL_STATUS = f"⚠️ Storage Critical ({free_gb:.1f}GB left) - Pausing"
             await asyncio.sleep(60)
             continue
@@ -167,6 +207,9 @@ async def background_downloader():
             while not SCAN_TRIGGER.is_set(): await asyncio.sleep(1)
 
         SCAN_TRIGGER.clear()
+
+        sync_category_queue(force=True)
+
         GLOBAL_STATUS = "⚡ Running Flash Metadata Scan across Telegram..."
         custom_print("⚡ Scanning Telegram for new Posts...")
 
@@ -215,6 +258,10 @@ async def background_downloader():
                     await asyncio.sleep(5)
 
             while True:
+                # Pick up admin panel changes IMMEDIATELY (mid-cycle), not
+                # only at the start of a scan. This is the category-control fix.
+                sync_category_queue()
+
                 async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
                     async with conn.execute("SELECT video_id, category_id FROM posts WHERE status = 'Metadata_Only' ORDER BY video_id DESC") as cursor:
                         pending = await cursor.fetchall()
@@ -222,22 +269,34 @@ async def background_downloader():
                         GLOBAL_STATUS = "✅ Sync Complete! Queue empty."
                         custom_print("✅ Sync Complete. Downloader going to sleep.")
                         CATEGORY_QUEUE.clear()
+                        persist_category_queue()  # keep admin panel in sync
                         break
                     target_vid = None
                     target_cat_name = "Global"
+                    exhausted_cats = []
                     for queued_cat in CATEGORY_QUEUE:
                         async with conn.execute("SELECT id FROM categories WHERE name = ?", (queued_cat,)) as cursor:
                             cat_row = await cursor.fetchone()
                         if cat_row:
                             target_vid = next((r[0] for r in pending if r[1] == cat_row[0]), None)
-                            if target_vid: 
+                            if target_vid:
                                 target_cat_name = queued_cat
                                 break
-                    if not target_vid and CATEGORY_QUEUE:
-                        if CATEGORY_QUEUE[0] in CATEGORY_QUEUE:
-                            CATEGORY_QUEUE.pop(0)
-                            continue
-                    if not target_vid: 
+                            exhausted_cats.append(queued_cat)
+                        else:
+                            exhausted_cats.append(queued_cat)
+                    # Remove ONLY the categories that have nothing pending
+                    # (old code blindly popped index 0, which could drop a
+                    # still-active category) — and persist to Redis so the
+                    # admin panel reflects the change.
+                    if exhausted_cats and not target_vid:
+                        for c in exhausted_cats:
+                            if c in CATEGORY_QUEUE:
+                                CATEGORY_QUEUE.remove(c)
+                                custom_print(f"📂 Category '{c}' exhausted — removed from queue")
+                        persist_category_queue()
+                        continue
+                    if not target_vid:
                         target_vid = pending[0][0]
                         target_cat_name = "Global" 
 
@@ -254,7 +313,10 @@ async def background_downloader():
                         await conn.execute("UPDATE posts SET local_video_path = ?, status = 'Harvested' WHERE video_id = ?", (target_video, target_vid))
                         await conn.commit()
 
-                    is_active_cat = bool(CATEGORY_QUEUE and target_cat_name == CATEGORY_QUEUE[0])
+                    # Any admin-activated category gets CV priority (old code
+                    # only honored position 0, so 2nd/3rd active categories
+                    # silently lost their priority flag)
+                    is_active_cat = target_cat_name in CATEGORY_QUEUE
                     if REDIS_CACHE and REDIS_CACHE.sadd("PROCESSED_VIDEOS_SET", target_vid):
                         push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video}, is_priority=is_active_cat)
                         custom_print(f"📤 Queued #{target_vid} for CV Engine ({'🔴 PRIORITY' if is_active_cat else '⚪ DEFAULT'})")
@@ -359,7 +421,8 @@ def trigger_scan(category: str = None):
     global CATEGORY_QUEUE
     if category and category != "All Categories":
         if category in CATEGORY_QUEUE: CATEGORY_QUEUE.remove(category)
-        CATEGORY_QUEUE.insert(0, category) 
+        CATEGORY_QUEUE.insert(0, category)
+        persist_category_queue()  # keep admin panel in sync
     SCAN_TRIGGER.set(); return {"message": "Scan triggered"}
 @app.get("/api/categories")
 async def api_categories():
