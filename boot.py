@@ -66,6 +66,22 @@ is_fresh_session = not os.path.exists(BOOT_MARKER)
 
 if is_fresh_session:
     print("🆕 [SYSTEM] Phase 3: Fresh Session Detected — initializing clean state...", flush=True)
+
+    # 3a. If the database is missing (factory-reset Kaggle), try restoring the
+    #     latest snapshot from the Telegram channel BEFORE anything else runs.
+    #     This is what makes "never reprocess" true across sessions.
+    try:
+        from config import DB_PATH
+        db_missing = not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) == 0
+        if db_missing and os.environ.get("VIOS_AUTO_IMPORT", "1") != "0":
+            print("   📥 lake.db missing — attempting snapshot import from Telegram...", flush=True)
+            import asyncio
+            from snapshot_manager import import_snapshot
+            restored = asyncio.run(import_snapshot())
+            print(f"   {'✅ Snapshot restored — library is instantly searchable.' if restored else '⚠️ No snapshot found — starting with a fresh database.'}", flush=True)
+    except Exception as e:
+        print(f"   ⚠️ Snapshot auto-import skipped: {e}", flush=True)
+
     try:
         from queue_manager import get_redis
         r = get_redis()
@@ -87,6 +103,16 @@ if is_fresh_session:
         else:
             print("   ✅ Redis is clean — no stale data.", flush=True)
 
+        # 3b. Rebuild the dedup set from the database — Redis is ephemeral but
+        #     the DB is the source of truth for what is already processed.
+        try:
+            from snapshot_manager import rebuild_dedup_set
+            n = rebuild_dedup_set()
+            if n:
+                print(f"   ✅ Dedup set rebuilt from DB: {n} videos marked processed.", flush=True)
+        except Exception as e:
+            print(f"   ⚠️ Dedup rebuild skipped: {e}", flush=True)
+
         # Write session marker so crash recovery works within this session
         with open(BOOT_MARKER, 'w') as f:
             f.write(str(time.time()))
@@ -99,7 +125,9 @@ else:
     print("🔄 [SYSTEM] Phase 3: Crash Recovery — same session, checking orphaned jobs...", flush=True)
     try:
         from queue_manager import recover_processing_jobs, get_queue_metrics
-        recovered = recover_processing_jobs("QUEUE_VISION")
+        recovered = 0
+        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE"):
+            recovered += recover_processing_jobs(_q)
         if recovered > 0:
             print(f"   🔄 Recovered {recovered} orphaned job(s) from PROCESSING → DEFAULT queue.", flush=True)
         else:

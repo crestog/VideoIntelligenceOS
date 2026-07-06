@@ -20,6 +20,7 @@ SUBSYSTEMS = {
     "AI":    "🤖  [AI-ENGINE]",
     "ADMIN": "🛡️  [ADMIN]",
     "QUEUE": "📡  [QUEUE]",
+    "SNAP":  "📸  [SNAPSHOT]",
 }
 
 LEVELS = {

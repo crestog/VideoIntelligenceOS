@@ -39,11 +39,8 @@ def custom_print(*args, **kwargs):
         loop.create_task(ws_mgr.broadcast({"type": "log", "message": f"[{time.strftime('%H:%M:%S')}] {msg}"}))
     except: pass
 
-# --- CREDENTIALS ---
-API_ID = 37392880
-API_HASH = "4037344084ae998be2cdaee3192bd8f8"
-BOT_TOKEN = "8269867642:AAH76B2_aFbqc6OqNiCAm-NenTTmG_SWavU"
-CHANNEL_ID = -1003762735924
+# --- CREDENTIALS (single source of truth: config.py, env-overridable) ---
+from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID
 
 # --- DIRECTORY ROUTING (from config.py) ---
 SESSION_PATH = os.path.join(LAKE_DIR, 'bot_session')

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#09090b">
-<title>VIOS V17 — Frame Workstation</title>
+<title>VIOS V18 — Frame Workstation</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -23,6 +23,7 @@
   --accent-dim: rgba(34, 211, 238, 0.14);
   --danger: #f87171;
   --ok: #34d399;
+  --warn: #fbbf24;
   --radius: 10px;
   --font-sans: 'Inter', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
@@ -64,6 +65,14 @@ header.topbar {
   font-family: var(--font-mono); font-size: 10px; color: var(--accent);
   border: 1px solid var(--border-strong); border-radius: 99px; padding: 1px 8px;
 }
+.nav-tabs { display: flex; gap: 4px; margin-left: 18px; }
+.nav-tab {
+  background: none; border: none; color: var(--text-dim); font-size: 13px;
+  font-weight: 500; padding: 6px 14px; border-radius: 8px;
+  transition: color .15s, background .15s;
+}
+.nav-tab:hover { color: var(--text); background: var(--surface-2); }
+.nav-tab.sel { color: var(--accent); background: var(--accent-dim); }
 .topbar-status {
   margin-left: auto; display: flex; align-items: center; gap: 14px;
   font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
@@ -196,9 +205,11 @@ header.topbar {
 .canvas-hud {
   position: absolute; top: 12px; left: 12px; display: flex; gap: 8px;
   font-family: var(--font-mono); font-size: 11px; pointer-events: none;
+  flex-wrap: wrap; max-width: calc(100% - 140px);
 }
 .hud-pill { background: rgba(9,9,11,0.78); border: 1px solid var(--border); border-radius: 7px; padding: 3px 10px; color: var(--text-dim); backdrop-filter: blur(4px); }
 .hud-pill b { color: var(--accent); font-weight: 500; }
+.hud-pill.warn b { color: var(--warn); }
 .zoom-ctl { position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; }
 .zoom-ctl button {
   width: 30px; height: 30px; border-radius: 7px; border: 1px solid var(--border);
@@ -268,6 +279,15 @@ header.topbar {
   font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
   color: var(--text-faint); margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between;
 }
+.intel-ts { font-family: var(--font-mono); font-size: 12px; color: var(--accent); margin-bottom: 6px; }
+.intel-desc { font-size: 12.5px; color: var(--text); line-height: 1.55; min-height: 34px; }
+.intel-desc.dim { color: var(--text-faint); font-style: italic; }
+.intel-speech {
+  margin-top: 9px; padding: 8px 10px; border-left: 2px solid var(--accent);
+  background: var(--surface); border-radius: 0 7px 7px 0;
+  font-size: 12px; color: var(--text-dim); font-style: italic;
+}
+.intel-speech.off { display: none; }
 #histCanvas { width: 100%; height: 96px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); display: block; }
 .hist-legend { display: flex; gap: 12px; margin-top: 8px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); }
 .hist-legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
@@ -285,6 +305,51 @@ header.topbar {
 }
 .console-box div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* ═══════════════ DATABASE VIEW ═══════════════ */
+.db-wrap { flex: 1; overflow-y: auto; padding: 20px; }
+.db-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.db-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.db-card .num { font-family: var(--font-mono); font-size: 22px; font-weight: 600; color: var(--accent); }
+.db-card .lbl { font-size: 11px; color: var(--text-dim); margin-top: 3px; text-transform: uppercase; letter-spacing: .06em; }
+.snap-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 13px 16px; margin-bottom: 18px;
+}
+.snap-bar .title { font-weight: 600; font-size: 13px; margin-right: 6px; }
+.snap-status { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); margin-left: auto; }
+.snap-status.ok { color: var(--ok); }
+.snap-status.err { color: var(--danger); }
+.db-browser { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.db-toolbar { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.db-select {
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none;
+}
+.db-search {
+  flex: 1; min-width: 160px; max-width: 320px;
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none;
+}
+.db-search:focus, .db-select:focus { border-color: var(--accent); }
+.db-page { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); margin-left: auto; }
+.db-table-scroll { overflow-x: auto; max-height: 55vh; overflow-y: auto; }
+table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.db-table th {
+  position: sticky; top: 0; background: var(--surface-2); text-align: left;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim);
+  padding: 8px 12px; border-bottom: 1px solid var(--border-strong); white-space: nowrap;
+}
+.db-table td {
+  padding: 7px 12px; border-bottom: 1px solid var(--border);
+  max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
+}
+.db-table tr:hover td { background: var(--surface-2); }
+
 /* ═══════════════ TOASTS ═══════════════ */
 .toasts { position: fixed; bottom: 20px; right: 20px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
 .toast {
@@ -296,10 +361,6 @@ header.topbar {
 .toast.err { border-color: var(--danger); }
 .toast.ok { border-color: var(--ok); }
 @keyframes slideIn { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
-
-/* skeleton shimmer */
-.skel { background: linear-gradient(90deg, var(--surface) 25%, var(--surface-2) 50%, var(--surface) 75%); background-size: 200% 100%; animation: shim 1.4s infinite; }
-@keyframes shim { to { background-position: -200% 0; } }
 
 @media (max-width: 900px) {
   .ws { flex-direction: column; }
@@ -315,8 +376,12 @@ header.topbar {
     <div class="brand">
       <div class="brand-mark">V</div>
       <span class="brand-name">VIOS Workstation</span>
-      <span class="brand-ver">V17</span>
+      <span class="brand-ver">V18</span>
     </div>
+    <nav class="nav-tabs">
+      <button class="nav-tab sel" id="navLibrary" onclick="switchView('library')">Library</button>
+      <button class="nav-tab" id="navDb" onclick="switchView('db')">Database</button>
+    </nav>
     <div class="topbar-status">
       <span><span class="dot"></span>ENGINE ONLINE</span>
       <span id="topClock">--:--:--</span>
@@ -393,7 +458,9 @@ header.topbar {
           <div class="canvas-hud">
             <div class="hud-pill">FRAME <b id="hudFrame">0</b></div>
             <div class="hud-pill">TS <b id="hudTs">0.000s</b></div>
+            <div class="hud-pill">FPS <b id="hudFps">—</b></div>
             <div class="hud-pill">ZOOM <b id="hudZoom">100%</b></div>
+            <div class="hud-pill warn" id="hudTier" style="display:none">PREVIEW <b>·</b></div>
           </div>
           <div class="zoom-ctl">
             <button onclick="zoomCanvas(1.25)" title="Zoom in">+</button>
@@ -441,6 +508,12 @@ header.topbar {
 
       <aside class="ws-side">
         <div class="panel">
+          <h3>Frame Intel <span id="intelSrc" style="letter-spacing:0;text-transform:none;color:var(--accent)"></span></h3>
+          <div class="intel-ts" id="intelTs">— </div>
+          <div class="intel-desc dim" id="intelDesc">No analysis yet — GPU engine will describe each frame after processing.</div>
+          <div class="intel-speech off" id="intelSpeech"></div>
+        </div>
+        <div class="panel">
           <h3>Histogram <span id="histMode" style="letter-spacing:0;text-transform:none;color:var(--accent)">RGB</span></h3>
           <canvas id="histCanvas" width="260" height="96"></canvas>
           <div class="hist-legend"><span class="hl-r">RED</span><span class="hl-g">GREEN</span><span class="hl-b">BLUE</span></div>
@@ -448,7 +521,8 @@ header.topbar {
         <div class="panel">
           <h3>RAM Buffer</h3>
           <div class="meta-list">
-            <div class="meta-row"><span class="k">Frames buffered</span><span class="v" id="ramFrames">0 / 0</span></div>
+            <div class="meta-row"><span class="k">Preview tier</span><span class="v" id="ramPrev">0 / 0</span></div>
+            <div class="meta-row"><span class="k">Full-res tier</span><span class="v" id="ramFull">0 / 0</span></div>
             <div class="meta-row"><span class="k">Memory used</span><span class="v" id="ramBytes">0 MB</span></div>
           </div>
           <div class="ram-bar"><div class="ram-fill" id="ramFill"></div></div>
@@ -458,6 +532,7 @@ header.topbar {
           <h3>Clip Info</h3>
           <div class="meta-list">
             <div class="meta-row"><span class="k">Native FPS</span><span class="v" id="miFps">—</span></div>
+            <div class="meta-row"><span class="k">Playback FPS</span><span class="v" id="miPlayFps">—</span></div>
             <div class="meta-row"><span class="k">Frames</span><span class="v" id="miFrames">—</span></div>
             <div class="meta-row"><span class="k">Duration</span><span class="v" id="miDur">—</span></div>
             <div class="meta-row"><span class="k">Resolution</span><span class="v" id="miRes">—</span></div>
@@ -469,6 +544,36 @@ header.topbar {
       </aside>
     </div>
   </div>
+
+  <!-- ═══════ DATABASE VIEW ═══════ -->
+  <div class="view" id="view-db">
+    <div class="db-wrap">
+      <div class="db-cards" id="dbCards"></div>
+
+      <div class="snap-bar">
+        <span class="title">📸 Telegram Snapshot</span>
+        <button class="btn-icon" id="btnExport" onclick="snapExport()">⬆ Export DB → Telegram</button>
+        <button class="btn-icon" id="btnImport" onclick="snapImport()">⬇ Import latest ← Telegram</button>
+        <span class="snap-status" id="snapStatus">idle</span>
+      </div>
+
+      <div class="db-browser">
+        <div class="db-toolbar">
+          <select class="db-select" id="dbTableSelect" onchange="selectDbTable(this.value)"></select>
+          <input class="db-search" id="dbSearch" type="text" placeholder="Search in table…" autocomplete="off">
+          <span class="db-page" id="dbPageInfo">—</span>
+          <button class="btn-icon" onclick="dbPage(-1)">‹ Prev</button>
+          <button class="btn-icon" onclick="dbPage(1)">Next ›</button>
+        </div>
+        <div class="db-table-scroll">
+          <table class="db-table">
+            <thead id="dbThead"></thead>
+            <tbody id="dbTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="toasts" id="toasts"></div>
@@ -476,20 +581,22 @@ header.topbar {
 <script>
 'use strict';
 /* ════════════════════════════════════════════════════════════════
-   VIOS V17 — rebuilt engine
-   Perf strategy:
-   • Binary batches fetched with 3-way parallelism (was sequential)
-   • Frames stored as compressed JPEG Blobs (~100 KB) — cheap on RAM
-   • Decode via createImageBitmap (async, off-main-thread) into an
-     LRU bitmap cache; play loop never blocks on decode
-   • Predictive decode-ahead keeps playback stutter-free
-   • Histogram from a 96×54 downsample, throttled to 100 ms
+   VIOS V18 — progressive dual-tier engine
+   Loading strategy (time-to-interactive ≤ 2s at ANY video length):
+     0. /api/frame/{f}/0?tier=preview  → first paint in one round trip
+     1. LADDER: one sparse batch (?step=N, preview tier) spanning the
+        whole clip (~120 frames × ~8 KB ≈ 1 MB) → scrub anywhere
+     2. FILL: preview tier fully, chunks nearest playhead first
+     3. UPGRADE: full-res tier in background, replaces previews
+   Batch wire format: [u32 idx][u32 size][jpeg] repeated (LE).
+   Realtime FPS: actual frames drawn per second, measured in playLoop.
    ════════════════════════════════════════════════════════════════ */
 
 const CHUNK_SIZE = 40;
-const PARALLEL_FETCHES = 3;
+const PARALLEL_FETCHES = 6;      // cloudflared is h2 — one socket, many streams
 const BITMAP_CACHE_MAX = 96;
 const DECODE_AHEAD = 14;
+const LADDER_TARGET = 120;       // sparse pass frame budget
 
 /* ─── global state ─── */
 let dbCache = [];
@@ -498,16 +605,18 @@ let activeCategory = 'All';
 let activeSort = 'latest';
 let searchTerm = '';
 
-let session = 0;                 // increments per workspace open — stale-guard
+let session = 0;
 let networkAborter = null;
 let currentFolder = null;
 let currentMeta = null;
 
 let frameNames = [];
-let frameBlobs = [];             // Blob | null per frame
+let prevBlobs = [];              // preview tier  (Blob | null)
+let fullBlobs = [];              // full-res tier (Blob | null)
+let hasPreviewTier = false;
 let blobBytes = 0;
-let framesBuffered = 0;
-let bitmapCache = new Map();     // idx -> ImageBitmap  (LRU by Map order)
+let prevCount = 0, fullCount = 0;
+let bitmapCache = new Map();     // idx -> {bm, tier}
 let curIdx = 0;
 let nativeFps = 30;
 let playing = false;
@@ -518,6 +627,13 @@ let lastDrawn = -1;
 let lastHist = 0;
 let extractionTimer = null;
 let frameW = 0, frameH = 0;
+
+/* frame intel (notes + transcript) */
+let frameNotes = [];             // [{frame_idx, ts_sec, description, ...}] sorted
+let transcript = [];             // [{start_sec, end_sec, text}] sorted
+
+/* realtime fps measurement */
+let fpsWindowStart = 0, fpsDrawCount = 0, measuredFps = 0;
 
 /* canvas view */
 const canvas = document.getElementById('viewer');
@@ -546,6 +662,10 @@ function extractTimestamp(name) {
   const m = name && name.match(/_ts_([\d.]+)s/);
   return m ? parseFloat(m[1]) : 0;
 }
+function frameTs(idx) {
+  const t = extractTimestamp(frameNames[idx] || '');
+  return t || (nativeFps > 0 ? idx / nativeFps : 0);
+}
 
 function fmtBytes(b) {
   if (b > 1e9) return (b / 1e9).toFixed(2) + ' GB';
@@ -553,7 +673,6 @@ function fmtBytes(b) {
   return (b / 1e3).toFixed(0) + ' KB';
 }
 
-/* clock */
 setInterval(() => { $('topClock').textContent = new Date().toLocaleTimeString('en-GB'); }, 1000);
 
 /* ═══════════ DROPDOWNS ═══════════ */
@@ -680,15 +799,21 @@ async function refreshLibrary(manual = false) {
 
 /* ═══════════ VIEW SWITCHING ═══════════ */
 function switchView(target, push = true) {
-  if (target === 'library') teardownWorkspace();
+  if (target !== 'workspace') teardownWorkspace();
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  $(target === 'library' ? 'view-library' : 'view-workspace').classList.add('active');
-  if (push) history.pushState({ view: target, folder: currentFolder }, '', target === 'library' ? '#library' : `#ws/${currentFolder}`);
+  const viewId = target === 'library' ? 'view-library' : target === 'db' ? 'view-db' : 'view-workspace';
+  $(viewId).classList.add('active');
+  $('navLibrary').classList.toggle('sel', target === 'library');
+  $('navDb').classList.toggle('sel', target === 'db');
+  if (push) history.pushState({ view: target, folder: currentFolder }, '',
+    target === 'library' ? '#library' : target === 'db' ? '#db' : `#ws/${currentFolder}`);
   if (target === 'library') refreshLibrary(false);
+  if (target === 'db') refreshDbView();
 }
 window.addEventListener('popstate', e => {
   const s = e.state;
   if (!s || s.view === 'library') switchView('library', false);
+  else if (s.view === 'db') switchView('db', false);
   else if (s.folder) openWorkspace(s.folder, false);
 });
 
@@ -699,10 +824,13 @@ function teardownWorkspace() {
   $('btnPlay').textContent = 'Play';
   if (networkAborter) { networkAborter.abort(); networkAborter = null; }
   if (extractionTimer) { clearInterval(extractionTimer); extractionTimer = null; }
-  for (const bm of bitmapCache.values()) bm.close && bm.close();
+  for (const entry of bitmapCache.values()) entry.bm.close && entry.bm.close();
   bitmapCache.clear();
-  frameBlobs = []; frameNames = []; blobBytes = 0; framesBuffered = 0;
+  prevBlobs = []; fullBlobs = []; frameNames = []; blobBytes = 0;
+  prevCount = 0; fullCount = 0;
+  frameNotes = []; transcript = [];
   lastBitmap = null; lastDrawn = -1; curIdx = 0; frameW = 0; frameH = 0;
+  measuredFps = 0; fpsDrawCount = 0; fpsWindowStart = 0;
   currentFolder = null; currentMeta = null;
   updateRamPanel();
 }
@@ -715,6 +843,7 @@ async function openWorkspace(folderId, push = true) {
 
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   $('view-workspace').classList.add('active');
+  $('navLibrary').classList.remove('sel'); $('navDb').classList.remove('sel');
   if (push) history.pushState({ view: 'workspace', folder: folderId }, '', `#ws/${folderId}`);
 
   $('wsTitle').textContent = currentMeta ? currentMeta.title : folderId;
@@ -732,11 +861,13 @@ async function openWorkspace(folderId, push = true) {
 
     frameNames = data.frames || [];
     nativeFps = data.native_fps || 30;
-    frameBlobs = new Array(frameNames.length).fill(null);
+    hasPreviewTier = !!data.has_preview;
+    prevBlobs = new Array(frameNames.length).fill(null);
+    fullBlobs = new Array(frameNames.length).fill(null);
 
     $('miFps').textContent = nativeFps.toFixed(2);
     $('miFrames').textContent = String(frameNames.length);
-    const dur = frameNames.length ? extractTimestamp(frameNames[frameNames.length - 1]) : 0;
+    const dur = frameNames.length ? frameTs(frameNames.length - 1) : 0;
     $('miDur').textContent = dur.toFixed(2) + 's';
     $('tcEnd').textContent = dur.toFixed(3);
     $('scrubber').max = Math.max(0, frameNames.length - 1);
@@ -751,20 +882,36 @@ async function openWorkspace(folderId, push = true) {
       return;
     }
 
-    $('loadOverlayTxt').textContent = 'Buffering frames…';
-    startBinaryBuffer(folderId, mySession).then(() => {
+    // Frame intel loads in parallel with frames (non-blocking)
+    loadFrameNotes(folderId, mySession);
+
+    // ── PASS 0: instant single-frame first paint ──
+    paintFirstFrame(folderId, mySession);
+
+    // ── PASS 1-3: progressive buffer ──
+    startProgressiveBuffer(folderId, mySession).then(() => {
       if (mySession === session) showToast('Buffer complete — all frames in RAM', 'ok');
     }).catch(() => {});
-
-    // Show the FIRST frame the instant its chunk arrives (handled in buffer),
-    // but also try single-frame fast path via <img> for instant feedback:
-    scrubTo(0, true);
   } catch (e) {
     if (mySession !== session) return;
     $('loadOverlay').classList.remove('on');
     showToast('Failed to open workspace', 'error');
     switchView('library');
   }
+}
+
+async function paintFirstFrame(folder, mySession) {
+  try {
+    const res = await apiFetch(`/api/frame/${folder}/0?tier=${hasPreviewTier ? 'preview' : 'full'}`,
+                               { signal: networkAborter ? networkAborter.signal : undefined });
+    const blob = await res.blob();
+    if (mySession !== session) return;
+    if (hasPreviewTier) { if (!prevBlobs[0]) { prevBlobs[0] = blob; prevCount++; blobBytes += blob.size; } }
+    else if (!fullBlobs[0]) { fullBlobs[0] = blob; fullCount++; blobBytes += blob.size; }
+    $('loadOverlay').classList.remove('on');
+    if (curIdx === 0) requestDraw(0);
+    updateRamPanel();
+  } catch (e) { /* ladder pass will cover it */ }
 }
 
 function startExtractionPoll(folderId, expected) {
@@ -781,100 +928,174 @@ function startExtractionPoll(folderId, expected) {
         showToast('Extraction complete — reloading frames', 'ok');
         openWorkspace(folderId, false);
       } else if (st.frames_ready > frameNames.length && frameNames.length === 0) {
-        openWorkspace(folderId, false); // first frames appeared
+        openWorkspace(folderId, false);
       }
     } catch (e) { /* transient */ }
   }, 2500);
 }
 
-/* ═══════════ BINARY BUFFER — parallel chunk loader ═══════════ */
-async function startBinaryBuffer(folder, mySession) {
+/* ═══════════ PROGRESSIVE BUFFER ═══════════ */
+function storeBatch(buf, tier) {
+  // wire format: [u32 idx][u32 size][jpeg] repeated
+  const view = new DataView(buf);
+  const bytes = new Uint8Array(buf);
+  let off = 0;
+  const touched = [];
+  while (off + 8 <= buf.byteLength) {
+    const idx = view.getUint32(off, true);
+    const len = view.getUint32(off + 4, true);
+    off += 8;
+    if (off + len > buf.byteLength || idx >= frameNames.length) break;
+    const target = tier === 'preview' ? prevBlobs : fullBlobs;
+    if (!target[idx]) {
+      target[idx] = new Blob([bytes.subarray(off, off + len)], { type: 'image/jpeg' });
+      blobBytes += len;
+      if (tier === 'preview') prevCount++; else fullCount++;
+      touched.push(idx);
+      // full-res arrival invalidates a cached preview bitmap
+      if (tier === 'full') {
+        const c = bitmapCache.get(idx);
+        if (c && c.tier === 'preview') { bitmapCache.delete(idx); c.bm.close && c.bm.close(); }
+      }
+    }
+    off += len;
+  }
+  return touched;
+}
+
+async function fetchBatch(folder, params, tier, mySession) {
+  const qs = new URLSearchParams(params).toString();
+  const res = await apiFetch(`/api/batch/${folder}?${qs}&tier=${tier}`,
+                             { signal: networkAborter ? networkAborter.signal : undefined });
+  const buf = await res.arrayBuffer();
+  if (mySession !== session) return [];
+  const touched = storeBatch(buf, tier);
+  updateRamPanel();
+  // redraw if the playhead was waiting on one of these frames
+  if (touched.includes(curIdx) || (lastDrawn !== curIdx && touched.some(i => Math.abs(i - curIdx) < CHUNK_SIZE))) {
+    requestDraw(curIdx);
+  }
+  return touched;
+}
+
+async function startProgressiveBuffer(folder, mySession) {
   const total = frameNames.length;
-  const starts = [];
-  for (let s = 0; s < total; s += CHUNK_SIZE) starts.push(s);
+  const tier1 = hasPreviewTier ? 'preview' : 'full';
 
-  let cursor = 0;
-  let firstFrameShown = false;
+  // ── PASS 1: sparse ladder spanning the entire clip ──
+  const step = Math.max(1, Math.floor(total / LADDER_TARGET));
+  if (step > 1) {
+    $('loadOverlayTxt').textContent = 'Loading preview ladder…';
+    try { await fetchBatch(folder, { start: 0, count: LADDER_TARGET + 2, step }, tier1, mySession); } catch (e) {}
+    if (mySession !== session) return;
+    $('loadOverlay').classList.remove('on');
+  }
 
+  // ── PASS 2: fill tier1 completely, playhead-nearest chunks first ──
+  await fillTier(folder, tier1, mySession);
+  if (mySession !== session) return;
+
+  // ── PASS 3: background full-res upgrade ──
+  if (hasPreviewTier) await fillTier(folder, 'full', mySession);
+  if (mySession === session) { $('loadOverlay').classList.remove('on'); updateRamPanel(); }
+}
+
+async function fillTier(folder, tier, mySession) {
+  const total = frameNames.length;
+  const target = tier === 'preview' ? prevBlobs : fullBlobs;
+  const pending = new Set();
+  for (let s = 0; s < total; s += CHUNK_SIZE) {
+    // skip chunks that are already fully buffered
+    let missing = false;
+    for (let i = s; i < Math.min(s + CHUNK_SIZE, total); i++) {
+      if (!target[i]) { missing = true; break; }
+    }
+    if (missing) pending.add(s);
+  }
+  const nextChunk = () => {
+    // playhead-nearest scheduling: the chunk closest to curIdx wins
+    let best = -1, bestDist = Infinity;
+    for (const s of pending) {
+      const d = Math.abs(s + CHUNK_SIZE / 2 - curIdx);
+      if (d < bestDist) { bestDist = d; best = s; }
+    }
+    if (best >= 0) pending.delete(best);
+    return best;
+  };
   const worker = async () => {
-    while (cursor < starts.length) {
-      const myStart = starts[cursor++];
+    while (pending.size) {
       if (mySession !== session) return;
-      let buf;
-      try {
-        const res = await apiFetch(`/api/batch/${folder}?start=${myStart}&count=${CHUNK_SIZE}`,
-                                   { signal: networkAborter ? networkAborter.signal : undefined });
-        buf = await res.arrayBuffer();
-      } catch (e) { if (mySession !== session) return; continue; }
-      if (mySession !== session) return;
-
-      // Parse packed [4-byte LE size][jpeg]... — build Blobs from views (no copies of the whole buffer)
-      const view = new DataView(buf);
-      const bytes = new Uint8Array(buf);
-      let off = 0, idx = myStart;
-      while (off + 4 <= buf.byteLength && idx < total) {
-        const len = view.getUint32(off, true); off += 4;
-        if (off + len > buf.byteLength) break;
-        if (!frameBlobs[idx]) {
-          frameBlobs[idx] = new Blob([bytes.subarray(off, off + len)], { type: 'image/jpeg' });
-          blobBytes += len;
-          framesBuffered++;
-        }
-        off += len; idx++;
-      }
-      updateRamPanel();
-
-      if (!firstFrameShown && frameBlobs[0]) {
-        firstFrameShown = true;
-        $('loadOverlay').classList.remove('on');
-        scrubTo(0, true);
-      }
-      // If the playhead is waiting inside this chunk, draw it now
-      if (curIdx >= myStart && curIdx < myStart + CHUNK_SIZE) requestDraw(curIdx);
+      const s = nextChunk();
+      if (s < 0) return;
+      try { await fetchBatch(folder, { start: s, count: CHUNK_SIZE }, tier, mySession); }
+      catch (e) { if (mySession !== session) return; }
     }
   };
-
   await Promise.all(Array.from({ length: PARALLEL_FETCHES }, worker));
-  updateRamPanel();
-  if (mySession === session) $('loadOverlay').classList.remove('on');
 }
 
 function updateRamPanel() {
   const total = frameNames.length || 0;
-  $('ramFrames').textContent = `${framesBuffered} / ${total}`;
+  $('ramPrev').textContent = hasPreviewTier ? `${prevCount} / ${total}` : '—';
+  $('ramFull').textContent = `${fullCount} / ${total}`;
   $('ramBytes').textContent = fmtBytes(blobBytes);
-  const pct = total ? (framesBuffered / total) * 100 : 0;
-  $('ramFill').style.width = pct + '%';
-  $('bufFill').style.width = pct + '%';
-  $('ramNote').textContent = pct >= 100 ? 'Fully buffered — zero-latency scrubbing'
-                       : pct > 0 ? `Buffering ${pct.toFixed(0)}% (${PARALLEL_FETCHES} parallel streams)` : 'Buffering not started';
+  const primary = hasPreviewTier ? prevCount : fullCount;
+  const pct = total ? (primary / total) * 100 : 0;
+  const fullPct = total ? (fullCount / total) * 100 : 0;
+  $('ramFill').style.width = Math.max(pct, fullPct) + '%';
+  $('bufFill').style.width = Math.max(pct, fullPct) + '%';
+  $('ramNote').textContent =
+    fullPct >= 100 ? 'Fully buffered (full-res) — zero-latency scrubbing'
+    : pct >= 100 ? 'Preview tier complete — upgrading to full-res…'
+    : pct > 0 ? `Buffering ${pct.toFixed(0)}% (${PARALLEL_FETCHES} parallel streams)`
+    : 'Buffering not started';
 }
 
-/* ═══════════ DECODE PIPELINE (LRU ImageBitmap cache) ═══════════ */
-const inflight = new Map(); // idx -> Promise
-function getBitmap(idx) {
-  if (bitmapCache.has(idx)) {
-    const bm = bitmapCache.get(idx);
-    bitmapCache.delete(idx); bitmapCache.set(idx, bm); // refresh LRU
-    return Promise.resolve(bm);
+/* ═══════════ DECODE PIPELINE (tier-aware LRU bitmap cache) ═══════════ */
+const inflight = new Map();
+function blobFor(idx) {
+  if (fullBlobs[idx]) return { blob: fullBlobs[idx], tier: 'full' };
+  if (prevBlobs[idx]) return { blob: prevBlobs[idx], tier: 'preview' };
+  return null;
+}
+function hasAnyBlob(idx) { return !!(fullBlobs[idx] || prevBlobs[idx]); }
+
+function nearestLoaded(idx) {
+  if (hasAnyBlob(idx)) return idx;
+  const total = frameNames.length;
+  for (let d = 1; d < total; d++) {
+    if (idx - d >= 0 && hasAnyBlob(idx - d)) return idx - d;
+    if (idx + d < total && hasAnyBlob(idx + d)) return idx + d;
   }
-  if (inflight.has(idx)) return inflight.get(idx);
-  const blob = frameBlobs[idx];
-  if (!blob) return Promise.reject(new Error('not buffered'));
+  return -1;
+}
+
+function getBitmap(idx) {
+  const src = blobFor(idx);
+  if (!src) return Promise.reject(new Error('not buffered'));
+  const cached = bitmapCache.get(idx);
+  if (cached && cached.tier === src.tier) {
+    bitmapCache.delete(idx); bitmapCache.set(idx, cached);
+    return Promise.resolve(cached.bm);
+  }
+  const flightKey = idx + ':' + src.tier;
+  if (inflight.has(flightKey)) return inflight.get(flightKey);
   const mySession = session;
-  const p = createImageBitmap(blob).then(bm => {
-    inflight.delete(idx);
+  const p = createImageBitmap(src.blob).then(bm => {
+    inflight.delete(flightKey);
     if (mySession !== session) { bm.close && bm.close(); throw new Error('stale'); }
-    bitmapCache.set(idx, bm);
-    if (!frameW) { frameW = bm.width; frameH = bm.height; updateResInfo(); }
+    const old = bitmapCache.get(idx);
+    if (old) { bitmapCache.delete(idx); old.bm.close && old.bm.close(); }
+    bitmapCache.set(idx, { bm, tier: src.tier });
+    if (src.tier === 'full' && !frameW) { frameW = bm.width; frameH = bm.height; updateResInfo(); }
     while (bitmapCache.size > BITMAP_CACHE_MAX) {
-      const [oldIdx, oldBm] = bitmapCache.entries().next().value;
+      const [oldIdx, oldEntry] = bitmapCache.entries().next().value;
       bitmapCache.delete(oldIdx);
-      oldBm.close && oldBm.close();
+      oldEntry.bm.close && oldEntry.bm.close();
     }
     return bm;
-  }).catch(err => { inflight.delete(idx); throw err; });
-  inflight.set(idx, p);
+  }).catch(err => { inflight.delete(flightKey); throw err; });
+  inflight.set(flightKey, p);
   return p;
 }
 
@@ -882,7 +1103,7 @@ function decodeAhead(fromIdx) {
   for (let i = 1; i <= DECODE_AHEAD; i++) {
     const idx = fromIdx + i;
     if (idx >= frameNames.length) break;
-    if (!bitmapCache.has(idx) && !inflight.has(idx) && frameBlobs[idx]) getBitmap(idx).catch(() => {});
+    if (!bitmapCache.has(idx) && hasAnyBlob(idx)) getBitmap(idx).catch(() => {});
   }
 }
 
@@ -923,12 +1144,17 @@ function requestDraw(idx) {
   requestAnimationFrame(() => {
     drawQueued = false;
     const mySession = session;
-    getBitmap(idx).then(bm => {
+    const drawIdx = nearestLoaded(idx);   // never black-screen: nearest loaded frame
+    if (drawIdx < 0) return;
+    getBitmap(drawIdx).then(bm => {
       if (mySession !== session || idx !== curIdx) return;
       drawBitmap(bm);
-      lastDrawn = idx;
+      lastDrawn = drawIdx;
+      const entry = bitmapCache.get(drawIdx);
+      $('hudTier').style.display = (entry && entry.tier === 'preview') ? '' : 'none';
+      if (playing) fpsDrawCount++;
       maybeHistogram(bm);
-    }).catch(() => { /* frame not buffered yet — buffer loop will redraw */ });
+    }).catch(() => {});
   });
 }
 
@@ -941,7 +1167,7 @@ const histCtx = histCanvas.getContext('2d');
 
 function maybeHistogram(bm) {
   const now = performance.now();
-  if (playing && now - lastHist < 120) return; // throttle during playback
+  if (playing && now - lastHist < 120) return;
   lastHist = now;
   try {
     histSrcCtx.drawImage(bm, 0, 0, 96, 54);
@@ -969,13 +1195,59 @@ function maybeHistogram(bm) {
   } catch (e) { /* histogram is best-effort */ }
 }
 
+/* ═══════════ FRAME INTEL — timestamp + description per frame ═══════════ */
+async function loadFrameNotes(folderId, mySession) {
+  try {
+    const data = await (await apiFetch(`/api/notes/${folderId}`)).json();
+    if (mySession !== session) return;
+    frameNotes = (data.notes || []).sort((a, b) => a.ts_sec - b.ts_sec);
+    transcript = (data.transcript || []).sort((a, b) => a.start_sec - b.start_sec);
+    $('intelSrc').textContent = frameNotes.length ? `${frameNotes.length} notes` : '';
+    updateIntel();
+  } catch (e) { /* notes are non-critical */ }
+}
+
+function _lastAtOrBefore(arr, key, t) {
+  let lo = 0, hi = arr.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid][key] <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return ans;
+}
+
+function updateIntel() {
+  const ts = frameTs(curIdx);
+  $('intelTs').textContent = `⏱ ${ts.toFixed(3)}s · frame ${curIdx}`;
+  const dEl = $('intelDesc'), sEl = $('intelSpeech');
+
+  if (frameNotes.length) {
+    const i = _lastAtOrBefore(frameNotes, 'ts_sec', ts + 1e-6);
+    const note = i >= 0 ? frameNotes[i] : frameNotes[0];
+    dEl.textContent = note.description || '—';
+    dEl.classList.remove('dim');
+  } else {
+    dEl.textContent = 'No analysis yet — GPU engine will describe each frame after processing.';
+    dEl.classList.add('dim');
+  }
+
+  if (transcript.length) {
+    const i = _lastAtOrBefore(transcript, 'start_sec', ts + 1e-6);
+    const seg = i >= 0 ? transcript[i] : null;
+    if (seg && ts <= (seg.end_sec + 0.4)) {
+      sEl.textContent = `🎙 “${seg.text}”`;
+      sEl.classList.remove('off');
+    } else sEl.classList.add('off');
+  } else sEl.classList.add('off');
+}
+
 /* ═══════════ TRANSPORT ═══════════ */
 function scrubTo(idx, force = false) {
   idx = Math.max(0, Math.min(idx, frameNames.length - 1));
   if (idx === curIdx && !force) return;
   curIdx = idx;
   $('scrubber').value = idx;
-  const ts = extractTimestamp(frameNames[idx] || '');
+  const ts = frameTs(idx);
   $('tcCur').textContent = ts.toFixed(3);
   $('hudFrame').textContent = idx;
   $('hudTs').textContent = ts.toFixed(3) + 's';
@@ -983,6 +1255,7 @@ function scrubTo(idx, force = false) {
   $('playFill').style.width = pct + '%';
   requestDraw(idx);
   decodeAhead(idx);
+  updateIntel();
 }
 
 $('scrubber').addEventListener('input', e => { stopPlayback(); scrubTo(parseInt(e.target.value, 10)); });
@@ -992,14 +1265,23 @@ function playLoop(ts) {
   if (!lastRaf) lastRaf = ts;
   const dt = (ts - lastRaf) / 1000;
   lastRaf = ts;
+
+  /* realtime FPS: draws per rolling 500 ms window */
+  if (!fpsWindowStart) fpsWindowStart = ts;
+  if (ts - fpsWindowStart >= 500) {
+    measuredFps = fpsDrawCount / ((ts - fpsWindowStart) / 1000);
+    fpsDrawCount = 0; fpsWindowStart = ts;
+    $('hudFps').textContent = measuredFps.toFixed(1);
+    $('miPlayFps').textContent = `${measuredFps.toFixed(1)} fps`;
+  }
+
   playAccum += dt * nativeFps * speed;
   if (playAccum >= 1) {
     const step = Math.floor(playAccum);
     playAccum -= step;
     let next = curIdx + step;
     if (next >= frameNames.length) { next = 0; } // loop
-    // Never stall on an unbuffered frame — skip forward only if buffered
-    if (frameBlobs[next] || bitmapCache.has(next)) scrubTo(next);
+    if (hasAnyBlob(next) || bitmapCache.has(next)) scrubTo(next);
   }
   requestAnimationFrame(playLoop);
 }
@@ -1008,10 +1290,11 @@ function togglePlay() {
   if (!frameNames.length) return;
   playing = !playing;
   $('btnPlay').textContent = playing ? 'Pause' : 'Play';
-  if (playing) { lastRaf = 0; playAccum = 0; requestAnimationFrame(playLoop); }
+  if (playing) { lastRaf = 0; playAccum = 0; fpsWindowStart = 0; fpsDrawCount = 0; requestAnimationFrame(playLoop); }
+  else { $('hudFps').textContent = '—'; $('miPlayFps').textContent = '—'; }
 }
 function stopPlayback() {
-  if (playing) { playing = false; $('btnPlay').textContent = 'Play'; }
+  if (playing) { playing = false; $('btnPlay').textContent = 'Play'; $('hudFps').textContent = '—'; $('miPlayFps').textContent = '—'; }
 }
 function setSpeed(m) {
   speed = m;
@@ -1021,11 +1304,10 @@ function jumpToSecond() {
   const sec = parseFloat($('jumpInput').value);
   if (isNaN(sec) || !frameNames.length) return;
   stopPlayback();
-  // binary search closest timestamp
   let lo = 0, hi = frameNames.length - 1;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (extractTimestamp(frameNames[mid]) < sec) lo = mid + 1; else hi = mid;
+    if (frameTs(mid) < sec) lo = mid + 1; else hi = mid;
   }
   scrubTo(lo);
 }
@@ -1083,6 +1365,116 @@ window.addEventListener('mousemove', e => {
 window.addEventListener('mouseup', () => { panning = false; canvas.classList.remove('panning'); });
 canvas.addEventListener('dblclick', resetZoom);
 
+/* ═══════════ DATABASE VIEW ═══════════ */
+let dbActiveTable = null;
+let dbOffset = 0;
+let dbTotal = 0;
+const DB_LIMIT = 50;
+let dbSearchDebounce = null;
+let snapPollTimer = null;
+
+$('dbSearch').addEventListener('input', () => {
+  clearTimeout(dbSearchDebounce);
+  dbSearchDebounce = setTimeout(() => { dbOffset = 0; loadDbRows(); }, 250);
+});
+
+async function refreshDbView() {
+  loadDbOverview();
+  loadDbTables();
+  pollSnapStatus(false);
+}
+
+async function loadDbOverview() {
+  try {
+    const o = await (await apiFetch('/api/db/overview')).json();
+    const cards = [
+      [o.posts, 'Posts indexed'], [o.harvested, 'Videos harvested'],
+      [o.videos_extracted, 'Frame-extracted'], [o.total_frames, 'Total frames'],
+      [o.frame_notes, 'Frame notes'], [o.transcript_segments, 'Transcript segs'],
+      [o.categories, 'Categories'], [o.creators, 'Creators'],
+      [o.db_size_mb + ' MB', 'Database size'],
+    ];
+    $('dbCards').innerHTML = cards.map(([n, l]) =>
+      `<div class="db-card"><div class="num">${n ?? 0}</div><div class="lbl">${l}</div></div>`).join('');
+  } catch (e) { showToast('Failed to load DB overview', 'error'); }
+}
+
+async function loadDbTables() {
+  try {
+    const data = await (await apiFetch('/api/db/tables')).json();
+    const sel = $('dbTableSelect');
+    const prev = dbActiveTable;
+    sel.innerHTML = (data.tables || []).map(t =>
+      `<option value="${t.name}" ${t.name === prev ? 'selected' : ''}>${t.name} (${t.rows} rows)</option>`).join('');
+    if (!prev && data.tables && data.tables.length) {
+      dbActiveTable = data.tables[0].name;
+      sel.value = dbActiveTable;
+    }
+    if (dbActiveTable) loadDbRows();
+  } catch (e) { showToast('Failed to list tables', 'error'); }
+}
+
+function selectDbTable(name) {
+  dbActiveTable = name;
+  dbOffset = 0;
+  $('dbSearch').value = '';
+  loadDbRows();
+}
+
+function dbPage(dir) {
+  const next = dbOffset + dir * DB_LIMIT;
+  if (next < 0 || next >= dbTotal) return;
+  dbOffset = next;
+  loadDbRows();
+}
+
+async function loadDbRows() {
+  if (!dbActiveTable) return;
+  try {
+    const q = encodeURIComponent($('dbSearch').value.trim());
+    const data = await (await apiFetch(
+      `/api/db/table/${dbActiveTable}?offset=${dbOffset}&limit=${DB_LIMIT}&q=${q}`)).json();
+    dbTotal = data.total || 0;
+    $('dbThead').innerHTML = '<tr>' + data.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
+    $('dbTbody').innerHTML = (data.rows || []).map(r =>
+      '<tr>' + r.map(v => `<td title="${String(v ?? '').replace(/"/g, '&quot;')}">${v ?? '<span style="color:var(--text-faint)">null</span>'}</td>`).join('') + '</tr>').join('');
+    const from = dbTotal ? dbOffset + 1 : 0;
+    const to = Math.min(dbOffset + DB_LIMIT, dbTotal);
+    $('dbPageInfo').textContent = `${from}–${to} of ${dbTotal}`;
+  } catch (e) { showToast('Failed to load table rows', 'error'); }
+}
+
+/* ── Snapshot controls ── */
+async function snapExport() {
+  try {
+    const r = await (await apiFetch('/api/db/export', { method: 'POST' })).json();
+    showToast(r.message, r.ok ? 'ok' : 'error');
+    if (r.ok) pollSnapStatus(true);
+  } catch (e) { showToast('Export request failed', 'error'); }
+}
+async function snapImport() {
+  if (!confirm('Import will OVERWRITE the current database with the latest Telegram snapshot. Continue?')) return;
+  try {
+    const r = await (await apiFetch('/api/db/import', { method: 'POST' })).json();
+    showToast(r.message, r.ok ? 'ok' : 'error');
+    if (r.ok) pollSnapStatus(true);
+  } catch (e) { showToast('Import request failed', 'error'); }
+}
+async function pollSnapStatus(loop) {
+  clearTimeout(snapPollTimer);
+  try {
+    const s = await (await apiFetch('/api/db/snapshot/status')).json();
+    const el = $('snapStatus');
+    el.textContent = s.state === 'idle' ? 'idle' : `${s.state}: ${s.detail || '…'}`;
+    el.className = 'snap-status' + (s.state === 'done' ? ' ok' : s.state === 'error' ? ' err' : '');
+    const running = s.state === 'exporting' || s.state === 'importing';
+    if (running || loop === true) {
+      if (running) snapPollTimer = setTimeout(() => pollSnapStatus(true), 2000);
+      else if (s.state === 'done') { loadDbOverview(); loadDbTables(); }
+    }
+  } catch (e) { /* transient */ }
+}
+
 /* ═══════════ CONSOLE LOGS ═══════════ */
 async function pollLogs() {
   if (!$('view-workspace').classList.contains('active')) return;
@@ -1099,7 +1491,6 @@ setInterval(pollLogs, 5000);
 (async function boot() {
   history.replaceState({ view: 'library' }, '', '#library');
   await Promise.all([refreshLibrary(false), loadCategories()]);
-  // auto-refresh library every 30s while visible
   setInterval(() => {
     if ($('view-library').classList.contains('active') && !document.hidden) refreshLibrary(false);
   }, 30000);

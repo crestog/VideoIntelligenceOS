@@ -36,8 +36,25 @@ STATE_FILE  = os.path.join(LAKE_DIR, 'state.txt')
 # ═══════════════════════════════════════════════════════════
 # QUEUE NAMES
 # ═══════════════════════════════════════════════════════════
-QUEUE_VISION = 'QUEUE_VISION'
-QUEUE_MODELS = 'QUEUE_MODELS'
+QUEUE_VISION  = 'QUEUE_VISION'
+QUEUE_MODELS  = 'QUEUE_MODELS'
+QUEUE_ANALYZE = 'QUEUE_ANALYZE'   # GPU analysis jobs (after frame extraction)
+
+# ═══════════════════════════════════════════════════════════
+# FRAME EXTRACTION TIERS
+# ═══════════════════════════════════════════════════════════
+PREVIEW_DIR_NAME = '.preview'     # per-video subfolder for the low-res tier
+PREVIEW_WIDTH    = 320            # preview tier width (height auto, keeps aspect)
+PREVIEW_QUALITY  = 6              # ffmpeg -q:v for preview jpegs (2 best..31 worst)
+FULL_QUALITY     = 2              # ffmpeg -q:v for full-res jpegs
+
+# ═══════════════════════════════════════════════════════════
+# SNAPSHOT (Telegram DB export/import)
+# ═══════════════════════════════════════════════════════════
+SNAPSHOT_DIR        = (os.path.join('/tmp', 'vios_snapshots') if os.path.isdir('/tmp')
+                       else os.path.join(LAKE_DIR, '.snapshots'))
+SNAPSHOT_CHUNK_MB   = 1900        # stay under the 2 GB MTProto bot limit per part
+SNAPSHOT_TAG        = '#VIOS_SNAPSHOT'   # caption tag used to find snapshots in the channel
 
 # ═══════════════════════════════════════════════════════════
 # WORKER CONFIGURATION
@@ -52,6 +69,14 @@ BATCH_FRAME_COUNT        = 200    # Frames per binary batch fetch in V17
 # SQLITE — shared connection settings (prevents "database is locked")
 # ═══════════════════════════════════════════════════════════
 SQLITE_TIMEOUT = 30  # seconds; ALL sqlite3.connect calls must pass this
+
+# ═══════════════════════════════════════════════════════════
+# TELEGRAM (shared by Ghost Worker + Snapshot Manager)
+# ═══════════════════════════════════════════════════════════
+API_ID     = int(os.environ.get('VIOS_API_ID', 37392880))
+API_HASH   = os.environ.get('VIOS_API_HASH', '4037344084ae998be2cdaee3192bd8f8')
+BOT_TOKEN  = os.environ.get('VIOS_BOT_TOKEN', '8269867642:AAH76B2_aFbqc6OqNiCAm-NenTTmG_SWavU')
+CHANNEL_ID = int(os.environ.get('VIOS_CHANNEL_ID', -1003762735924))
 
 # ═══════════════════════════════════════════════════════════
 # REDIS
