@@ -10,7 +10,7 @@ import nest_asyncio
 from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
 from v17_backend import v17_router
 from admin_backend import admin_router
-from config import BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR
+from config import BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR, SQLITE_TIMEOUT
 
 nest_asyncio.apply()
 
@@ -452,6 +452,212 @@ def get_state():
 @app.get("/analyze", response_class=HTMLResponse)
 async def analyze_ui(id: str = "", t: str = ""):
     return f"<html><body style='background:#050505; color:white; font-family:sans-serif; padding:50px; text-align:center;'><h2 style='color:#00e5ff;'>🔍 Pattern Recognition Module</h2><p><b>Video ID:</b> {id}</p><p><b>Exact Timestamp:</b> {t}s</p></body></html>"
+
+# ═══════════════════════════════════════════════════════════
+# LAYER-5 INTELLIGENCE APIs
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/semantic_search")
+async def api_semantic_search(q: str = "", k: int = 10, mode: str = "siglip"):
+    """
+    Embed query text and search Qdrant for the nearest frames or chunks.
+
+    mode: 'siglip'  → CLIP-style image-text similarity (frames_siglip)
+          'clip'    → OpenAI CLIP (frames_clip)
+          'bge'     → BGE text embedding (chunks_bge — chunk narratives)
+
+    Returns ranked list of {video_path, msg_id, timestamp/start_t, score, chunk_id?}.
+    """
+    if not q.strip():
+        return {"error": "Query is empty", "results": []}
+
+    try:
+        from tripartite_db import get_qdrant
+        qdrant = get_qdrant()
+        if qdrant is None:
+            return {"error": "Qdrant not available", "results": []}
+
+        collection_map = {
+            "siglip": ("frames_siglip", "siglip"),
+            "clip":   ("frames_clip",   "clip"),
+            "bge":    ("chunks_bge",    "bge"),
+        }
+        if mode not in collection_map:
+            return {"error": f"Unknown mode '{mode}'. Use siglip|clip|bge", "results": []}
+
+        collection_name, embed_type = collection_map[mode]
+
+        # Produce query embedding
+        query_vec = None
+        if embed_type in ("siglip", "clip"):
+            # Use transformers text encoder on the model_manager warm models
+            try:
+                import sys, os
+                sys.path.insert(0, os.path.dirname(__file__))
+                from model_manager import WARM_MODELS
+                import torch
+                if embed_type == "siglip":
+                    proc  = WARM_MODELS.get("siglip_proc") or WARM_MODELS.get("siglip_processor")
+                    model = WARM_MODELS.get("siglip_model")
+                else:
+                    proc  = WARM_MODELS.get("clip_proc") or WARM_MODELS.get("clip_processor")
+                    model = WARM_MODELS.get("clip_model")
+                if proc and model:
+                    device = next(model.parameters()).device
+                    inputs = proc(text=[q], return_tensors="pt", padding=True, truncation=True).to(device)
+                    with torch.no_grad():
+                        feats = model.get_text_features(**inputs)
+                        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+                    query_vec = feats[0].cpu().float().tolist()
+            except Exception as e:
+                return {"error": f"Text embedding failed: {e}", "results": []}
+
+        elif embed_type == "bge":
+            try:
+                from model_manager import WARM_MODELS
+                # oracle_worker holds BGE, fallback: load inline
+                bge = WARM_MODELS.get("bge_model")
+                if bge is None:
+                    from sentence_transformers import SentenceTransformer
+                    bge = SentenceTransformer("BAAI/bge-large-en-v1.5")
+                query_vec = bge.encode(q, normalize_embeddings=True).tolist()
+            except Exception as e:
+                return {"error": f"BGE embedding failed: {e}", "results": []}
+
+        if query_vec is None:
+            return {"error": "Could not produce query embedding", "results": []}
+
+        hits = qdrant.search(collection_name=collection_name, query_vector=query_vec, limit=k)
+        results = [
+            {
+                "score": round(float(h.score), 4),
+                "video_path": h.payload.get("video_path", ""),
+                "msg_id": h.payload.get("msg_id"),
+                "timestamp": h.payload.get("timestamp") or h.payload.get("start_t"),
+                "frame_idx": h.payload.get("frame_idx"),
+                "chunk_id": h.payload.get("chunk_id"),
+            }
+            for h in hits
+        ]
+        return {"query": q, "mode": mode, "collection": collection_name, "results": results}
+
+    except Exception as e:
+        return {"error": str(e), "results": []}
+
+
+@app.get("/api/graph_search")
+async def api_graph_search(q: str = "", limit: int = 10):
+    """
+    Search the Neo4j knowledge graph for entities matching `q`.
+    Returns the entity, its type/description, and linked chunk narratives with timestamps.
+    """
+    if not q.strip():
+        return {"error": "Query is empty", "results": []}
+
+    try:
+        from tripartite_db import get_neo4j_driver
+        driver = get_neo4j_driver()
+        if driver is None:
+            return {"error": "Neo4j not available — graph search disabled", "results": []}
+
+        with driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) CONTAINS toLower($q) OR toLower(e.description) CONTAINS toLower($q)
+                WITH e LIMIT $limit
+                OPTIONAL MATCH (c:Chunk)-[:CONTAINS_ENTITY]->(e)
+                OPTIONAL MATCH (c)-[:DESCRIBED_BY]->(n:Narrative)
+                RETURN e.name AS entity, e.type AS type, e.description AS description,
+                       collect(DISTINCT {chunk_id: c.id, start: c.start, end: c.end, narrative: n.text})[..5] AS chunks
+                """,
+                q=q, limit=limit,
+            )
+            rows = result.data()
+
+        driver.close()
+        return {"query": q, "results": rows}
+
+    except Exception as e:
+        return {"error": str(e), "results": []}
+
+
+@app.get("/api/spatial_proof")
+async def api_spatial_proof(msg_id: int = 0, frame_idx: int = 0, query: str = ""):
+    """
+    Run Grounding DINO + SAM on a specific frame to produce a spatial mask overlay.
+    Returns a JPEG image with the matched region highlighted.
+
+    msg_id    — video message ID (matches the videos table)
+    frame_idx — frame number (0-indexed, full-res tier)
+    query     — text description of object/text to localise
+    """
+    if not query.strip():
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "query is required"}, status_code=400)
+
+    import glob as _glob
+    from fastapi.responses import StreamingResponse
+    import io
+
+    # Locate frame file
+    frame_dir = os.path.join(VIDEO_DIR, f"frames_{msg_id}")
+    pattern = os.path.join(frame_dir, f"frame_{frame_idx:05d}_ts_*.jpg")
+    matches = _glob.glob(pattern)
+    if not matches:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": f"Frame {frame_idx} not found for video {msg_id}"}, status_code=404)
+
+    frame_path = matches[0]
+    try:
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(frame_path).convert("RGB")
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": f"Failed to open frame: {e}"}, status_code=500)
+
+    # Get OCR results for this frame from the DB
+    import sqlite3 as _sqlite3
+    ocr_results = []
+    try:
+        conn_s = _sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT)
+        row = conn_s.execute(
+            "SELECT ocr_text FROM frame_notes WHERE msg_id=? AND frame_idx=?",
+            (msg_id, frame_idx)
+        ).fetchone()
+        conn_s.close()
+        # EasyOCR format expected: list of (bbox, text, conf)
+        # We convert the stored flat string into a minimal structure
+        if row and row[0]:
+            ocr_results = [([(0,0),(0,0),(0,0),(0,0)], row[0], 0.9)]
+    except Exception:
+        pass
+
+    # Run spatial proof
+    try:
+        from model_manager import hybrid_spatial_proof
+        result_arr, success, message = hybrid_spatial_proof(pil_img, query, ocr_results)
+    except ImportError:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "model_manager not available in this process"}, status_code=503)
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    # Encode result as JPEG and stream back
+    import numpy as np
+    from PIL import Image as PILImage
+    result_pil = PILImage.fromarray(result_arr.astype(np.uint8))
+    buf = io.BytesIO()
+    result_pil.save(buf, format="JPEG", quality=88)
+    buf.seek(0)
+
+    headers = {
+        "X-Spatial-Proof-Success": str(success),
+        "X-Spatial-Proof-Message": message,
+    }
+    return StreamingResponse(buf, media_type="image/jpeg", headers=headers)
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_main_ui():

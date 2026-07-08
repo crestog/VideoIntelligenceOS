@@ -30,9 +30,10 @@ import redis as redis_lib
 
 from queue_manager import claim_job, ack_job, fail_job, push_job
 from config import (VIDEO_DIR, THUMB_DIR, DB_PATH, QUEUE_VISION, QUEUE_ANALYZE,
+                    QUEUE_ORACLE, QUEUE_VISION_EMBED,
                     DISK_PAUSE_THRESHOLD_GB, DISK_WARN_THRESHOLD_GB,
                     PREVIEW_DIR_NAME, PREVIEW_WIDTH, PREVIEW_QUALITY, FULL_QUALITY,
-                    SQLITE_TIMEOUT)
+                    SQLITE_TIMEOUT, DEFAULT_ORACLE_MODE)
 from logger import vios_log
 
 QUEUE_NAME = QUEUE_VISION
@@ -193,7 +194,7 @@ def run_worker():
     log("═══════════════════════════════════════════════")
     log("🚀 CV FRAME ENGINE v2 (ffmpeg dual-tier) — ONLINE")
     log(f"📂 Frames: {VIDEO_DIR} | 🖼️ Thumbs: {THUMB_DIR}")
-    log(f"📡 Queue: {QUEUE_NAME} → pushes {QUEUE_ANALYZE} on success")
+    log(f"📡 Queue: {QUEUE_NAME} → pushes {QUEUE_ANALYZE}, {QUEUE_ORACLE}, {QUEUE_VISION_EMBED} on success")
     log("═══════════════════════════════════════════════")
 
     os.makedirs(VIDEO_DIR, exist_ok=True)
@@ -247,12 +248,23 @@ def run_worker():
             jobs_completed += 1
             total_frames += frames_extracted
 
-            # Hand off to the GPU analysis stage (idempotent by msg_id)
-            push_job(QUEUE_ANALYZE, {"msg_id": msg_id, "path": video_path,
-                                     "folder_id": f"frames_{msg_id}"})
+            # ── Push downstream jobs ──────────────────────────────
+            folder_id = f"frames_{msg_id}"
+            common = {"msg_id": msg_id, "path": video_path, "folder_id": folder_id,
+                      "uuid": str(msg_id)}
+
+            # Existing: YOLO + Whisper analysis
+            push_job(QUEUE_ANALYZE, common)
+
+            # New: Qwen2.5-VL narrative generation (blitz by default)
+            push_job(QUEUE_ORACLE, {**common, "mode": DEFAULT_ORACLE_MODE})
+
+            # New: SigLIP / CLIP / Depth / RAFT embedding
+            push_job(QUEUE_VISION_EMBED, common)
 
             elapsed = time.time() - job.get("claimed_at", time.time())
-            log(f"🏁 JOB #{msg_id} COMPLETED — {frames_extracted} frames in {elapsed:.2f}s → queued for GPU analysis")
+            log(f"🏁 JOB #{msg_id} COMPLETED — {frames_extracted} frames in {elapsed:.2f}s "
+                f"→ queued ANALYZE + ORACLE + EMBED")
             log(f"📊 Lifetime: {jobs_completed} ok | {jobs_failed} failed | {total_frames} frames")
 
         except Exception as e:

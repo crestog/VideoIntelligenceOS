@@ -109,15 +109,137 @@ def load_easyocr():
     log("🔤 Loading EasyOCR...")
     WARM_MODELS['ocr_reader'] = easyocr.Reader(['en'], gpu=torch.cuda.is_available(), verbose=False)
 
+
+def load_grounding_dino():
+    from transformers import GroundingDinoForObjectDetection, GroundingDinoProcessor
+    log("📍 Loading Grounding DINO-Base...")
+    WARM_MODELS['dino_processor'] = GroundingDinoProcessor.from_pretrained(
+        "IDEA-Research/grounding-dino-base")
+    WARM_MODELS['dino_model'] = GroundingDinoForObjectDetection.from_pretrained(
+        "IDEA-Research/grounding-dino-base").to(device_0).eval()
+
+
+def load_sam():
+    from transformers import SamModel, SamProcessor
+    log("✂️  Loading SAM-ViT-Base...")
+    WARM_MODELS['sam_processor'] = SamProcessor.from_pretrained("facebook/sam-vit-base")
+    WARM_MODELS['sam_model'] = SamModel.from_pretrained(
+        "facebook/sam-vit-base").to(device_0).eval()
+
+
+def load_depth_anything():
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    log("📏 Loading Depth-Anything-V2-Small...")
+    WARM_MODELS['depth_proc'] = AutoImageProcessor.from_pretrained(
+        "depth-anything/Depth-Anything-V2-Small-hf")
+    WARM_MODELS['depth_model'] = AutoModelForDepthEstimation.from_pretrained(
+        "depth-anything/Depth-Anything-V2-Small-hf").to(device_0).eval()
+
 MODEL_REGISTRY = {
-    "siglip": load_siglip,
-    "clip": load_clip,
-    "dinov2": load_dinov2,
-    "whisper": load_whisper,
-    "raft": load_raft,
-    "yolo": load_yolo,
-    "easyocr": load_easyocr,
+    "siglip":           load_siglip,
+    "clip":             load_clip,
+    "dinov2":           load_dinov2,
+    "whisper":          load_whisper,
+    "raft":             load_raft,
+    "yolo":             load_yolo,
+    "easyocr":          load_easyocr,
+    "grounding_dino":   load_grounding_dino,
+    "sam":              load_sam,
+    "depth_anything":   load_depth_anything,
 }
+
+
+# ═══════════════════════════════════════════════════════════
+# SPATIAL PROOF UTILITY (Grounding DINO → SAM overlay)
+# ═══════════════════════════════════════════════════════════
+def hybrid_spatial_proof(pil_image, text_query: str, ocr_results: list):
+    """
+    Localise `text_query` in `pil_image` using:
+      1. EasyOCR result list  (text match → blue mask)
+      2. Grounding DINO       (object match → green mask)
+    Then refine the bounding box with SAM to produce a pixel-level mask.
+
+    Returns (np.ndarray uint8 RGB, success: bool, message: str).
+    """
+    import numpy as np
+    import cv2
+
+    img_arr = np.array(pil_image)
+    query_lower = text_query.lower()
+    best_box = None
+    box_type = None
+
+    # 1. OCR hit
+    for (bbox, text, conf) in ocr_results:
+        if query_lower in text.lower() or any(
+            word in text.lower() for word in query_lower.split() if len(word) > 3
+        ):
+            xs = [pt[0] for pt in bbox]
+            ys = [pt[1] for pt in bbox]
+            best_box = [min(xs), min(ys), max(xs), max(ys)]
+            box_type = "OCR"
+            break
+
+    # 2. Grounding DINO fallback
+    if not best_box:
+        dino_proc  = WARM_MODELS.get('dino_processor')
+        dino_model = WARM_MODELS.get('dino_model')
+        if dino_proc and dino_model:
+            try:
+                inputs = dino_proc(
+                    images=pil_image, text=query_lower + ".", return_tensors="pt"
+                ).to(device_0)
+                with torch.no_grad():
+                    outputs = dino_model(**inputs)
+                results = dino_proc.post_process_grounded_object_detection(
+                    outputs, inputs.input_ids,
+                    threshold=0.15, text_threshold=0.15,
+                    target_sizes=[pil_image.size[::-1]],
+                )[0]
+                if len(results["boxes"]) > 0:
+                    best_box = results["boxes"][0].tolist()
+                    box_type = "DINO"
+            except Exception as e:
+                log(f"⚠️ Grounding DINO inference failed: {e}", "WARN")
+
+    if not best_box:
+        return img_arr.astype(np.uint8), False, "❌ No text or object boundary detected."
+
+    # 3. SAM refinement
+    sam_proc  = WARM_MODELS.get('sam_processor')
+    sam_model = WARM_MODELS.get('sam_model')
+    if sam_proc and sam_model:
+        try:
+            sam_inputs = sam_proc(
+                images=pil_image, input_boxes=[[best_box]], return_tensors="pt"
+            ).to(device_0)
+            with torch.no_grad():
+                sam_out = sam_model(**sam_inputs)
+            mask = sam_proc.image_processor.post_process_masks(
+                sam_out.pred_masks.cpu(),
+                sam_inputs["original_sizes"].cpu(),
+                sam_inputs["reshaped_input_sizes"].cpu(),
+            )[0][0][0].numpy()
+            color = np.array([255, 50, 50]) if box_type == "OCR" else np.array([50, 255, 50])
+            img_arr = img_arr.copy()
+            img_arr[mask] = (img_arr[mask] * 0.6 + color * 0.4).clip(0, 255)
+        except Exception as e:
+            log(f"⚠️ SAM mask failed: {e}", "WARN")
+
+    # Draw bounding box
+    color_bgr = [50, 50, 255] if box_type == "OCR" else [50, 255, 50]
+    cv2.rectangle(
+        img_arr,
+        (int(best_box[0]), int(best_box[1])),
+        (int(best_box[2]), int(best_box[3])),
+        color_bgr, 3,
+    )
+    msg = (
+        f"🔤 EasyOCR matched → blue spatial mask."
+        if box_type == "OCR"
+        else f"🧩 Grounding DINO matched → green spatial mask."
+    )
+    return img_arr.astype(np.uint8), True, msg
 
 
 # ═══════════════════════════════════════════════════════════
@@ -286,7 +408,8 @@ if __name__ == "__main__":
     log("🚀 Model Manager v2: warming the 7 foundational models...")
     ensure_analysis_tables()
 
-    for model in ["yolo", "whisper", "dinov2", "siglip", "clip", "raft", "easyocr"]:
+    for model in ["yolo", "whisper", "dinov2", "siglip", "clip", "raft", "easyocr",
+                  "grounding_dino", "sam", "depth_anything"]:
         push_job("QUEUE_MODELS", {"model_name": model})
 
     # Phase 1: drain QUEUE_MODELS (blocking until empty)

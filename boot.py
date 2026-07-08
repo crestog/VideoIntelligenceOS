@@ -126,7 +126,7 @@ else:
     try:
         from queue_manager import recover_processing_jobs, get_queue_metrics
         recovered = 0
-        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE"):
+        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_ORACLE", "QUEUE_VISION_EMBED"):
             recovered += recover_processing_jobs(_q)
         if recovered > 0:
             print(f"   🔄 Recovered {recovered} orphaned job(s) from PROCESSING → DEFAULT queue.", flush=True)
@@ -157,16 +157,36 @@ print("", flush=True)
 print("=" * 60, flush=True)
 print("🚀 IGNITING VIDEO INTELLIGENCE OS", flush=True)
 print("=" * 60, flush=True)
-print("   🤖 [ENGINE]    → model_manager.py  (7 SOTA GPU models)", flush=True)
-print("   🖥️ [UI]        → ui_server.py      (FastAPI + Ghost Worker)", flush=True)
-print("   🎞️ [CV-ENGINE] → frame_worker.py   (OpenCV frame extraction)", flush=True)
+print("   🤖 [ENGINE]    → model_manager.py       (YOLO + Whisper GPU models)", flush=True)
+print("   🧠 [ORACLE]    → oracle_worker.py        (Qwen2.5-VL + GraphRAG)", flush=True)
+print("   📐 [EMBED]     → vision_embed_worker.py  (SigLIP/CLIP/Depth/RAFT)", flush=True)
+print("   🖥️ [UI]        → ui_server.py            (FastAPI + Ghost Worker)", flush=True)
+print("   🎞️ [CV-ENGINE] → frame_worker.py         (ffmpeg dual-tier extraction)", flush=True)
 print("=" * 60, flush=True)
 print("", flush=True)
 
+# ── Optional: Start Neo4j knowledge-graph engine ──
+print("🕸️ [SYSTEM] Phase 4a: Attempting Neo4j startup...", flush=True)
+try:
+    from tripartite_db import start_neo4j, ensure_neo4j_schema, get_neo4j_driver
+    neo4j_ok = start_neo4j(timeout_sec=30)
+    if neo4j_ok:
+        _drv = get_neo4j_driver()
+        ensure_neo4j_schema(_drv)
+        if _drv:
+            _drv.close()
+        print("   ✅ Neo4j knowledge graph online.", flush=True)
+    else:
+        print("   ⚠️ Neo4j unavailable — graph features disabled (non-fatal).", flush=True)
+except Exception as _e:
+    print(f"   ⚠️ Neo4j startup skipped: {_e}", flush=True)
+
 # Launch workers via Watchdog Threads
-threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
-threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"], "🖥️ [UI]", False), daemon=True).start()
-threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"], "🎞️ [CV-ENGINE]", False), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"],      "🤖 [ENGINE]",  True), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "oracle_worker.py"],      "🧠 [ORACLE]",  True), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "vision_embed_worker.py"], "📐 [EMBED]",   True), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"],           "🖥️  [UI]",     False), daemon=True).start()
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"],        "🎞️  [CV]",     False), daemon=True).start()
 
 try:
     # Keep main orchestrator alive indefinitely

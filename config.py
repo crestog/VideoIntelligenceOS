@@ -36,9 +36,11 @@ STATE_FILE  = os.path.join(LAKE_DIR, 'state.txt')
 # ═══════════════════════════════════════════════════════════
 # QUEUE NAMES
 # ═══════════════════════════════════════════════════════════
-QUEUE_VISION  = 'QUEUE_VISION'
-QUEUE_MODELS  = 'QUEUE_MODELS'
-QUEUE_ANALYZE = 'QUEUE_ANALYZE'   # GPU analysis jobs (after frame extraction)
+QUEUE_VISION       = 'QUEUE_VISION'
+QUEUE_MODELS       = 'QUEUE_MODELS'
+QUEUE_ANALYZE      = 'QUEUE_ANALYZE'       # GPU analysis jobs (after frame extraction)
+QUEUE_ORACLE       = 'QUEUE_ORACLE'        # Qwen2.5-VL narrative generation
+QUEUE_VISION_EMBED = 'QUEUE_VISION_EMBED'  # SigLIP/CLIP/Depth/RAFT embedding
 
 # ═══════════════════════════════════════════════════════════
 # FRAME EXTRACTION TIERS
@@ -83,6 +85,33 @@ CHANNEL_ID = int(os.environ.get('VIOS_CHANNEL_ID', -1003762735924))
 # ═══════════════════════════════════════════════════════════
 REDIS_HOST = os.environ.get('VIOS_REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.environ.get('VIOS_REDIS_PORT', 6379))
+
+# ═══════════════════════════════════════════════════════════
+# QDRANT (local on-disk vector store)
+# ═══════════════════════════════════════════════════════════
+QDRANT_PATH = os.environ.get('VIOS_QDRANT_PATH', os.path.join(BASE_DIR, 'qdrant_storage'))
+
+# ═══════════════════════════════════════════════════════════
+# NEO4J (community, launched as subprocess)
+# ═══════════════════════════════════════════════════════════
+NEO4J_HOME       = os.environ.get('VIOS_NEO4J_HOME', '/kaggle/working/neo4j-community-5.18.0')
+NEO4J_JAVA_HOME  = os.environ.get('VIOS_NEO4J_JAVA_HOME', '/usr/lib/jvm/java-17-openjdk-amd64')
+NEO4J_BOLT_URL   = os.environ.get('VIOS_NEO4J_BOLT_URL', 'bolt://127.0.0.1:7687')
+
+# ═══════════════════════════════════════════════════════════
+# NVIDIA NIM API (GraphRAG entity extraction)
+# ═══════════════════════════════════════════════════════════
+NVIDIA_API_KEY = os.environ.get('VIOS_NVIDIA_API_KEY', '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')
+NIM_MODEL      = os.environ.get('VIOS_NIM_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
+NIM_BASE_URL   = 'https://integrate.api.nvidia.com/v1'
+
+# ═══════════════════════════════════════════════════════════
+# ORACLE PROCESSING MODES
+# blitz: 15s chunks, 1 fps, 75 tokens — fast overview
+# omni:  5s chunks, 2 fps, 150 tokens — rich detail
+# ═══════════════════════════════════════════════════════════
+DEFAULT_ORACLE_MODE    = os.environ.get('VIOS_ORACLE_MODE', 'blitz')  # 'blitz' | 'omni'
+GRAPHRAG_IN_OMNI_ONLY = os.environ.get('VIOS_GRAPHRAG_OMNI_ONLY', '1') != '0'  # default: True
 
 # ═══════════════════════════════════════════════════════════
 # ENSURE DIRECTORIES EXIST

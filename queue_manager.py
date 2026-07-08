@@ -47,7 +47,7 @@ def get_redis():
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 PRIORITY_QUEUES = {"QUEUE_VISION"}    # Queues with dual-lane priority routing
-ALL_QUEUES = ["QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_MODELS"]
+ALL_QUEUES = ["QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_MODELS", "QUEUE_ORACLE", "QUEUE_VISION_EMBED"]
 MAX_RETRIES = 3
 
 
