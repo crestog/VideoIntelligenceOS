@@ -62,16 +62,20 @@ def clear_ram():
 #   GPU 1: reasoning/audio (Whisper) — per the 2×T4 split
 # ═══════════════════════════════════════════════════════════
 def load_siglip():
-    from transformers import AutoModel
+    from transformers import AutoModel, AutoProcessor
     log("👁️ Loading SigLIP2...")
     WARM_MODELS['siglip_model'] = AutoModel.from_pretrained(
         "google/siglip-so400m-patch14-384", torch_dtype=torch.float16).to(device_0).eval()
+    WARM_MODELS['siglip_proc'] = AutoProcessor.from_pretrained(
+        "google/siglip-so400m-patch14-384")
 
 def load_clip():
-    from transformers import CLIPModel
+    from transformers import CLIPModel, CLIPProcessor
     log("👁️ Loading CLIP...")
     WARM_MODELS['clip_model'] = CLIPModel.from_pretrained(
         "openai/clip-vit-large-patch14", torch_dtype=torch.float16).to(device_0).eval()
+    WARM_MODELS['clip_proc'] = CLIPProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14")
 
 def load_dinov2():
     from transformers import AutoModel
@@ -507,8 +511,8 @@ if __name__ == "__main__":
     log("🚀 Model Manager v2: warming the 7 foundational models...")
     ensure_analysis_tables()
 
-    for model in ["yolo", "whisper", "dinov2", "siglip", "clip", "raft", "easyocr",
-                  "grounding_dino", "sam", "depth_anything"]:
+    for model in ["yolo", "whisper", "siglip", "clip", "easyocr",
+                  "grounding_dino", "sam"]:
         push_job("QUEUE_MODELS", {"model_name": model})
 
     # Phase 1: drain QUEUE_MODELS (blocking until empty)

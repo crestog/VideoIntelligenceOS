@@ -13,3 +13,10 @@ __v0_jsx-dev-runtime.ts
 node_modules
 .next/
 .DS_Store
+# Runtime state — never commit (Kaggle wipes this each session; restored via Telegram snapshot)
+__pycache__/
+*.pyc
+appendonly.aof
+*.rdb
+DataLake/
+Insta-Vault/DataLake/

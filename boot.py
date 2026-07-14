@@ -87,7 +87,10 @@ print("   ✅ Zombie sweep complete.", flush=True)
 # PHASE 2: MESSAGE BROKER
 # ══════════════════════════════════════════════════════════
 print("🗄️ [SYSTEM] Phase 2: Booting Redis Message Broker (AOF mode)...", flush=True)
-os.system("redis-server --daemonize yes --appendonly yes")
+os.makedirs("/kaggle/working/redis_data", exist_ok=True)
+os.system("redis-server --daemonize yes --appendonly yes "
+          "--dir /kaggle/working/redis_data "
+          "--logfile /kaggle/working/redis_data/redis.log")
 
 # Readiness check with retry — no race between Redis boot and workers
 _redis_ok = False
@@ -103,6 +106,12 @@ if _redis_ok:
     print("   ✅ Redis broker online (ping verified).", flush=True)
 else:
     print("   ❌ Redis did not become ready — queue-dependent workers will retry on their own.", flush=True)
+    _log = "/kaggle/working/redis_data/redis.log"
+    if os.path.exists(_log):
+        print("   📄 redis.log tail:", flush=True)
+        os.system(f"tail -n 20 {_log}")
+    else:
+        print("   📄 No redis.log — redis-server likely failed to launch at all.", flush=True)
 
 # ══════════════════════════════════════════════════════════
 # PHASE 3: SESSION INIT — Fresh Session vs Crash Recovery
