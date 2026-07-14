@@ -368,6 +368,110 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
   .panel { border-bottom: none; border-right: 1px solid var(--border); min-width: 240px; }
   .console-box { display: none; }
 }
+
+/* ═══════════════ SEARCH / PIPELINE / EXPLORER (VX) ═══════════════ */
+.vx-wrap { padding: 18px 22px; overflow-y: auto; height: 100%; display: flex; flex-direction: column; gap: 14px; }
+.vx-subtabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.vx-subtab {
+  background: var(--surface); border: 1px solid var(--border); color: var(--text-dim);
+  padding: 7px 16px; border-radius: 8px; font-size: 12.5px; cursor: pointer; font-family: inherit;
+}
+.vx-subtab.sel { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
+.vx-searchbar { display: flex; gap: 8px; align-items: center; }
+.vx-input {
+  flex: 1; background: var(--surface); border: 1px solid var(--border-strong); color: var(--text);
+  border-radius: 9px; padding: 11px 15px; font-size: 14px; font-family: inherit; outline: none;
+}
+.vx-input:focus { border-color: var(--accent); }
+.vx-btn {
+  background: var(--surface-2); border: 1px solid var(--border-strong); color: var(--text);
+  padding: 10px 18px; border-radius: 9px; font-size: 13px; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+}
+.vx-btn:hover { border-color: var(--accent); }
+.vx-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.vx-btn.danger { border-color: var(--danger); color: var(--danger); }
+.vx-engines { display: flex; gap: 8px; flex-wrap: wrap; }
+.vx-chip {
+  font-family: var(--font-mono); font-size: 10.5px; padding: 4px 10px; border-radius: 20px;
+  border: 1px solid var(--border); color: var(--text-dim); background: var(--surface);
+}
+.vx-chip.ok { border-color: var(--ok); color: var(--ok); }
+.vx-chip.bad { border-color: var(--danger); color: var(--danger); }
+.vx-results { display: flex; flex-direction: column; gap: 10px; }
+.vx-result {
+  display: flex; gap: 14px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px; cursor: pointer; align-items: flex-start;
+}
+.vx-result:hover { border-color: var(--accent); background: var(--surface-2); }
+.vx-result img { width: 120px; height: 68px; object-fit: cover; border-radius: 6px; background: var(--surface-2); flex-shrink: 0; }
+.vx-result .body { flex: 1; min-width: 0; }
+.vx-result .title { font-size: 13.5px; font-weight: 600; margin-bottom: 3px; }
+.vx-result .snippet { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.vx-result .snippet mark { background: transparent; color: var(--accent); font-weight: 600; }
+.vx-result .meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+.vx-badge { font-family: var(--font-mono); font-size: 9.5px; padding: 2px 7px; border-radius: 4px; border: 1px solid var(--border-strong); color: var(--text-dim); text-transform: uppercase; }
+.vx-badge.moment { border-color: var(--ok); color: var(--ok); }
+.vx-badge.semantic { border-color: var(--accent); color: var(--accent); }
+.vx-badge.graph { border-color: var(--warn, #e5a50a); color: var(--warn, #e5a50a); }
+.vx-empty { text-align: center; color: var(--text-faint); padding: 44px 0; font-size: 13.5px; }
+.vx-skel { height: 74px; border-radius: 10px; background: linear-gradient(90deg, var(--surface) 25%, var(--surface-2) 50%, var(--surface) 75%); background-size: 200% 100%; animation: vxShimmer 1.2s infinite; }
+@keyframes vxShimmer { to { background-position: -200% 0; } }
+/* Pipeline */
+.vx-qgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.vx-qcard { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.vx-qcard.paused { border-color: var(--warn, #e5a50a); }
+.vx-qcard h4 { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); letter-spacing: 0.4px; display: flex; justify-content: space-between; align-items: center; }
+.vx-qnums { display: flex; gap: 14px; flex-wrap: wrap; }
+.vx-qnum { display: flex; flex-direction: column; }
+.vx-qnum b { font-size: 19px; font-weight: 700; }
+.vx-qnum span { font-family: var(--font-mono); font-size: 9.5px; color: var(--text-faint); text-transform: uppercase; }
+.vx-qnum.dlq b { color: var(--danger); }
+.vx-qactions { display: flex; gap: 6px; flex-wrap: wrap; }
+.vx-qactions .vx-btn { padding: 5px 10px; font-size: 11px; border-radius: 6px; }
+.vx-stages { display: flex; gap: 4px; }
+.vx-stage { font-family: var(--font-mono); font-size: 9px; padding: 2.5px 7px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-faint); }
+.vx-stage.done { border-color: var(--ok); color: var(--ok); }
+.vx-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 92vw); z-index: 150;
+  background: var(--surface); border-left: 1px solid var(--border-strong);
+  box-shadow: -18px 0 60px rgba(0,0,0,0.5); display: none; flex-direction: column;
+}
+.vx-drawer.open { display: flex; }
+.vx-drawer-head { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.vx-drawer-body { flex: 1; overflow-y: auto; padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
+.vx-json { font-family: var(--font-mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: var(--text-dim); }
+/* Explorer */
+.vx-split { display: flex; gap: 14px; min-height: 0; flex: 1; }
+.vx-split > .left { flex: 1.2; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.vx-split > .right { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+.vx-video-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+.vx-vcard { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; cursor: pointer; display: flex; flex-direction: column; gap: 7px; }
+.vx-vcard:hover { border-color: var(--accent); }
+.vx-vcard .t { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vx-chunk-strip { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+.vx-chunk-pill { font-family: var(--font-mono); font-size: 10.5px; padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+.vx-chunk-pill.sel { border-color: var(--accent); color: var(--accent); }
+.vx-player { width: 100%; border-radius: 10px; background: #000; max-height: 320px; }
+.vx-framestrip { display: flex; gap: 5px; overflow-x: auto; padding: 4px 0; }
+.vx-framestrip img { height: 56px; border-radius: 5px; cursor: pointer; border: 1px solid var(--border); flex-shrink: 0; }
+.vx-framestrip img:hover { border-color: var(--accent); }
+.vx-section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.vx-section > h4 { padding: 10px 14px; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.6px; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+.vx-section > .sec-body { padding: 12px 14px; font-size: 12.5px; line-height: 1.55; color: var(--text); max-height: 320px; overflow-y: auto; }
+.vx-section.collapsed > .sec-body { display: none; }
+.vx-timeline { display: flex; flex-direction: column; gap: 0; }
+.vx-tl-item { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; align-items: baseline; }
+.vx-tl-item .st { font-family: var(--font-mono); font-size: 10px; min-width: 90px; color: var(--accent); text-transform: uppercase; }
+.vx-tl-item .ok { color: var(--ok); } .vx-tl-item .err { color: var(--danger); }
+#vxGraphBox { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; flex: 1; min-height: 420px; }
+#vxGraphCanvas { width: 100%; height: 100%; }
+.vx-graph-inspector { position: absolute; top: 12px; right: 12px; width: 250px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 12px; display: none; z-index: 5; max-height: 70%; overflow-y: auto; }
+.vx-graph-inspector.open { display: block; }
+.vx-banner { background: var(--surface-2); border: 1px solid var(--warn, #e5a50a); color: var(--text); border-radius: 8px; padding: 8px 14px; font-size: 12.5px; display: none; }
+.vx-banner.on { display: block; }
+.vx-kv { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+.vx-kv .k { color: var(--text-faint); font-family: var(--font-mono); font-size: 10.5px; }
 </style>
 </head>
 <body>
@@ -380,6 +484,9 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
     </div>
     <nav class="nav-tabs">
       <button class="nav-tab sel" id="navLibrary" onclick="switchView('library')">Library</button>
+      <button class="nav-tab" id="navSearch" onclick="switchView('search')">Search</button>
+      <button class="nav-tab" id="navPipeline" onclick="switchView('pipeline')">Pipeline</button>
+      <button class="nav-tab" id="navExplorer" onclick="switchView('explorer')">Explorer</button>
       <button class="nav-tab" id="navDb" onclick="switchView('db')">Database</button>
     </nav>
     <div class="topbar-status">
@@ -574,6 +681,114 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
       </div>
     </div>
   </div>
+
+  <!-- ═══════ SEARCH VIEW ═══════ -->
+  <div class="view" id="view-search">
+    <div class="vx-wrap">
+      <div class="vx-subtabs" role="tablist" aria-label="Search engines">
+        <button class="vx-subtab sel" data-eng="unified" onclick="VX.setSearchTab('unified')">Unified</button>
+        <button class="vx-subtab" data-eng="moments" onclick="VX.setSearchTab('moments')">Moments</button>
+        <button class="vx-subtab" data-eng="semantic" onclick="VX.setSearchTab('semantic')">Semantic</button>
+        <button class="vx-subtab" data-eng="graph" onclick="VX.setSearchTab('graph')">Graph</button>
+      </div>
+      <div class="vx-searchbar">
+        <input class="vx-input" id="vxSearchInput" type="text"
+               placeholder="Search everything the AI has seen, heard and understood…" autocomplete="off">
+        <select class="vx-input" id="vxSemMode" style="flex:0 0 150px;display:none">
+          <option value="siglip">SigLIP (frames)</option>
+          <option value="clip">CLIP (frames)</option>
+          <option value="bge">BGE (narratives)</option>
+        </select>
+        <button class="vx-btn" id="vxSearchBtn" onclick="VX.runSearch()">Search</button>
+      </div>
+      <div class="vx-engines" id="vxEngineChips"></div>
+      <div class="vx-results" id="vxResults">
+        <div class="vx-empty">Type a query to search moments, embeddings and the knowledge graph.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════ PIPELINE VIEW ═══════ -->
+  <div class="view" id="view-pipeline">
+    <div class="vx-wrap">
+      <div class="vx-banner" id="vxWsBanner">Live connection lost — reconnecting, falling back to polling…</div>
+      <div class="vx-searchbar" style="justify-content:space-between">
+        <span style="font-size:14px;font-weight:600">Queue &amp; Pipeline Control</span>
+        <span style="display:flex;gap:8px">
+          <button class="vx-btn" onclick="VX.reapStale()">Reap stale jobs</button>
+          <button class="vx-btn" onclick="VX.loadQueues(true)">Refresh</button>
+        </span>
+      </div>
+      <div class="vx-qgrid" id="vxQueueGrid"><div class="vx-skel"></div><div class="vx-skel"></div><div class="vx-skel"></div></div>
+      <div class="vx-searchbar" style="justify-content:space-between;margin-top:6px">
+        <span style="font-size:14px;font-weight:600">Per-video pipeline stages</span>
+        <button class="vx-btn" onclick="VX.loadPipelineVideos()">Refresh</button>
+      </div>
+      <div class="db-table-scroll" style="max-height:420px">
+        <table class="db-table">
+          <thead><tr><th>Video</th><th>Downloaded</th><th>Frames</th><th>Analyzed</th><th>Narrated</th><th>Chunks</th></tr></thead>
+          <tbody id="vxPipeBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="vx-drawer" id="vxDlqDrawer" role="dialog" aria-label="DLQ inspector">
+      <div class="vx-drawer-head">
+        <b id="vxDlqTitle">DLQ</b>
+        <button class="vx-btn" onclick="VX.closeDlq()">Close</button>
+      </div>
+      <div class="vx-drawer-body" id="vxDlqBody"></div>
+    </div>
+  </div>
+
+  <!-- ═══════ EXPLORER VIEW ═══════ -->
+  <div class="view" id="view-explorer">
+    <div class="vx-wrap">
+      <div class="vx-subtabs">
+        <button class="vx-subtab sel" data-ex="stores" onclick="VX.setExplorerTab('stores')">Stores &amp; Videos</button>
+        <button class="vx-subtab" data-ex="graphviz" onclick="VX.setExplorerTab('graphviz')">Knowledge Graph</button>
+      </div>
+
+      <div id="vxExStores">
+        <div class="vx-qgrid" id="vxStoreCards" style="margin-bottom:14px"><div class="vx-skel"></div><div class="vx-skel"></div></div>
+        <div class="vx-searchbar">
+          <input class="vx-input" id="vxVidFilter" type="text" placeholder="Filter videos by title or ID…" autocomplete="off">
+          <button class="vx-btn" id="vxSyncBtn" onclick="VX.manualSync()">Sync from Telegram</button>
+        </div>
+        <div class="vx-video-list" id="vxVideoList" style="margin-top:12px"></div>
+        <div class="vx-searchbar" style="justify-content:center;margin-top:10px">
+          <button class="vx-btn" id="vxMoreVids" onclick="VX.loadVideos(false)">Load more</button>
+        </div>
+      </div>
+
+      <div id="vxExGraph" style="display:none;flex:1;min-height:0;flex-direction:column;gap:10px">
+        <div class="vx-searchbar">
+          <input class="vx-input" id="vxGraphQ" type="text" placeholder="Highlight nodes by name…" autocomplete="off">
+          <select class="vx-input" id="vxGraphLimit" style="flex:0 0 130px">
+            <option value="100">100 nodes</option>
+            <option value="200" selected>200 nodes</option>
+            <option value="500">500 nodes</option>
+          </select>
+          <button class="vx-btn" onclick="VX.loadGraph()">Load graph</button>
+        </div>
+        <div id="vxGraphBox">
+          <div id="vxGraphCanvas"></div>
+          <div class="vx-graph-inspector" id="vxNodeInspector"></div>
+          <div class="vx-empty" id="vxGraphEmpty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">
+            Click &quot;Load graph&quot; to render the live Neo4j knowledge graph.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chunk inspector drawer (video → chunk drill-down) -->
+    <div class="vx-drawer" id="vxChunkDrawer" role="dialog" aria-label="Chunk data inspector">
+      <div class="vx-drawer-head">
+        <b id="vxChunkTitle">Chunk</b>
+        <button class="vx-btn" onclick="VX.closeChunk()">Close</button>
+      </div>
+      <div class="vx-drawer-body" id="vxChunkBody"></div>
+    </div>
+  </div>
 </div>
 
 <div class="toasts" id="toasts"></div>
@@ -590,7 +805,7 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
      3. UPGRADE: full-res tier in background, replaces previews
    Batch wire format: [u32 idx][u32 size][jpeg] repeated (LE).
    Realtime FPS: actual frames drawn per second, measured in playLoop.
-   ════════════════════════════════════════════════════════════════ */
+   ══════════════════════��═════════════════════════════════════════ */
 
 const CHUNK_SIZE = 40;
 const PARALLEL_FETCHES = 6;      // cloudflared is h2 — one socket, many streams
@@ -798,22 +1013,28 @@ async function refreshLibrary(manual = false) {
 }
 
 /* ═══════════ VIEW SWITCHING ═══════════ */
+const NAMED_VIEWS = { library: 'view-library', db: 'view-db', search: 'view-search',
+                      pipeline: 'view-pipeline', explorer: 'view-explorer' };
+const NAV_IDS = { library: 'navLibrary', db: 'navDb', search: 'navSearch',
+                  pipeline: 'navPipeline', explorer: 'navExplorer' };
 function switchView(target, push = true) {
   if (target !== 'workspace') teardownWorkspace();
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  const viewId = target === 'library' ? 'view-library' : target === 'db' ? 'view-db' : 'view-workspace';
+  const viewId = NAMED_VIEWS[target] || 'view-workspace';
   $(viewId).classList.add('active');
-  $('navLibrary').classList.toggle('sel', target === 'library');
-  $('navDb').classList.toggle('sel', target === 'db');
+  Object.entries(NAV_IDS).forEach(([k, id]) => {
+    const el = $(id); if (el) el.classList.toggle('sel', target === k);
+  });
   if (push) history.pushState({ view: target, folder: currentFolder }, '',
-    target === 'library' ? '#library' : target === 'db' ? '#db' : `#ws/${currentFolder}`);
+    NAMED_VIEWS[target] ? `#${target}` : `#ws/${currentFolder}`);
   if (target === 'library') refreshLibrary(false);
   if (target === 'db') refreshDbView();
+  if (window.VX && VX.onViewSwitch) VX.onViewSwitch(target);
 }
 window.addEventListener('popstate', e => {
   const s = e.state;
   if (!s || s.view === 'library') switchView('library', false);
-  else if (s.view === 'db') switchView('db', false);
+  else if (NAMED_VIEWS[s.view]) switchView(s.view, false);
   else if (s.folder) openWorkspace(s.folder, false);
 });
 
@@ -1495,6 +1716,567 @@ setInterval(pollLogs, 5000);
     if ($('view-library').classList.contains('active') && !document.hidden) refreshLibrary(false);
   }, 30000);
 })();
+
+/* ═══════════════════════════════════════════════════════════
+   VX — Search / Pipeline / Explorer module (zero-error layer)
+   Every network call goes through VX.api(): per-key abort,
+   timeout, one retry, validated responses. Conflicting actions
+   are serialized with a client-side mutex; the backend mirrors
+   this with Redis op-locks (409 → toast, never a crash).
+   ═══════════════════════════════════════════════════════════ */
+window.VX = (function () {
+  'use strict';
+
+  /* ── zero-error request lifecycle manager ── */
+  const inflight = new Map();          // key → AbortController
+  const busy = new Set();              // client-side action mutex
+
+  async function api(url, { key = null, method = 'GET', timeout = 15000, retry = 1 } = {}) {
+    if (key) { const prev = inflight.get(key); if (prev) prev.abort(); }
+    const ctrl = new AbortController();
+    if (key) inflight.set(key, ctrl);
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+      const res = await fetch(url, { method, signal: ctrl.signal });
+      let data = null;
+      try { data = await res.json(); } catch { data = {}; }
+      if (res.status === 409) { showToast(data.error || 'Operation already in progress', 'error'); return { __conflict: true }; }
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data || {};
+    } catch (e) {
+      if (e.name === 'AbortError') return { __aborted: true };
+      if (retry > 0) {
+        await new Promise(r => setTimeout(r, 600));
+        return api(url, { key, method, timeout, retry: retry - 1 });
+      }
+      showToast(`Request failed: ${e.message}`.slice(0, 120), 'error');
+      return { __error: e.message };
+    } finally {
+      clearTimeout(timer);
+      if (key && inflight.get(key) === ctrl) inflight.delete(key);
+    }
+  }
+
+  /* Serialized action: instant busy state, rollback on failure */
+  async function action(name, btn, fn) {
+    if (busy.has(name)) { showToast('Please wait — action in progress', 'info'); return; }
+    busy.add(name);
+    if (btn) btn.disabled = true;
+    try { await fn(); }
+    catch (e) { showToast(`${name} failed: ${e.message}`.slice(0, 120), 'error'); }
+    finally { busy.delete(name); if (btn) btn.disabled = false; }
+  }
+
+  const esc = s => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const escSnippet = s => esc(s)
+    .replace(/&lt;mark&gt;/g, '<mark>').replace(/&lt;\/mark&gt;/g, '</mark>');
+  const fmtT = t => { t = Math.max(0, Number(t) || 0); const m = Math.floor(t / 60), s = Math.floor(t % 60); return `${m}:${String(s).padStart(2, '0')}`; };
+  const debounce = (fn, ms) => { let h; return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); }; };
+
+  /* Global error boundary — never a white screen */
+  window.addEventListener('error', e => { try { showToast(`UI error: ${String(e.message).slice(0, 90)}`, 'error'); } catch {} });
+  window.addEventListener('unhandledrejection', e => { try { showToast(`Async error: ${String(e.reason && e.reason.message || e.reason).slice(0, 90)}`, 'error'); } catch {} });
+
+  /* ═══════════ SEARCH ═══════════ */
+  let searchTab = 'unified';
+
+  function setSearchTab(tab) {
+    searchTab = tab;
+    document.querySelectorAll('#view-search .vx-subtab').forEach(b =>
+      b.classList.toggle('sel', b.dataset.eng === tab));
+    $('vxSemMode').style.display = tab === 'semantic' ? '' : 'none';
+    if ($('vxSearchInput').value.trim()) runSearch();
+  }
+
+  function engineChips(engines, counts) {
+    if (!engines) { $('vxEngineChips').innerHTML = ''; return; }
+    $('vxEngineChips').innerHTML = Object.entries(engines).map(([k, v]) => {
+      const cls = v === 'ok' ? 'ok' : 'bad';
+      const n = counts && counts[k] != null ? ` · ${counts[k]}` : '';
+      return `<span class="vx-chip ${cls}">${esc(k)}: ${esc(v)}${n}</span>`;
+    }).join('');
+  }
+
+  function resultCard(r, badges) {
+    const thumb = r.thumb ? `<img src="${esc(r.thumb)}" alt="" loading="lazy">` : '';
+    const bd = (badges || []).map(b => `<span class="vx-badge ${esc(b)}">${esc(b)}</span>`).join(' ');
+    return `<div class="vx-result" onclick="VX.openResult(${Number(r.msg_id) || 0}, ${Number(r.timestamp) || 0})"
+      role="button" tabindex="0"
+      onkeydown="if(event.key==='Enter')VX.openResult(${Number(r.msg_id) || 0}, ${Number(r.timestamp) || 0})">
+      ${thumb}
+      <div class="body">
+        <div class="title">${esc(r.title || `Video #${r.msg_id}`)}</div>
+        <div class="snippet">${escSnippet(r.snippet || r.entity || '')}</div>
+        <div class="meta">${bd}
+          <span>t=${fmtT(r.timestamp)}</span>
+          ${r.score != null ? `<span>score ${Number(r.score).toFixed(3)}</span>` : ''}
+          ${r.rrf != null ? `<span>rrf ${Number(r.rrf).toFixed(4)}</span>` : ''}
+          ${r.source ? `<span>${esc(r.source)}</span>` : ''}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  async function runSearch() {
+    const q = $('vxSearchInput').value.trim();
+    if (!q) { $('vxResults').innerHTML = '<div class="vx-empty">Type a query to search.</div>'; engineChips(null); return; }
+    $('vxResults').innerHTML = '<div class="vx-skel"></div><div class="vx-skel"></div><div class="vx-skel"></div>';
+    const eq = encodeURIComponent(q);
+    let data;
+    if (searchTab === 'unified') {
+      data = await api(`/api/search/unified?q=${eq}&limit=30`, { key: 'search', timeout: 25000 });
+      if (data.__aborted) return;
+      engineChips(data.engines, data.engine_counts);
+      const rows = (data.results || []).map(r => resultCard(r, r.engines));
+      $('vxResults').innerHTML = rows.length ? rows.join('') :
+        `<div class="vx-empty">No results for &quot;${esc(q)}&quot; in any engine.</div>`;
+    } else if (searchTab === 'moments') {
+      data = await api(`/api/search/moments?q=${eq}&limit=40`, { key: 'search' });
+      if (data.__aborted) return;
+      engineChips({ moments: data.status || (data.__error ? 'error' : 'ok') }, { moments: (data.results || []).length });
+      const rows = (data.results || []).map(r => resultCard(r, ['moment']));
+      $('vxResults').innerHTML = rows.length ? rows.join('') : `<div class="vx-empty">No moments matched.</div>`;
+    } else if (searchTab === 'semantic') {
+      const mode = $('vxSemMode').value;
+      data = await api(`/api/search/semantic?q=${eq}&k=30&mode=${mode}`, { key: 'search', timeout: 30000 });
+      if (data.__aborted) return;
+      engineChips({ semantic: data.status || 'error' }, { semantic: (data.results || []).length });
+      const rows = (data.results || []).map(r => resultCard(r, ['semantic']));
+      $('vxResults').innerHTML = rows.length ? rows.join('') :
+        `<div class="vx-empty">${data.reason ? esc(data.reason) : 'No semantic matches (is model_manager running?)'}</div>`;
+    } else { /* graph */
+      data = await api(`/api/search/graph?q=${eq}&limit=25`, { key: 'search' });
+      if (data.__aborted) return;
+      engineChips({ graph: data.status || 'error' }, { graph: (data.results || []).length });
+      const rows = (data.results || []).map(gr => {
+        const e = gr.entity || {};
+        const ctx = (gr.contexts || []).map(c =>
+          `<span class="vx-chip" style="cursor:pointer" onclick="event.stopPropagation();VX.openResult(${Number(c.msg_id) || 0}, ${Number(c.start_t) || 0})">Video #${esc(c.msg_id)} @ ${fmtT(c.start_t)}</span>`).join(' ');
+        return `<div class="vx-result" style="cursor:default">
+          <div class="body">
+            <div class="title"><span class="vx-badge graph">entity</span> ${esc(e.label)}</div>
+            <div class="meta" style="margin-top:8px;gap:6px;flex-wrap:wrap">${ctx || '<span>No linked videos</span>'}</div>
+          </div></div>`;
+      });
+      $('vxResults').innerHTML = rows.length ? rows.join('') :
+        `<div class="vx-empty">${data.status === 'offline' ? 'Knowledge graph is offline on this session.' : 'No entities matched.'}</div>`;
+    }
+  }
+
+  /* Click a result → play that video seeked to the timestamp (chunk drawer player) */
+  async function openResult(msgId, ts) {
+    if (!msgId) { showToast('Result has no video reference', 'error'); return; }
+    const full = await api(`/api/db/video/${msgId}/full`, { key: 'result' });
+    if (full.__error || full.__aborted) return;
+    const v = full.video || {};
+    const play = full.video_file || {};
+    openDrawer('vxChunkDrawer', 'vxChunkTitle', `${v.title || 'Video #' + msgId} @ ${fmtT(ts)}`);
+    $('vxChunkBody').innerHTML = play.url
+      ? `<video class="vx-player" controls autoplay src="${esc(play.url)}#t=${Math.floor(ts)}"></video>
+         <div class="vx-kv"><span class="k">VIDEO</span><span>#${esc(msgId)} — ${esc(v.title || '')}</span></div>
+         <div class="vx-kv"><span class="k">TIMESTAMP</span><span>${fmtT(ts)}</span></div>
+         <button class="vx-btn" onclick="VX.openVideo(${msgId})">Open full data inspector</button>`
+      : `<div class="vx-empty">Video file not on this session's disk (cleaned up).<br>
+         The metadata and analysis are still in the database.</div>
+         <button class="vx-btn" onclick="VX.openVideo(${msgId})">Open data inspector</button>`;
+    const vid = $('vxChunkBody').querySelector('video');
+    if (vid) vid.addEventListener('loadedmetadata', () => { try { vid.currentTime = ts; } catch {} }, { once: true });
+  }
+
+  /* ═══════════ PIPELINE ═══════════ */
+  let pollTimer = null;
+
+  function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+  function startPolling() {
+    stopPolling();
+    pollTimer = setInterval(() => { if (!document.hidden) loadQueues(false); }, 5000);
+  }
+
+  async function loadQueues(manual) {
+    const data = await api('/api/queues', { key: 'queues', retry: manual ? 1 : 0 });
+    if (data.__aborted || data.__error) return;
+    renderQueues(data);
+  }
+
+  function renderQueues(metrics) {
+    const grid = $('vxQueueGrid');
+    if (!metrics || typeof metrics !== 'object') return;
+    const names = Object.keys(metrics).filter(k => k.startsWith('QUEUE'));
+    if (!names.length) { grid.innerHTML = '<div class="vx-empty">No queue metrics yet.</div>'; return; }
+    grid.innerHTML = names.map(qn => {
+      const m = metrics[qn] || {};
+      const short = qn.replace('QUEUE_', '');
+      const dlq = Number(m.dlq_count || m.dead_letter || 0);
+      const paused = !!m.paused;
+      return `<div class="vx-qcard ${paused ? 'paused' : ''}">
+        <h4>${esc(short)} ${paused ? '<span class="vx-chip bad">PAUSED</span>' : ''}</h4>
+        <div class="vx-qnums">
+          <div class="vx-qnum"><b>${Number(m.pending || m.queue_depth || 0)}</b><span>pending</span></div>
+          <div class="vx-qnum"><b>${Number(m.processing || m.processing_count || 0)}</b><span>in-flight</span></div>
+          <div class="vx-qnum dlq"><b>${dlq}</b><span>dlq</span></div>
+          <div class="vx-qnum"><b>${Number(m.total_completed || 0)}</b><span>done</span></div>
+        </div>
+        <div class="vx-qactions">
+          <button class="vx-btn" onclick="VX.togglePause('${esc(qn)}', ${paused}, this)">${paused ? 'Resume' : 'Pause'}</button>
+          <button class="vx-btn" onclick="VX.openDlq('${esc(qn)}')">DLQ (${dlq})</button>
+          <button class="vx-btn" onclick="VX.showProcessing('${esc(qn)}')">In-flight</button>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  async function togglePause(qn, isPaused, btn) {
+    await action(`pause_${qn}`, btn, async () => {
+      const data = await api(`/api/queues/${qn}/${isPaused ? 'resume' : 'pause'}`, { method: 'POST' });
+      if (data.ok) { showToast(`${qn} ${isPaused ? 'resumed' : 'paused'}`, 'ok'); loadQueues(true); }
+    });
+  }
+
+  async function reapStale() {
+    await action('reap', null, async () => {
+      const data = await api('/api/queues/reap', { method: 'POST', timeout: 30000 });
+      if (data.ok) {
+        const total = Object.values(data.reaped || {}).reduce((a, b) => a + b, 0);
+        showToast(total ? `Requeued ${total} stale job(s)` : 'No stale jobs found', 'ok');
+        loadQueues(true);
+      }
+    });
+  }
+
+  function openDrawer(drawerId, titleId, title) {
+    $(titleId).textContent = title;
+    $(drawerId).classList.add('open');
+  }
+
+  async function openDlq(qn) {
+    openDrawer('vxDlqDrawer', 'vxDlqTitle', `${qn} — dead letters`);
+    $('vxDlqBody').innerHTML = '<div class="vx-skel"></div>';
+    const data = await api(`/api/queues/${qn}/dlq?count=30`, { key: 'dlq' });
+    if (data.__aborted) return;
+    const jobs = data.jobs || [];
+    $('vxDlqBody').innerHTML = `
+      <div class="vx-qactions">
+        <button class="vx-btn" onclick="VX.replayDlq('${esc(qn)}', this)">Replay all</button>
+        <button class="vx-btn danger" onclick="VX.purgeDlq('${esc(qn)}', this)">Purge all</button>
+      </div>` +
+      (jobs.length ? jobs.map(j => `
+        <div class="vx-section">
+          <h4>${esc(j.id || 'job')} — ${esc(j.last_error || 'no error recorded').slice(0, 80)}</h4>
+          <div class="sec-body"><div class="vx-json">${esc(JSON.stringify(j, null, 2)).slice(0, 4000)}</div></div>
+        </div>`).join('')
+        : '<div class="vx-empty">DLQ is empty — nothing has permanently failed.</div>');
+  }
+  function closeDlq() { $('vxDlqDrawer').classList.remove('open'); }
+
+  async function replayDlq(qn, btn) {
+    await action(`dlq_${qn}`, btn, async () => {
+      const data = await api(`/api/queues/${qn}/dlq/replay`, { method: 'POST', timeout: 30000 });
+      if (data.ok) { showToast(`Replayed ${data.replayed} job(s)`, 'ok'); openDlq(qn); loadQueues(true); }
+    });
+  }
+  async function purgeDlq(qn, btn) {
+    if (!confirm(`Permanently delete ALL dead-lettered jobs in ${qn}?`)) return;
+    await action(`dlq_${qn}`, btn, async () => {
+      const data = await api(`/api/queues/${qn}/dlq/purge`, { method: 'POST' });
+      if (data.ok) { showToast(`Purged ${data.purged} job(s)`, 'ok'); openDlq(qn); loadQueues(true); }
+    });
+  }
+
+  async function showProcessing(qn) {
+    openDrawer('vxDlqDrawer', 'vxDlqTitle', `${qn} — in-flight jobs`);
+    $('vxDlqBody').innerHTML = '<div class="vx-skel"></div>';
+    const data = await api(`/api/queues/${qn}/processing?count=30`, { key: 'dlq' });
+    if (data.__aborted) return;
+    const jobs = data.jobs || [];
+    $('vxDlqBody').innerHTML = jobs.length ? jobs.map(j => `
+      <div class="vx-kv">
+        <span class="k">${esc(j.id || '?').slice(0, 14)}</span>
+        <span>${j.alive ? '<span style="color:var(--ok)">alive</span>' : '<span style="color:var(--danger)">no heartbeat</span>'}
+          · ${fmtT(j.in_flight_sec)} in flight</span>
+      </div>`).join('')
+      : '<div class="vx-empty">Nothing is being processed right now.</div>';
+  }
+
+  async function loadPipelineVideos() {
+    const data = await api('/api/pipeline/videos?limit=40', { key: 'pipe' });
+    if (data.__aborted || data.__error) return;
+    const rows = (data.videos || []).map(v => {
+      const st = v.stages || {};
+      const cell = ok => `<td>${ok ? '<span class="vx-stage done">done</span>' : '<span class="vx-stage">—</span>'}</td>`;
+      return `<tr style="cursor:pointer" onclick="VX.openVideo(${v.msg_id});switchView('explorer')">
+        <td>${esc(v.title)}</td>${cell(st.downloaded)}${cell(st.frames)}${cell(st.analyzed)}${cell(st.narrated)}
+        <td>${Number(v.chunk_count || 0)}</td></tr>`;
+    });
+    $('vxPipeBody').innerHTML = rows.length ? rows.join('') :
+      '<tr><td colspan="6" style="text-align:center;color:var(--text-faint);padding:30px">No videos in the database yet — run a Telegram sync from the Explorer tab.</td></tr>';
+  }
+
+  /* ═══════════ EXPLORER ═══════════ */
+  let exTab = 'stores', vidOffset = 0, vidTotal = 0, graphInstance = null;
+
+  function setExplorerTab(tab) {
+    exTab = tab;
+    document.querySelectorAll('#view-explorer .vx-subtab').forEach(b =>
+      b.classList.toggle('sel', b.dataset.ex === tab));
+    $('vxExStores').style.display = tab === 'stores' ? '' : 'none';
+    $('vxExGraph').style.display = tab === 'graphviz' ? 'flex' : 'none';
+    if (tab === 'stores') { loadOverview(); loadVideos(true); }
+  }
+
+  async function loadOverview() {
+    const data = await api('/api/explorer/overview', { key: 'overview', timeout: 20000 });
+    if (data.__aborted || data.__error) return;
+    const card = (name, st, body) => `<div class="vx-qcard">
+      <h4>${esc(name)} <span class="vx-chip ${st === 'ok' ? 'ok' : 'bad'}">${esc(st || 'unknown')}</span></h4>
+      <div style="font-size:12px;color:var(--text-dim);line-height:1.6">${body}</div></div>`;
+    const s = data.sqlite || {}, qd = data.qdrant || {}, pg = data.postgres || {}, neo = data.neo4j || {};
+    const sqlBody = s.counts ? Object.entries(s.counts).map(([k, v]) => `${esc(k)}: <b>${v}</b>`).join('<br>') + `<br>size: <b>${s.size_mb} MB</b>` : esc(s.reason || '');
+    const qdBody = qd.collections ? Object.entries(qd.collections).map(([k, v]) => `${esc(k)}: <b>${v.points != null ? v.points + ' pts' : esc(v.error || 'missing')}</b>`).join('<br>') : esc(qd.reason || 'not reachable');
+    const pgBody = pg.status === 'ok' ? `chunks: <b>${pg.chunks}</b><br>frames: <b>${pg.frames}</b>` : esc(pg.reason || 'not reachable');
+    const neoBody = neo.status === 'ok' ? `nodes: <b>${neo.nodes}</b> · edges: <b>${neo.edges}</b><br>${Object.entries(neo.labels || {}).map(([k, v]) => `${esc(k)}: ${v}`).join(' · ')}` : esc(neo.reason || 'not reachable');
+    $('vxStoreCards').innerHTML =
+      card('SQLite', s.status, sqlBody) + card('Qdrant', qd.status, qdBody) +
+      card('PostgreSQL', pg.status, pgBody) + card('Neo4j', neo.status, neoBody);
+  }
+
+  async function loadVideos(reset) {
+    if (reset) { vidOffset = 0; $('vxVideoList').innerHTML = '<div class="vx-skel"></div><div class="vx-skel"></div>'; }
+    const q = encodeURIComponent($('vxVidFilter').value.trim());
+    const data = await api(`/api/db/videos?offset=${vidOffset}&limit=24&q=${q}`, { key: 'vids' });
+    if (data.__aborted || data.__error) return;
+    vidTotal = data.total || 0;
+    const cards = (data.videos || []).map(v => {
+      const st = v.stages || {};
+      const stages = ['downloaded', 'frames', 'analyzed', 'narrated'].map(k =>
+        `<span class="vx-stage ${st[k] ? 'done' : ''}">${k}</span>`).join('');
+      return `<div class="vx-vcard" onclick="VX.openVideo(${v.msg_id})" role="button" tabindex="0"
+        onkeydown="if(event.key==='Enter')VX.openVideo(${v.msg_id})">
+        <div class="t">${esc(v.title)}</div>
+        <div style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-faint)">
+          #${v.msg_id} · ${esc(v.duration_str || '?')} · ${v.frames} frames · ${v.chunk_count} chunks</div>
+        <div class="vx-stages">${stages}</div>
+      </div>`;
+    });
+    if (reset) $('vxVideoList').innerHTML = cards.join('') || '<div class="vx-empty">No videos in the database yet.</div>';
+    else $('vxVideoList').insertAdjacentHTML('beforeend', cards.join(''));
+    vidOffset += (data.videos || []).length;
+    $('vxMoreVids').style.display = vidOffset < vidTotal ? '' : 'none';
+  }
+
+  async function manualSync() {
+    await action('sync', $('vxSyncBtn'), async () => {
+      showToast('Syncing from Telegram…', 'info');
+      const data = await api('/api/db/sync', { method: 'POST', timeout: 120000 });
+      if (data.ok) { showToast('Sync complete', 'ok'); loadOverview(); loadVideos(true); }
+    });
+  }
+
+  /* ── Per-video → per-chunk Data Inspector ── */
+  async function openVideo(msgId) {
+    openDrawer('vxChunkDrawer', 'vxChunkTitle', `Video #${msgId} — loading…`);
+    $('vxChunkBody').innerHTML = '<div class="vx-skel"></div><div class="vx-skel"></div>';
+    const data = await api(`/api/db/video/${msgId}/full`, { key: 'chunk' });
+    if (data.__aborted) return;
+    if (data.__error) { $('vxChunkBody').innerHTML = '<div class="vx-empty">Could not load this video.</div>'; return; }
+    const v = data.video || {};
+    $('vxChunkTitle').textContent = v.title || `Video #${msgId}`;
+    const chunks = data.chunks || [];
+    const pills = chunks.map((c, i) =>
+      `<button class="vx-chunk-pill" id="vxPill_${esc(c.chunk_id)}"
+        onclick="VX.openChunkDetail('${esc(c.chunk_id)}')">${i + 1} · ${fmtT(c.start_t)}–${fmtT(c.end_t)}</button>`).join('');
+    const vf = data.video_file || {};
+    $('vxChunkBody').innerHTML = `
+      ${vf.url ? `<video class="vx-player" controls src="${esc(vf.url)}"></video>`
+        : '<div class="vx-empty" style="padding:20px">Video file cleaned up from this session\'s disk — analysis data below is still available.</div>'}
+      <div class="vx-kv"><span class="k">TRANSCRIPT SEGMENTS</span><span>${data.transcript_count || 0}</span></div>
+      <div class="vx-kv"><span class="k">FRAME ANALYSES</span><span>${data.frame_note_count || 0}</span></div>
+      <div class="vx-kv"><span class="k">ORACLE CHUNKS</span><span>${chunks.length}</span></div>
+      <h4 style="font-size:12px;margin-top:6px;color:var(--text-dim)">CHUNK TIMELINE — click a chunk to inspect everything the AI produced for it</h4>
+      <div class="vx-chunk-strip">${pills || '<span class="vx-empty" style="padding:10px">Not yet chunked — currently at stage: ' + (v.status || 'pending') + '</span>'}</div>
+      <div id="vxChunkDetail"></div>`;
+  }
+
+  function section(title, bodyHtml, open) {
+    return `<div class="vx-section ${open ? '' : 'collapsed'}">
+      <h4 onclick="this.parentElement.classList.toggle('collapsed')">${title}<span>▾</span></h4>
+      <div class="sec-body">${bodyHtml}</div></div>`;
+  }
+
+  async function openChunkDetail(chunkId) {
+    document.querySelectorAll('.vx-chunk-pill').forEach(p => p.classList.remove('sel'));
+    const pill = $(`vxPill_${chunkId}`); if (pill) pill.classList.add('sel');
+    const box = $('vxChunkDetail');
+    box.innerHTML = '<div class="vx-skel"></div><div class="vx-skel"></div>';
+    const data = await api(`/api/db/chunk/${encodeURIComponent(chunkId)}`, { key: 'chunk', timeout: 20000 });
+    if (data.__aborted) return;
+    if (data.__error) { box.innerHTML = '<div class="vx-empty">Could not load chunk.</div>'; return; }
+    const c = data.chunk || {}, pb = data.playback || {};
+
+    /* player seeked to the chunk window */
+    let player = '';
+    if (pb.url) {
+      player = `<video class="vx-player" id="vxChunkVideo" controls src="${esc(pb.url)}#t=${Math.floor(pb.start_t || 0)}"></video>`;
+    } else {
+      player = '<div class="vx-empty" style="padding:16px">Chunk video file not on disk (cleaned up).</div>';
+    }
+
+    /* frames strip — the actual extracted images */
+    const frames = (data.frames || []).map(f =>
+      `<img src="${esc(f.url)}" alt="frame at ${fmtT(f.ts)}" loading="lazy" title="${fmtT(f.ts)}"
+        onclick="window.open('${esc(f.full_url || f.url)}', '_blank')">`).join('');
+
+    /* AI analysis — narration + raw record */
+    const narration = c.narrative || c.narration || c.text || '';
+    const frameNotes = (data.frame_notes || []).map(n =>
+      `<div class="vx-tl-item"><span class="st">${fmtT(n.ts_sec)}</span>
+        <span>${esc(n.description || '')}${n.ocr_text ? `<br><i style="color:var(--text-faint)">OCR: ${esc(n.ocr_text)}</i>` : ''}</span></div>`).join('');
+    const transcripts = (data.transcripts || []).map(t =>
+      `<div class="vx-tl-item"><span class="st">${fmtT(t.start_sec)}</span><span>${esc(t.text || '')}</span></div>`).join('');
+    const moments = (data.moments || []).map(m =>
+      `<div class="vx-tl-item"><span class="st">${fmtT(m.ts_sec)} ${esc(m.source || '')}</span><span>${esc(m.content || '')}</span></div>`).join('');
+    const ents = data.entities || {};
+    const entChips = (ents.entities || []).map(e =>
+      `<span class="vx-chip" style="cursor:pointer" onclick="VX.jumpToGraphSearch('${esc(e)}')">${esc(e)}</span>`).join(' ');
+    const events = (data.events || []).map(e =>
+      `<div class="vx-tl-item"><span class="st ${e.status === 'failed' ? 'err' : e.status === 'completed' ? 'ok' : ''}">${esc(e.stage || e.event || '?')}</span>
+        <span>${esc(e.status || '')} · ${esc(e.detail || '')} <i style="color:var(--text-faint)">${esc(e.created_at || '')}</i></span></div>`).join('');
+
+    box.innerHTML = player +
+      (frames ? `<div class="vx-framestrip">${frames}</div>` : '') +
+      section('AI Narration (Oracle)', narration ? `<p style="white-space:pre-wrap">${esc(narration)}</p>` : '<i>Not yet narrated for this chunk.</i>', true) +
+      section(`Visual Analysis — ${(data.frame_notes || []).length} frame notes`, frameNotes || '<i>No frame analysis stored for this window.</i>', false) +
+      section(`Speech Transcript — ${(data.transcripts || []).length} segments`, transcripts || '<i>No speech in this window.</i>', false) +
+      section(`Indexed Moments (FTS) — ${(data.moments || []).length}`, moments || '<i>No moments indexed yet.</i>', false) +
+      section('Entities → Knowledge Graph', entChips || `<i>${ents.status === 'offline' ? 'Graph offline on this session.' : 'No entities extracted yet.'}</i>`, false) +
+      section(`Processing Timeline — ${(data.events || []).length} events`, events || '<i>No processing events recorded for this chunk.</i>', false) +
+      section('Raw stored record (verbatim JSON)', `<div class="vx-json">${esc(JSON.stringify(c, null, 2)).slice(0, 12000)}</div>`, false);
+
+    const vid = $('vxChunkVideo');
+    if (vid && pb.start_t != null) {
+      vid.addEventListener('loadedmetadata', () => { try { vid.currentTime = pb.start_t; } catch {} }, { once: true });
+      if (pb.end_t) vid.addEventListener('timeupdate', () => { if (vid.currentTime > pb.end_t + 0.5) vid.pause(); });
+    }
+  }
+
+  function closeChunk() {
+    const vid = $('vxChunkBody').querySelector('video');
+    if (vid) { try { vid.pause(); vid.removeAttribute('src'); vid.load(); } catch {} }
+    $('vxChunkDrawer').classList.remove('open');
+  }
+
+  function jumpToGraphSearch(entity) {
+    closeChunk();
+    switchView('search');
+    setSearchTab('graph');
+    $('vxSearchInput').value = entity;
+    runSearch();
+  }
+
+  /* ── Interactive Neo4j graph (force-graph CDN) ── */
+  async function loadGraph() {
+    const limit = $('vxGraphLimit').value;
+    const q = encodeURIComponent($('vxGraphQ').value.trim());
+    $('vxGraphEmpty').textContent = 'Loading graph from Neo4j…';
+    $('vxGraphEmpty').style.display = 'flex';
+    const data = await api(`/api/db/graph?limit=${limit}&q=${q}`, { key: 'graph', timeout: 15000 });
+    if (data.__aborted) return;
+    if (data.status !== 'ok' || !(data.nodes || []).length) {
+      $('vxGraphEmpty').textContent = data.status === 'offline'
+        ? 'Neo4j is offline on this session — the graph will appear once it\'s running.'
+        : 'The graph is empty — entities appear here after Oracle narration + GraphRAG extraction.';
+      if (graphInstance) { try { graphInstance.graphData({ nodes: [], links: [] }); } catch {} }
+      return;
+    }
+    $('vxGraphEmpty').style.display = 'none';
+    if (typeof ForceGraph === 'undefined') {
+      $('vxGraphEmpty').textContent = 'Graph renderer failed to load (CDN blocked).';
+      $('vxGraphEmpty').style.display = 'flex';
+      return;
+    }
+    const palette = { Entity: '#4f8cff', Video: '#2fbf71', Chunk: '#e5a50a', Concept: '#c678dd' };
+    const gdata = {
+      nodes: data.nodes.map(n => ({ ...n })),
+      links: (data.edges || []).map(e => ({ source: e.source, target: e.target, type: e.type })),
+    };
+    if (!graphInstance) {
+      graphInstance = ForceGraph()($('vxGraphCanvas'))
+        .nodeLabel(n => `${n.type}: ${n.label}`)
+        .nodeColor(n => palette[n.type] || '#8b8fa3')
+        .nodeVal(n => n.type === 'Video' ? 6 : n.type === 'Entity' ? 3 : 2)
+        .linkColor(() => 'rgba(140,145,165,0.35)')
+        .linkDirectionalArrowLength(3)
+        .onNodeClick(node => showNodeInspector(node))
+        .onNodeRightClick(node => expandGraphNode(node.id))
+        .onBackgroundClick(() => $('vxNodeInspector').classList.remove('open'));
+      const box = $('vxGraphBox');
+      graphInstance.width(box.clientWidth).height(box.clientHeight);
+      window.addEventListener('resize', debounce(() => {
+        if (graphInstance) graphInstance.width(box.clientWidth).height(box.clientHeight);
+      }, 200));
+    }
+    graphInstance.graphData(gdata);
+  }
+
+  async function showNodeInspector(node) {
+    const insp = $('vxNodeInspector');
+    insp.classList.add('open');
+    insp.innerHTML = `<b style="font-size:13px">${esc(node.label)}</b>
+      <div class="vx-chip" style="margin:6px 0">${esc(node.type)}</div>
+      ${Object.entries(node.props || {}).slice(0, 12).map(([k, v]) =>
+        `<div class="vx-kv"><span class="k">${esc(k)}</span><span style="text-align:right;word-break:break-word">${esc(String(v).slice(0, 120))}</span></div>`).join('')}
+      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+        <button class="vx-btn" style="padding:5px 10px;font-size:11px" onclick="VX.expandGraphNode('${esc(node.id)}')">Expand neighbors</button>
+        ${node.type === 'Entity' ? `<button class="vx-btn" style="padding:5px 10px;font-size:11px" onclick="VX.jumpToGraphSearch('${esc(node.label)}')">Search this entity</button>` : ''}
+      </div>`;
+  }
+
+  async function expandGraphNode(nodeId) {
+    if (!graphInstance) return;
+    const data = await api(`/api/db/graph/expand/${encodeURIComponent(nodeId)}`, { key: 'graphExpand' });
+    if (data.status !== 'ok') { showToast('Could not expand node', 'error'); return; }
+    const cur = graphInstance.graphData();
+    const have = new Set(cur.nodes.map(n => n.id));
+    const newNodes = (data.nodes || []).filter(n => !have.has(n.id));
+    const haveLinks = new Set(cur.links.map(l => `${l.source.id || l.source}→${l.target.id || l.target}`));
+    const newLinks = (data.edges || []).filter(e => !haveLinks.has(`${e.source}→${e.target}`))
+      .map(e => ({ source: e.source, target: e.target, type: e.type }));
+    if (!newNodes.length && !newLinks.length) { showToast('No new neighbors', 'info'); return; }
+    graphInstance.graphData({ nodes: [...cur.nodes, ...newNodes], links: [...cur.links, ...newLinks] });
+  }
+
+  /* ── View lifecycle: abort pending work + manage polling per tab ── */
+  function onViewSwitch(target) {
+    stopPolling();
+    ['search', 'queues', 'dlq', 'vids', 'chunk', 'overview', 'pipe', 'graph', 'result'].forEach(k => {
+      const c = inflight.get(k); if (c) { c.abort(); inflight.delete(k); }
+    });
+    closeChunk(); closeDlq();
+    if (target === 'pipeline') { loadQueues(true); loadPipelineVideos(); startPolling(); }
+    if (target === 'explorer') setExplorerTab(exTab);
+    if (target === 'search') setTimeout(() => $('vxSearchInput').focus(), 50);
+  }
+
+  /* ── wiring ── */
+  document.addEventListener('DOMContentLoaded', () => {});
+  $('vxSearchInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !(e.nativeEvent || e).isComposing && e.keyCode !== 229) runSearch();
+  });
+  $('vxSearchInput').addEventListener('input', debounce(() => {
+    if ($('vxSearchInput').value.trim().length >= 3) runSearch();
+  }, 450));
+  $('vxVidFilter').addEventListener('input', debounce(() => loadVideos(true), 400));
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && $('view-pipeline').classList.contains('active')) loadQueues(false);
+  });
+
+  return { setSearchTab, runSearch, openResult, loadQueues, togglePause, reapStale,
+           openDlq, closeDlq, replayDlq, purgeDlq, showProcessing, loadPipelineVideos,
+           setExplorerTab, loadOverview, loadVideos, manualSync, openVideo,
+           openChunkDetail, closeChunk, jumpToGraphSearch, loadGraph, expandGraphNode,
+           onViewSwitch };
+})();
 </script>
+<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js" defer></script>
 </body>
 </html>

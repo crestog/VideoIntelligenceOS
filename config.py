@@ -74,11 +74,13 @@ SQLITE_TIMEOUT = 30  # seconds; ALL sqlite3.connect calls must pass this
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM (shared by Ghost Worker + Snapshot Manager)
+# SECURITY: no hardcoded defaults. Set these via environment variables
+# (on Kaggle: UserSecretsClient → os.environ in the launcher cell).
 # ═══════════════════════════════════════════════════════════
-API_ID     = int(os.environ.get('VIOS_API_ID', 37392880))
-API_HASH   = os.environ.get('VIOS_API_HASH', '4037344084ae998be2cdaee3192bd8f8')
-BOT_TOKEN  = os.environ.get('VIOS_BOT_TOKEN', '8269867642:AAH76B2_aFbqc6OqNiCAm-NenTTmG_SWavU')
-CHANNEL_ID = int(os.environ.get('VIOS_CHANNEL_ID', -1003762735924))
+API_ID     = int(os.environ.get('VIOS_API_ID', 0) or 0)
+API_HASH   = os.environ.get('VIOS_API_HASH', '')
+BOT_TOKEN  = os.environ.get('VIOS_BOT_TOKEN', '')
+CHANNEL_ID = int(os.environ.get('VIOS_CHANNEL_ID', 0) or 0)
 
 # ═══════════════════════════════════════════════════════════
 # REDIS
@@ -101,7 +103,7 @@ NEO4J_BOLT_URL   = os.environ.get('VIOS_NEO4J_BOLT_URL', 'bolt://127.0.0.1:7687'
 # ═══════════════════════════════════════════════════════════
 # NVIDIA NIM API (GraphRAG entity extraction)
 # ═══════════════════════════════════════════════════════════
-NVIDIA_API_KEY = os.environ.get('VIOS_NVIDIA_API_KEY', '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')
+NVIDIA_API_KEY = os.environ.get('VIOS_NVIDIA_API_KEY', '')
 NIM_MODEL      = os.environ.get('VIOS_NIM_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
 NIM_BASE_URL   = 'https://integrate.api.nvidia.com/v1'
 
@@ -118,3 +120,63 @@ GRAPHRAG_IN_OMNI_ONLY = os.environ.get('VIOS_GRAPHRAG_OMNI_ONLY', '1') != '0'  #
 # ═══════════════════════════════════════════════════════════
 for d in [LAKE_DIR, VIDEO_DIR, THUMB_DIR, FLAG_DIR]:
     os.makedirs(d, exist_ok=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# CONFIG VALIDATION — fail loudly and clearly, never mysteriously
+# ═══════════════════════════════════════════════════════════
+# (name, value, required_for, is_critical)
+_SECRET_SPECS = [
+    ('VIOS_API_ID',         API_ID,         'Telegram sync (Ghost Worker, snapshots)', True),
+    ('VIOS_API_HASH',       API_HASH,       'Telegram sync (Ghost Worker, snapshots)', True),
+    ('VIOS_BOT_TOKEN',      BOT_TOKEN,      'Telegram sync (Ghost Worker, snapshots)', True),
+    ('VIOS_CHANNEL_ID',     CHANNEL_ID,     'Telegram sync (Ghost Worker, snapshots)', True),
+    ('VIOS_NVIDIA_API_KEY', NVIDIA_API_KEY, 'GraphRAG entity extraction (optional)',   False),
+]
+
+
+def validate_config(strict=False):
+    """
+    Check that required secrets are present. Returns a report dict:
+      {"ok": bool, "missing_critical": [...], "missing_optional": [...], "set": [...]}
+
+    strict=True raises RuntimeError listing every missing critical secret,
+    so boot fails with ONE clear message instead of a cryptic mid-run error.
+    """
+    missing_critical, missing_optional, present = [], [], []
+    for name, value, purpose, critical in _SECRET_SPECS:
+        if not value:
+            (missing_critical if critical else missing_optional).append(
+                {'name': name, 'needed_for': purpose})
+        else:
+            present.append(name)
+
+    report = {
+        'ok': len(missing_critical) == 0,
+        'missing_critical': missing_critical,
+        'missing_optional': missing_optional,
+        'set': present,
+    }
+
+    if strict and missing_critical:
+        lines = ['[CONFIG] Missing required environment variables:']
+        for m in missing_critical:
+            lines.append(f"  - {m['name']}  (needed for: {m['needed_for']})")
+        lines.append('Set them as Kaggle Secrets and export them before running boot.py.')
+        raise RuntimeError('\n'.join(lines))
+
+    return report
+
+
+def env_check_masked():
+    """Masked env/secret status for the /api/system/env-check endpoint."""
+    def _mask(v):
+        s = str(v)
+        if not s or s == '0':
+            return None
+        return (s[:3] + '…' + s[-2:]) if len(s) > 6 else '•••'
+
+    return {
+        name: {'set': bool(value), 'masked': _mask(value), 'needed_for': purpose, 'critical': critical}
+        for name, value, purpose, critical in _SECRET_SPECS
+    }

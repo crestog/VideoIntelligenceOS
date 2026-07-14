@@ -43,6 +43,38 @@ def run_with_watchdog(command, prefix, is_engine):
 
 
 # ══════════════════════════════════════════════════════════
+# PHASE 0: CONFIG VALIDATION + DEPENDENCY CHECK
+# Fail with ONE clear message instead of a cryptic mid-run error.
+# ══════════════════════════════════════════════════════════
+print("🔎 [SYSTEM] Phase 0: Validating configuration & dependencies...", flush=True)
+try:
+    from config import validate_config
+    _report = validate_config(strict=False)
+    for _m in _report["missing_critical"]:
+        print(f"   ❌ MISSING SECRET: {_m['name']}  (needed for: {_m['needed_for']})", flush=True)
+    for _m in _report["missing_optional"]:
+        print(f"   ⚠️ optional secret not set: {_m['name']}  ({_m['needed_for']})", flush=True)
+    if _report["ok"]:
+        print("   ✅ All critical secrets present.", flush=True)
+    else:
+        print("   ⚠️ Boot continues, but Telegram-dependent features WILL fail "
+              "until the secrets above are set.", flush=True)
+except Exception as _e:
+    print(f"   ⚠️ Config validation skipped: {_e}", flush=True)
+
+_MISSING_DEPS = []
+for _mod in ("redis", "fastapi", "uvicorn", "aiosqlite", "pyrogram"):
+    try:
+        __import__(_mod)
+    except ImportError:
+        _MISSING_DEPS.append(_mod)
+if _MISSING_DEPS:
+    print(f"   ❌ MISSING PYTHON PACKAGES: {', '.join(_MISSING_DEPS)} — "
+          f"install them before booting (pip install {' '.join(_MISSING_DEPS)})", flush=True)
+else:
+    print("   ✅ Core Python dependencies importable.", flush=True)
+
+# ══════════════════════════════════════════════════════════
 # PHASE 1: PRE-FLIGHT SWEEP
 # ══════════════════════════════════════════════════════════
 print("🧹 [SYSTEM] Phase 1: Sweeping Zombie Processes...", flush=True)
@@ -56,8 +88,21 @@ print("   ✅ Zombie sweep complete.", flush=True)
 # ══════════════════════════════════════════════════════════
 print("🗄️ [SYSTEM] Phase 2: Booting Redis Message Broker (AOF mode)...", flush=True)
 os.system("redis-server --daemonize yes --appendonly yes")
-time.sleep(0.5)  # Give Redis a moment to boot
-print("   ✅ Redis broker online.", flush=True)
+
+# Readiness check with retry — no race between Redis boot and workers
+_redis_ok = False
+for _attempt in range(15):
+    try:
+        from queue_manager import get_redis
+        get_redis().ping()
+        _redis_ok = True
+        break
+    except Exception:
+        time.sleep(0.5 + _attempt * 0.2)
+if _redis_ok:
+    print("   ✅ Redis broker online (ping verified).", flush=True)
+else:
+    print("   ❌ Redis did not become ready — queue-dependent workers will retry on their own.", flush=True)
 
 # ══════════════════════════════════════════════════════════
 # PHASE 3: SESSION INIT — Fresh Session vs Crash Recovery
@@ -149,6 +194,35 @@ else:
 
     except Exception as e:
         print(f"   ⚠️ Recovery skipped: {e}", flush=True)
+
+# ══════════════════════════════════════════════════════════
+# PHASE 3c: AUTHORITATIVE SQLITE SCHEMA (idempotent, after any snapshot restore)
+# ══════════════════════════════════════════════════════════
+try:
+    from db_schema import init_sqlite_schema
+    if init_sqlite_schema():
+        print("   ✅ SQLite schema ready (all tables + FTS + WAL).", flush=True)
+except Exception as _e:
+    print(f"   ⚠️ SQLite schema init failed: {_e}", flush=True)
+
+# ══════════════════════════════════════════════════════════
+# PHASE 3d: STALE-JOB REAPER — background thread that recovers
+# in-flight jobs whose worker died mid-processing.
+# ══════════════════════════════════════════════════════════
+def _reaper_loop():
+    from queue_manager import reap_stale_jobs
+    while True:
+        time.sleep(300)  # every 5 minutes
+        try:
+            result = reap_stale_jobs()
+            total = sum(result.values())
+            if total:
+                print(f"♻️ [REAPER] Requeued {total} stale in-flight job(s): {result}", flush=True)
+        except Exception as _e:
+            print(f"⚠️ [REAPER] sweep failed: {_e}", flush=True)
+
+threading.Thread(target=_reaper_loop, daemon=True).start()
+print("   ✅ Stale-job reaper armed (5-minute sweeps).", flush=True)
 
 # ══════════════════════════════════════════════════════════
 # PHASE 4: IGNITION

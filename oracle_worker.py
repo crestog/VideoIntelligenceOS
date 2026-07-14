@@ -39,7 +39,7 @@ from config import (
 )
 from graphrag_prompts import PROMPTS
 from logger import vios_log
-from queue_manager import claim_job, ack_job, fail_job
+from queue_manager import claim_job, ack_job, fail_job, job_heartbeat
 
 
 # ═══════════════════════════════════════════════════════════
@@ -484,11 +484,26 @@ if __name__ == "__main__":
         log(f"📥 ORACLE JOB: Video #{msg_id} mode={payload.get('mode', DEFAULT_ORACLE_MODE)}")
 
         try:
-            process_oracle_job(payload)
+            _t0 = time.time()
+            with job_heartbeat(QUEUE_ORACLE, job.get("id"), "oracle_worker"):
+                process_oracle_job(payload)
             ack_job(QUEUE_ORACLE, job, job_raw)
             log(f"🏁 ORACLE #{msg_id} COMPLETE", "SUCCESS")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="narrated", status="completed",
+                             worker="oracle_worker",
+                             duration_sec=round(time.time() - _t0, 2))
+            except Exception:
+                pass
         except Exception as e:
             result = fail_job(QUEUE_ORACLE, job, job_raw, str(e))
             log(f"❌ ORACLE #{msg_id} FAILED → {result}: {str(e)[:200]}", "ERROR")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="narrated", status="failed",
+                             worker="oracle_worker", detail=f"{result}: {str(e)[:200]}")
+            except Exception:
+                pass
             clear_ram()
             time.sleep(2)

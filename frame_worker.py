@@ -28,7 +28,7 @@ import time
 
 import redis as redis_lib
 
-from queue_manager import claim_job, ack_job, fail_job, push_job
+from queue_manager import claim_job, ack_job, fail_job, push_job, job_heartbeat
 from config import (VIDEO_DIR, THUMB_DIR, DB_PATH, QUEUE_VISION, QUEUE_ANALYZE,
                     QUEUE_ORACLE, QUEUE_VISION_EMBED,
                     DISK_PAUSE_THRESHOLD_GB, DISK_WARN_THRESHOLD_GB,
@@ -243,10 +243,20 @@ def run_worker():
         log(f"📥 JOB CLAIMED: Video #{msg_id}{retry_tag}")
 
         try:
-            frames_extracted = extract_video_data(video_path, msg_id)
+            _t0 = time.time()
+            with job_heartbeat(QUEUE_NAME, job.get("id"), "frame_worker"):
+                frames_extracted = extract_video_data(video_path, msg_id)
             ack_job(QUEUE_NAME, job, job_raw)
             jobs_completed += 1
             total_frames += frames_extracted
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="frames", status="completed",
+                             worker="frame_worker",
+                             detail=f"{frames_extracted} frames extracted",
+                             duration_sec=round(time.time() - _t0, 2))
+            except Exception:
+                pass
 
             # ── Push downstream jobs ──────────────────────────────
             folder_id = f"frames_{msg_id}"
@@ -271,6 +281,12 @@ def run_worker():
             result = fail_job(QUEUE_NAME, job, job_raw, str(e))
             jobs_failed += 1
             log(f"❌ JOB #{msg_id} FAILED → {result} | {str(e)[:200]}")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="frames", status="failed",
+                             worker="frame_worker", detail=f"{result}: {str(e)[:200]}")
+            except Exception:
+                pass
             time.sleep(2)
 
 

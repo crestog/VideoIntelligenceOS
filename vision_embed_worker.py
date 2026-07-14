@@ -37,7 +37,7 @@ from config import (
     SQLITE_TIMEOUT, DB_PATH,
 )
 from logger import vios_log
-from queue_manager import claim_job, ack_job, fail_job
+from queue_manager import claim_job, ack_job, fail_job, job_heartbeat
 
 
 # ═══════════════════════════════════════════════════════════
@@ -371,11 +371,26 @@ if __name__ == "__main__":
         log(f"📥 EMBED JOB: Video #{msg_id}")
 
         try:
-            process_embed_job(payload)
+            _t0 = time.time()
+            with job_heartbeat(QUEUE_VISION_EMBED, job.get("id"), "vision_embed_worker"):
+                process_embed_job(payload)
             ack_job(QUEUE_VISION_EMBED, job, job_raw)
             log(f"🏁 EMBED #{msg_id} COMPLETE", "SUCCESS")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="embedded", status="completed",
+                             worker="vision_embed_worker",
+                             duration_sec=round(time.time() - _t0, 2))
+            except Exception:
+                pass
         except Exception as e:
             result = fail_job(QUEUE_VISION_EMBED, job, job_raw, str(e))
             log(f"❌ EMBED #{msg_id} FAILED → {result}: {str(e)[:200]}", "ERROR")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="embedded", status="failed",
+                             worker="vision_embed_worker", detail=f"{result}: {str(e)[:200]}")
+            except Exception:
+                pass
             clear_ram()
             time.sleep(2)

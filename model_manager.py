@@ -35,7 +35,7 @@ os.environ.setdefault("HF_HOME", "/kaggle/working/huggingface_cache")
 
 import torch
 
-from queue_manager import claim_job, ack_job, fail_job, pop_job, push_job
+from queue_manager import claim_job, ack_job, fail_job, pop_job, push_job, job_heartbeat
 from config import DB_PATH, VIDEO_DIR, QUEUE_ANALYZE, SQLITE_TIMEOUT, PREVIEW_DIR_NAME
 from logger import vios_log
 
@@ -402,6 +402,105 @@ def process_analyze_job(payload):
 
 
 # ═══════════════════════════════════════════════════════════
+# RPC SERVER — serves cross-process requests from ui_server
+# (embed_text for semantic search, spatial_proof for the proof endpoint).
+# ui_server must NEVER import this module; it talks via Redis instead.
+# ═══════════════════════════════════════════════════════════
+RPC_QUEUE = "VIOS_RPC"
+RPC_RESULT_PREFIX = "VIOS_RPC_RESULT:"
+
+
+def _rpc_embed_text(payload):
+    text = str(payload.get("text", ""))[:512]
+    mode = payload.get("mode", "siglip")
+    if not text.strip():
+        return {"ok": False, "error": "empty text"}
+
+    if mode in ("siglip", "clip"):
+        if mode == "siglip":
+            proc = WARM_MODELS.get('siglip_proc') or WARM_MODELS.get('siglip_processor')
+            model = WARM_MODELS.get('siglip_model')
+        else:
+            proc = WARM_MODELS.get('clip_proc') or WARM_MODELS.get('clip_processor')
+            model = WARM_MODELS.get('clip_model')
+        if not (proc and model):
+            return {"ok": False, "error": f"{mode} model not warm yet"}
+        device = next(model.parameters()).device
+        inputs = proc(text=[text], return_tensors="pt", padding=True, truncation=True).to(device)
+        with torch.no_grad():
+            feats = model.get_text_features(**inputs)
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+        return {"ok": True, "vector": feats[0].cpu().float().tolist()}
+
+    if mode == "bge":
+        bge = WARM_MODELS.get('bge_model')
+        if bge is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                bge = SentenceTransformer("BAAI/bge-large-en-v1.5")
+                WARM_MODELS['bge_model'] = bge  # cache for next call
+            except Exception as e:
+                return {"ok": False, "error": f"BGE load failed: {str(e)[:150]}"}
+        vec = bge.encode(text, normalize_embeddings=True).tolist()
+        return {"ok": True, "vector": vec}
+
+    return {"ok": False, "error": f"unknown embed mode '{mode}'"}
+
+
+def _rpc_spatial_proof(payload):
+    import base64, io as _io
+    import numpy as np
+    from PIL import Image as PILImage
+    frame_path = payload.get("frame_path", "")
+    query = payload.get("query", "")
+    if not frame_path or not os.path.exists(frame_path):
+        return {"ok": False, "error": "frame file not found"}
+    pil_img = PILImage.open(frame_path).convert("RGB")
+    ocr_hint = payload.get("ocr_results") or ""
+    ocr_list = [([[0, 0]], ocr_hint, 1.0)] if ocr_hint else []
+    result_arr, success, message = hybrid_spatial_proof(pil_img, query, ocr_list)
+    result_pil = PILImage.fromarray(np.asarray(result_arr).astype(np.uint8))
+    buf = _io.BytesIO()
+    result_pil.save(buf, format="JPEG", quality=88)
+    return {"ok": True, "success": bool(success), "message": str(message)[:200],
+            "image_b64": base64.b64encode(buf.getvalue()).decode()}
+
+
+_RPC_HANDLERS = {"embed_text": _rpc_embed_text, "spatial_proof": _rpc_spatial_proof}
+
+
+def rpc_server_loop():
+    """Background thread: serve RPC requests without blocking the analyze loop."""
+    from queue_manager import get_redis
+    r = get_redis()
+    log("📡 RPC server armed (embed_text, spatial_proof).")
+    while True:
+        try:
+            item = r.brpop(RPC_QUEUE, timeout=5)
+            if not item:
+                continue
+            try:
+                req = json.loads(item[1])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            req_id = req.get("id", "")
+            handler = _RPC_HANDLERS.get(req.get("kind", ""))
+            if not req_id:
+                continue
+            if handler is None:
+                result = {"ok": False, "error": f"unknown RPC kind '{req.get('kind')}'"}
+            else:
+                try:
+                    result = handler(req.get("payload", {}))
+                except Exception as e:
+                    result = {"ok": False, "error": str(e)[:300]}
+            r.set(RPC_RESULT_PREFIX + req_id, json.dumps(result), ex=60)
+        except Exception as e:
+            log(f"⚠️ RPC server error: {str(e)[:150]} — continuing", "WARN")
+            time.sleep(1)
+
+
+# ═══════════════════════════════════════════════════════════
 # MAIN — warm-up then analysis loop
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -429,6 +528,10 @@ if __name__ == "__main__":
 
     log(f"🧠 Warm-up complete ({len(WARM_MODELS)} engines). Consuming {QUEUE_ANALYZE}...")
 
+    # Start the RPC server thread (semantic-search embeds + spatial proofs)
+    import threading as _threading
+    _threading.Thread(target=rpc_server_loop, daemon=True).start()
+
     # Phase 2: reliable analysis loop
     while True:
         try:
@@ -444,11 +547,26 @@ if __name__ == "__main__":
         msg_id = payload.get("msg_id", "?")
         log(f"📥 ANALYZE JOB: Video #{msg_id}")
         try:
-            process_analyze_job(payload)
+            _t0 = time.time()
+            with job_heartbeat(QUEUE_ANALYZE, job.get("id"), "model_manager"):
+                process_analyze_job(payload)
             ack_job(QUEUE_ANALYZE, job, job_raw)
             log(f"🏁 ANALYZE #{msg_id} COMPLETE", "SUCCESS")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="analyzed", status="completed",
+                             worker="model_manager",
+                             duration_sec=round(time.time() - _t0, 2))
+            except Exception:
+                pass
         except Exception as e:
             result = fail_job(QUEUE_ANALYZE, job, job_raw, str(e))
             log(f"❌ ANALYZE #{msg_id} FAILED → {result} | {str(e)[:200]}", "ERROR")
+            try:
+                from db_schema import record_event
+                record_event(msg_id=msg_id, stage="analyzed", status="failed",
+                             worker="model_manager", detail=f"{result}: {str(e)[:200]}")
+            except Exception:
+                pass
             clear_ram()
             time.sleep(2)

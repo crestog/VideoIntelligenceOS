@@ -25,13 +25,18 @@ import json
 import time
 import uuid
 
+try:
+    from config import REDIS_HOST, REDIS_PORT
+except Exception:  # standalone usage fallback
+    REDIS_HOST, REDIS_PORT = 'localhost', 6379
+
 
 # ═══════════════════════════════════════════════════════════
 # CONNECTION POOL
 # ═══════════════════════════════════════════════════════════
 redis_pool = redis.ConnectionPool(
-    host='localhost',
-    port=6379,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
     decode_responses=True,
     socket_timeout=30,          # Must be > any blocking-pop timeout (max 5s)
     socket_connect_timeout=5,
@@ -59,6 +64,12 @@ def _default_key(q):     return f"{q}_DEFAULT"
 def _processing_key(q):  return f"{q}_PROCESSING"
 def _dlq_key(q):         return f"{q}_DLQ"
 def _metrics_key():      return "VIOS_METRICS"
+def _pause_key(q):       return f"VIOS_PAUSED:{q}"
+def _heartbeat_key(q, job_id): return f"VIOS_HB:{q}:{job_id}"
+def _oplock_key(name):   return f"VIOS_OPLOCK:{name}"
+
+HEARTBEAT_TTL_SEC   = 120     # a live worker refreshes well within this window
+STALE_JOB_GRACE_SEC = 1800    # jobs with NO heartbeat are considered stale after 30 min in-flight
 
 def _lanes(q):
     """(priority_lane, default_lane) — non-priority queues use one lane."""
@@ -107,9 +118,17 @@ def claim_job(queue_name, timeout=2):
     Priority queues drain the PRIORITY lane first (non-blocking), then block
     on the DEFAULT lane for `timeout` seconds.
 
+    Respects the queue's pause flag: while paused, no job is claimed and the
+    worker naturally idles (we sleep for `timeout` to avoid a hot loop).
+
     Returns (job_dict, raw_string) or (None, None).
     """
     r = get_redis()
+
+    if r.exists(_pause_key(queue_name)):
+        time.sleep(min(timeout, 2))
+        return None, None
+
     proc_key = _processing_key(queue_name)
     prio_lane, default_lane = _lanes(queue_name)
 
@@ -126,7 +145,71 @@ def claim_job(queue_name, timeout=2):
     job["claimed_at"] = time.time()
     r.hincrby(_metrics_key(), f"{queue_name}:claimed", 1)
 
+    # Initial heartbeat so the reaper knows this claim is fresh
+    try:
+        heartbeat_job(queue_name, job.get("id", ""), worker="claim")
+    except Exception:
+        pass  # heartbeat is best-effort; claiming must never fail because of it
+
     return job, job_raw
+
+
+# ═══════════════════════════════════════════════════════════
+# HEARTBEAT — workers ping while processing long jobs
+# ═══════════════════════════════════════════════════════════
+def heartbeat_job(queue_name, job_id, worker="worker"):
+    """Refresh the liveness marker for an in-flight job (TTL-based)."""
+    if not job_id:
+        return
+    r = get_redis()
+    r.set(_heartbeat_key(queue_name, job_id),
+          json.dumps({"worker": worker, "ts": time.time()}),
+          ex=HEARTBEAT_TTL_SEC)
+
+
+class job_heartbeat:
+    """
+    Context manager that keeps a job's heartbeat alive from a background
+    thread while the worker does long processing:
+
+        with job_heartbeat(QUEUE_ANALYZE, job.get("id"), "model_manager"):
+            process_analyze_job(payload)
+
+    Best-effort by design — heartbeat failures never interrupt the job.
+    """
+    def __init__(self, queue_name, job_id, worker="worker", interval_sec=30):
+        self.queue_name = queue_name
+        self.job_id = job_id or ""
+        self.worker = worker
+        self.interval = interval_sec
+        self._stop = None
+        self._thread = None
+
+    def __enter__(self):
+        if not self.job_id:
+            return self
+        import threading
+        self._stop = threading.Event()
+
+        def _beat():
+            while not self._stop.wait(self.interval):
+                try:
+                    heartbeat_job(self.queue_name, self.job_id, self.worker)
+                except Exception:
+                    pass
+
+        try:
+            heartbeat_job(self.queue_name, self.job_id, self.worker)
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=_beat, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._stop is not None:
+            self._stop.set()
+        return False  # never swallow worker exceptions
 
 
 # ═══════════════════════════════════════════════════════════
@@ -138,6 +221,7 @@ def ack_job(queue_name, job, job_raw):
     pipe = r.pipeline()
     pipe.lrem(_processing_key(queue_name), 1, job_raw)
     pipe.hincrby(_metrics_key(), f"{queue_name}:completed", 1)
+    pipe.delete(_heartbeat_key(queue_name, job.get("id", "")))
 
     if "claimed_at" in job:
         elapsed = time.time() - job["claimed_at"]
@@ -154,6 +238,7 @@ def fail_job(queue_name, job, job_raw, error_msg):
     """Retry (< MAX_RETRIES) or dead-letter. Returns 'RETRIED' or 'DEAD'."""
     r = get_redis()
     r.lrem(_processing_key(queue_name), 1, job_raw)
+    r.delete(_heartbeat_key(queue_name, job.get("id", "")))
 
     retries = job.get("retries", 0)
     _prio, default_lane = _lanes(queue_name)
@@ -203,6 +288,95 @@ def recover_processing_jobs(queue_name):
 
 
 # ═══════════════════════════════════════════════════════════
+# STALE-JOB REAPER — recover in-flight jobs whose worker died
+# ═══════════════════════════════════════════════════════════
+def reap_stale_jobs(queue_name=None, grace_sec=STALE_JOB_GRACE_SEC):
+    """
+    Scan PROCESSING lists for jobs whose worker heartbeat expired and whose
+    claim is older than `grace_sec`. Requeue them (retries incremented so a
+    poison job still dead-letters eventually). Returns {queue: reaped_count}.
+    """
+    r = get_redis()
+    queues = [queue_name] if queue_name else list(ALL_QUEUES)
+    now = time.time()
+    result = {}
+
+    for q in queues:
+        proc_key = _processing_key(q)
+        _prio, default_lane = _lanes(q)
+        reaped = 0
+
+        for job_raw in r.lrange(proc_key, 0, -1):
+            try:
+                job = json.loads(job_raw)
+            except (json.JSONDecodeError, TypeError):
+                # Corrupt entry — remove so it can't clog the list forever
+                r.lrem(proc_key, 1, job_raw)
+                continue
+
+            job_id = job.get("id", "")
+            claimed_at = float(job.get("claimed_at", job.get("created_at", now)))
+            has_heartbeat = bool(job_id) and r.exists(_heartbeat_key(q, job_id))
+
+            if not has_heartbeat and (now - claimed_at) > grace_sec:
+                # Atomically-ish: only requeue if we successfully removed it
+                if r.lrem(proc_key, 1, job_raw) == 1:
+                    job["retries"] = job.get("retries", 0) + 1
+                    job["status"] = "REAPED"
+                    job["reaped_at"] = now
+                    if job["retries"] > MAX_RETRIES:
+                        job["status"] = "DEAD"
+                        job["last_error"] = "reaped: exceeded retries after worker loss"
+                        r.lpush(_dlq_key(q), json.dumps(job))
+                        r.hincrby(_metrics_key(), f"{q}:dead", 1)
+                    else:
+                        r.lpush(default_lane, json.dumps(job))
+                    reaped += 1
+
+        if reaped:
+            r.hincrby(_metrics_key(), f"{q}:reaped", reaped)
+        result[q] = reaped
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# PAUSE / RESUME — per-queue flow control
+# ═══════════════════════════════════════════════════════════
+def pause_queue(queue_name):
+    get_redis().set(_pause_key(queue_name), str(time.time()))
+    return True
+
+def resume_queue(queue_name):
+    get_redis().delete(_pause_key(queue_name))
+    return True
+
+def is_paused(queue_name):
+    return bool(get_redis().exists(_pause_key(queue_name)))
+
+
+# ═══════════════════════════════════════════════════════════
+# OPERATION LOCKS — prevent conflicting admin actions (multi-tab safe)
+# ═══════════════════════════════════════════════════════════
+def acquire_op_lock(name, ttl_sec=60):
+    """SET NX lock. Returns a lock token, or None if already held."""
+    r = get_redis()
+    token = uuid.uuid4().hex
+    if r.set(_oplock_key(name), token, nx=True, ex=ttl_sec):
+        return token
+    return None
+
+def release_op_lock(name, token):
+    """Release only if we still own it (compare-and-delete)."""
+    r = get_redis()
+    key = _oplock_key(name)
+    if r.get(key) == token:
+        r.delete(key)
+        return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════
 # METRICS — Full real-time observability
 # ═══════════════════════════════════════════════════════════
 def get_queue_metrics(queue_name=None):
@@ -231,7 +405,10 @@ def get_queue_metrics(queue_name=None):
             "total_retries": int(r.hget(_metrics_key(), f"{q}:retries") or 0),
             "total_dead": int(r.hget(_metrics_key(), f"{q}:dead") or 0),
             "total_recovered": int(r.hget(_metrics_key(), f"{q}:recovered") or 0),
+            "total_reaped": int(r.hget(_metrics_key(), f"{q}:reaped") or 0),
             "last_duration_sec": r.hget(_metrics_key(), f"{q}:last_duration_sec") or "N/A",
+            "last_completed_at": r.hget(_metrics_key(), f"{q}:last_completed_at") or None,
+            "paused": bool(r.exists(_pause_key(q))),
         }
 
     result["_global"] = {
@@ -277,7 +454,40 @@ def peek_dlq(queue_name, count=10):
     """Inspect dead-lettered jobs without removing them."""
     r = get_redis()
     items = r.lrange(_dlq_key(queue_name), 0, count - 1)
-    return [json.loads(item) for item in items]
+    out = []
+    for item in items:
+        try:
+            out.append(json.loads(item))
+        except (json.JSONDecodeError, TypeError):
+            out.append({"id": "corrupt", "payload": None, "last_error": "unparseable DLQ entry"})
+    return out
+
+
+def purge_dlq(queue_name):
+    """Permanently delete all dead-lettered jobs for a queue. Returns count purged."""
+    r = get_redis()
+    dlq = _dlq_key(queue_name)
+    count = r.llen(dlq)
+    r.delete(dlq)
+    return count
+
+
+def peek_processing(queue_name, count=25):
+    """Inspect in-flight jobs (with liveness info) without removing them."""
+    r = get_redis()
+    now = time.time()
+    out = []
+    for item in r.lrange(_processing_key(queue_name), 0, count - 1):
+        try:
+            job = json.loads(item)
+        except (json.JSONDecodeError, TypeError):
+            out.append({"id": "corrupt", "alive": False})
+            continue
+        job_id = job.get("id", "")
+        job["alive"] = bool(job_id) and bool(r.exists(_heartbeat_key(queue_name, job_id)))
+        job["in_flight_sec"] = round(now - float(job.get("claimed_at", now)), 1)
+        out.append(job)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════

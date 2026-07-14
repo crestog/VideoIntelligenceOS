@@ -10,6 +10,8 @@ import nest_asyncio
 from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
 from v17_backend import v17_router
 from admin_backend import admin_router
+from explorer_backend import explorer_router, rpc_call_sync
+from db_schema import init_sqlite_schema
 from config import BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR, SQLITE_TIMEOUT
 
 nest_asyncio.apply()
@@ -215,12 +217,12 @@ async def background_downloader():
             latest_id = ping.id
             await ping.delete()
 
+            # One query + set difference in Python (was one SELECT per message
+            # ID — O(N) round-trips that froze the scan on large channels)
             async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
-                missing_ids = []
-                for i in range(latest_id, 0, -1):
-                    async with conn.execute("SELECT video_id FROM posts WHERE video_id = ?", (i,)) as cursor:
-                        if not await cursor.fetchone():
-                            missing_ids.append(i)
+                async with conn.execute("SELECT video_id FROM posts") as cursor:
+                    known_ids = {row[0] for row in await cursor.fetchall()}
+            missing_ids = [i for i in range(latest_id, 0, -1) if i not in known_ids]
 
             BATCH_SIZE = 200
             for i in range(0, len(missing_ids), BATCH_SIZE):
@@ -346,6 +348,7 @@ app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="main_videos")
 
 app.include_router(v17_router)
 app.include_router(admin_router)
+app.include_router(explorer_router)
 
 @app.get("/api/status")
 def get_status():
@@ -368,18 +371,23 @@ async def ws_endpoint(ws: WebSocket):
     async def push_status():
         last_s = ""
         tick = 0
+        seq = 0  # monotonic sequence — lets the client drop out-of-order frames
         while True:
             gs = globals().get("GLOBAL_STATUS", "")
             if gs != last_s:
                 last_s = gs
                 try: await ws.send_json({"type":"status", "message":gs})
                 except: break
-            # Broadcast queue metrics every 5 seconds (25 × 0.2s)
+            # Broadcast ALL queue metrics every 5 seconds (25 × 0.2s)
             tick += 1
             if tick % 25 == 0:
                 try:
-                    m = get_queue_metrics("QUEUE_VISION")
-                    await ws.send_json({"type": "queue", "data": m})
+                    m = await asyncio.to_thread(get_queue_metrics)
+                    seq += 1
+                    await ws.send_json({"type": "queues", "seq": seq,
+                                        "ts": time.time(), "data": m})
+                    # Legacy message shape kept for older UI code paths
+                    await ws.send_json({"type": "queue", "data": m.get("QUEUE_VISION", {})})
                 except: pass
             await asyncio.sleep(0.2)
     t = asyncio.create_task(push_status())
@@ -460,89 +468,21 @@ async def analyze_ui(id: str = "", t: str = ""):
 @app.get("/api/semantic_search")
 async def api_semantic_search(q: str = "", k: int = 10, mode: str = "siglip"):
     """
-    Embed query text and search Qdrant for the nearest frames or chunks.
+    Legacy alias for /api/search/semantic.
 
-    mode: 'siglip'  → CLIP-style image-text similarity (frames_siglip)
-          'clip'    → OpenAI CLIP (frames_clip)
-          'bge'     → BGE text embedding (chunks_bge — chunk narratives)
-
-    Returns ranked list of {video_path, msg_id, timestamp/start_t, score, chunk_id?}.
+    FIXED: the old implementation imported model_manager.WARM_MODELS into
+    THIS process — but model_manager runs as a separate process, so the dict
+    was always empty (and the import alone would try to pull 7 GPU models
+    into the web server). Embedding now goes through a Redis RPC to the
+    model_manager process, which owns the warm models.
     """
     if not q.strip():
         return {"error": "Query is empty", "results": []}
-
-    try:
-        from tripartite_db import get_qdrant
-        qdrant = get_qdrant()
-        if qdrant is None:
-            return {"error": "Qdrant not available", "results": []}
-
-        collection_map = {
-            "siglip": ("frames_siglip", "siglip"),
-            "clip":   ("frames_clip",   "clip"),
-            "bge":    ("chunks_bge",    "bge"),
-        }
-        if mode not in collection_map:
-            return {"error": f"Unknown mode '{mode}'. Use siglip|clip|bge", "results": []}
-
-        collection_name, embed_type = collection_map[mode]
-
-        # Produce query embedding
-        query_vec = None
-        if embed_type in ("siglip", "clip"):
-            # Use transformers text encoder on the model_manager warm models
-            try:
-                import sys, os
-                sys.path.insert(0, os.path.dirname(__file__))
-                from model_manager import WARM_MODELS
-                import torch
-                if embed_type == "siglip":
-                    proc  = WARM_MODELS.get("siglip_proc") or WARM_MODELS.get("siglip_processor")
-                    model = WARM_MODELS.get("siglip_model")
-                else:
-                    proc  = WARM_MODELS.get("clip_proc") or WARM_MODELS.get("clip_processor")
-                    model = WARM_MODELS.get("clip_model")
-                if proc and model:
-                    device = next(model.parameters()).device
-                    inputs = proc(text=[q], return_tensors="pt", padding=True, truncation=True).to(device)
-                    with torch.no_grad():
-                        feats = model.get_text_features(**inputs)
-                        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
-                    query_vec = feats[0].cpu().float().tolist()
-            except Exception as e:
-                return {"error": f"Text embedding failed: {e}", "results": []}
-
-        elif embed_type == "bge":
-            try:
-                from model_manager import WARM_MODELS
-                # oracle_worker holds BGE, fallback: load inline
-                bge = WARM_MODELS.get("bge_model")
-                if bge is None:
-                    from sentence_transformers import SentenceTransformer
-                    bge = SentenceTransformer("BAAI/bge-large-en-v1.5")
-                query_vec = bge.encode(q, normalize_embeddings=True).tolist()
-            except Exception as e:
-                return {"error": f"BGE embedding failed: {e}", "results": []}
-
-        if query_vec is None:
-            return {"error": "Could not produce query embedding", "results": []}
-
-        hits = qdrant.search(collection_name=collection_name, query_vector=query_vec, limit=k)
-        results = [
-            {
-                "score": round(float(h.score), 4),
-                "video_path": h.payload.get("video_path", ""),
-                "msg_id": h.payload.get("msg_id"),
-                "timestamp": h.payload.get("timestamp") or h.payload.get("start_t"),
-                "frame_idx": h.payload.get("frame_idx"),
-                "chunk_id": h.payload.get("chunk_id"),
-            }
-            for h in hits
-        ]
-        return {"query": q, "mode": mode, "collection": collection_name, "results": results}
-
-    except Exception as e:
-        return {"error": str(e), "results": []}
+    from explorer_backend import _semantic_search_sync
+    data = await asyncio.to_thread(_semantic_search_sync, q, k, mode)
+    return {"query": q, "mode": mode,
+            "error": data.get("reason") if data.get("status") != "ok" else None,
+            "results": data.get("results", [])}
 
 
 @app.get("/api/graph_search")
@@ -633,30 +573,30 @@ async def api_spatial_proof(msg_id: int = 0, frame_idx: int = 0, query: str = ""
     except Exception:
         pass
 
-    # Run spatial proof
-    try:
-        from model_manager import hybrid_spatial_proof
-        result_arr, success, message = hybrid_spatial_proof(pil_img, query, ocr_results)
-    except ImportError:
+    # Run spatial proof via Redis RPC in the model_manager process.
+    # (Importing model_manager here would try to load 7 GPU models into the
+    # web server — the models live in a separate process.)
+    import base64
+    rpc = await asyncio.to_thread(
+        rpc_call_sync, "spatial_proof",
+        {"frame_path": frame_path, "query": query, "ocr_results": ocr_results and ocr_results[0][1] or ""},
+        30.0)
+    if not rpc.get("ok"):
         from fastapi.responses import JSONResponse
-        return JSONResponse({"error": "model_manager not available in this process"}, status_code=503)
-    except Exception as e:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": rpc.get("error", "spatial proof RPC failed "
+                             "(is model_manager running?)")}, status_code=503)
 
-    # Encode result as JPEG and stream back
-    import numpy as np
-    from PIL import Image as PILImage
-    result_pil = PILImage.fromarray(result_arr.astype(np.uint8))
-    buf = io.BytesIO()
-    result_pil.save(buf, format="JPEG", quality=88)
-    buf.seek(0)
+    try:
+        img_bytes = base64.b64decode(rpc["image_b64"])
+    except (KeyError, ValueError):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "corrupt spatial proof result"}, status_code=500)
 
     headers = {
-        "X-Spatial-Proof-Success": str(success),
-        "X-Spatial-Proof-Message": message,
+        "X-Spatial-Proof-Success": str(rpc.get("success", False)),
+        "X-Spatial-Proof-Message": str(rpc.get("message", ""))[:200],
     }
-    return StreamingResponse(buf, media_type="image/jpeg", headers=headers)
+    return StreamingResponse(io.BytesIO(img_bytes), media_type="image/jpeg", headers=headers)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -665,7 +605,8 @@ async def serve_main_ui():
         return f.read()
 
 if __name__ == "__main__":
-    init_db()
+    init_sqlite_schema()   # authoritative, idempotent full schema (WAL + FTS)
+    init_db()              # legacy init kept for safety (all IF NOT EXISTS)
     
     def start_cloudflared():
         time.sleep(2) 
