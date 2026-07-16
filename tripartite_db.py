@@ -56,8 +56,7 @@ def init_qdrant():
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 
-        os.makedirs(QDRANT_PATH, exist_ok=True)
-        client = QdrantClient(path=QDRANT_PATH)
+        client = QdrantClient(host="localhost", port=6333)
 
         for name, dim in QDRANT_COLLECTIONS.items():
             if not client.collection_exists(name):

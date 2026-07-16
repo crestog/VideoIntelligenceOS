@@ -142,6 +142,21 @@ else
     echo "   ✅ pgweb already present."
 fi
 
+# ────────────────────────────────────────────────────────────
+# 7. QDRANT SERVER BINARY (server mode — local/embedded mode only
+#    supports ONE process; Oracle + Embed + search need concurrent access)
+# ────────────────────────────────────────────────────────────
+echo "🔷 [7/7] Fetching Qdrant server binary..."
+(
+  if [ ! -f "./qdrant" ]; then
+    wget -q -O /tmp/qdrant.tar.gz "https://github.com/qdrant/qdrant/releases/download/v1.18.1/qdrant-x86_64-unknown-linux-gnu.tar.gz"
+    tar -xzf /tmp/qdrant.tar.gz -C .
+    chmod +x ./qdrant
+    rm -f /tmp/qdrant.tar.gz
+  fi
+) || echo "   ⚠️ Qdrant binary download failed — vector search will stay in single-process embedded mode."
+[ -f "./qdrant" ] && echo "   ✅ Qdrant server binary ready."
+
 echo ""
 echo "============================================================"
 echo "  VIOS V19 Layer-5 Bootstrap COMPLETE"

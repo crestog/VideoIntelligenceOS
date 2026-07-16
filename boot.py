@@ -275,6 +275,30 @@ try:
 except Exception as _e:
     print(f"   ⚠️ Neo4j startup skipped: {_e}", flush=True)
 
+print("🔷 [SYSTEM] Phase 4b: Starting Qdrant vector database server...", flush=True)
+try:
+    _qdrant_bin = os.path.join(os.getcwd(), "qdrant")
+    if os.path.isfile(_qdrant_bin):
+        os.makedirs("/kaggle/working/qdrant_data", exist_ok=True)
+        _qdrant_env = os.environ.copy()
+        _qdrant_env["QDRANT__STORAGE__STORAGE_PATH"] = "/kaggle/working/qdrant_data"
+        subprocess.Popen([_qdrant_bin, "--disable-telemetry"], env=_qdrant_env,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import urllib.request
+        _qdrant_ready = False
+        for _ in range(30):
+            try:
+                urllib.request.urlopen("http://localhost:6333/", timeout=1)
+                _qdrant_ready = True
+                break
+            except Exception:
+                time.sleep(1)
+        print(f"   {'✅ Qdrant server online' if _qdrant_ready else '⚠️ Qdrant server did not respond in time'} (localhost:6333).", flush=True)
+    else:
+        print("   ⚠️ ./qdrant binary not found (setup_layer5.sh may need re-running) — vector writes will fail this session.", flush=True)
+except Exception as _qe:
+    print(f"   ⚠️ Qdrant server launch skipped: {_qe}", flush=True)
+
 # Launch workers via Watchdog Threads
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"],      "🤖 [ENGINE]",  True), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"],           "🖥️  [UI]",     False), daemon=True).start()

@@ -76,29 +76,22 @@ def load_models():
 
     import shutil
     _free_gb = shutil.disk_usage("/kaggle/working").free / (1024**3)
-    if _free_gb < 18:
-        log(f"⛔ Skipping Qwen2.5-VL-7B — only {_free_gb:.1f}GB free, need ~18GB. "
+    if _free_gb < 8:
+        log(f"⛔ Skipping Qwen2.5-VL-7B — only {_free_gb:.1f}GB free, need ~8GB. "
             "Oracle narration disabled this session until disk space is freed.", "ERROR")
         return
 
-    log("🧠 Loading Qwen2.5-VL-7B-Instruct (4-bit)...")
+    log("🧠 Loading Qwen2.5-VL-7B-Instruct (pre-quantized 4-bit)...")
+    QWEN_REPO = "unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit"
     try:
         from transformers import (
             Qwen2_5_VLForConditionalGeneration,
             AutoProcessor,
-            BitsAndBytesConfig,
         )
-        quant = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        QWEN_PROCESSOR = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        QWEN_PROCESSOR = AutoProcessor.from_pretrained(QWEN_REPO)
         QWEN_MODEL = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen2.5-VL-7B-Instruct",
+            QWEN_REPO,
             torch_dtype=torch.bfloat16,
-            quantization_config=quant,
             device_map={"": device_1},
         ).eval()
         log("✅ Qwen2.5-VL-7B Oracle loaded", "SUCCESS")
