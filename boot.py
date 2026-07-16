@@ -77,6 +77,12 @@ else:
 # ══════════════════════════════════════════════════════════
 # PHASE 1: PRE-FLIGHT SWEEP
 # ══════════════════════════════════════════════════════════
+print("💾 [SYSTEM] Phase 0b: Checking disk space...", flush=True)
+import shutil as _shutil
+_free_gb = _shutil.disk_usage("/kaggle/working").free / (1024**3) if os.path.isdir("/kaggle/working") else 999
+print(f"   {'✅' if _free_gb >= 25 else '⚠️'} {_free_gb:.1f}GB free "
+      f"(Whisper+Qwen+SigLIP+CLIP need ~22GB combined — clear /kaggle/working/huggingface_cache if low)", flush=True)
+
 print("🧹 [SYSTEM] Phase 1: Sweeping Zombie Processes...", flush=True)
 os.system("pkill -9 ffmpeg > /dev/null 2>&1 || true")
 os.system("pkill -9 ffprobe > /dev/null 2>&1 || true")

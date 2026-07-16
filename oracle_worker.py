@@ -74,6 +74,13 @@ BGE_MODEL = None
 def load_models():
     global QWEN_MODEL, QWEN_PROCESSOR, BGE_MODEL
 
+    import shutil
+    _free_gb = shutil.disk_usage("/kaggle/working").free / (1024**3)
+    if _free_gb < 18:
+        log(f"⛔ Skipping Qwen2.5-VL-7B — only {_free_gb:.1f}GB free, need ~18GB. "
+            "Oracle narration disabled this session until disk space is freed.", "ERROR")
+        return
+
     log("🧠 Loading Qwen2.5-VL-7B-Instruct (4-bit)...")
     try:
         from transformers import (

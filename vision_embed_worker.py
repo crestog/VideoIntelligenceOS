@@ -64,6 +64,13 @@ MODELS = {}
 def load_models():
     """Load all 4 vision models. Failures are non-fatal (model stays None)."""
 
+    import shutil
+    _free_gb = shutil.disk_usage("/kaggle/working").free / (1024**3)
+    if _free_gb < 5:
+        log(f"⛔ Skipping SigLIP/CLIP/Depth-Anything — only {_free_gb:.1f}GB free, need ~5GB. "
+            "Frame embedding disabled this session until disk space is freed.", "ERROR")
+        return
+
     # 1. SigLIP-SO400M
     log("👁️ Loading SigLIP-SO400M-patch14-384...")
     try:
