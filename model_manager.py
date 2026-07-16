@@ -421,6 +421,16 @@ def _rpc_embed_text(payload):
         return {"ok": False, "error": "empty text"}
 
     if mode in ("siglip", "clip"):
+        if mode == "siglip" and not WARM_MODELS.get('siglip_model'):
+            try:
+                load_siglip()
+            except Exception as e:
+                return {"ok": False, "error": f"siglip lazy-load failed: {str(e)[:150]}"}
+        if mode == "clip" and not WARM_MODELS.get('clip_model'):
+            try:
+                load_clip()
+            except Exception as e:
+                return {"ok": False, "error": f"clip lazy-load failed: {str(e)[:150]}"}
         if mode == "siglip":
             proc = WARM_MODELS.get('siglip_proc') or WARM_MODELS.get('siglip_processor')
             model = WARM_MODELS.get('siglip_model')
@@ -511,7 +521,7 @@ if __name__ == "__main__":
     log("🚀 Model Manager v2: warming the 7 foundational models...")
     ensure_analysis_tables()
 
-    for model in ["yolo", "whisper", "siglip", "clip", "easyocr",
+    for model in ["yolo", "whisper", "easyocr",
                   "grounding_dino", "sam"]:
         push_job("QUEUE_MODELS", {"model_name": model})
 

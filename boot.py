@@ -266,10 +266,12 @@ except Exception as _e:
 
 # Launch workers via Watchdog Threads
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"],      "🤖 [ENGINE]",  True), daemon=True).start()
-threading.Thread(target=run_with_watchdog, args=(["python", "-u", "oracle_worker.py"],      "🧠 [ORACLE]",  True), daemon=True).start()
-threading.Thread(target=run_with_watchdog, args=(["python", "-u", "vision_embed_worker.py"], "📐 [EMBED]",   True), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"],           "🖥️  [UI]",     False), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"],        "🎞️  [CV]",     False), daemon=True).start()
+time.sleep(20)  # stagger: let model_manager clear its HF Hub downloads before Oracle starts its own
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "oracle_worker.py"],      "🧠 [ORACLE]",  True), daemon=True).start()
+time.sleep(20)  # stagger again before the 3rd concurrent downloader starts
+threading.Thread(target=run_with_watchdog, args=(["python", "-u", "vision_embed_worker.py"], "📐 [EMBED]",   True), daemon=True).start()
 
 try:
     # Keep main orchestrator alive indefinitely
