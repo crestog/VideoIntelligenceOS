@@ -257,7 +257,12 @@ print("", flush=True)
 # ── Optional: Start Neo4j knowledge-graph engine ──
 print("🕸️ [SYSTEM] Phase 4a: Attempting Neo4j startup...", flush=True)
 try:
-    from tripartite_db import start_neo4j, ensure_neo4j_schema, get_neo4j_driver
+    from tripartite_db import start_neo4j, ensure_neo4j_schema, get_neo4j_driver, init_postgres
+    try:
+        init_postgres()
+        print("   ✅ PostgreSQL schema ready (frames/chunks tables).", flush=True)
+    except Exception as _pg_e:
+        print(f"   ⚠️ PostgreSQL schema init failed: {_pg_e}", flush=True)
     neo4j_ok = start_neo4j(timeout_sec=30)
     if neo4j_ok:
         _drv = get_neo4j_driver()

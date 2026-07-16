@@ -86,10 +86,9 @@ def load_dinov2():
 def load_whisper():
     from faster_whisper import WhisperModel
     log("🎙️ Loading Whisper-Large-v3...")
-    dev_idx = 1 if (torch.cuda.is_available() and torch.cuda.device_count() > 1) else 0
     WARM_MODELS['whisper_model'] = WhisperModel(
         "large-v3", device="cuda" if torch.cuda.is_available() else "cpu",
-        device_index=dev_idx, compute_type="float16" if torch.cuda.is_available() else "int8")
+        device_index=0, compute_type="float16" if torch.cuda.is_available() else "int8")
 
 def load_raft():
     from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
