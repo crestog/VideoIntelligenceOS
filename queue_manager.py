@@ -426,6 +426,24 @@ def get_queue_depth(queue_name):
     return r.llen(queue_name)
 
 
+def downstream_backlog():
+    """
+    Total work-in-flight behind the extraction stage: pending + processing
+    across QUEUE_ANALYZE / QUEUE_ORACLE / QUEUE_VISION_EMBED. The Ghost Worker
+    uses this for backpressure — while the GPU pipeline is saturated, pulling
+    more videos from Telegram only converts disk space into queue depth.
+    """
+    r = get_redis()
+    total = 0
+    pipe = r.pipeline()
+    for q in ("QUEUE_ANALYZE", "QUEUE_ORACLE", "QUEUE_VISION_EMBED"):
+        pipe.llen(q)
+        pipe.llen(_processing_key(q))
+    for n in pipe.execute():
+        total += int(n or 0)
+    return total
+
+
 # ═══════════════════════════════════════════════════════════
 # DLQ MANAGEMENT
 # ═══════════════════════════════════════════════════════════

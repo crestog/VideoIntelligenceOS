@@ -82,6 +82,11 @@ def get_frame_names(folder_name: str):
         return entry['names']
     names = sorted(os.path.basename(p)
                    for p in glob.glob(os.path.join(folder_path, 'frame_*.jpg')))
+    if not names:
+        # Full-res tier purged after processing (data_lifecycle.py) — the
+        # saved index preserves the filename list (frame idx + timestamps)
+        from data_lifecycle import load_frame_index
+        names = load_frame_index(folder_path)
     _frame_cache[folder_name] = {'names': names, 'mtime': mtime, 'ts': now}
     return names
 
@@ -96,7 +101,14 @@ def _frame_path(folder_name: str, filename: str, tier: str) -> str:
         if os.path.exists(p):
             return p
         # legacy folders have no preview tier — fall through to full
-    return os.path.join(folder_path, filename)
+    full_path = os.path.join(folder_path, filename)
+    if not os.path.exists(full_path):
+        # Full tier purged after processing — serve preview instead of 404
+        idx_part = filename.split('_ts_')[0]
+        p = os.path.join(folder_path, PREVIEW_DIR_NAME, idx_part + '.jpg')
+        if os.path.exists(p):
+            return p
+    return full_path
 
 
 # ═══════════════════════════════════════════════════════════

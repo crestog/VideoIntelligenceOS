@@ -63,6 +63,20 @@ print("   python pkgs :", "✅ all importable" if not _missing else f"❌ missin
 if _missing:
     raise SystemExit("Install failed — fix the packages above and re-run this cell.")
 
+# ── 2b. FULL LAYER-5 STACK (PostgreSQL + Neo4j + Qdrant + helper binaries) ──
+# Idempotent: safe to re-run; skips anything already installed/downloaded.
+print("🏗️ [2b/6] Running setup_layer5.sh (PostgreSQL, Neo4j, Qdrant musl build)…", flush=True)
+_setup = subprocess.Popen(["bash", "setup_layer5.sh"], stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, bufsize=1)
+for _line in iter(_setup.stdout.readline, ""):
+    print("   " + _line, end="", flush=True)
+_setup.wait()
+if _setup.returncode != 0:
+    print(f"   ⚠️ setup_layer5.sh exited rc={_setup.returncode} — boot continues; "
+          "Qdrant/Neo4j/PostgreSQL features may be degraded.", flush=True)
+else:
+    print("   ✅ Layer-5 stack ready.", flush=True)
+
 # ── 3. SECRETS → ENV (with checklist) ────────────────────────────────
 print("🔐 [3/6] Loading Kaggle secrets…", flush=True)
 SECRETS = [

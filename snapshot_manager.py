@@ -172,6 +172,8 @@ async def export_snapshot(progress_cb=None):
     app = Client(SNAP_SESSION, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     await app.start()
     try:
+        if not await _ensure_peer(app):
+            raise RuntimeError("Channel peer unresolvable — cannot upload snapshot")
         part_msg_ids = []
         for i, part in enumerate(parts, 1):
             cap = f"{SNAPSHOT_TAG} {manifest['created_utc']} part {i}/{len(parts)}"
@@ -206,8 +208,72 @@ async def export_snapshot(progress_cb=None):
 # ═══════════════════════════════════════════════════════════
 # IMPORT — restore the newest snapshot from the channel
 # ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+# PEER RESOLUTION — fresh sessions raise "Peer id invalid"
+# ═══════════════════════════════════════════════════════════
+async def _ensure_peer(app):
+    """
+    Make sure the channel peer is in this session's cache. A brand-new
+    Pyrogram session (fresh Kaggle boot) knows nothing about CHANNEL_ID, so
+    the first get_chat/send_message raises "Peer id invalid: -100...".
+    Fix: post via the HTTP Bot API — Telegram then pushes the update to this
+    MTProto session, which populates the peer cache. Same trick the Ghost
+    Worker uses. Returns True when the peer is usable.
+    """
+    try:
+        await app.resolve_peer(CHANNEL_ID)
+        return True
+    except Exception:
+        pass
+
+    import urllib.request
+    got_update = asyncio.Event()
+
+    async def _on_msg(client, message):
+        if message.chat and message.chat.id == CHANNEL_ID:
+            got_update.set()
+
+    from pyrogram.handlers import MessageHandler
+    handler = app.add_handler(MessageHandler(_on_msg))
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = json.dumps({"chat_id": CHANNEL_ID, "text": ".",
+                              "disable_notification": True}).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={'Content-Type': 'application/json'})
+        resp = json.load(urllib.request.urlopen(req, timeout=10))
+        try:
+            await asyncio.wait_for(got_update.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            pass
+        # Clean up the nudge message via HTTP API (works even if MTProto still can't)
+        if resp.get("ok"):
+            del_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+            del_payload = json.dumps({"chat_id": CHANNEL_ID,
+                                      "message_id": resp["result"]["message_id"]}).encode()
+            del_req = urllib.request.Request(del_url, data=del_payload,
+                                             headers={'Content-Type': 'application/json'})
+            try:
+                urllib.request.urlopen(del_req, timeout=10)
+            except Exception:
+                pass
+        await app.resolve_peer(CHANNEL_ID)
+        return True
+    except Exception as e:
+        log(f"Peer resolution failed: {e}", "ERROR")
+        return False
+    finally:
+        try:
+            app.remove_handler(*handler) if isinstance(handler, tuple) else app.remove_handler(handler)
+        except Exception:
+            pass
+
+
 async def _find_latest_manifest(app):
     """Pinned message first; fall back to scanning recent messages."""
+    if not await _ensure_peer(app):
+        log("Channel peer unresolvable — cannot scan for snapshots", "WARN")
+        return None
     try:
         chat = await app.get_chat(CHANNEL_ID)
         pinned = getattr(chat, 'pinned_message', None)

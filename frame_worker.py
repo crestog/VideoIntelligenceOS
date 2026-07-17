@@ -95,6 +95,16 @@ def extract_video_data(video_path, msg_id):
     # ── Disk Space Guard ──
     free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024 ** 3)
     while free_gb < DISK_PAUSE_THRESHOLD_GB:
+        # First try to free space ourselves: purge full-res tiers of already-
+        # processed videos before stalling and waiting for someone else to.
+        try:
+            from data_lifecycle import emergency_disk_sweep
+            emergency_disk_sweep(min_free_gb=DISK_PAUSE_THRESHOLD_GB)
+            free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024 ** 3)
+            if free_gb >= DISK_PAUSE_THRESHOLD_GB:
+                break
+        except Exception:
+            pass
         log(f"⏸️ Disk space low ({free_gb:.1f}GB) — pausing extraction...")
         time.sleep(30)
         free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024 ** 3)

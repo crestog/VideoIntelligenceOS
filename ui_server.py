@@ -7,7 +7,8 @@ from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 import nest_asyncio
-from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
+from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq, downstream_backlog
+from config import (DISK_DL_PAUSE_GB, QUEUE_VISION_MAX_PENDING, DOWNSTREAM_MAX_BACKLOG)
 from v17_backend import v17_router
 from admin_backend import admin_router
 from explorer_backend import explorer_router, rpc_call_sync
@@ -194,12 +195,40 @@ async def background_downloader():
             return
 
     import shutil
+
+    async def wait_for_capacity():
+        """
+        Backpressure gate — block new downloads while:
+          • free disk < DISK_DL_PAUSE_GB (frames of ONE long video can eat 300+ MB), or
+          • the extraction queue is already stocked, or
+          • the GPU pipeline (analyze/oracle/embed) backlog is saturated.
+        Checked before EVERY download, not just once per scan cycle — the old
+        once-per-cycle check let the disk run from 19 GB down to under 1 GB.
+        """
+        global GLOBAL_STATUS
+        while True:
+            free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
+            if free_gb < DISK_DL_PAUSE_GB:
+                GLOBAL_STATUS = f"⏸️ Storage low ({free_gb:.1f}GB) — downloads paused until frames purge"
+                await asyncio.sleep(30)
+                continue
+            try:
+                vision_depth = get_queue_depth("QUEUE_VISION")
+                backlog = downstream_backlog()
+            except Exception:
+                vision_depth, backlog = 0, 0
+            if vision_depth >= QUEUE_VISION_MAX_PENDING:
+                GLOBAL_STATUS = f"⏸️ Extraction queue full ({vision_depth} pending) — throttling downloads"
+                await asyncio.sleep(10)
+                continue
+            if backlog >= DOWNSTREAM_MAX_BACKLOG:
+                GLOBAL_STATUS = f"⏸️ GPU backlog {backlog} jobs — throttling downloads"
+                await asyncio.sleep(15)
+                continue
+            return
+
     while True:
-        free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-        if free_gb < 1.0:
-            GLOBAL_STATUS = f"⚠️ Storage Critical ({free_gb:.1f}GB left) - Pausing"
-            await asyncio.sleep(60)
-            continue
+        await wait_for_capacity()
 
         if not SCAN_TRIGGER.is_set():
             GLOBAL_STATUS = "💤 Idling. Background queue is empty."
@@ -257,6 +286,9 @@ async def background_downloader():
                     await asyncio.sleep(5)
 
             while True:
+                # Backpressure before EVERY download (disk + queue depth + GPU backlog)
+                await wait_for_capacity()
+
                 # Pick up admin panel changes IMMEDIATELY (mid-cycle), not
                 # only at the start of a scan. This is the category-control fix.
                 sync_category_queue()
@@ -536,19 +568,17 @@ async def api_spatial_proof(msg_id: int = 0, frame_idx: int = 0, query: str = ""
         from fastapi.responses import JSONResponse
         return JSONResponse({"error": "query is required"}, status_code=400)
 
-    import glob as _glob
     from fastapi.responses import StreamingResponse
     import io
 
-    # Locate frame file
-    frame_dir = os.path.join(VIDEO_DIR, f"frames_{msg_id}")
-    pattern = os.path.join(frame_dir, f"frame_{frame_idx:05d}_ts_*.jpg")
-    matches = _glob.glob(pattern)
-    if not matches:
+    # Locate frame file — re-extracts from the source video if the full-res
+    # tier was purged after processing (see data_lifecycle.py)
+    from data_lifecycle import ensure_full_frame
+    frame_path = await asyncio.to_thread(ensure_full_frame, msg_id, frame_idx)
+    if not frame_path:
         from fastapi.responses import JSONResponse
-        return JSONResponse({"error": f"Frame {frame_idx} not found for video {msg_id}"}, status_code=404)
-
-    frame_path = matches[0]
+        return JSONResponse({"error": f"Frame {frame_idx} not found for video {msg_id} "
+                             "(and re-extraction from source video failed)"}, status_code=404)
     try:
         from PIL import Image as PILImage
         pil_img = PILImage.open(frame_path).convert("RGB")

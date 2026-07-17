@@ -150,35 +150,42 @@ def _embed_images(model_key, proc_key, pil_imgs):
         return None
 
 
-def _depth_score(pil_img):
-    """Return mean predicted depth (scalar) for one PIL image."""
+DEPTH_BATCH = 16   # images per Depth-Anything forward pass
+RAFT_BATCH  = 4    # frame-pairs per RAFT forward pass (iterative model — keep small)
+
+
+def _depth_scores(pil_imgs):
+    """Return mean predicted depth per image (batched). Falls back to zeros."""
     model = MODELS.get("depth_model")
     proc = MODELS.get("depth_proc")
-    if model is None or proc is None:
-        return 0.0
+    if model is None or proc is None or not pil_imgs:
+        return [0.0] * len(pil_imgs)
     try:
-        inp = proc(images=pil_img, return_tensors="pt").to(device_0)
+        inp = proc(images=pil_imgs, return_tensors="pt").to(device_0)
         with torch.no_grad():
-            return float(model(**inp).predicted_depth.mean().item())
-    except Exception:
-        return 0.0
+            pred = model(**inp).predicted_depth          # (N, H, W)
+        return [float(d) for d in pred.mean(dim=(1, 2)).cpu()]
+    except Exception as e:
+        log(f"⚠️ Depth batch failed: {e}", "WARN")
+        return [0.0] * len(pil_imgs)
 
 
-def _motion_score(pil_prev, pil_curr):
-    """Return mean optical flow magnitude between two PIL images."""
+def _motion_scores(pil_pairs):
+    """Return mean optical-flow magnitude per (prev, curr) pair (batched)."""
     raft = MODELS.get("raft_model")
     transforms = MODELS.get("raft_transforms")
-    if raft is None or transforms is None:
-        return 0.0
+    if raft is None or transforms is None or not pil_pairs:
+        return [0.0] * len(pil_pairs)
     try:
-        t1 = torch.tensor(np.array(pil_prev)).permute(2, 0, 1).unsqueeze(0).to(device_0)
-        t2 = torch.tensor(np.array(pil_curr)).permute(2, 0, 1).unsqueeze(0).to(device_0)
+        t1 = torch.stack([torch.tensor(np.array(a)).permute(2, 0, 1) for a, _ in pil_pairs]).to(device_0)
+        t2 = torch.stack([torch.tensor(np.array(b)).permute(2, 0, 1) for _, b in pil_pairs]).to(device_0)
         i1, i2 = transforms(t1, t2)
         with torch.no_grad():
-            flow = raft(i1, i2)[-1]
-        return float(torch.norm(flow, dim=1).mean().item())
-    except Exception:
-        return 0.0
+            flow = raft(i1, i2)[-1]                      # (N, 2, H, W)
+        return [float(m) for m in torch.norm(flow, dim=1).mean(dim=(1, 2)).cpu()]
+    except Exception as e:
+        log(f"⚠️ RAFT batch failed: {e}", "WARN")
+        return [0.0] * len(pil_pairs)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -261,19 +268,19 @@ def process_embed_job(payload: dict):
     clip_points = []
     pg_rows = []   # (frame_id, video_uuid, video_path, msg_id, timestamp, frame_idx, depth, motion)
 
-    # Compute depth + motion per frame (sequential, each frame is cheap)
+    # Depth (batched) + motion (batched over consecutive-frame pairs) —
+    # replaces the old one-frame-at-a-time loop that dominated job latency
+    pils = [f[2] for f in all_frames]
     depths = []
-    motions = []
-    for i, (f_idx, ts, pil) in enumerate(all_frames):
-        depth = _depth_score(pil)
-        motion = 0.0
-        if i > 0:
-            _, _, prev_pil = all_frames[i - 1]
-            motion = _motion_score(prev_pil, pil)
-        depths.append(round(depth, 3))
-        motions.append(round(motion, 3))
-        if i % 20 == 0:
-            clear_ram()
+    for b in range(0, total, DEPTH_BATCH):
+        depths.extend(_depth_scores(pils[b: b + DEPTH_BATCH]))
+    motions = [0.0]   # first frame has no predecessor
+    pairs = list(zip(pils[:-1], pils[1:]))
+    for b in range(0, len(pairs), RAFT_BATCH):
+        motions.extend(_motion_scores(pairs[b: b + RAFT_BATCH]))
+    depths = [round(d, 3) for d in depths]
+    motions = [round(m, 3) for m in motions]
+    clear_ram()
 
     # Batch through SigLIP + CLIP
     for batch_start in range(0, total, EMBED_BATCH):
@@ -383,6 +390,11 @@ if __name__ == "__main__":
                 process_embed_job(payload)
             ack_job(QUEUE_VISION_EMBED, job, job_raw)
             log(f"🏁 EMBED #{msg_id} COMPLETE", "SUCCESS")
+            try:
+                from data_lifecycle import mark_stage_done
+                mark_stage_done(msg_id, "embedded")   # purges full-res frames once analyze is also done
+            except Exception:
+                pass
             try:
                 from db_schema import record_event
                 record_event(msg_id=msg_id, stage="embedded", status="completed",

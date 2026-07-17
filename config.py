@@ -62,10 +62,24 @@ SNAPSHOT_TAG        = '#VIOS_SNAPSHOT'   # caption tag used to find snapshots in
 # WORKER CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 MAX_RETRIES              = 3      # Retry attempts before dead-lettering
-DISK_PAUSE_THRESHOLD_GB  = 0.5    # CV engine pauses below this
-DISK_WARN_THRESHOLD_GB   = 1.5    # CV engine warns below this
-DISK_DL_PAUSE_GB         = 1.0    # Ghost Worker pauses downloads below this
+DISK_PAUSE_THRESHOLD_GB  = 2.0    # CV engine pauses below this (one long video can eat 300+ MB of frames)
+DISK_WARN_THRESHOLD_GB   = 4.0    # CV engine warns below this
+DISK_DL_PAUSE_GB         = 3.0    # Ghost Worker pauses downloads below this
 BATCH_FRAME_COUNT        = 200    # Frames per binary batch fetch in V17
+
+# ── Downloader backpressure: don't outrun the GPU pipeline ──
+# The Ghost Worker stops fetching new videos while the extraction queue or
+# the combined GPU backlog (analyze + oracle + embed) is above these caps,
+# so disk usage stays bounded by work-in-flight instead of channel size.
+QUEUE_VISION_MAX_PENDING   = int(os.environ.get('VIOS_VISION_MAX_PENDING', 4))
+DOWNSTREAM_MAX_BACKLOG     = int(os.environ.get('VIOS_DOWNSTREAM_MAX_BACKLOG', 30))
+
+# ── Frame lifecycle: full-res frames are a processing artifact ──
+# After a video is BOTH analyzed (YOLO/OCR) and embedded (SigLIP/CLIP/etc),
+# the full-res JPEG tier is deleted; the ~8 KB preview tier + thumbnails stay.
+# Spatial-proof re-extracts single full-res frames from the video on demand.
+PURGE_FULL_FRAMES = os.environ.get('VIOS_PURGE_FULL_FRAMES', '1') != '0'
+FRAME_INDEX_NAME  = 'frames_index.json'   # written at purge time so the UI keeps its frame list
 
 # ═══════════════════════════════════════════════════════════
 # SQLITE — shared connection settings (prevents "database is locked")

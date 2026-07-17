@@ -327,23 +327,37 @@ def _sample_frames(folder_id, fps):
         yield i, ts, frames[i]
 
 
+YOLO_BATCH = 16   # frames per YOLO forward pass — one batched call beats 16 sequential ones
+
+
 def analyze_frames(msg_id, folder_id, fps):
-    """YOLO + OCR per sampled frame → frame_notes table. Returns note count."""
+    """YOLO (batched) + OCR per sampled frame → frame_notes table. Returns note count."""
     yolo = WARM_MODELS.get('yolo_model')
     ocr = WARM_MODELS.get('ocr_reader')
-    notes = []
 
-    for idx, ts, path in _sample_frames(folder_id, fps):
-        objects = []
-        ocr_text = ""
-        if yolo:
+    sampled = list(_sample_frames(folder_id, fps))   # [(idx, ts, path), ...]
+    if not sampled:
+        return 0
+
+    # ── YOLO: batched inference over all sampled frames ──
+    objects_per_frame = [[] for _ in sampled]
+    if yolo:
+        for b_start in range(0, len(sampled), YOLO_BATCH):
+            batch = sampled[b_start: b_start + YOLO_BATCH]
             try:
-                res = yolo.predict(path, verbose=False, conf=0.35)[0]
-                names = res.names
-                for b in res.boxes:
-                    objects.append({"label": names[int(b.cls)], "conf": round(float(b.conf), 2)})
+                results = yolo.predict([p for _, _, p in batch], verbose=False, conf=0.35)
+                for j, res in enumerate(results):
+                    names = res.names
+                    objects_per_frame[b_start + j] = [
+                        {"label": names[int(b.cls)], "conf": round(float(b.conf), 2)}
+                        for b in res.boxes]
             except Exception:
                 pass
+
+    notes = []
+    for i, (idx, ts, path) in enumerate(sampled):
+        objects = objects_per_frame[i]
+        ocr_text = ""
         if ocr:
             try:
                 ocr_text = " ".join(t[1] for t in ocr.readtext(path) if t[2] > 0.4)
@@ -565,6 +579,11 @@ if __name__ == "__main__":
                 process_analyze_job(payload)
             ack_job(QUEUE_ANALYZE, job, job_raw)
             log(f"🏁 ANALYZE #{msg_id} COMPLETE", "SUCCESS")
+            try:
+                from data_lifecycle import mark_stage_done
+                mark_stage_done(msg_id, "analyzed")   # purges full-res frames once embed is also done
+            except Exception:
+                pass
             try:
                 from db_schema import record_event
                 record_event(msg_id=msg_id, stage="analyzed", status="completed",

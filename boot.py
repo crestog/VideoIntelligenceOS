@@ -276,8 +276,45 @@ except Exception as _e:
     print(f"   ⚠️ Neo4j startup skipped: {_e}", flush=True)
 
 print("🔷 [SYSTEM] Phase 4b: Starting Qdrant vector database server...", flush=True)
+
+
+def _qdrant_binary_ok(path):
+    """True if `path --version` exits 0. Returns (ok, stderr_snippet)."""
+    try:
+        _r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        return _r.returncode == 0, (_r.stderr or _r.stdout).strip()[:200]
+    except Exception as _e:
+        return False, str(_e)[:200]
+
+
+def _fetch_qdrant_musl(dest_dir, version="v1.18.2"):
+    """
+    Download the musl (statically linked) Qdrant build — the gnu build needs
+    GLIBC 2.38 while Kaggle's Ubuntu 22.04 ships 2.35. Self-heals stale
+    binaries left behind by older setup scripts. Returns True on success.
+    """
+    url = (f"https://github.com/qdrant/qdrant/releases/download/{version}/"
+           f"qdrant-x86_64-unknown-linux-musl.tar.gz")
+    print(f"   📥 Fetching Qdrant {version} (musl/static)...", flush=True)
+    rc = os.system(f"wget -q -O /tmp/qdrant.tar.gz '{url}' "
+                   f"&& tar -xzf /tmp/qdrant.tar.gz -C '{dest_dir}' "
+                   f"&& chmod +x '{dest_dir}/qdrant' && rm -f /tmp/qdrant.tar.gz")
+    return rc == 0
+
+
 try:
     _qdrant_bin = os.path.join(os.getcwd(), "qdrant")
+
+    # ── 0. Self-heal: broken (glibc-incompatible) or missing binary → musl build ──
+    _ok, _err = (_qdrant_binary_ok(_qdrant_bin) if os.path.isfile(_qdrant_bin) else (False, "not present"))
+    if not _ok:
+        print(f"   ⚠️ Qdrant binary unusable ({_err}) — re-downloading static build...", flush=True)
+        try:
+            os.remove(_qdrant_bin)
+        except OSError:
+            pass
+        _fetch_qdrant_musl(os.getcwd())
+
     if os.path.isfile(_qdrant_bin):
         # ── 1. Verify the binary is actually executable ──
         _ver_result = subprocess.run(

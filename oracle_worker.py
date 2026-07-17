@@ -113,19 +113,33 @@ def load_models():
 # ═══════════════════════════════════════════════════════════
 # NIM CLIENT (lazy, avoids import errors when openai missing)
 # ═══════════════════════════════════════════════════════════
-_nim_client = None
+_nim_client = None   # None = not checked yet | False = unavailable (cached) | client
 
 
 def get_nim_client():
+    """
+    Return the NVIDIA NIM client, or None when GraphRAG is unavailable.
+    The unavailable verdict is cached — without it, every chunk fired a
+    doomed API call that failed with "Header of type `authorization` was
+    missing" (the SDK sends no auth header when api_key is empty).
+    """
     global _nim_client
+    if _nim_client is False:
+        return None
     if _nim_client is not None:
         return _nim_client
+    if not NVIDIA_API_KEY:
+        log("⚠️ VIOS_NVIDIA_API_KEY not set — GraphRAG entity extraction disabled "
+            "(narratives + graph structure still stored)", "WARN")
+        _nim_client = False
+        return None
     try:
         from openai import OpenAI
         _nim_client = OpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY)
         return _nim_client
     except ImportError:
         log("⚠️ openai package missing — GraphRAG NIM extraction disabled", "WARN")
+        _nim_client = False
         return None
 
 
@@ -319,7 +333,7 @@ def process_oracle_job(payload: dict):
     os.makedirs(chunks_dir, exist_ok=True)
 
     previous_context = "This is the start of the video."
-    bge_points = []
+    bge_pending = []   # (point_id, narrative, payload) — encoded in one batch after the loop
     import sqlite3
     sqlite_rows = []
 
@@ -336,12 +350,13 @@ def process_oracle_job(payload: dict):
         end_t = min(start_t + chunk_size, duration)
         chunk_file = os.path.join(chunks_dir, f"chunk_{start_t}.mp4")
 
-        # Extract chunk via ffmpeg
+        # Extract chunk via ffmpeg — no audio track (-an): Qwen2.5-VL only
+        # consumes video frames, so encoding AAC per chunk was pure waste
         subprocess.run(
             ["ffmpeg", "-ss", str(start_t), "-i", video_path,
              "-t", str(end_t - start_t),
-             "-c:v", "libx264", "-preset", "ultrafast",
-             "-c:a", "aac", chunk_file, "-y"],
+             "-c:v", "libx264", "-preset", "ultrafast", "-an",
+             chunk_file, "-y"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
         if not os.path.exists(chunk_file):
@@ -356,24 +371,17 @@ def process_oracle_job(payload: dict):
         c_id_str = f"chunk_{v_uuid}_{start_t}"
         c_id_int = hash(c_id_str) & ((1 << 63) - 1)
 
-        # BGE embedding
-        if BGE_MODEL is not None and qdrant is not None and PointStruct is not None:
-            try:
-                bge_vec = BGE_MODEL.encode(narrative, normalize_embeddings=True).tolist()
-                bge_points.append(PointStruct(
-                    id=c_id_int,
-                    vector=bge_vec,
-                    payload={
-                        "chunk_id": c_id_str,
-                        "video_path": video_path,
-                        "msg_id": msg_id,
-                        "start_t": start_t,
-                        "end_t": end_t,
-                        "mode": mode,
-                    },
-                ))
-            except Exception as e:
-                log(f"⚠️ BGE embed failed chunk {c_id_str}: {e}", "WARN")
+        # BGE embedding — deferred: narratives are collected here and encoded
+        # in ONE batched forward pass after the chunk loop (per-chunk encode
+        # paid the full tokenize/transfer overhead for every single sentence)
+        bge_pending.append((c_id_int, narrative, {
+            "chunk_id": c_id_str,
+            "video_path": video_path,
+            "msg_id": msg_id,
+            "start_t": start_t,
+            "end_t": end_t,
+            "mode": mode,
+        }))
 
         # PostgreSQL insert
         if pg_conn is not None:
@@ -414,13 +422,19 @@ def process_oracle_job(payload: dict):
             except Exception as e:
                 log(f"⚠️ Neo4j insert failed for {c_id_str}: {e}", "WARN")
 
-    # Batch-upsert BGE vectors
-    if bge_points and qdrant is not None:
+    # Batch-encode all narratives in one BGE forward pass, then batch-upsert
+    if bge_pending and BGE_MODEL is not None and qdrant is not None and PointStruct is not None:
         try:
+            vecs = BGE_MODEL.encode([n for _, n, _ in bge_pending],
+                                    normalize_embeddings=True, batch_size=32)
+            bge_points = [
+                PointStruct(id=pid, vector=vec.tolist(), payload=meta)
+                for (pid, _n, meta), vec in zip(bge_pending, vecs)
+            ]
             qdrant.upsert(collection_name="chunks_bge", points=bge_points)
-            log(f"✅ Upserted {len(bge_points)} BGE chunk vectors")
+            log(f"✅ Upserted {len(bge_points)} BGE chunk vectors (batched encode)")
         except Exception as e:
-            log(f"⚠️ Qdrant upsert failed: {e}", "WARN")
+            log(f"⚠️ BGE encode/upsert failed: {e}", "WARN")
 
     # SQLite mirror
     if sqlite_rows:

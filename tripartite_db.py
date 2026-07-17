@@ -18,7 +18,6 @@ and Qdrant runs embedded (no server needed — just a local path).
 import os
 import subprocess
 import time
-import traceback
 
 from logger import vios_log
 from config import (
@@ -32,9 +31,14 @@ def log(msg, level="INFO"):
 
 
 # ═══════════════════════════════════════════════════════════
-# QDRANT — embedded, on-disk vector store
+# QDRANT — server mode (localhost:6333, launched by boot.py)
 # ═══════════════════════════════════════════════════════════
 _qdrant_client = None
+_qdrant_last_fail = 0.0
+QDRANT_RETRY_COOLDOWN_SEC = 60   # after a failed init, don't hammer the port on every job
+
+QDRANT_HOST = os.environ.get("VIOS_QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.environ.get("VIOS_QDRANT_PORT", 6333))
 
 # Collection specs: name → vector dimension
 QDRANT_COLLECTIONS = {
@@ -46,17 +50,24 @@ QDRANT_COLLECTIONS = {
 
 def init_qdrant():
     """
-    Create (or reuse) the embedded Qdrant client and ensure all 3 collections exist.
-    Returns the QdrantClient instance, or None if qdrant-client is not installed.
+    Create (or reuse) the Qdrant client and ensure all 3 collections exist.
+    Returns the QdrantClient instance, or None if the server is unreachable.
+
+    Failure is cached for QDRANT_RETRY_COOLDOWN_SEC: workers process jobs in a
+    tight loop, and without the cooldown a dead Qdrant produced a full traceback
+    per job. One short WARN line per cooldown window instead.
     """
-    global _qdrant_client
+    global _qdrant_client, _qdrant_last_fail
     if _qdrant_client is not None:
         return _qdrant_client
+    if time.time() - _qdrant_last_fail < QDRANT_RETRY_COOLDOWN_SEC:
+        return None
     try:
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 
-        client = QdrantClient(host="localhost", port=6333)
+        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT,
+                              timeout=10, check_compatibility=False)
 
         for name, dim in QDRANT_COLLECTIONS.items():
             if not client.collection_exists(name):
@@ -65,19 +76,19 @@ def init_qdrant():
                     vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
                 )
                 log(f"✅ Qdrant collection '{name}' created (dim={dim})")
-            else:
-                log(f"📦 Qdrant collection '{name}' already exists")
 
         _qdrant_client = client
-        log("✅ Qdrant online (embedded, on-disk)", "SUCCESS")
+        log(f"✅ Qdrant online ({QDRANT_HOST}:{QDRANT_PORT})", "SUCCESS")
         return client
 
     except ImportError:
         log("⚠️ qdrant-client not installed — vector search disabled", "WARN")
+        _qdrant_last_fail = time.time()
         return None
     except Exception as e:
-        log(f"❌ Qdrant init failed: {e}", "ERROR")
-        traceback.print_exc()
+        _qdrant_last_fail = time.time()
+        log(f"⚠️ Qdrant unreachable ({type(e).__name__}: {str(e)[:120]}) — "
+            f"vector writes skipped, retrying in {QDRANT_RETRY_COOLDOWN_SEC}s", "WARN")
         return None
 
 
