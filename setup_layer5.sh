@@ -145,9 +145,11 @@ fi
 # ────────────────────────────────────────────────────────────
 # 7. QDRANT SERVER BINARY (server mode — local/embedded mode only
 #    supports ONE process; Oracle + Embed + search need concurrent access)
+#    NOTE: We use the musl (static) build because Kaggle runs Ubuntu 22.04
+#    (glibc 2.35) but recent Qdrant gnu builds require glibc 2.38+.
 # ────────────────────────────────────────────────────────────
 QDRANT_VERSION="v1.18.2"
-echo "🔷 [7/7] Fetching Qdrant server binary (${QDRANT_VERSION})..."
+echo "🔷 [7/7] Fetching Qdrant server binary (${QDRANT_VERSION}, musl/static)..."
 
 # Always re-download if the binary doesn't pass --version
 _qdrant_ok=0
@@ -162,8 +164,9 @@ if [ -f "./qdrant" ]; then
 fi
 
 if [ "$_qdrant_ok" -eq 0 ]; then
+  # Use musl (statically linked) build — no glibc dependency
   wget -q -O /tmp/qdrant.tar.gz \
-    "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz" \
+    "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-musl.tar.gz" \
     && tar -xzf /tmp/qdrant.tar.gz -C . \
     && chmod +x ./qdrant \
     && rm -f /tmp/qdrant.tar.gz
