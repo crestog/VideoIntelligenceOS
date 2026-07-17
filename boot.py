@@ -279,21 +279,91 @@ print("🔷 [SYSTEM] Phase 4b: Starting Qdrant vector database server...", flush
 try:
     _qdrant_bin = os.path.join(os.getcwd(), "qdrant")
     if os.path.isfile(_qdrant_bin):
-        os.makedirs("/kaggle/working/qdrant_data", exist_ok=True)
-        _qdrant_env = os.environ.copy()
-        _qdrant_env["QDRANT__STORAGE__STORAGE_PATH"] = "/kaggle/working/qdrant_data"
-        subprocess.Popen([_qdrant_bin, "--disable-telemetry"], env=_qdrant_env,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # ── 1. Verify the binary is actually executable ──
+        _ver_result = subprocess.run(
+            [_qdrant_bin, "--version"],
+            capture_output=True, text=True, timeout=10
+        )
+        if _ver_result.returncode != 0:
+            print(f"   ❌ Qdrant binary exists but --version failed (rc={_ver_result.returncode}):", flush=True)
+            print(f"      stdout: {_ver_result.stdout.strip()[:200]}", flush=True)
+            print(f"      stderr: {_ver_result.stderr.strip()[:200]}", flush=True)
+            raise RuntimeError("Qdrant binary broken")
+
+        print(f"   ℹ️  {_ver_result.stdout.strip()}", flush=True)
+
+        # ── 2. Prepare storage + config ──
+        _qdrant_storage = "/kaggle/working/qdrant_data"
+        _qdrant_log = "/kaggle/working/qdrant_data/qdrant_server.log"
+        os.makedirs(_qdrant_storage, exist_ok=True)
+
+        # Write a minimal YAML config so Qdrant doesn't rely on env-vars alone
+        _qdrant_config = os.path.join(os.getcwd(), "qdrant_config.yaml")
+        with open(_qdrant_config, "w") as _cf:
+            _cf.write(
+                f"storage:\n"
+                f"  storage_path: {_qdrant_storage}\n"
+                f"  snapshots_path: {_qdrant_storage}/snapshots\n"
+                f"service:\n"
+                f"  host: 0.0.0.0\n"
+                f"  grpc_port: 6334\n"
+                f"  http_port: 6333\n"
+                f"telemetry_disabled: true\n"
+            )
+
+        # ── 3. Kill any leftover Qdrant from a prior run ──
+        subprocess.run("pkill -9 -f qdrant", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+
+        # ── 4. Launch with stderr captured to a log file ──
+        _qdrant_log_fh = open(_qdrant_log, "w")
+        _qdrant_proc = subprocess.Popen(
+            [_qdrant_bin, "--config-path", _qdrant_config],
+            stdout=_qdrant_log_fh,
+            stderr=subprocess.STDOUT,
+        )
+
+        # ── 5. Wait for readiness with early-exit on process death ──
         import urllib.request
         _qdrant_ready = False
-        for _ in range(30):
+        for _tick in range(40):
+            # Check if process died
+            _rc = _qdrant_proc.poll()
+            if _rc is not None:
+                _qdrant_log_fh.close()
+                print(f"   ❌ Qdrant process exited immediately (exit code {_rc}).", flush=True)
+                # Print the last 25 lines of the log
+                try:
+                    with open(_qdrant_log) as _lf:
+                        _lines = _lf.readlines()
+                        print("   📄 Qdrant log (last 25 lines):", flush=True)
+                        for _ll in _lines[-25:]:
+                            print(f"      {_ll.rstrip()}", flush=True)
+                except Exception:
+                    pass
+                break
             try:
                 urllib.request.urlopen("http://localhost:6333/", timeout=1)
                 _qdrant_ready = True
                 break
             except Exception:
                 time.sleep(1)
-        print(f"   {'✅ Qdrant server online' if _qdrant_ready else '⚠️ Qdrant server did not respond in time'} (localhost:6333).", flush=True)
+
+        if _qdrant_ready:
+            print("   ✅ Qdrant server online (localhost:6333).", flush=True)
+        elif _qdrant_proc.poll() is None:
+            # Still running but not responding
+            print("   ⚠️ Qdrant server started but did not respond in 40s (localhost:6333).", flush=True)
+            print(f"   📄 Check log: {_qdrant_log}", flush=True)
+            try:
+                with open(_qdrant_log) as _lf:
+                    _lines = _lf.readlines()
+                    print("   📄 Qdrant log (last 15 lines):", flush=True)
+                    for _ll in _lines[-15:]:
+                        print(f"      {_ll.rstrip()}", flush=True)
+            except Exception:
+                pass
     else:
         print("   ⚠️ ./qdrant binary not found (setup_layer5.sh may need re-running) — vector writes will fail this session.", flush=True)
 except Exception as _qe:

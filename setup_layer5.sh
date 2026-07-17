@@ -146,16 +146,39 @@ fi
 # 7. QDRANT SERVER BINARY (server mode — local/embedded mode only
 #    supports ONE process; Oracle + Embed + search need concurrent access)
 # ────────────────────────────────────────────────────────────
-echo "🔷 [7/7] Fetching Qdrant server binary..."
-(
-  if [ ! -f "./qdrant" ]; then
-    wget -q -O /tmp/qdrant.tar.gz "https://github.com/qdrant/qdrant/releases/download/v1.18.1/qdrant-x86_64-unknown-linux-gnu.tar.gz"
-    tar -xzf /tmp/qdrant.tar.gz -C .
-    chmod +x ./qdrant
-    rm -f /tmp/qdrant.tar.gz
+QDRANT_VERSION="v1.18.2"
+echo "🔷 [7/7] Fetching Qdrant server binary (${QDRANT_VERSION})..."
+
+# Always re-download if the binary doesn't pass --version
+_qdrant_ok=0
+if [ -f "./qdrant" ]; then
+  if ./qdrant --version >/dev/null 2>&1; then
+    _qdrant_ok=1
+    echo "   ✅ Qdrant binary already present and working: $(./qdrant --version 2>&1)"
+  else
+    echo "   ⚠️ Existing ./qdrant binary is broken — re-downloading..."
+    rm -f ./qdrant
   fi
-) || echo "   ⚠️ Qdrant binary download failed — vector search will stay in single-process embedded mode."
-[ -f "./qdrant" ] && echo "   ✅ Qdrant server binary ready."
+fi
+
+if [ "$_qdrant_ok" -eq 0 ]; then
+  wget -q -O /tmp/qdrant.tar.gz \
+    "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz" \
+    && tar -xzf /tmp/qdrant.tar.gz -C . \
+    && chmod +x ./qdrant \
+    && rm -f /tmp/qdrant.tar.gz
+
+  # Verify the freshly downloaded binary
+  if [ -f "./qdrant" ] && ./qdrant --version >/dev/null 2>&1; then
+    echo "   ✅ Qdrant binary ready: $(./qdrant --version 2>&1)"
+  else
+    echo "   ❌ Qdrant binary download/extraction failed!"
+    echo "   Debug info:"
+    ls -la ./qdrant 2>/dev/null || echo "      ./qdrant does not exist"
+    file ./qdrant 2>/dev/null || true
+    ./qdrant --version 2>&1 || true
+  fi
+fi
 
 echo ""
 echo "============================================================"

@@ -104,7 +104,7 @@ print("   cloudflared :", "✅" if os.path.isfile("./cloudflared") else "❌ dow
 # ── 5. IDEMPOTENT PRE-FLIGHT (safe to re-run this cell) ─────────────
 print("🧹 [5/6] Cleaning previous run…", flush=True)
 for pat in ("boot.py", "ui_server.py", "model_manager.py", "oracle_worker.py",
-            "vision_embed_worker.py", "frame_worker.py", "cloudflared", "redis-server"):
+            "vision_embed_worker.py", "frame_worker.py", "cloudflared", "redis-server", "qdrant"):
     sh(f"pkill -9 -f {pat} > /dev/null 2>&1 || true")
 sh("rm -f /tmp/vios_session_active")
 time.sleep(2)
