@@ -22,15 +22,17 @@ one 4-bit model are a corruption/OOM hazard.
 import os
 import threading
 
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# config before torch: importing it runs configure_environment(), which sets
+# HF_HOME/HF_HUB_CACHE/SENTENCE_TRANSFORMERS_HOME on the scratch disk. This
+# module pulls the heaviest weights in the system (Qwen2.5-VL-7B alone is
+# 16.6 GB), so if this import lands after torch the whole download goes to the
+# 20 GB output quota and the session runs out of disk mid-load.
+from config import HF_TOKEN, MODEL_CACHE_DIR
 
 import numpy as np
 import torch
 import cv2
 
-from config import HF_TOKEN
 from logger import vios_log
 
 MODELS = {}
@@ -49,9 +51,13 @@ def log(msg, level="INFO"):
 # ═══════════════════════════════════════════════════════════
 def load_all():
     """Warm every Omniscient model. Failures are per-model, not fatal."""
+    # Only log in when the token is not already the active one. huggingface_hub
+    # reads HF_TOKEN from the environment by itself, and calling login() on top
+    # of that prints a confusing "Environment variable HF_TOKEN is set and is
+    # the current active token independently..." note on every boot.
     try:
-        from huggingface_hub import login
-        if HF_TOKEN:
+        if HF_TOKEN and not os.environ.get("HF_TOKEN"):
+            from huggingface_hub import login
             login(token=HF_TOKEN)
     except Exception as e:
         log(f"HF login skipped: {e}", "WARN")

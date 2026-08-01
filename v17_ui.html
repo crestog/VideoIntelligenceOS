@@ -314,15 +314,6 @@ header.topbar {
 }
 .db-card .num { font-family: var(--font-mono); font-size: 22px; font-weight: 600; color: var(--accent); }
 .db-card .lbl { font-size: 11px; color: var(--text-dim); margin-top: 3px; text-transform: uppercase; letter-spacing: .06em; }
-.snap-bar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 13px 16px; margin-bottom: 18px;
-}
-.snap-bar .title { font-weight: 600; font-size: 13px; margin-right: 6px; }
-.snap-status { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); margin-left: auto; }
-.snap-status.ok { color: var(--ok); }
-.snap-status.err { color: var(--danger); }
 .db-browser { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .db-toolbar { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .db-select {
@@ -550,13 +541,6 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
   <div class="view" id="view-db">
     <div class="db-wrap">
       <div class="db-cards" id="dbCards"></div>
-
-      <div class="snap-bar">
-        <span class="title">📸 Telegram Snapshot</span>
-        <button class="btn-icon" id="btnExport" onclick="snapExport()">⬆ Export DB → Telegram</button>
-        <button class="btn-icon" id="btnImport" onclick="snapImport()">⬇ Import latest ← Telegram</button>
-        <span class="snap-status" id="snapStatus">idle</span>
-      </div>
 
       <div class="db-browser">
         <div class="db-toolbar">
@@ -1389,8 +1373,6 @@ let dbOffset = 0;
 let dbTotal = 0;
 const DB_LIMIT = 50;
 let dbSearchDebounce = null;
-let snapPollTimer = null;
-
 $('dbSearch').addEventListener('input', () => {
   clearTimeout(dbSearchDebounce);
   dbSearchDebounce = setTimeout(() => { dbOffset = 0; loadDbRows(); }, 250);
@@ -1399,7 +1381,6 @@ $('dbSearch').addEventListener('input', () => {
 async function refreshDbView() {
   loadDbOverview();
   loadDbTables();
-  pollSnapStatus(false);
 }
 
 async function loadDbOverview() {
@@ -1460,37 +1441,6 @@ async function loadDbRows() {
     const to = Math.min(dbOffset + DB_LIMIT, dbTotal);
     $('dbPageInfo').textContent = `${from}–${to} of ${dbTotal}`;
   } catch (e) { showToast('Failed to load table rows', 'error'); }
-}
-
-/* ── Snapshot controls ── */
-async function snapExport() {
-  try {
-    const r = await (await apiFetch('/api/db/export', { method: 'POST' })).json();
-    showToast(r.message, r.ok ? 'ok' : 'error');
-    if (r.ok) pollSnapStatus(true);
-  } catch (e) { showToast('Export request failed', 'error'); }
-}
-async function snapImport() {
-  if (!confirm('Import will OVERWRITE the current database with the latest Telegram snapshot. Continue?')) return;
-  try {
-    const r = await (await apiFetch('/api/db/import', { method: 'POST' })).json();
-    showToast(r.message, r.ok ? 'ok' : 'error');
-    if (r.ok) pollSnapStatus(true);
-  } catch (e) { showToast('Import request failed', 'error'); }
-}
-async function pollSnapStatus(loop) {
-  clearTimeout(snapPollTimer);
-  try {
-    const s = await (await apiFetch('/api/db/snapshot/status')).json();
-    const el = $('snapStatus');
-    el.textContent = s.state === 'idle' ? 'idle' : `${s.state}: ${s.detail || '…'}`;
-    el.className = 'snap-status' + (s.state === 'done' ? ' ok' : s.state === 'error' ? ' err' : '');
-    const running = s.state === 'exporting' || s.state === 'importing';
-    if (running || loop === true) {
-      if (running) snapPollTimer = setTimeout(() => pollSnapStatus(true), 2000);
-      else if (s.state === 'done') { loadDbOverview(); loadDbTables(); }
-    }
-  } catch (e) { /* transient */ }
 }
 
 /* ═══════════ CONSOLE LOGS ═══════════ */

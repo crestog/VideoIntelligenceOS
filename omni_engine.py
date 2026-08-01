@@ -28,11 +28,15 @@ import time
 import traceback
 import uuid as uuid_lib
 
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("HF_HOME", "/kaggle/working/huggingface_cache"
-                      if os.path.isdir("/kaggle/working") else
-                      os.path.expanduser("~/.cache/huggingface"))
+# config first, before torch/transformers — importing it runs
+# configure_environment(), which redirects every model cache to the scratch
+# disk. These libraries latch their cache paths at import time, so this import
+# order is load-bearing: reversing it puts ~19 GB of Omniscient weights back on
+# the 20 GB output quota, which is what caused "No space left on device".
+from config import (ARCHIVE_DIR, LAKE_DIR, API_ID, API_HASH, BOT_TOKEN,
+                    QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE, OMNI_DEDUP_SET,
+                    NIM_API_KEY, NIM_BASE_URL, NIM_MODEL, OMNI_DASHBOARD_PORT,
+                    OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS)
 
 import cv2
 import numpy as np
@@ -42,10 +46,6 @@ import scipy.signal
 import torch
 from PIL import Image
 
-from config import (ARCHIVE_DIR, LAKE_DIR, API_ID, API_HASH, BOT_TOKEN,
-                    QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE, OMNI_DEDUP_SET,
-                    NIM_API_KEY, NIM_BASE_URL, NIM_MODEL, OMNI_DASHBOARD_PORT,
-                    OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS)
 from logger import vios_log
 from queue_manager import (claim_job, ack_job, fail_job, push_job, get_queue_metrics,
                            wait_for_redis)

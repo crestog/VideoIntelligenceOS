@@ -9,23 +9,22 @@ on 2×T4 / 15 GB RAM / 57 GB disk Kaggle sessions, with Telegram as permanent st
 ## 1. The One Rule That Shapes Everything
 
 > **Videos are immutable and live in Telegram forever, keyed by message ID.
-> The database is the only mutable artifact — so the database itself is
-> versioned INTO the same Telegram channel.**
+> The database is a local index that can always be rebuilt from the channel.**
 
-Process once → snapshot the DB to Telegram → any future session imports the
-snapshot and is instantly searchable. Nothing is ever reprocessed.
+Every message id is scanned at most once ever (`scanned_ids`), and every
+processed video is remembered in the Redis dedup set, which is rebuilt from
+`lake.db` on boot. Nothing is reprocessed within or across a session.
 
 ```
 ┌─────────────────────── TELEGRAM CHANNEL ───────────────────────┐
 │  video #1 … video #N          (immutable, msg_id = primary key)│
-│  #VIOS_SNAPSHOT part 1..k     (compressed DB, ≤1.9 GB/part)    │
-│  #VIOS_SNAPSHOT_MANIFEST      (pointer msg, PINNED)            │
 └────────────────────────────────────────────────────────────────┘
-          ▲ export (snapshot_manager.py)        │ import on boot
-          │                                     ▼
+          │ full-channel metadata scan (incremental, resumable)
+          ▼
 ┌──────────────────────── KAGGLE SESSION ────────────────────────┐
 │                          lake.db (SQLite WAL)                  │
 │  posts / videos / frame_notes / transcripts / moments_search   │
+│  scanned_ids  ← channel coverage, so a rescan never repeats    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -120,22 +119,24 @@ structured analysis JSON: topic, intent, audience, hook type/analysis,
 retention mechanics, pattern interrupts (timestamped), ending type, CTA text,
 narrative structure, emotional arc, persuasion mechanisms, editing style.
 Stored per-video in an `analysis` table; each field FTS-indexed.
-New models later = new tables + re-export snapshot. The cycle never changes.
+New models later = new tables. The pipeline never changes.
 
-## 8. Snapshot Cycle (snapshot_manager.py)
+## 8. Channel Scan & Dedup
 
-**Export:** `VACUUM INTO` (transactional, WAL-safe, no downtime) → tar with
-`.thumbnails/` → zstd → split ≤1.9 GB → upload parts → upload + **pin** manifest.
-**Import:** read pinned manifest (O(1); fallback: scan) → download parts →
-sha256-verify → restore → **rebuild dedup set from `videos` table**.
-**Boot:** if `lake.db` is missing, auto-import runs before workers ignite
-(`VIOS_AUTO_IMPORT=0` to disable). UI buttons + status live in the Database tab.
+**Scan (ui_server.py Ghost Worker):** newest id via `get_chat_history(limit=1)`
+→ one set-difference against `posts` ∪ `scanned_ids` → fetch the gap in batches
+of 200 → record **every** id in `scanned_ids`, video or not. Coverage is the
+whole channel, but each id costs one Telegram round trip *ever*, so a rescan of
+a fully-covered channel is a single API call.
+
+**Dedup (dedup_manager.py):** `PROCESSED_VIDEOS_SET` ← `SELECT msg_id FROM
+videos`, rebuilt on boot because Redis is ephemeral and `lake.db` is not.
 
 ## 9. Database Tab (v17_ui.html)
 
 Overview cards (posts / harvested / extracted / frames / notes / transcript
 segments / DB size) · read-only browser over **every** table with search +
-pagination · snapshot Export/Import buttons with live status.
+pagination.
 
 ## 10. The Omniscient Layer (unified from the Layer-5 notebook)
 
@@ -174,12 +175,12 @@ Telegram Bot ──(PRIORITY lane)─▶ QUEUE_OMNI_ORACLE ─▶ Oracle Worker 
 
 | File | Role |
 |---|---|
-| `boot.py` | watchdog, Redis boot, snapshot auto-import, dedup rebuild |
+| `boot.py` | watchdog, Redis boot, storage budget, dedup rebuild |
 | `ui_server.py` | FastAPI shell, Ghost Worker, WebSocket, tunnel, `/omni` proxy |
 | `frame_worker.py` | ffmpeg dual-tier extraction → QUEUE_ANALYZE |
 | `model_manager.py` | GPU warm-up + analysis worker (transcripts, frame notes, FTS) |
-| `snapshot_manager.py` | Telegram DB export/import + dedup rebuild (CLI + API) |
-| `v17_backend.py` | workspace/frame/batch/notes/db/snapshot endpoints |
+| `dedup_manager.py` | rebuilds the Redis dedup set from `lake.db` (CLI + boot) |
+| `v17_backend.py` | workspace/frame/batch/notes/db endpoints |
 | `v17_ui.html` | Library · Workstation · Database · Omniscient (four views, one file) |
 | `queue_manager.py` | atomic reliable queues, DLQ, metrics |
 | `config.py` | single source of truth (paths, tiers, creds, queues) |

@@ -1,6 +1,6 @@
 import os, sqlite3, aiosqlite, redis, re, builtins, time, asyncio, urllib.request, json, uvicorn, threading, subprocess
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 import logging
 import aiofiles
 from fastapi.staticfiles import StaticFiles
@@ -12,7 +12,7 @@ from v17_backend import v17_router
 from admin_backend import admin_router
 from config import (BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR,
                     OMNI_ENABLED, OMNI_DEDUP_SET, OMNI_DASHBOARD_PORT,
-                    QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE)
+                    QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE, DISK_DL_PAUSE_GB)
 
 nest_asyncio.apply()
 
@@ -110,6 +110,12 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS posts (video_id INTEGER PRIMARY KEY, category_id INTEGER, creator_id INTEGER, likes INTEGER, caption TEXT, local_video_path TEXT, status TEXT)''')
     cursor.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS posts_search USING fts5(video_id UNINDEXED, caption, creator, category)''')
     cursor.execute('''CREATE TRIGGER IF NOT EXISTS sync_posts_search AFTER INSERT ON posts BEGIN INSERT INTO posts_search(video_id, caption, creator, category) VALUES (new.video_id, new.caption, (SELECT username FROM creators WHERE id = new.creator_id), (SELECT name FROM categories WHERE id = new.category_id)); END;''')
+    # Scan coverage: every message id we have ALREADY asked Telegram about,
+    # video or not. Without this, non-video ids (text posts, service messages,
+    # our own deleted ping) are absent from `posts` forever, so each scan
+    # re-fetched them — the channel gap never closed and every cycle replayed
+    # the whole history, which is what triggered the FloodWait storms.
+    cursor.execute("CREATE TABLE IF NOT EXISTS scanned_ids (video_id INTEGER PRIMARY KEY)")
     conn.commit()
     conn.close()
 
@@ -190,13 +196,21 @@ async def background_downloader():
             await ping.delete()
         except Exception as e:
             GLOBAL_STATUS = "❌ Bot access denied."
+            custom_print(f"❌ Cannot reach channel {CHANNEL_ID}: {str(e)[:120]}")
+            if "peer id invalid" in str(e).lower():
+                custom_print("   ↳ Telegram has not cached this channel for the bot. Fix: add the "
+                             "bot to the channel AS AN ADMIN, then post any message there once. "
+                             "A bot cannot resolve a channel it has never received an update from.")
             await asyncio.sleep(10)
             return
 
     import shutil
     while True:
+        # Guard the scratch tier (where videos/frames land), using the shared
+        # threshold rather than a local literal — frame_worker pauses at the
+        # same boundary, so the two stay in step.
         free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
-        if free_gb < 1.0:
+        if free_gb < DISK_DL_PAUSE_GB:
             GLOBAL_STATUS = f"⚠️ Storage Critical ({free_gb:.1f}GB left) - Pausing"
             await asyncio.sleep(60)
             continue
@@ -213,16 +227,33 @@ async def background_downloader():
         custom_print("⚡ Scanning Telegram for new Posts...")
 
         try:
-            ping = await app_client.send_message(CHANNEL_ID, ".", disable_notification=True)
-            latest_id = ping.id
-            await ping.delete()
+            # Read the newest id instead of posting-then-deleting a ping every
+            # cycle. The old probe wrote to the channel on each scan and the
+            # deleted id then sat in the "missing" list forever.
+            latest_id = 0
+            async for m in app_client.get_chat_history(CHANNEL_ID, limit=1):
+                latest_id = m.id
+            if not latest_id:
+                custom_print("⚠️ Channel appears empty — nothing to scan.")
+                await asyncio.sleep(30)
+                continue
 
             async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
-                missing_ids = []
-                for i in range(latest_id, 0, -1):
-                    async with conn.execute("SELECT video_id FROM posts WHERE video_id = ?", (i,)) as cursor:
-                        if not await cursor.fetchone():
-                            missing_ids.append(i)
+                # One set-difference instead of one SELECT per id. The old loop
+                # ran `latest_id` queries per scan (tens of thousands on a real
+                # channel) just to build this list. Full range is still covered
+                # — the whole channel is scanned, we just ask the DB once.
+                async with conn.execute("SELECT video_id FROM posts") as cursor:
+                    known = {row[0] for row in await cursor.fetchall()}
+                async with conn.execute("SELECT video_id FROM scanned_ids") as cursor:
+                    known.update(row[0] for row in await cursor.fetchall())
+                missing_ids = [i for i in range(latest_id, 0, -1) if i not in known]
+
+            if missing_ids:
+                custom_print(f"🔍 {len(missing_ids)} of {latest_id} message ids not yet scanned "
+                             f"({len(known)} already covered)")
+            else:
+                custom_print(f"✅ Channel fully scanned — all {latest_id} ids covered.")
 
             BATCH_SIZE = 200
             for i in range(0, len(missing_ids), BATCH_SIZE):
@@ -249,10 +280,16 @@ async def background_downloader():
                                 creator_row = await cursor.fetchone()
                                 creator_id = creator_row[0] if creator_row else 1
                             await conn.execute('INSERT OR IGNORE INTO posts (video_id, category_id, creator_id, likes, caption, status) VALUES (?, ?, ?, ?, ?, ?)', (msg.id, cat_id, creator_id, likes, clean_caption, 'Metadata_Only'))
+                        # Mark the whole chunk covered, including non-video ids,
+                        # so the next scan starts where this one finished.
+                        await conn.executemany('INSERT OR IGNORE INTO scanned_ids (video_id) VALUES (?)',
+                                               [(cid,) for cid in chunk])
                         await conn.commit()
-                    await asyncio.sleep(2)
-                except FloodWait as e: await asyncio.sleep(e.value)
-                except Exception as e: 
+                    await asyncio.sleep(0.5)
+                except FloodWait as e:
+                    custom_print(f"⚠️ FloodWait during scan: sleeping {e.value}s")
+                    await asyncio.sleep(e.value)
+                except Exception as e:
                     custom_print(f"⚠️ Scan Network Error: {str(e)[:50]}")
                     await asyncio.sleep(5)
 
@@ -355,6 +392,38 @@ async def background_downloader():
 
 # --- FASTAPI APP ---
 app = FastAPI(title="Insta-Vault Modular OS")
+
+
+# When the disk fills, SQLite raises "database or disk is full" from deep inside
+# a route and Starlette re-raises it through the ASGI stack — the client gets a
+# dropped connection and the console gets an unreadable traceback wall, which is
+# exactly what buried the real cause (no space) in the last failed run. These
+# handlers turn that into one actionable line plus a normal JSON error.
+@app.exception_handler(sqlite3.Error)
+async def _sqlite_error_handler(request: Request, exc: sqlite3.Error):
+    detail = str(exc)
+    if "disk is full" in detail or "database or disk is full" in detail:
+        custom_print(f"❌ DISK FULL while serving {request.url.path} — "
+                     f"free space on the scratch tier and restart.")
+        msg = ("Disk is full. Frames/models live on the scratch tier; free space "
+               "there or point VIOS_SCRATCH_DIR at a larger volume.")
+    else:
+        custom_print(f"❌ DB error on {request.url.path}: {detail[:160]}")
+        msg = f"Database error: {detail[:200]}"
+    return JSONResponse(status_code=503, content={"ok": False, "error": msg})
+
+
+@app.exception_handler(OSError)
+async def _os_error_handler(request: Request, exc: OSError):
+    # errno 28 == ENOSPC
+    if getattr(exc, "errno", None) == 28:
+        custom_print(f"❌ NO SPACE LEFT while serving {request.url.path}")
+        return JSONResponse(status_code=503, content={
+            "ok": False,
+            "error": "No space left on device. Free the scratch tier and retry."})
+    custom_print(f"❌ I/O error on {request.url.path}: {str(exc)[:160]}")
+    return JSONResponse(status_code=500,
+                        content={"ok": False, "error": str(exc)[:200]})
 
 app.mount("/data", StaticFiles(directory=VIDEO_DIR), name="v17_data")
 app.mount("/thumbs", StaticFiles(directory=os.path.join(LAKE_DIR, '.thumbnails')), name="v17_thumbs")

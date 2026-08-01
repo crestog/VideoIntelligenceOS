@@ -84,27 +84,34 @@ if not redis_ready:
 print("   ✅ Redis broker online (in-memory, no AOF).", flush=True)
 
 # ══════════════════════════════════════════════════════════
+# PHASE 2.5: STORAGE BUDGET
+# ══════════════════════════════════════════════════════════
+# Printed before any model downloads so a too-small scratch tier is visible
+# up front, rather than surfacing 3 minutes later as "No space left on device"
+# in the middle of a 16 GB Qwen shard.
+print("💽 [SYSTEM] Phase 2.5: Storage Budget...", flush=True)
+try:
+    from config import disk_report, SCRATCH_DIR, MODEL_CACHE_DIR
+
+    for label, path, free in disk_report():
+        print(f"   {label:<24} {free:6.1f} GB free   {path}", flush=True)
+
+    _scratch_free = next((f for lbl, _, f in disk_report() if lbl.startswith('SCRATCH')), 0.0)
+    # The two model stacks together pull ~28 GB of weights.
+    if _scratch_free < 30:
+        print(f"   ⚠️ Scratch has {_scratch_free:.1f} GB — the full model set needs ~28 GB.", flush=True)
+        print("      Expect some models to fail to load. Free space or set", flush=True)
+        print("      VIOS_SCRATCH_DIR to a larger volume.", flush=True)
+except Exception as e:
+    print(f"   ⚠️ Storage report unavailable: {e}", flush=True)
+
+# ══════════════════════════════════════════════════════════
 # PHASE 3: SESSION INIT — Fresh Session vs Crash Recovery
 # ══════════════════════════════════════════════════════════
 is_fresh_session = not os.path.exists(BOOT_MARKER)
 
 if is_fresh_session:
     print("🆕 [SYSTEM] Phase 3: Fresh Session Detected — initializing clean state...", flush=True)
-
-    # 3a. If the database is missing (factory-reset Kaggle), try restoring the
-    #     latest snapshot from the Telegram channel BEFORE anything else runs.
-    #     This is what makes "never reprocess" true across sessions.
-    try:
-        from config import DB_PATH
-        db_missing = not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) == 0
-        if db_missing and os.environ.get("VIOS_AUTO_IMPORT", "1") != "0":
-            print("   📥 lake.db missing — attempting snapshot import from Telegram...", flush=True)
-            import asyncio
-            from snapshot_manager import import_snapshot
-            restored = asyncio.run(import_snapshot())
-            print(f"   {'✅ Snapshot restored — library is instantly searchable.' if restored else '⚠️ No snapshot found — starting with a fresh database.'}", flush=True)
-    except Exception as e:
-        print(f"   ⚠️ Snapshot auto-import skipped: {e}", flush=True)
 
     try:
         from queue_manager import get_redis
@@ -127,10 +134,10 @@ if is_fresh_session:
         else:
             print("   ✅ Redis is clean — no stale data.", flush=True)
 
-        # 3b. Rebuild the dedup set from the database — Redis is ephemeral but
+        # 3a. Rebuild the dedup set from the database — Redis is ephemeral but
         #     the DB is the source of truth for what is already processed.
         try:
-            from snapshot_manager import rebuild_dedup_set
+            from dedup_manager import rebuild_dedup_set
             n = rebuild_dedup_set()
             if n:
                 print(f"   ✅ Dedup set rebuilt from DB: {n} videos marked processed.", flush=True)

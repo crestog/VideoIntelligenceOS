@@ -14,7 +14,6 @@ Endpoints:
   /api/db/tables                    → All tables + row counts          [NEW]
   /api/db/table/{name}              → Paginated read-only table browser [NEW]
   /api/db/overview                  → Headline counts + DB size        [NEW]
-  /api/db/export | /api/db/import   → Telegram snapshot cycle          [NEW]
   /api/logs                         → System log stream
 
 Performance notes:
@@ -24,7 +23,6 @@ Performance notes:
     becomes scrubbable in <2s regardless of video length.
 """
 
-import asyncio
 import glob
 import json
 import os
@@ -499,55 +497,6 @@ def db_overview():
         }
     finally:
         conn.close()
-
-
-# ═══════════════════════════════════════════════════════════
-# SNAPSHOT — Telegram export/import, background with status
-# ═══════════════════════════════════════════════════════════
-_snap_status = {"state": "idle", "detail": "", "started": 0.0}
-
-
-def _snap_running():
-    return _snap_status["state"] in ("exporting", "importing")
-
-
-async def _run_snapshot(kind: str):
-    import snapshot_manager
-    _snap_status.update(state=f"{kind}ing", detail="starting…", started=time.time())
-    try:
-        if kind == "export":
-            msg_id = await snapshot_manager.export_snapshot()
-            _snap_status.update(state="done",
-                                detail=f"Exported OK — manifest msg #{msg_id}")
-        else:
-            ok = await snapshot_manager.import_snapshot()
-            _snap_status.update(state="done" if ok else "error",
-                                detail="Imported OK — DB restored" if ok
-                                       else "No snapshot found in channel")
-    except Exception as e:
-        _snap_status.update(state="error", detail=str(e)[:300])
-        vios_log(f"Snapshot {kind} failed: {e}", "SNAP", "ERROR")
-
-
-@v17_router.post("/api/db/export")
-async def db_export():
-    if _snap_running():
-        return {"ok": False, "message": "A snapshot operation is already running"}
-    asyncio.create_task(_run_snapshot("export"))
-    return {"ok": True, "message": "Export started — uploading DB snapshot to Telegram"}
-
-
-@v17_router.post("/api/db/import")
-async def db_import():
-    if _snap_running():
-        return {"ok": False, "message": "A snapshot operation is already running"}
-    asyncio.create_task(_run_snapshot("import"))
-    return {"ok": True, "message": "Import started — restoring latest snapshot from Telegram"}
-
-
-@v17_router.get("/api/db/snapshot/status")
-def db_snapshot_status():
-    return dict(_snap_status)
 
 
 # ═══════════════════════════════════════════════════════════

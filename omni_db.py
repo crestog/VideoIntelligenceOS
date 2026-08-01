@@ -15,11 +15,13 @@ constraint is invisible in practice.
 
 import hashlib
 import os
+import shutil
 import subprocess
 import time
 
 from config import (QDRANT_PATH, OMNI_PG_DB, OMNI_PG_USER, OMNI_PG_PASSWORD,
-                    OMNI_PG_HOST, NEO4J_HOME, NEO4J_BOLT, JAVA_HOME)
+                    OMNI_PG_HOST, NEO4J_HOME, NEO4J_BOLT, JAVA_HOME,
+                    NEO4J_DATA_DIR)
 from logger import vios_log
 
 
@@ -60,33 +62,143 @@ def _start_postgres():
             break
 
 
+def _find_java():
+    """
+    Locate a JRE for Neo4j. Returns a JAVA_HOME path, or None.
+
+    Neo4j 5.x needs Java 17+. The configured default is Kaggle's usual OpenJDK
+    17 location, but that moves between image builds, so fall back to probing.
+    Returning None lets the caller report "no JRE" instead of Neo4j failing with
+    an opaque error 30-90 seconds later.
+    """
+    if os.path.isfile(os.path.join(JAVA_HOME, "bin", "java")):
+        return JAVA_HOME
+
+    for base in ("/usr/lib/jvm",):
+        if not os.path.isdir(base):
+            continue
+        # Newest version first — Neo4j rejects anything below 17.
+        for name in sorted(os.listdir(base), reverse=True):
+            cand = os.path.join(base, name)
+            if os.path.isfile(os.path.join(cand, "bin", "java")):
+                return cand
+
+    java = shutil.which("java")
+    if java:  # .../<home>/bin/java
+        return os.path.dirname(os.path.dirname(os.path.realpath(java)))
+    return None
+
+
+# Config lines appended once to neo4j.conf. Kept as a list so the marker check
+# below can detect a partially-configured file from an older revision.
+_NEO4J_SETTINGS = [
+    "dbms.security.auth_enabled=false",
+    "server.bolt.listen_address=0.0.0.0:7687",
+    # Storage on the scratch disk: the graph is fully rebuildable from
+    # Postgres + the frames, so it must not consume the 20 GB output quota.
+    f"server.directories.data={NEO4J_DATA_DIR}/data",
+    f"server.directories.logs={NEO4J_DATA_DIR}/logs",
+    f"server.directories.transaction.logs.root={NEO4J_DATA_DIR}/transactions",
+    # Explicit, modest heap. Unset, the JVM claims 25% of the 15 GB box (~3.8 GB)
+    # on top of two model stacks already competing for RAM — that OOM is the most
+    # likely reason the graph never came up.
+    "server.memory.heap.initial_size=512m",
+    "server.memory.heap.max_size=1g",
+    "server.memory.pagecache.size=512m",
+    # A single small instance does not need 4 GC threads on a 4-vCPU box.
+    "server.jvm.additional=-XX:ParallelGCThreads=2",
+]
+_NEO4J_MARKER = "# ── VIOS managed settings ──"
+
+
+def _write_neo4j_conf():
+    """Append VIOS settings to neo4j.conf exactly once. Returns True on success."""
+    conf = os.path.join(NEO4J_HOME, "conf", "neo4j.conf")
+    try:
+        with open(conf, "r", encoding="utf-8") as f:
+            content = f.read()
+        if _NEO4J_MARKER not in content:
+            with open(conf, "a", encoding="utf-8") as f:
+                f.write("\n" + _NEO4J_MARKER + "\n")
+                f.write("\n".join(_NEO4J_SETTINGS) + "\n")
+        return True
+    except OSError as e:
+        log(f"Neo4j config write failed ({e}) — graph disabled", "WARN")
+        return False
+
+
 def _start_neo4j():
-    """Launch Neo4j from the community tarball if present (daemonizes itself)."""
+    """
+    Launch Neo4j from the community tarball if present (daemonizes itself).
+
+    Every failure path logs a specific reason. The previous version swallowed
+    stdout/stderr into capture_output and discarded it, so a failed start
+    produced only "Neo4j: unreachable" 60s later with nothing to act on.
+    """
     neo4j_bin = os.path.join(NEO4J_HOME, "bin", "neo4j")
     if not os.path.exists(neo4j_bin):
-        log(f"Neo4j not installed at {NEO4J_HOME} — knowledge graph disabled", "WARN")
-        return
-    conf = os.path.join(NEO4J_HOME, "conf", "neo4j.conf")
-    try:  # one-time config: no auth, bind bolt on all interfaces
-        with open(conf, "r+", encoding="utf-8") as f:
-            content = f.read()
-            if "dbms.security.auth_enabled=false" not in content:
-                f.write("\ndbms.security.auth_enabled=false\n"
-                        "server.bolt.listen_address=0.0.0.0:7687\n")
-    except OSError:
-        pass
+        log(f"Neo4j not installed at {NEO4J_HOME} — knowledge graph disabled "
+            f"(setup.sh downloads it; check the tarball step)", "WARN")
+        return False
+
+    java_home = _find_java()
+    if not java_home:
+        log("No Java 17+ runtime found — Neo4j cannot start, knowledge graph "
+            "disabled (install openjdk-17-jre)", "WARN")
+        return False
+
+    for sub in ("data", "logs", "transactions"):
+        try:
+            os.makedirs(os.path.join(NEO4J_DATA_DIR, sub), exist_ok=True)
+        except OSError as e:
+            log(f"Neo4j data dir {NEO4J_DATA_DIR} not writable ({e}) — graph disabled", "WARN")
+            return False
+
+    if not _write_neo4j_conf():
+        return False
+
     env = os.environ.copy()
-    env["JAVA_HOME"] = JAVA_HOME
+    env["JAVA_HOME"] = java_home
+    # NEO4J_CONF is read by the launcher script; without it a relocated
+    # install can pick up a stale conf from a different prefix.
+    env["NEO4J_CONF"] = os.path.join(NEO4J_HOME, "conf")
+
     try:
-        subprocess.run([neo4j_bin, "start"], env=env, capture_output=True, timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f"Neo4j start failed: {e}", "WARN")
+        proc = subprocess.run([neo4j_bin, "start"], env=env, capture_output=True,
+                              text=True, timeout=180)
+    except FileNotFoundError as e:
+        log(f"Neo4j launcher not executable: {e}", "WARN")
+        return False
+    except subprocess.TimeoutExpired:
+        log("Neo4j start timed out after 180s — graph disabled", "WARN")
+        return False
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " · ")
+        log(f"Neo4j start failed (exit {proc.returncode}): {detail[:300]}", "WARN")
+        return False
+
+    return True
+
+
+def _tail_neo4j_log(lines=12):
+    """Last few lines of neo4j.log — the only place the real boot error appears."""
+    for candidate in (os.path.join(NEO4J_DATA_DIR, "logs", "neo4j.log"),
+                      os.path.join(NEO4J_HOME, "logs", "neo4j.log")):
+        try:
+            with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+                tail = [ln.rstrip() for ln in f.readlines()[-lines:] if ln.strip()]
+            if tail:
+                return tail
+        except OSError:
+            continue
+    return []
 
 
 def ensure_services():
     """Start Postgres + Neo4j (idempotent), verify connectivity, set flags."""
     _start_postgres()
-    _start_neo4j()
+    neo4j_started = _start_neo4j()
 
     # Postgres: quick probe with retries (service start is fast)
     for _ in range(10):
@@ -99,21 +211,35 @@ def ensure_services():
     log(f"PostgreSQL: {'✅ online' if AVAILABLE['postgres'] else '❌ unreachable'}",
         "SUCCESS" if AVAILABLE["postgres"] else "WARN")
 
-    # Neo4j: JVM boot takes ~15-30s — poll bolt connectivity
-    try:
-        from neo4j import GraphDatabase
-        for _ in range(20):
-            try:
-                with GraphDatabase.driver(NEO4J_BOLT, auth=None) as driver:
-                    driver.verify_connectivity()
-                AVAILABLE["neo4j"] = True
-                break
-            except Exception:
-                time.sleep(3)
-    except ImportError:
-        pass
-    log(f"Neo4j: {'✅ online' if AVAILABLE['neo4j'] else '❌ unreachable (graph features off)'}",
-        "SUCCESS" if AVAILABLE["neo4j"] else "WARN")
+    # Neo4j: JVM boot takes ~15-30s — poll bolt connectivity, but only if the
+    # launcher actually reported success. Probing for 60s after a failed start
+    # is what made this look like a mysterious timeout rather than a start error.
+    last_err = None
+    if neo4j_started:
+        try:
+            from neo4j import GraphDatabase
+            for _ in range(20):
+                try:
+                    with GraphDatabase.driver(NEO4J_BOLT, auth=None) as driver:
+                        driver.verify_connectivity()
+                    AVAILABLE["neo4j"] = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(3)
+        except ImportError:
+            last_err = "neo4j Python driver not installed (pip install neo4j)"
+
+    if AVAILABLE["neo4j"]:
+        log("Neo4j: ✅ online (knowledge graph active)", "SUCCESS")
+    else:
+        log("Neo4j: ❌ unreachable (graph features off)", "WARN")
+        if neo4j_started and last_err:
+            log(f"   └─ last bolt error: {str(last_err)[:200]}", "WARN")
+            for line in _tail_neo4j_log():
+                log(f"   │ {line[:200]}", "WARN")
+        log("   └─ VIOS continues without the graph: vectors + relational "
+            "indexing are unaffected, GraphRAG entity queries are disabled.", "WARN")
     return AVAILABLE
 
 

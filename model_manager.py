@@ -29,15 +29,17 @@ import sqlite3
 import sys
 import time
 
-# Professional Logging Filter: Mute raw library noise
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-os.environ.setdefault("HF_HOME", "/kaggle/working/huggingface_cache")
+# config MUST be imported before torch/transformers: importing it runs
+# configure_environment(), which points HF_HOME/TORCH_HOME/etc. at the scratch
+# disk. Those libraries read their cache paths at import time, so doing this
+# afterwards silently leaves the weights on the 20 GB output quota — which is
+# exactly what filled the disk when both model stacks ran together.
+from config import (DB_PATH, VIDEO_DIR, QUEUE_ANALYZE, SQLITE_TIMEOUT,
+                    PREVIEW_DIR_NAME, MODEL_CACHE_DIR)
 
 import torch
 
 from queue_manager import claim_job, ack_job, fail_job, pop_job, push_job, wait_for_redis
-from config import DB_PATH, VIDEO_DIR, QUEUE_ANALYZE, SQLITE_TIMEOUT, PREVIEW_DIR_NAME
 from logger import vios_log
 
 device_0 = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -84,9 +86,13 @@ def load_whisper():
     from faster_whisper import WhisperModel
     log("🎙️ Loading Whisper-Large-v3...")
     dev_idx = 1 if (torch.cuda.is_available() and torch.cuda.device_count() > 1) else 0
+    # download_root is explicit: faster-whisper uses its own CTranslate2 cache
+    # dir and does not honour HF_HOME, so without this the ~3 GB large-v3
+    # weights land on the output quota regardless of the env.
     WARM_MODELS['whisper_model'] = WhisperModel(
         "large-v3", device="cuda" if torch.cuda.is_available() else "cpu",
-        device_index=dev_idx, compute_type="float16" if torch.cuda.is_available() else "int8")
+        device_index=dev_idx, compute_type="float16" if torch.cuda.is_available() else "int8",
+        download_root=os.path.join(MODEL_CACHE_DIR, "faster_whisper"))
 
 def load_raft():
     from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
@@ -100,7 +106,12 @@ def load_yolo():
     import logging
     logging.getLogger("ultralytics").setLevel(logging.ERROR)
     log("🎯 Loading YOLOv11x...")
-    WARM_MODELS['yolo_model'] = YOLO("yolo11x.pt")
+    # Absolute path into the scratch cache. A bare "yolo11x.pt" is resolved
+    # relative to the cwd, so ultralytics downloaded 109 MB into the repo
+    # checkout on the output quota and re-downloaded it every fresh session.
+    yolo_weights = os.path.join(MODEL_CACHE_DIR, "ultralytics", "yolo11x.pt")
+    os.makedirs(os.path.dirname(yolo_weights), exist_ok=True)
+    WARM_MODELS['yolo_model'] = YOLO(yolo_weights)
     WARM_MODELS['yolo_model'].to(device_0)
 
 def load_easyocr():

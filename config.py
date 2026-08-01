@@ -4,13 +4,36 @@ VIOS Configuration — Single Source of Truth
 All paths, constants, queue names, and thresholds.
 Every module imports from here instead of defining its own paths.
 
-BASE_DIR resolution order:
-  1. VIOS_BASE_DIR environment variable (explicit override)
-  2. /kaggle/working/Insta-Vault  (default Kaggle deployment path)
-  3. ./Insta-Vault relative to this file (local development fallback)
+═══════════════════════════════════════════════════════════════════════════
+STORAGE TIERING — why this matters, and why it broke
+═══════════════════════════════════════════════════════════════════════════
+Kaggle gives you two very different pools of space:
+
+  /kaggle/working  → the OUTPUT quota (~20 GB). Survives the session, is what
+                     you can download, and is *small*.
+  /kaggle/temp     → scratch on the container disk (the rest of the ~57.6 GB).
+                     Vanishes with the session. Large.
+
+The Omniscient merge put HF_HOME on /kaggle/working. Each model stack fits
+there alone — model_manager.py pulls ~9.5 GB, omni_models.py pulls ~19 GB
+(Qwen2.5-VL-7B is 16.6 GB by itself) — but together they need ~28 GB in a
+20 GB quota. So the merged system died at "No space left on device" on the
+first Qwen shard, and every downstream failure (bge, siglip, "database or
+disk is full", the ASGI traceback) was that same wall.
+
+The rule now: anything re-downloadable or re-derivable lives on SCRATCH_DIR.
+Only irreplaceable state (lake.db, the Telegram session) stays on the output
+quota, since that is the one thing a finished Kaggle session leaves behind.
+
+  SCRATCH (big, ephemeral)   model weights, HF/torch caches, extracted frames,
+                             thumbnails, Qdrant vectors, Neo4j store, Postgres
+  OUTPUT  (small, kept)      lake.db, bot_session, state.txt, flagged dataset
+
+Override any of it with VIOS_BASE_DIR / VIOS_SCRATCH_DIR.
 """
 
 import os
+import shutil
 
 # ═══════════════════════════════════════════════════════════
 # FILESYSTEM PATHS
@@ -27,11 +50,126 @@ else:
 
 LAKE_DIR    = os.path.join(BASE_DIR, 'DataLake')
 DB_PATH     = os.path.join(LAKE_DIR, 'lake.db')
-VIDEO_DIR   = os.path.join(LAKE_DIR, 'videos')
-THUMB_DIR   = os.path.join(LAKE_DIR, '.thumbnails')
 FLAG_DIR    = os.path.join(LAKE_DIR, '_Flagged_Dataset')
 SESSION_DIR = os.path.join(LAKE_DIR, 'bot_session')
 STATE_FILE  = os.path.join(LAKE_DIR, 'state.txt')
+
+
+# ═══════════════════════════════════════════════════════════
+# SCRATCH DISK — the big ephemeral pool
+# ═══════════════════════════════════════════════════════════
+def _free_gb(path):
+    """Free space in GB for the mount holding `path` (0.0 if unmeasurable)."""
+    try:
+        probe = path
+        while probe and not os.path.isdir(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        return shutil.disk_usage(probe).free / (1024 ** 3)
+    except OSError:
+        return 0.0
+
+
+def _usable(path):
+    """True if `path` can be created and written to."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, '.vios_write_probe')
+        with open(probe, 'w') as f:
+            f.write('ok')
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _pick_scratch():
+    """
+    Choose the roomiest writable scratch location.
+
+    Preference order is deliberate — /kaggle/temp is Kaggle's documented
+    scratch mount and does not count against the output quota — but the final
+    pick is by measured free space, so this stays correct even if Kaggle
+    changes its disk geometry or we run somewhere else entirely.
+    """
+    if os.environ.get('VIOS_SCRATCH_DIR'):
+        return os.environ['VIOS_SCRATCH_DIR']
+
+    candidates = ['/kaggle/temp/vios_scratch', '/tmp/vios_scratch']
+    # Last resort: sit next to BASE_DIR (same quota, but always writable).
+    candidates.append(os.path.join(BASE_DIR, '_scratch'))
+
+    best, best_free = None, -1.0
+    for cand in candidates:
+        if not _usable(cand):
+            continue
+        free = _free_gb(cand)
+        if free > best_free:
+            best, best_free = cand, free
+    return best or os.path.join(BASE_DIR, '_scratch')
+
+
+SCRATCH_DIR = _pick_scratch()
+
+# Heavy, regenerable data — all on scratch.
+MODEL_CACHE_DIR = os.path.join(SCRATCH_DIR, 'model_cache')
+VIDEO_DIR       = os.path.join(SCRATCH_DIR, 'videos')       # videos + extracted frames
+THUMB_DIR       = os.path.join(SCRATCH_DIR, 'thumbnails')
+NEO4J_DATA_DIR  = os.path.join(SCRATCH_DIR, 'neo4j')
+
+
+# ═══════════════════════════════════════════════════════════
+# CACHE + LOG ENVIRONMENT
+# Must be set BEFORE torch/transformers import, so every entrypoint imports
+# config first. Uses setdefault throughout — an explicit env var always wins.
+# ═══════════════════════════════════════════════════════════
+def configure_environment():
+    """Point every model cache at scratch and mute duplicate-registration noise."""
+    hf_home = os.path.join(MODEL_CACHE_DIR, 'huggingface')
+    os.environ.setdefault('HF_HOME', hf_home)
+    os.environ.setdefault('HF_HUB_CACHE', os.path.join(hf_home, 'hub'))
+    os.environ.setdefault('SENTENCE_TRANSFORMERS_HOME',
+                          os.path.join(MODEL_CACHE_DIR, 'sentence_transformers'))
+    os.environ.setdefault('TORCH_HOME', os.path.join(MODEL_CACHE_DIR, 'torch'))
+    os.environ.setdefault('EASYOCR_MODULE_PATH', os.path.join(MODEL_CACHE_DIR, 'easyocr'))
+    os.environ.setdefault('YOLO_CONFIG_DIR', os.path.join(MODEL_CACHE_DIR, 'ultralytics'))
+    os.environ.setdefault('MPLCONFIGDIR', os.path.join(MODEL_CACHE_DIR, 'matplotlib'))
+    os.environ.setdefault('XDG_CACHE_HOME', os.path.join(MODEL_CACHE_DIR, 'xdg'))
+
+    # transformers probes for TensorFlow at import and loads it if installed.
+    # TF then re-registers the CUDA factories torch already registered, which is
+    # the entire source of the "Unable to register cuDNN/cuBLAS/cuFFT factory"
+    # and "computation placer already registered" spam. Nothing in VIOS uses TF,
+    # so refusing the import removes the cause instead of hiding the symptom.
+    os.environ.setdefault('USE_TF', '0')
+    os.environ.setdefault('USE_FLAX', '0')
+    os.environ.setdefault('TRANSFORMERS_NO_TF', '1')
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+    os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+    os.environ.setdefault('GLOG_minloglevel', '2')
+
+    os.environ.setdefault('HF_HUB_DISABLE_PROGRESS_BARS', '1')
+    os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
+    os.environ.setdefault('TRANSFORMERS_VERBOSITY', 'error')
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+
+configure_environment()
+
+
+def disk_report():
+    """
+    Per-tier free space, for the boot banner.
+    Returns [(label, path, free_gb), ...].
+    """
+    return [
+        ('OUTPUT  (kept, quota)', BASE_DIR,       _free_gb(BASE_DIR)),
+        ('SCRATCH (ephemeral)',   SCRATCH_DIR,    _free_gb(SCRATCH_DIR)),
+        ('MODELS  (on scratch)',  MODEL_CACHE_DIR, _free_gb(MODEL_CACHE_DIR)),
+    ]
 
 # ═══════════════════════════════════════════════════════════
 # QUEUE NAMES
@@ -49,20 +187,12 @@ PREVIEW_QUALITY  = 6              # ffmpeg -q:v for preview jpegs (2 best..31 wo
 FULL_QUALITY     = 2              # ffmpeg -q:v for full-res jpegs
 
 # ═══════════════════════════════════════════════════════════
-# SNAPSHOT (Telegram DB export/import)
-# ═══════════════════════════════════════════════════════════
-SNAPSHOT_DIR        = (os.path.join('/tmp', 'vios_snapshots') if os.path.isdir('/tmp')
-                       else os.path.join(LAKE_DIR, '.snapshots'))
-SNAPSHOT_CHUNK_MB   = 1900        # stay under the 2 GB MTProto bot limit per part
-SNAPSHOT_TAG        = '#VIOS_SNAPSHOT'   # caption tag used to find snapshots in the channel
-
-# ═══════════════════════════════════════════════════════════
 # WORKER CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 MAX_RETRIES              = 3      # Retry attempts before dead-lettering
-DISK_PAUSE_THRESHOLD_GB  = 0.5    # CV engine pauses below this
-DISK_WARN_THRESHOLD_GB   = 1.5    # CV engine warns below this
-DISK_DL_PAUSE_GB         = 1.0    # Ghost Worker pauses downloads below this
+DISK_PAUSE_THRESHOLD_GB  = 2.0    # CV engine pauses extraction below this (on scratch)
+DISK_WARN_THRESHOLD_GB   = 5.0    # CV engine warns below this
+DISK_DL_PAUSE_GB         = 3.0    # Ghost Worker pauses Telegram downloads below this
 BATCH_FRAME_COUNT        = 200    # Frames per binary batch fetch in V17
 
 # ═══════════════════════════════════════════════════════════
@@ -90,9 +220,11 @@ REDIS_PORT = int(os.environ.get('VIOS_REDIS_PORT', 6379))
 # ═══════════════════════════════════════════════════════════
 OMNI_ENABLED = os.environ.get('VIOS_OMNI', '1') != '0'
 
-# Filesystem
-ARCHIVE_DIR  = os.path.join(LAKE_DIR, 'omni_archive')     # bot downloads, frames, chunks
-QDRANT_PATH  = os.path.join(LAKE_DIR, 'qdrant_storage')   # embedded Qdrant store
+# Filesystem — both on scratch: bot downloads are re-fetchable from Telegram and
+# the vector store is rebuildable from the frames, so neither belongs in the
+# 20 GB output quota.
+ARCHIVE_DIR  = os.path.join(SCRATCH_DIR, 'omni_archive')     # bot downloads, frames, chunks
+QDRANT_PATH  = os.path.join(SCRATCH_DIR, 'qdrant_storage')   # embedded Qdrant store
 
 # Queues (dual-lane: bot uploads = PRIORITY, Ghost Worker harvest = DEFAULT)
 QUEUE_OMNI_VISION = 'QUEUE_OMNI_VISION'
