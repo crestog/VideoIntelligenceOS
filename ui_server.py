@@ -425,8 +425,17 @@ async def _os_error_handler(request: Request, exc: OSError):
     return JSONResponse(status_code=500,
                         content={"ok": False, "error": str(exc)[:200]})
 
+# StaticFiles raises at construction if the directory is missing, which crashes
+# the whole process before uvicorn ever starts — and the watchdog then reboots
+# it forever. config creates these, but a mount must never be the thing that
+# takes the UI down, so make sure they exist here too.
+for _static_dir in (VIDEO_DIR, THUMB_DIR):
+    os.makedirs(_static_dir, exist_ok=True)
+
 app.mount("/data", StaticFiles(directory=VIDEO_DIR), name="v17_data")
-app.mount("/thumbs", StaticFiles(directory=os.path.join(LAKE_DIR, '.thumbnails')), name="v17_thumbs")
+# THUMB_DIR, not LAKE_DIR/.thumbnails: thumbnails are regenerable, so they live
+# on the scratch tier now. This was the last hardcoded copy of the legacy path.
+app.mount("/thumbs", StaticFiles(directory=THUMB_DIR), name="v17_thumbs")
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="main_videos")
 
 app.include_router(v17_router)

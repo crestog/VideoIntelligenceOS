@@ -156,6 +156,19 @@ def configure_environment():
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
     os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
+    # Create the cache dirs now. Several libraries write a settings file on
+    # first import and silently fall back to /tmp if the directory is not
+    # already there — Ultralytics does exactly that ("user config directory
+    # ... is not writable, using /tmp/Ultralytics"), which would scatter caches
+    # back off the scratch tier one library at a time.
+    for _var in ('HF_HOME', 'HF_HUB_CACHE', 'SENTENCE_TRANSFORMERS_HOME',
+                 'TORCH_HOME', 'EASYOCR_MODULE_PATH', 'YOLO_CONFIG_DIR',
+                 'MPLCONFIGDIR', 'XDG_CACHE_HOME'):
+        try:
+            os.makedirs(os.environ[_var], exist_ok=True)
+        except OSError:
+            pass  # unwritable tier is reported by the boot storage budget
+
 
 configure_environment()
 
