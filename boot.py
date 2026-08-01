@@ -126,7 +126,7 @@ else:
     try:
         from queue_manager import recover_processing_jobs, get_queue_metrics
         recovered = 0
-        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE"):
+        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"):
             recovered += recover_processing_jobs(_q)
         if recovered > 0:
             print(f"   🔄 Recovered {recovered} orphaned job(s) from PROCESSING → DEFAULT queue.", flush=True)
@@ -153,6 +153,11 @@ else:
 # ══════════════════════════════════════════════════════════
 # PHASE 4: IGNITION
 # ══════════════════════════════════════════════════════════
+try:
+    from config import OMNI_ENABLED
+except Exception:
+    OMNI_ENABLED = False
+
 print("", flush=True)
 print("=" * 60, flush=True)
 print("🚀 IGNITING VIDEO INTELLIGENCE OS", flush=True)
@@ -160,6 +165,8 @@ print("=" * 60, flush=True)
 print("   🤖 [ENGINE]    → model_manager.py  (7 SOTA GPU models)", flush=True)
 print("   🖥️ [UI]        → ui_server.py      (FastAPI + Ghost Worker)", flush=True)
 print("   🎞️ [CV-ENGINE] → frame_worker.py   (OpenCV frame extraction)", flush=True)
+if OMNI_ENABLED:
+    print("   🔮 [OMNI]      → omni_engine.py    (Tri-partite DB + GraphRAG + Bot)", flush=True)
 print("=" * 60, flush=True)
 print("", flush=True)
 
@@ -167,6 +174,8 @@ print("", flush=True)
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"], "🖥️ [UI]", False), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"], "🎞️ [CV-ENGINE]", False), daemon=True).start()
+if OMNI_ENABLED:
+    threading.Thread(target=run_with_watchdog, args=(["python", "-u", "omni_engine.py"], "🔮 [OMNI]", True), daemon=True).start()
 
 try:
     # Keep main orchestrator alive indefinitely

@@ -46,8 +46,12 @@ def get_redis():
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════
-PRIORITY_QUEUES = {"QUEUE_VISION"}    # Queues with dual-lane priority routing
-ALL_QUEUES = ["QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_MODELS"]
+# Queues with dual-lane priority routing.
+# QUEUE_OMNI_*: Telegram-bot uploads ride the PRIORITY lane, Ghost Worker
+# harvest jobs ride the DEFAULT lane — the bot always wins.
+PRIORITY_QUEUES = {"QUEUE_VISION", "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"}
+ALL_QUEUES = ["QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_MODELS",
+              "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"]
 MAX_RETRIES = 3
 
 

@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Omniscient God-Mode Explorer</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --accent: #58a6ff; --green: #238636; }
+        body { background-color: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; padding: 20px; margin: 0; }
+        h1, h2, h3 { color: #fff; margin-top: 0; }
+        .header { border-bottom: 1px solid var(--border); padding-bottom: 15px; margin-bottom: 20px; }
+
+        .layout { display: flex; gap: 20px; height: calc(100vh - 100px); }
+        .sidebar { width: 250px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 15px; overflow-y: auto; }
+        .main-content { flex-grow: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+        .nav-link { display: block; padding: 10px; color: var(--accent); cursor: pointer; border-radius: 4px; border: 1px solid transparent; margin-bottom: 5px; }
+        .nav-link:hover { background: #1f2428; border-color: var(--border); }
+
+        .tabs { display: flex; gap: 10px; margin-bottom: 15px; }
+        .tab-btn { background: var(--card); color: var(--text); border: 1px solid var(--border); padding: 8px 15px; border-radius: 4px; cursor: pointer; }
+        .tab-btn.active { background: var(--green); color: #fff; border-color: var(--green); }
+
+        .scroll-area { flex-grow: 1; overflow-y: auto; padding-right: 10px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
+        .card { background: var(--card); border: 1px solid var(--border); padding: 15px; border-radius: 6px; display: flex; flex-direction: column; }
+
+        video, img { width: 100%; border-radius: 4px; background: #000; border: 1px solid #000; }
+        .meta-tag { display: inline-block; background: #1f2428; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; margin: 5px 5px 0 0; border: 1px solid var(--border); }
+
+        .action-btn { background: #21262d; color: var(--accent); border: 1px solid var(--border); padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.9em; flex: 1; }
+        .action-btn:hover { background: #30363d; }
+
+        .raw-dump { background: #010409; border: 1px solid var(--border); padding: 10px; font-family: monospace; font-size: 0.8em; color: #79c0ff; overflow-y: auto; display: none; word-wrap: break-word; }
+
+        #network-canvas { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 6px; background: #000; }
+        #graph-inspector { width: 300px; background: var(--card); border-left: 1px solid var(--border); padding: 15px; display: none; overflow-y: auto; }
+        .graph-container { display: flex; height: 100%; gap: 15px; }
+
+        /* Scrubber Styles */
+        .frame-player { position: relative; width: 100%; background: #000; border: 1px solid var(--border); border-radius: 6px; aspect-ratio: 16/9; display: flex; justify-content: center; align-items: center; }
+        #current-frame-img { max-height: 100%; max-width: 100%; object-fit: contain; }
+        .scrubber-controls { display: flex; align-items: center; gap: 10px; margin-top: 15px; }
+        input[type=range] { flex-grow: 1; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>👁️ Omniscient Database Explorer</h1>
+    </div>
+
+    <div class="layout">
+        <div class="sidebar">
+            <h3>Indexed Videos</h3>
+            <div id="vlist-content">Loading database...</div>
+        </div>
+
+        <div class="main-content" id="dashboard-main" style="display:none;">
+            <div style="display:flex; justify-content: space-between; align-items: center;">
+                <h2 id="dd-title">Select a Video</h2>
+            </div>
+
+            <div class="tabs">
+                <button class="tab-btn active" id="tab-macro" onclick="switchTab('macro')">1. Macro (Chunks &amp; Qwen)</button>
+                <button class="tab-btn" id="tab-micro" onclick="switchTab('micro')">2. Micro (Frames &amp; Vectors)</button>
+                <button class="tab-btn" id="tab-graph" onclick="switchTab('graph')">3. Neo4j Knowledge Graph</button>
+            </div>
+
+            <div id="view-macro" class="scroll-area">
+                <div id="chunk-grid" class="grid"></div>
+            </div>
+
+            <div id="view-micro" class="scroll-area" style="display:none;">
+                <div class="panel" style="display:flex; gap: 20px;">
+                    <div style="flex: 1.5;">
+                        <div class="frame-player">
+                            <img id="current-frame-img" src="" alt="Select a frame">
+                        </div>
+                        <div class="scrubber-controls">
+                            <button class="action-btn" style="flex: 0;" onclick="prevFrame()">◀ Prev</button>
+                            <input type="range" id="frame-slider" min="0" value="0" step="1" oninput="seekFrame(this.value)">
+                            <button class="action-btn" style="flex: 0;" onclick="nextFrame()">Next ▶</button>
+                        </div>
+                    </div>
+
+                    <div style="flex: 1; display: flex; flex-direction: column; gap: 15px;">
+                        <div class="card">
+                            <h3>Frame Metadata</h3>
+                            <div style="font-size: 1.1em; line-height: 1.6;">
+                                <strong>Frame Index:</strong> <span id="meta-idx" style="color:var(--accent);">0</span><br>
+                                <strong>Timestamp:</strong> <span id="meta-ts" style="color:var(--accent);">0.0s</span><br>
+                                <strong>Depth Score:</strong> <span id="meta-depth" style="color:var(--accent);">0.0</span><br>
+                                <strong>Motion Score:</strong> <span id="meta-motion" style="color:var(--accent);">0.0</span><br>
+                                <strong>Frame ID:</strong> <span id="meta-fid" style="font-size:0.7em; color:#888;">...</span>
+                            </div>
+                        </div>
+                        <div class="card" style="flex-grow: 1; display: flex; flex-direction: column;">
+                            <h3>Vector Math Explorer</h3>
+                            <div style="display: flex; gap: 10px;">
+                                <button class="action-btn" onclick="fetchCurrentVector('frames_siglip')">Fetch SigLIP (1152-d)</button>
+                                <button class="action-btn" onclick="fetchCurrentVector('frames_clip')">Fetch CLIP (768-d)</button>
+                            </div>
+                            <pre id="current-vector-dump" class="raw-dump" style="flex-grow: 1; display:block; margin-top: 15px;">Slide to a frame and click fetch to view raw vector arrays from Qdrant.</pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="view-graph" class="scroll-area" style="display:none;">
+                <div class="graph-container">
+                    <div id="network-canvas"></div>
+                    <div id="graph-inspector">
+                        <h3 style="margin-top:0;">Raw Node/Edge Data</h3>
+                        <p style="font-size:0.85em; color:#8b949e;">Click any item in the graph to view its database properties.</p>
+                        <pre id="graph-raw-json" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; color: #79c0ff;"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // NOTE: all URLs are RELATIVE (no leading slash) so this page works both
+        // served directly by the engine's Flask app AND behind the /omni proxy
+        // inside the unified VIOS workstation.
+        let rawNodes = {};
+        let rawEdges = {};
+        let globalFrames = [];
+        let currentFrameIndex = 0;
+        let currentVideoUuid = '';
+
+        // Load Videos
+        fetch('api/videos').then(r => r.json()).then(data => {
+            let html = '';
+            if (data.error) {
+                document.getElementById('vlist-content').innerHTML = `<p style="color:#f85149;">${data.error}</p>`;
+                return;
+            }
+            data.forEach(v => {
+                html += `<div class="nav-link" onclick="loadDeepDive('${v.video_uuid}')">🎥 ${v.video_uuid}</div>`;
+            });
+            document.getElementById('vlist-content').innerHTML = html || '<p>No videos found.</p>';
+        }).catch(e => {
+            document.getElementById('vlist-content').innerHTML = '<p style="color:#f85149;">Engine still booting — refresh shortly.</p>';
+        });
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(`tab-${tab}`).classList.add('active');
+
+            document.getElementById('view-macro').style.display = 'none';
+            document.getElementById('view-micro').style.display = 'none';
+            document.getElementById('view-graph').style.display = 'none';
+
+            document.getElementById(`view-${tab}`).style.display = 'block';
+        }
+
+        function loadDeepDive(uuid) {
+            document.getElementById('dashboard-main').style.display = 'flex';
+            document.getElementById('dd-title').innerText = `Forensic View: ${uuid}`;
+            document.getElementById('chunk-grid').innerHTML = 'Loading chunks from Postgres...';
+            currentVideoUuid = uuid;
+
+            // 1. Load Postgres Content
+            fetch(`api/video/${uuid}`).then(r => r.json()).then(data => {
+                // Render Chunks (Macro)
+                let cHtml = '';
+                (data.chunks || []).forEach(c => {
+                    cHtml += `<div class="card">
+                        <video controls preload="metadata" src="media/chunk/${uuid}/${c.start_t}"></video>
+                        <div style="margin-top:10px;">
+                            <span class="meta-tag">ID: ${c.chunk_id}</span>
+                            <span class="meta-tag">Time: ${c.start_t}s - ${c.end_t}s</span>
+                        </div>
+                        <div style="margin-top:15px; font-size:0.9em;">
+                            <strong style="color:#ff0066;">Qwen Narrative Transcript:</strong><br>
+                            ${c.description}
+                        </div>
+                    </div>`;
+                });
+                document.getElementById('chunk-grid').innerHTML = cHtml || '<p>No chunks indexed yet — Oracle may still be processing.</p>';
+
+                // Setup Micro Scrubber
+                globalFrames = data.frames || [];
+                if(globalFrames.length > 0) {
+                    document.getElementById('frame-slider').max = globalFrames.length - 1;
+                    seekFrame(0);
+                }
+            });
+
+            // 2. Load Neo4j Graph
+            fetch('api/neo4j/graph').then(r => r.json()).then(data => {
+                if (data.error) {
+                    document.getElementById('graph-raw-json').innerText = data.error;
+                    return;
+                }
+                rawNodes = {}; rawEdges = {};
+                data.nodes.forEach(n => rawNodes[n.id] = n.raw_properties);
+                data.edges.forEach(e => rawEdges[e.id] = e.raw_properties);
+
+                let nodes = new vis.DataSet(data.nodes);
+                let edges = new vis.DataSet(data.edges);
+                let container = document.getElementById('network-canvas');
+                let options = {
+                    nodes: { shape: 'dot', font: {color: 'white'} },
+                    edges: { font: {color: '#888'}, arrows: 'to' },
+                    physics: { stabilization: true },
+                    interaction: { hover: true }
+                };
+                let network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+
+                // On Click: Show raw JSON properties in the side panel
+                network.on("click", function (params) {
+                    document.getElementById('graph-inspector').style.display = 'block';
+                    if (params.nodes.length > 0) {
+                        document.getElementById('graph-raw-json').innerText = JSON.stringify(rawNodes[params.nodes[0]], null, 2);
+                    } else if (params.edges.length > 0) {
+                        document.getElementById('graph-raw-json').innerText = JSON.stringify(rawEdges[params.edges[0]], null, 2);
+                    } else {
+                        document.getElementById('graph-inspector').style.display = 'none';
+                    }
+                });
+            });
+        }
+
+        // Scrubber Logic
+        function seekFrame(index) {
+            currentFrameIndex = parseInt(index);
+            document.getElementById('frame-slider').value = currentFrameIndex;
+
+            let f = globalFrames[currentFrameIndex];
+            if(!f) return;
+
+            document.getElementById('current-frame-img').src = `media/frame/${currentVideoUuid}/${f.frame_idx}`;
+            document.getElementById('meta-idx').innerText = f.frame_idx;
+            document.getElementById('meta-ts').innerText = f.timestamp + 's';
+            document.getElementById('meta-depth').innerText = f.depth;
+            document.getElementById('meta-motion').innerText = f.motion;
+            document.getElementById('meta-fid').innerText = f.frame_id;
+            document.getElementById('current-vector-dump').innerText = "Click fetch to view raw vector arrays from Qdrant.";
+        }
+
+        function prevFrame() { if(currentFrameIndex > 0) seekFrame(currentFrameIndex - 1); }
+        function nextFrame() { if(currentFrameIndex < globalFrames.length - 1) seekFrame(currentFrameIndex + 1); }
+
+        function fetchCurrentVector(collection) {
+            let f = globalFrames[currentFrameIndex];
+            if(!f) return;
+
+            let div = document.getElementById('current-vector-dump');
+            div.innerText = `Querying Qdrant [${collection}]...`;
+
+            fetch(`api/vector/${collection}/${f.frame_id}`)
+                .then(r => r.json())
+                .then(data => {
+                    if(data.error) { div.innerText = data.error; }
+                    else { div.innerText = JSON.stringify(data.vector, null, 1); }
+                });
+        }
+    </script>
+</body>
+</html>

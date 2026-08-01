@@ -85,7 +85,55 @@ REDIS_HOST = os.environ.get('VIOS_REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.environ.get('VIOS_REDIS_PORT', 6379))
 
 # ═══════════════════════════════════════════════════════════
+# OMNISCIENT LAYER (tri-partite DB + GraphRAG engine)
+#   Set VIOS_OMNI=0 to disable the whole subsystem.
+# ═══════════════════════════════════════════════════════════
+OMNI_ENABLED = os.environ.get('VIOS_OMNI', '1') != '0'
+
+# Filesystem
+ARCHIVE_DIR  = os.path.join(LAKE_DIR, 'omni_archive')     # bot downloads, frames, chunks
+QDRANT_PATH  = os.path.join(LAKE_DIR, 'qdrant_storage')   # embedded Qdrant store
+
+# Queues (dual-lane: bot uploads = PRIORITY, Ghost Worker harvest = DEFAULT)
+QUEUE_OMNI_VISION = 'QUEUE_OMNI_VISION'
+QUEUE_OMNI_ORACLE = 'QUEUE_OMNI_ORACLE'
+OMNI_DEDUP_SET    = 'OMNI_PROCESSED_SET'
+
+# Hugging Face (for gated model downloads).
+#   Supplied by the launcher from Kaggle Secrets -> os.environ["HF_TOKEN"].
+#   Empty is fine: every model in the stack is currently public.
+HF_TOKEN = os.environ.get('HF_TOKEN', '')
+
+# NVIDIA NIM API (GraphRAG extraction + query rewrite + synthesis).
+#   Supplied by the launcher from Kaggle Secrets -> os.environ["VIOS_NIM_API_KEY"].
+#   Empty disables GraphRAG/synthesis only; vision + oracle pipelines still run.
+NIM_API_KEY  = os.environ.get('VIOS_NIM_API_KEY', '')
+NIM_BASE_URL = os.environ.get('VIOS_NIM_BASE_URL', 'https://integrate.api.nvidia.com/v1')
+NIM_MODEL    = os.environ.get('VIOS_NIM_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
+
+# PostgreSQL (Omniscient relational store)
+OMNI_PG_DB       = os.environ.get('VIOS_PG_DB', 'omnidb')
+OMNI_PG_USER     = os.environ.get('VIOS_PG_USER', 'omni')
+OMNI_PG_PASSWORD = os.environ.get('VIOS_PG_PASSWORD', 'omni')
+OMNI_PG_HOST     = os.environ.get('VIOS_PG_HOST', 'localhost')
+
+# Neo4j (knowledge graph). NEO4J_HOME = extracted community tarball.
+NEO4J_HOME = os.environ.get('VIOS_NEO4J_HOME',
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         'neo4j-community-5.18.0'))
+NEO4J_BOLT = os.environ.get('VIOS_NEO4J_BOLT', 'bolt://127.0.0.1:7687')
+JAVA_HOME  = os.environ.get('VIOS_JAVA_HOME', '/usr/lib/jvm/java-17-openjdk-amd64')
+
+# God-Mode Explorer dashboard (Flask inside omni_engine, proxied at /omni)
+OMNI_DASHBOARD_PORT = int(os.environ.get('VIOS_OMNI_DASHBOARD_PORT', 5000))
+
+# Processing modes: (chunk_seconds, qwen_fps, qwen_max_tokens, frame_step_fps)
+OMNI_MODE_OMNI  = {'chunk': 5.0,  'fps': 2.0, 'tokens': 150}
+OMNI_MODE_BLITZ = {'chunk': 15.0, 'fps': 1.0, 'tokens': 75}
+OMNI_BLITZ_SAMPLE_FPS = 0.4       # blitz-mode frame sampling rate
+
+# ═══════════════════════════════════════════════════════════
 # ENSURE DIRECTORIES EXIST
 # ═══════════════════════════════════════════════════════════
-for d in [LAKE_DIR, VIDEO_DIR, THUMB_DIR, FLAG_DIR]:
+for d in [LAKE_DIR, VIDEO_DIR, THUMB_DIR, FLAG_DIR, ARCHIVE_DIR]:
     os.makedirs(d, exist_ok=True)

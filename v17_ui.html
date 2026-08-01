@@ -381,6 +381,7 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
     <nav class="nav-tabs">
       <button class="nav-tab sel" id="navLibrary" onclick="switchView('library')">Library</button>
       <button class="nav-tab" id="navDb" onclick="switchView('db')">Database</button>
+      <button class="nav-tab" id="navOmni" onclick="switchView('omni')">Omniscient</button>
     </nav>
     <div class="topbar-status">
       <span><span class="dot"></span>ENGINE ONLINE</span>
@@ -573,6 +574,12 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- ═══════ OMNISCIENT VIEW (God-Mode Explorer, proxied at /omni) ═══════ -->
+  <div class="view" id="view-omni">
+    <iframe id="omniFrame" title="Omniscient Database Explorer"
+            style="flex:1; width:100%; border:0; background:#0d1117;"></iframe>
   </div>
 </div>
 
@@ -801,19 +808,30 @@ async function refreshLibrary(manual = false) {
 function switchView(target, push = true) {
   if (target !== 'workspace') teardownWorkspace();
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  const viewId = target === 'library' ? 'view-library' : target === 'db' ? 'view-db' : 'view-workspace';
+  const viewId = target === 'library' ? 'view-library'
+               : target === 'db' ? 'view-db'
+               : target === 'omni' ? 'view-omni'
+               : 'view-workspace';
   $(viewId).classList.add('active');
   $('navLibrary').classList.toggle('sel', target === 'library');
   $('navDb').classList.toggle('sel', target === 'db');
+  $('navOmni').classList.toggle('sel', target === 'omni');
   if (push) history.pushState({ view: target, folder: currentFolder }, '',
-    target === 'library' ? '#library' : target === 'db' ? '#db' : `#ws/${currentFolder}`);
+    target === 'library' ? '#library' : target === 'db' ? '#db'
+    : target === 'omni' ? '#omni' : `#ws/${currentFolder}`);
   if (target === 'library') refreshLibrary(false);
   if (target === 'db') refreshDbView();
+  if (target === 'omni') {
+    // Lazy-load the God-Mode Explorer iframe on first open (proxied Flask app)
+    const fr = $('omniFrame');
+    if (!fr.src) fr.src = '/omni/';
+  }
 }
 window.addEventListener('popstate', e => {
   const s = e.state;
   if (!s || s.view === 'library') switchView('library', false);
   else if (s.view === 'db') switchView('db', false);
+  else if (s.view === 'omni') switchView('omni', false);
   else if (s.folder) openWorkspace(s.folder, false);
 });
 

@@ -10,7 +10,9 @@ import nest_asyncio
 from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
 from v17_backend import v17_router
 from admin_backend import admin_router
-from config import BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR
+from config import (BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR,
+                    OMNI_ENABLED, OMNI_DEDUP_SET, OMNI_DASHBOARD_PORT,
+                    QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE)
 
 nest_asyncio.apply()
 
@@ -320,7 +322,21 @@ async def background_downloader():
                     elif not REDIS_CACHE:
                         push_job("QUEUE_VISION", {"msg_id": target_vid, "path": target_video}, is_priority=is_active_cat)
                         custom_print(f"📤 Queued #{target_vid} for CV Engine (no Redis)")
-                    
+
+                    # Omniscient pipeline: harvested videos ride the DEFAULT
+                    # lane (bot uploads own the PRIORITY lane in the engine)
+                    if OMNI_ENABLED:
+                        try:
+                            omni_uuid = f"tg{target_vid}"
+                            if not REDIS_CACHE or REDIS_CACHE.sadd(OMNI_DEDUP_SET, omni_uuid):
+                                omni_job = {"uuid": omni_uuid, "path": target_video,
+                                            "mode": "blitz", "source": "harvest"}
+                                push_job(QUEUE_OMNI_VISION, omni_job, is_priority=False)
+                                push_job(QUEUE_OMNI_ORACLE, omni_job, is_priority=False)
+                                custom_print(f"🔮 Queued #{target_vid} for Omniscient Engine (⚪ DEFAULT)")
+                        except Exception as e:
+                            custom_print(f"⚠️ Omni queue push failed for #{target_vid}: {str(e)[:60]}")
+
                     await asyncio.sleep(4)
 
                 except FloodWait as e: 
@@ -361,6 +377,60 @@ def get_status():
     except:
         free_gb = "N/A"
     return {"status": GLOBAL_STATUS, "queue": metrics, "disk_free": free_gb}
+
+# ── OMNISCIENT DASHBOARD PROXY ──
+# The God-Mode Explorer (Flask) lives inside omni_engine.py on localhost so it
+# can share the embedded Qdrant store with the workers. We reverse-proxy it at
+# /omni so the workstation's "Omniscient" tab (and cloudflared) can reach it.
+_OMNI_DASH_URL = f"http://127.0.0.1:{OMNI_DASHBOARD_PORT}"
+_HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
+
+
+@app.get("/omni")
+async def omni_root_redirect():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/omni/")   # trailing slash → relative URLs resolve
+
+
+@app.api_route("/omni/{path:path}", methods=["GET", "POST"])
+async def omni_proxy(request: Request, path: str = ""):
+    try:
+        import httpx
+    except ImportError:
+        return HTMLResponse("<h3>httpx not installed — run setup.sh</h3>", status_code=500)
+    try:
+        client = httpx.AsyncClient(base_url=_OMNI_DASH_URL,
+                                   timeout=httpx.Timeout(10.0, read=None))
+        fwd_headers = {k: v for k, v in request.headers.items()
+                       if k.lower() not in _HOP_HEADERS}
+        req = client.build_request(request.method, f"/{path}",
+                                   params=request.query_params,
+                                   headers=fwd_headers,
+                                   content=await request.body())
+        resp = await client.send(req, stream=True)
+        resp_headers = {k: v for k, v in resp.headers.items()
+                        if k.lower() not in _HOP_HEADERS}
+
+        async def _stream():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(_stream(), status_code=resp.status_code,
+                                 headers=resp_headers,
+                                 media_type=resp.headers.get("content-type"))
+    except Exception as e:
+        return HTMLResponse(
+            "<html><body style='background:#0d1117;color:#c9d1d9;font-family:sans-serif;"
+            "padding:50px;text-align:center;'><h2>🔮 Omniscient Engine is still booting…</h2>"
+            f"<p>The dashboard will appear once models finish loading.</p>"
+            f"<p style='color:#8b949e;font-size:0.8em'>{type(e).__name__}</p>"
+            "</body></html>", status_code=503)
+
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):

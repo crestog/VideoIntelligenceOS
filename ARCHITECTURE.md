@@ -134,16 +134,54 @@ Overview cards (posts / harvested / extracted / frames / notes / transcript
 segments / DB size) · read-only browser over **every** table with search +
 pagination · snapshot Export/Import buttons with live status.
 
-## 10. File Map
+## 10. The Omniscient Layer (unified from the Layer-5 notebook)
+
+A second, independent intelligence pipeline (`omni_engine.py`, enabled via
+`VIOS_OMNI=1`, the default) running as a fourth watchdog process:
+
+```
+Ghost Worker ──(DEFAULT lane)──▶ QUEUE_OMNI_VISION ─▶ Vision Worker ─▶ PG + Qdrant
+Telegram Bot ──(PRIORITY lane)─▶ QUEUE_OMNI_ORACLE ─▶ Oracle Worker ─▶ PG + Qdrant + Neo4j
+```
+
+* **Tri-partite DB:** PostgreSQL (frames/chunks + Qwen narratives), Qdrant
+  embedded (SigLIP 1152-d / CLIP 768-d frame vectors, BGE 1024-d chunk
+  vectors), Neo4j (Video→Chunk→Narrative graph + GraphRAG entities via
+  NVIDIA NIM).
+* **Priority routing:** every video the Ghost Worker harvests is auto-queued
+  on the DEFAULT lane (`mode=blitz`); videos uploaded directly to the
+  Telegram bot ride the PRIORITY lane (`blitz` or `omni` mode, user choice)
+  and always pre-empt harvest jobs. Both use queue_manager v3 (atomic
+  claims, 3×retry, DLQ, crash recovery on boot).
+* **Search:** any text message to the bot triggers hybrid retrieval
+  (NIM query rewrite → BGE chunk hit → SigLIP+CLIP frame scoring → peak
+  detection → spatial proof via OCR/GroundingDINO/SAM → Qwen2.5-VL clip
+  analysis → NIM GraphRAG synthesis).
+* **God-Mode Explorer:** Flask dashboard inside the engine process
+  (localhost:5000) — chunk narratives, frame scrubber with depth/motion,
+  raw Qdrant vectors, interactive Neo4j graph. Reverse-proxied by
+  `ui_server` at `/omni` and embedded as the **Omniscient** tab in
+  `v17_ui.html`. (Embedded Qdrant is single-process — this is why the
+  dashboard lives in the engine and is proxied, not served directly.)
+* **Models:** GPU 0 → GroundingDINO, SAM, Depth-Anything-V2, RAFT, SigLIP,
+  CLIP, BGE, EasyOCR · GPU 1 → Qwen2.5-VL-7B (4-bit NF4), generation
+  serialized behind a lock (oracle worker + search share it).
+
+## 11. File Map
 
 | File | Role |
 |---|---|
 | `boot.py` | watchdog, Redis boot, snapshot auto-import, dedup rebuild |
-| `ui_server.py` | FastAPI shell, Ghost Worker, WebSocket, tunnel |
+| `ui_server.py` | FastAPI shell, Ghost Worker, WebSocket, tunnel, `/omni` proxy |
 | `frame_worker.py` | ffmpeg dual-tier extraction → QUEUE_ANALYZE |
 | `model_manager.py` | GPU warm-up + analysis worker (transcripts, frame notes, FTS) |
 | `snapshot_manager.py` | Telegram DB export/import + dedup rebuild (CLI + API) |
 | `v17_backend.py` | workspace/frame/batch/notes/db/snapshot endpoints |
-| `v17_ui.html` | Library · Workstation · Database (three views, one file) |
+| `v17_ui.html` | Library · Workstation · Database · Omniscient (four views, one file) |
 | `queue_manager.py` | atomic reliable queues, DLQ, metrics |
 | `config.py` | single source of truth (paths, tiers, creds, queues) |
+| `omni_engine.py` | Omniscient workers + Telegram bot + God-Mode dashboard |
+| `omni_db.py` | PostgreSQL / Qdrant / Neo4j layer, service self-healing |
+| `omni_models.py` | Omniscient perception stack + Qwen oracle (locked) |
+| `omni_prompts.py` | GraphRAG + VideoRAG prompt suite |
+| `omni_dashboard.html` | God-Mode Explorer UI (relative URLs → proxy-safe) |
