@@ -84,3 +84,60 @@ print("⚙️ [SYSTEM] Provisioning Environment...")
 os.system("bash setup.sh > setup_logs.txt 2>&1") 
 os.system("python boot.py")
 ```
+
+### Launching the Omniscient branch (`feature/omniscient-unified`)
+
+The unified build adds the tri-partite database (PostgreSQL + Qdrant + Neo4j), the
+Qwen2.5-VL Oracle, GraphRAG, and the God-Mode Explorer tab. It needs a longer
+`setup.sh` run (Java 17, PostgreSQL, Neo4j) and two extra secrets. Use this cell:
+
+```python
+import os, subprocess
+from kaggle_secrets import UserSecretsClient
+
+BRANCH    = "feature/omniscient-unified"
+WORKSPACE = "/kaggle/working/vios_system"
+secrets   = UserSecretsClient()
+
+# ── Credentials (all injected as env vars; nothing is hardcoded in the repo) ──
+repo = f"https://crestog:{secrets.get_secret('github_token')}@github.com/crestog/VideoIntelligenceOS.git"
+
+for env_key, secret_name in [("HF_TOKEN", "hf_token"), ("VIOS_NIM_API_KEY", "nim_api_key")]:
+    try:
+        os.environ[env_key] = secrets.get_secret(secret_name)
+    except Exception:
+        print(f"⚠️  Secret '{secret_name}' not set — continuing without it.")
+
+os.environ["VIOS_OMNI"] = "1"   # set to "0" to boot the classic VIOS stack only
+
+# ── Clone or fast-forward the branch ──
+os.chdir("/kaggle/working")
+if os.path.isdir(f"{WORKSPACE}/.git"):
+    subprocess.run(["git", "-C", WORKSPACE, "fetch", repo, BRANCH], check=True)
+    subprocess.run(["git", "-C", WORKSPACE, "checkout", "-B", BRANCH, "FETCH_HEAD"], check=True)
+else:
+    subprocess.run(["git", "clone", "--depth", "1", "-b", BRANCH, repo, WORKSPACE], check=True)
+
+os.chdir(WORKSPACE)
+print(f"✅ [GIT] On {BRANCH} @ "
+      f"{subprocess.check_output(['git','rev-parse','--short','HEAD']).decode().strip()}")
+
+# ── Provision (Java 17 + PostgreSQL + Neo4j + pip). Takes ~8-12 min cold. ──
+print("⚙️  [SYSTEM] Provisioning — tail setup_logs.txt if this stalls...")
+os.system("bash setup.sh > setup_logs.txt 2>&1")
+
+# ── Ignite: Redis (AOF) → UI Server → Model Engine → Omniscient Engine ──
+os.system("python boot.py")
+```
+
+**What to expect in the console:** the watchdog boots Redis, then four auto-healing
+workers. The Omniscient engine reports each backend as it comes up
+(`✅ PostgreSQL`, `✅ Qdrant`, `✅ Neo4j`) and degrades gracefully if one fails —
+a missing backend disables only the features that depend on it. Once cloudflared
+prints the tunnel URL, the **Omniscient** tab in the Command Deck serves the
+God-Mode Explorer, and the Telegram bot accepts video uploads on the priority lane.
+
+**Required Kaggle Secrets:** `github_token` (mandatory), `hf_token` (optional —
+all models are currently public), `nim_api_key` (optional — without it, GraphRAG
+extraction and answer synthesis are skipped and raw visual output is returned).
+
