@@ -137,15 +137,38 @@ def _load_easyocr():
     MODELS["ocr_reader"] = easyocr.Reader(["en"], gpu=torch.cuda.is_available(), verbose=False)
 
 
+def _gpu_dtype(device):
+    """
+    Pick bfloat16 only where the hardware actually implements it.
+
+    Kaggle's T4s are Turing (sm_75) and have no bf16 tensor cores. Torch will
+    happily accept torch.bfloat16 there and emulate it, but bitsandbytes picks
+    its 4-bit kernel path off the compute dtype and the bf16 path assumes
+    sm_80+. On Turing that pairing is a documented source of illegal memory
+    accesses under load. float16 is native on every GPU this stack runs on and
+    is already what SigLIP and CLIP use here, so nothing else has to change.
+    """
+    if not torch.cuda.is_available():
+        return torch.float32
+    try:
+        index = torch.device(device).index or 0
+        major, _minor = torch.cuda.get_device_capability(index)
+    except Exception:
+        return torch.float16          # unknown GPU → take the universally safe path
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
 def _load_qwen():
     from transformers import (AutoProcessor, Qwen2_5_VLForConditionalGeneration,
                               BitsAndBytesConfig)
     qwen_id = "Qwen/Qwen2.5-VL-7B-Instruct"
-    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+    dtype = _gpu_dtype(device_1)
+    log(f"Oracle compute dtype on {device_1}: {str(dtype).split('.')[-1]}")
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=dtype,
                                bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
     MODELS["oracle_processor"] = AutoProcessor.from_pretrained(qwen_id)
     MODELS["oracle_model"] = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        qwen_id, torch_dtype=torch.bfloat16, quantization_config=quant,
+        qwen_id, torch_dtype=dtype, quantization_config=quant,
         device_map={"": device_1}).eval()
 
 

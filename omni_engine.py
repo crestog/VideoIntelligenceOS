@@ -48,7 +48,7 @@ from PIL import Image
 
 from logger import vios_log
 from queue_manager import (claim_job, ack_job, fail_job, push_job, get_queue_metrics,
-                           wait_for_redis)
+                           wait_for_redis, recover_processing_jobs)
 import omni_db
 from omni_db import (stable_id64, get_pg_conn, get_pg_conn_optional,
                      get_qdrant, get_neo4j)
@@ -256,6 +256,65 @@ def process_vision_job(payload):
     return total_frames
 
 
+# ═══════════════════════════════════════════════════════════
+# CUDA CONTEXT LOSS — the one failure that must never be retried
+# ═══════════════════════════════════════════════════════════
+_LOST_CONTEXT_MARKERS = (
+    "an illegal memory access",
+    "unspecified launch failure",
+    "device-side assert triggered",
+    "misaligned address",
+    "context is destroyed",
+)
+
+
+def _is_cuda_context_lost(exc):
+    """
+    True when `exc` means this process's CUDA context is unrecoverable.
+
+    These faults are sticky. Once the driver returns cudaErrorIllegalAddress the
+    context is poisoned for the lifetime of the process and *every* subsequent
+    kernel launch fails, including perfectly valid ones. Out-of-memory is
+    deliberately excluded: that one really is transient, and the normal
+    retry path is the right answer for it.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "out of memory" in text:
+        return False
+    return any(marker in text for marker in _LOST_CONTEXT_MARKERS)
+
+
+def _die_if_cuda_lost(exc, where):
+    """
+    Exit the process on a poisoned CUDA context so the watchdog can rebuild it.
+
+    Catching this error and continuing is the worst possible response: the
+    context never heals, so the loop burns through the entire backlog at three
+    retries each and dead-letters all of it, while the watchdog sees a healthy
+    process and never intervenes. That is exactly what turned one bad job into
+    1100+ failures.
+
+    The in-flight job is left in {QUEUE}_PROCESSING on purpose — boot.py's crash
+    recovery moves orphaned PROCESSING entries back onto the default lane for
+    both Omni queues, so it is re-queued on restart without burning a retry.
+
+    os._exit, not sys.exit: these loops run in daemon threads, where SystemExit
+    would only unwind the thread and leave the dead process alive.
+    """
+    if not _is_cuda_context_lost(exc):
+        return
+    log(f"💀 {where}: CUDA context lost — {str(exc)[:160]}", "ERROR")
+    log("   ↳ Unrecoverable in-process. Exiting so the watchdog restarts with a "
+        "fresh context; the in-flight job stays in PROCESSING and is re-queued "
+        "on boot.", "ERROR")
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(1)
+
+
 def vision_worker_loop():
     log("⚙️ Worker 1 (Vision) online — consuming QUEUE_OMNI_VISION")
     while True:
@@ -274,13 +333,20 @@ def vision_worker_loop():
                 ack_job(QUEUE_OMNI_VISION, job, job_raw)
                 log(f"👁️ Vision {v_uuid}: {n} frames indexed", "SUCCESS")
             except Exception as e:
+                # Checked before fail_job: a lost context is not this job's
+                # fault, so it must not consume a retry or reach the DLQ.
+                _die_if_cuda_lost(e, f"Vision {v_uuid}")
                 REDIS.hset(f"status:{v_uuid}", "vision", f"ERROR: {str(e)[:80]}")
                 result = fail_job(QUEUE_OMNI_VISION, job, job_raw, str(e))
                 log(f"❌ Vision {v_uuid} failed → {result}: {str(e)[:200]}", "ERROR")
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass          # a degraded context must not mask the real error
                 time.sleep(2)
         except Exception as outer:
-            log(f"Vision loop critical error: {outer}", "ERROR")
+            _die_if_cuda_lost(outer, "Vision loop")
+            log(f"Vision loop critical error: {type(outer).__name__}: {outer}", "ERROR")
             time.sleep(5)
 
 
@@ -383,13 +449,20 @@ def oracle_worker_loop():
                 ack_job(QUEUE_OMNI_ORACLE, job, job_raw)
                 log(f"🧠 Oracle {v_uuid}: {n} narrative chunks indexed", "SUCCESS")
             except Exception as e:
+                # Checked before fail_job: a lost context is not this job's
+                # fault, so it must not consume a retry or reach the DLQ.
+                _die_if_cuda_lost(e, f"Oracle {v_uuid}")
                 REDIS.hset(f"status:{v_uuid}", "oracle", f"ERROR: {str(e)[:80]}")
                 result = fail_job(QUEUE_OMNI_ORACLE, job, job_raw, str(e))
                 log(f"❌ Oracle {v_uuid} failed → {result}: {str(e)[:200]}", "ERROR")
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass          # a degraded context must not mask the real error
                 time.sleep(2)
         except Exception as outer:
-            log(f"Oracle loop critical error: {outer}", "ERROR")
+            _die_if_cuda_lost(outer, "Oracle loop")
+            log(f"Oracle loop critical error: {type(outer).__name__}: {outer}", "ERROR")
             time.sleep(5)
 
 
@@ -489,11 +562,18 @@ def build_dashboard():
             return jsonify({"error": "Neo4j offline — knowledge graph unavailable"})
         try:
             with driver.session() as session:
+                # elementId(), not id(): id() is deprecated in Neo4j 5 and the
+                # server emits a GqlStatusObject warning for every call, so a
+                # single dashboard refresh printed three warnings to the
+                # console. The ids are only ever used as opaque keys — here for
+                # node dedup, and in the dashboard as vis-network ids and
+                # rawNodes/rawEdges object keys — so the string form elementId()
+                # returns drops straight in.
                 results = session.run("""
                     MATCH (n)-[r]->(m)
-                    RETURN id(n) AS src_id, labels(n) AS src_lbl, properties(n) AS src_props,
-                           id(m) AS tgt_id, labels(m) AS tgt_lbl, properties(m) AS tgt_props,
-                           id(r) AS rel_id, type(r) AS rel_type, properties(r) AS rel_props
+                    RETURN elementId(n) AS src_id, labels(n) AS src_lbl, properties(n) AS src_props,
+                           elementId(m) AS tgt_id, labels(m) AS tgt_lbl, properties(m) AS tgt_props,
+                           elementId(r) AS rel_id, type(r) AS rel_type, properties(r) AS rel_props
                     LIMIT 300
                 """).data()
 
@@ -873,7 +953,10 @@ async def handle_search(client, message):
 
         os.remove(out_vid_path)
         await status_msg.delete()
-    except Exception:
+    except Exception as e:
+        # Same rule as the workers: if the context is gone, every later search
+        # fails too, so restart rather than apologise to the user forever.
+        _die_if_cuda_lost(e, "Search")
         log(f"Search failed:\n{traceback.format_exc()}", "ERROR")
         try:
             await status_msg.edit_text(
@@ -940,6 +1023,21 @@ def main():
     if not wait_for_redis(label="OMNI"):
         log("❌ Redis unreachable — Omniscient engine cannot run. Exiting.", "ERROR")
         sys.exit(1)
+
+    # 0b. Reclaim whatever the previous life of this process was holding.
+    #     boot.py runs the same sweep, but only once per notebook session — the
+    #     watchdog restarts this child directly, so boot never sees a mid-session
+    #     crash. Without this, the job in flight when the engine exits (now the
+    #     deliberate response to a lost CUDA context) would sit in PROCESSING
+    #     until the whole notebook restarted. max_recoveries caps the
+    #     crash-recover-crash loop if the video itself is what kills the engine.
+    try:
+        orphaned = sum(recover_processing_jobs(q, max_recoveries=2)
+                       for q in (QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE))
+        if orphaned:
+            log(f"🔄 Re-queued {orphaned} job(s) orphaned by the last engine restart")
+    except Exception as e:
+        log(f"Orphan recovery skipped: {e}", "WARN")
 
     # 1. Databases (idempotent service start + schema)
     omni_db.ensure_services()

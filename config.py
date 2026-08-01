@@ -154,7 +154,26 @@ def configure_environment():
     os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
     os.environ.setdefault('TRANSFORMERS_VERBOSITY', 'error')
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+    # PYTORCH_CUDA_ALLOC_CONF is deliberately NOT set here.
+    #
+    # This used to say 'expandable_segments:True', which was the cause of the
+    # "CUDA error: an illegal memory access was encountered" that killed every
+    # Omniscient job. expandable_segments swaps PyTorch's cudaMalloc-backed
+    # blocks for virtual reservations (cuMemAddressReserve/cuMemMap), and
+    # torch.cuda.empty_cache() then *unmaps physical pages* out from under
+    # ranges the process still holds pointers into. bitsandbytes' 4-bit NF4
+    # kernels (Qwen2.5-VL's oracle path) keep raw device pointers across calls,
+    # so the next launch dereferenced an unmapped address — and once the driver
+    # returns cudaErrorIllegalAddress the whole context is dead for the life of
+    # the process. Both engines call empty_cache() after every job, so the fault
+    # was guaranteed rather than occasional.
+    #
+    # Neither the standalone repo nor the standalone notebook ever set this,
+    # which is exactly why each ran clean alone and only the merge broke: this
+    # module is imported by every entrypoint, so one line here reconfigured the
+    # allocator for a process it was never tested against. The stock allocator
+    # is what both halves were proven on — leave it alone.
 
     # Create the cache dirs now. Several libraries write a settings file on
     # first import and silently fall back to /tmp if the directory is not

@@ -245,21 +245,65 @@ def fail_job(queue_name, job, job_raw, error_msg):
 # ═══════════════════════════════════════════════════════════
 # RECOVERY — Requeue orphaned processing jobs on boot
 # ═══════════════════════════════════════════════════════════
-def recover_processing_jobs(queue_name):
-    """Move orphaned PROCESSING jobs back to the default lane. Returns count."""
+def recover_processing_jobs(queue_name, max_recoveries=None):
+    """
+    Move orphaned PROCESSING jobs back to the default lane. Returns the number
+    actually re-queued.
+
+    `max_recoveries` guards against a poison pill. A worker that dies *while*
+    holding a job — the correct response to an unrecoverable CUDA fault — leaves
+    that job in PROCESSING. Recovering it is right when the crash was
+    incidental, but if the job itself is what kills the worker, recovery and
+    restart chase each other forever and nothing else in the queue ever runs.
+    Past `max_recoveries` the job is dead-lettered instead, so the backlog keeps
+    moving and the offender stays inspectable in the DLQ.
+
+    Left as None (boot.py's whole-session sweep) the original unconditional
+    behaviour is preserved exactly.
+    """
     r = get_redis()
     proc_key = _processing_key(queue_name)
     _prio, default_lane = _lanes(queue_name)
 
     count = 0
+    quarantined = 0
     while True:
+        # RPOPLPUSH rather than RPOP: the move is atomic, so a crash mid-recovery
+        # can duplicate a job but can never drop one.
         orphan = r.rpoplpush(proc_key, default_lane)
         if not orphan:
             break
         count += 1
 
+        if max_recoveries is None:
+            continue
+
+        try:
+            job = json.loads(orphan)
+        except (ValueError, TypeError):
+            continue                      # unparseable envelope — leave it requeued as-is
+
+        job["recoveries"] = job.get("recoveries", 0) + 1
+        pipe = r.pipeline()
+        pipe.lrem(default_lane, 1, orphan)          # drop the copy just moved
+        if job["recoveries"] > max_recoveries:
+            job["status"] = "DEAD"
+            job["last_error"] = (f"Crashed the worker {job['recoveries']} times — "
+                                 f"quarantined to keep the queue moving.")
+            job["died_at"] = time.time()
+            pipe.lpush(_dlq_key(queue_name), json.dumps(job))
+            pipe.hincrby(_metrics_key(), f"{queue_name}:dead", 1)
+            count -= 1
+            quarantined += 1
+        else:
+            pipe.lpush(default_lane, json.dumps(job))   # same position, updated count
+        pipe.execute()
+
     if count > 0:
         r.hincrby(_metrics_key(), f"{queue_name}:recovered", count)
+    if quarantined > 0:
+        _safe_print(f"   ☠️ {queue_name}: quarantined {quarantined} job(s) that "
+                    f"repeatedly crashed the worker — see the DLQ.")
     return count
 
 

@@ -169,7 +169,25 @@ Telegram Bot ──(PRIORITY lane)─▶ QUEUE_OMNI_ORACLE ─▶ Oracle Worker 
   dashboard lives in the engine and is proxied, not served directly.)
 * **Models:** GPU 0 → GroundingDINO, SAM, Depth-Anything-V2, RAFT, SigLIP,
   CLIP, BGE, EasyOCR · GPU 1 → Qwen2.5-VL-7B (4-bit NF4), generation
-  serialized behind a lock (oracle worker + search share it).
+  serialized behind a lock (oracle worker + search share it). Qwen's compute
+  dtype is chosen from the GPU's compute capability — bf16 on sm_80+, fp16 on
+  Turing, because a T4 has no bf16 tensor cores and bitsandbytes picks its
+  4-bit kernel path off that dtype.
+* **Allocator:** stock PyTorch caching allocator. `PYTORCH_CUDA_ALLOC_CONF=
+  expandable_segments:True` must **not** be set: it makes
+  `torch.cuda.empty_cache()` unmap physical pages out from under reserved
+  address ranges, and bitsandbytes' 4-bit kernels hold raw device pointers
+  across calls. The Vision thread calls `empty_cache()` at the end of every job
+  while the Oracle thread is inside `generate()`, so the pairing produced a
+  guaranteed illegal memory access. See the comment in `config.py`.
+* **Failure policy:** a lost CUDA context (illegal access, device-side assert,
+  unspecified launch failure) is *sticky* — every later kernel launch in the
+  process fails too. Both loops therefore treat it as fatal and `os._exit(1)`
+  instead of retrying, so the watchdog rebuilds the context. The in-flight job
+  is left in `{QUEUE}_PROCESSING`; the engine sweeps its own orphans on the way
+  back up (`max_recoveries=2`, then the DLQ, so a poison-pill video cannot
+  crash-loop the engine). OOM is excluded — that one is genuinely transient and
+  takes the normal retry path.
 
 ## 11. File Map
 
