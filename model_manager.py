@@ -26,6 +26,7 @@ import gc
 import glob
 import json
 import sqlite3
+import sys
 import time
 
 # Professional Logging Filter: Mute raw library noise
@@ -35,7 +36,7 @@ os.environ.setdefault("HF_HOME", "/kaggle/working/huggingface_cache")
 
 import torch
 
-from queue_manager import claim_job, ack_job, fail_job, pop_job, push_job
+from queue_manager import claim_job, ack_job, fail_job, pop_job, push_job, wait_for_redis
 from config import DB_PATH, VIDEO_DIR, QUEUE_ANALYZE, SQLITE_TIMEOUT, PREVIEW_DIR_NAME
 from logger import vios_log
 
@@ -285,6 +286,12 @@ def process_analyze_job(payload):
 if __name__ == "__main__":
     log("🚀 Model Manager v2: warming the 7 foundational models...")
     ensure_analysis_tables()
+
+    # Redis must be up before the first push. Previously this crashed on
+    # ECONNREFUSED and the watchdog rebooted us every 3s, forever.
+    if not wait_for_redis(label="ENGINE"):
+        log("❌ Redis unreachable — cannot enqueue model warm-up. Exiting.", "ERROR")
+        sys.exit(1)
 
     for model in ["yolo", "whisper", "dinov2", "siglip", "clip", "raft", "easyocr"]:
         push_job("QUEUE_MODELS", {"model_name": model})

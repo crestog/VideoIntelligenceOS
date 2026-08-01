@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 import nest_asyncio
-from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq
+from queue_manager import push_job, get_queue_metrics, get_queue_depth, replay_dlq, wait_for_redis
 from v17_backend import v17_router
 from admin_backend import admin_router
 from config import (BASE_DIR, LAKE_DIR, DB_PATH, VIDEO_DIR, SESSION_DIR, STATE_FILE, THUMB_DIR,
@@ -530,7 +530,11 @@ async def serve_main_ui():
 
 if __name__ == "__main__":
     init_db()
-    
+
+    # Ghost Worker pushes into Redis as soon as a download finishes — make sure
+    # the broker is up first so the very first push doesn't ECONNREFUSE.
+    wait_for_redis(label="UI")
+
     def start_cloudflared():
         time.sleep(2) 
         cmd = ["./cloudflared", "tunnel", "--url", "http://localhost:8000"]

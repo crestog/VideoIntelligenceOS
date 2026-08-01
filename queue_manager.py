@@ -22,16 +22,19 @@ Key Schema (Redis):
 
 import redis
 import json
+import socket
 import time
 import uuid
+
+from config import REDIS_HOST, REDIS_PORT
 
 
 # ═══════════════════════════════════════════════════════════
 # CONNECTION POOL
 # ═══════════════════════════════════════════════════════════
 redis_pool = redis.ConnectionPool(
-    host='localhost',
-    port=6379,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
     decode_responses=True,
     socket_timeout=30,          # Must be > any blocking-pop timeout (max 5s)
     socket_connect_timeout=5,
@@ -41,6 +44,60 @@ redis_pool = redis.ConnectionPool(
 
 def get_redis():
     return redis.Redis(connection_pool=redis_pool)
+
+
+def _safe_print(msg):
+    """
+    print() that cannot raise. Console encoding is not guaranteed (a cp1252
+    Windows terminal rejects emoji), and this module's whole job on the failure
+    path is to report cleanly — a logging call must never become the exception.
+    """
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+    except Exception:
+        pass
+
+
+def wait_for_redis(timeout=30.0, label="", probe_interval=1.0):
+    """
+    Block until Redis accepts a connection, or give up after `timeout` seconds.
+
+    Workers must call this before their first queue op. Without it a worker that
+    starts before the broker dies on ECONNREFUSED, the watchdog restarts it 3s
+    later, and the whole stack loops forever with no useful diagnostic.
+
+    Uses a raw bounded socket probe rather than redis-py's ping(): the client
+    pool applies its own internal retry/backoff under every command, so a
+    "30 x 1s" loop built on ping() actually ran for minutes. A plain TCP connect
+    is what "is the broker listening?" really means, and it honours the deadline.
+
+    Returns True if Redis is reachable, False otherwise (caller decides whether
+    to degrade or exit — this function never raises).
+    """
+    tag = f"[{label}] " if label else ""
+    deadline = time.monotonic() + timeout
+    announced = False
+
+    while True:
+        try:
+            with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=2) as sock:
+                sock.sendall(b"PING\r\n")
+                if b"PONG" in sock.recv(64).upper():
+                    if announced:
+                        _safe_print(f"   ✅ {tag}Redis is up.")
+                    return True
+        except OSError as e:
+            if not announced:
+                _safe_print(f"   ⏳ {tag}Waiting for Redis... ({type(e).__name__})")
+                announced = True
+
+        if time.monotonic() + probe_interval >= deadline:
+            _safe_print(f"   ❌ {tag}Redis unreachable after {timeout:.0f}s "
+                        f"({REDIS_HOST}:{REDIS_PORT}).")
+            return False
+        time.sleep(probe_interval)
 
 
 # ═══════════════════════════════════════════════════════════

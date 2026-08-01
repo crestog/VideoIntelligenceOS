@@ -127,12 +127,61 @@ def get_pg_conn():
                             connect_timeout=10)
 
 
+# ── Graceful degradation: no-op stand-ins used when Postgres is unavailable ──
+# Without these, a Postgres outage made every vision/oracle job raise on connect,
+# burn all 3 retries and dead-letter — throwing away the Qdrant vectors and Neo4j
+# graph writes that would have succeeded. Now the relational rows are skipped and
+# the rest of the pipeline still lands.
+class _NullCursor:
+    def execute(self, *args, **kwargs):  return None
+    def fetchone(self):                  return None
+    def fetchall(self):                  return []
+    def __enter__(self):                 return self
+    def __exit__(self, *exc):            return False
+
+
+class _NullConn:
+    """Quacks like a psycopg2 connection; silently discards every write."""
+    def cursor(self):          return _NullCursor()
+    def commit(self):          return None
+    def rollback(self):        return None
+    def close(self):           return None
+    def __enter__(self):       return self
+    def __exit__(self, *exc):  return False
+
+
+_pg_warned = False
+
+
+def get_pg_conn_optional():
+    """
+    A live Postgres connection, or a no-op stand-in when PG is down.
+
+    Callers keep their normal cursor/commit/close code path — writes just go
+    nowhere when the backend is missing, so vector + graph indexing survives.
+    """
+    global _pg_warned
+    if AVAILABLE["postgres"]:
+        try:
+            return get_pg_conn()
+        except Exception as e:
+            AVAILABLE["postgres"] = False
+            log(f"PostgreSQL connection lost ({e}) — relational writes disabled", "WARN")
+    if not _pg_warned:
+        log("PostgreSQL unavailable — frames/chunks rows are being skipped. "
+            "Vectors and graph still index; the Explorer table will look empty.", "WARN")
+        _pg_warned = True
+    return _NullConn()
+
+
 def init_pg_schema():
     """Create the frames/chunks tables (idempotent)."""
     if not AVAILABLE["postgres"]:
         return False
+    conn = None
     try:
-        with get_pg_conn() as conn:
+        conn = get_pg_conn()
+        with conn:
             with conn.cursor() as cur:
                 cur.execute('''CREATE TABLE IF NOT EXISTS frames (
                     frame_id TEXT PRIMARY KEY, video_uuid TEXT, video_path TEXT,
@@ -149,6 +198,9 @@ def init_pg_schema():
         log(f"PostgreSQL schema init failed: {e}", "ERROR")
         AVAILABLE["postgres"] = False
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 # ═══════════════════════════════════════════════════════════

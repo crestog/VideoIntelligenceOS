@@ -28,7 +28,7 @@ import time
 
 import redis as redis_lib
 
-from queue_manager import claim_job, ack_job, fail_job, push_job
+from queue_manager import claim_job, ack_job, fail_job, push_job, wait_for_redis
 from config import (VIDEO_DIR, THUMB_DIR, DB_PATH, QUEUE_VISION, QUEUE_ANALYZE,
                     DISK_PAUSE_THRESHOLD_GB, DISK_WARN_THRESHOLD_GB,
                     PREVIEW_DIR_NAME, PREVIEW_WIDTH, PREVIEW_QUALITY, FULL_QUALITY,
@@ -198,6 +198,10 @@ def run_worker():
 
     os.makedirs(VIDEO_DIR, exist_ok=True)
     os.makedirs(THUMB_DIR, exist_ok=True)
+
+    # The loop below already survives Redis outages; waiting here just keeps the
+    # first 30s of logs free of retry spam while the broker finishes booting.
+    wait_for_redis(label="CV")
 
     jobs_completed = 0
     jobs_failed = 0

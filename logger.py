@@ -35,18 +35,50 @@ LEVELS = {
 # ═══════════════════════════════════════════════════════════
 LOG_BUFFER = deque(maxlen=500)
 
+
+def _safe_print(msg):
+    """
+    print() that cannot raise. The prefixes above are emoji, and a console
+    without UTF-8 (cp1252 Windows terminals) raises UnicodeEncodeError on
+    encode — which would turn a log line into a worker crash. Kaggle is UTF-8,
+    so this is a guard for local runs and any redirected/piped stdout.
+    """
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+    except Exception:
+        pass
+
 # Redis connection (lazy init — may not be available at import time)
 _redis_client = None
+_redis_next_try = 0.0        # monotonic deadline; don't reconnect before this
+_REDIS_RETRY_BACKOFF = 30.0  # seconds to stay quiet after a failed connect
+
 
 def _get_redis():
-    global _redis_client
-    if _redis_client is None:
-        try:
-            _redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True,
-                                        socket_timeout=2, socket_connect_timeout=2)
-            _redis_client.ping()
-        except:
-            _redis_client = None
+    """
+    Best-effort Redis handle for the cross-process log buffer.
+
+    Backs off for _REDIS_RETRY_BACKOFF after a failure. Without this, a Redis
+    outage made *every* log line attempt a fresh connect (2s timeout plus the
+    client's own retries), so logging itself became the bottleneck at exactly
+    the moment the operator needs to read the logs.
+    """
+    global _redis_client, _redis_next_try
+    if _redis_client is not None:
+        return _redis_client
+    if time.monotonic() < _redis_next_try:
+        return None
+    try:
+        client = redis.Redis(host='localhost', port=6379, decode_responses=True,
+                             socket_timeout=2, socket_connect_timeout=2,
+                             retry_on_timeout=False)
+        client.ping()
+        _redis_client = client
+    except Exception:
+        _redis_client = None
+        _redis_next_try = time.monotonic() + _REDIS_RETRY_BACKOFF
     return _redis_client
 
 
@@ -64,7 +96,7 @@ def vios_log(message, subsystem="SYS", level="INFO"):
     level_icon = LEVELS.get(level, "")
 
     formatted = f"[{ts}] {prefix} {level_icon}{message}"
-    print(formatted, flush=True)
+    _safe_print(formatted)
 
     # Store in memory buffer
     entry = {

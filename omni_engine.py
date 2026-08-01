@@ -22,6 +22,7 @@ import json
 import math
 import re
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -46,9 +47,11 @@ from config import (ARCHIVE_DIR, LAKE_DIR, API_ID, API_HASH, BOT_TOKEN,
                     NIM_API_KEY, NIM_BASE_URL, NIM_MODEL, OMNI_DASHBOARD_PORT,
                     OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS)
 from logger import vios_log
-from queue_manager import claim_job, ack_job, fail_job, push_job, get_queue_metrics
+from queue_manager import (claim_job, ack_job, fail_job, push_job, get_queue_metrics,
+                           wait_for_redis)
 import omni_db
-from omni_db import stable_id64, get_pg_conn, get_qdrant, get_neo4j
+from omni_db import (stable_id64, get_pg_conn, get_pg_conn_optional,
+                     get_qdrant, get_neo4j)
 import omni_models
 from omni_models import (MODELS, device_0, hybrid_spatial_proof,
                          extract_img_features, qwen_describe_video,
@@ -214,7 +217,7 @@ def process_vision_job(payload):
     # Batched embeddings → PG rows + Qdrant points
     from qdrant_client.models import PointStruct
     siglip_points, clip_points = [], []
-    pg_conn = get_pg_conn()
+    pg_conn = get_pg_conn_optional()
     try:
         with pg_conn.cursor() as pg_cursor:
             for i in range(0, total_frames, 32):
@@ -300,7 +303,7 @@ def process_oracle_job(payload):
 
     from qdrant_client.models import PointStruct
     bge_points = []
-    pg_conn = get_pg_conn()
+    pg_conn = get_pg_conn_optional()
     try:
         with pg_conn.cursor() as pg_cursor:
             for start_t in range(0, int(math.ceil(duration)), int(chunk_size)):
@@ -422,6 +425,8 @@ def build_dashboard():
 
     @app_dashboard.route("/api/video/<video_uuid>")
     def get_video_details(video_uuid):
+        if not omni_db.AVAILABLE["postgres"]:
+            return jsonify({"error": "PostgreSQL offline — no video details available"})
         try:
             conn = get_pg_conn()
             with conn.cursor() as cur:
@@ -698,7 +703,9 @@ async def handle_search(client, message):
             best_chunk = bge_hits[0].payload
             best_vid_path = best_chunk["video_path"]
             mid_idx = 0
-            pg_conn = get_pg_conn()
+            # Optional: if PG is down, c_desc/mid_idx keep their defaults and the
+            # cascade continues on vectors alone instead of aborting the search.
+            pg_conn = get_pg_conn_optional()
             try:
                 with pg_conn.cursor() as pg_cursor:
                     pg_cursor.execute("SELECT description FROM chunks WHERE chunk_id = %s",
@@ -750,7 +757,7 @@ async def handle_search(client, message):
                 client, message.chat.id, best_vid_path, best_clip_idx,
                 f"👁️ **[MODEL 3: CLIP Visual]**\n- Confidence Score: {c_scores_map[best_clip_idx]:.4f}")
 
-        pg_conn = get_pg_conn()
+        pg_conn = get_pg_conn_optional()
         try:
             with pg_conn.cursor() as pg_cursor:
                 pg_cursor.execute("SELECT frame_idx, timestamp, depth, motion FROM frames "
@@ -760,8 +767,10 @@ async def handle_search(client, message):
             pg_conn.close()
 
         if not db_frames:
+            hint = ("" if omni_db.AVAILABLE["postgres"]
+                    else " (PostgreSQL is offline — the frame index is unavailable.)")
             return await status_msg.edit_text(
-                "🚫 **Vision Sync Error:** No temporal data found for this video.")
+                f"🚫 **Vision Sync Error:** No temporal data found for this video.{hint}")
 
         # ── 5. Fused score curve → peak detection → best moment window ──
         scores, timestamps, indices = [], [], []
@@ -926,6 +935,11 @@ def main():
     nest_asyncio.apply()
 
     log("🚀 Omniscient Engine igniting — tri-partite DB + Layer 5 orchestration")
+
+    # 0. Broker first — both worker loops and the bot push jobs immediately.
+    if not wait_for_redis(label="OMNI"):
+        log("❌ Redis unreachable — Omniscient engine cannot run. Exiting.", "ERROR")
+        sys.exit(1)
 
     # 1. Databases (idempotent service start + schema)
     omni_db.ensure_services()

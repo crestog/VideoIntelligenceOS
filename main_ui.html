@@ -86,6 +86,7 @@
         <button class="tab-btn active" onclick="switchTab('reels')">📱 View Reels</button>
         <button class="tab-btn" onclick="switchTab('explore')">🔍 Explore DB</button>
         <button class="tab-btn" onclick="switchTab('v17_workspace')">🎬 V17 Workspace</button>
+        <button class="tab-btn" onclick="switchTab('omniscient')">🔮 Omniscient</button>
         <button class="tab-btn" onclick="switchTab('admin')">🛡️ Admin</button>
     </div>
 
@@ -157,6 +158,14 @@
         <iframe src="/v17" style="width: 100%; height: 100%; border: none; border-radius: 18px; background: #0f172a; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></iframe>
     </div>
 
+    <!-- Omniscient tri-partite dashboard (Postgres + Qdrant + Neo4j), reverse-proxied
+         from the Flask app embedded in omni_engine.py. Loaded lazily: the proxy target
+         only exists once the Omniscient engine is up, so an eager src= would log a
+         connection error on every page load before that happens. -->
+    <div id="omniscient" class="tab-content" style="height: 84vh; padding: 0;">
+        <iframe id="omniRootFrame" style="width: 100%; height: 100%; border: none; border-radius: 18px; background: #0b0f1a; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></iframe>
+    </div>
+
     <div id="admin" class="tab-content" style="height: 84vh; padding: 0;">
         <iframe src="/admin" style="width: 100%; height: 100%; border: none; border-radius: 18px; background: #030303; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></iframe>
     </div>
@@ -197,6 +206,7 @@
             document.getElementById(tabId).classList.add('active');
             event.currentTarget.classList.add('active');
             if(tabId === 'explore' && document.getElementById('explore-tbody').innerHTML === '') searchExplore();
+            if(tabId === 'omniscient') { const fr = document.getElementById('omniRootFrame'); if(!fr.src) fr.src = '/omni/'; }
         }
 
         async function init() { loadCategories(); const stateRes = await fetch('/api/state'); const stateData = await stateRes.json(); currentIndex = stateData.index || 0; await fetchPlaylist(currentPlayingCat); setInterval(updateStatus, 1500); setInterval(autoSyncFeed, 3000); }

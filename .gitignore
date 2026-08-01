@@ -20,10 +20,25 @@ neo4j.tar.gz
 qdrant_storage/
 Insta-Vault/
 huggingface_cache/
-appendonly.aof
-*.session
-*.session-journal
 cloudflared
 setup_logs.txt
 __pycache__/
 *.pyc
+*.pyo
+
+# Redis persistence — AOF is disabled (boot.py runs Redis in-memory), but if a
+# stray redis-server ever writes one, it must never enter the object store.
+# A committed AOF is what broke the Kaggle boot: git's CRLF normalization
+# corrupted the RESP framing and Redis refused to start. See .gitattributes.
+appendonly.aof
+appendonlydir/
+dump.rdb
+
+# Databases / session state
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.session
+*.session-journal

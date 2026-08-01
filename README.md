@@ -16,7 +16,7 @@ The system is divided into three completely independent execution layers, unifie
 ### 1. The Watchdog Orchestrator (`boot.py`)
 The master control plane. It never performs heavy computation; its only job is to keep the system alive.
 * **Pre-flight Sweep:** Automatically purges zombie FFmpeg/Cloudflare processes from previous crashes to protect system RAM.
-* **Redis Initialization:** Boots the Redis broker in `AOF` (Append-Only File) mode, ensuring job queues survive sudden power-offs.
+* **Redis Initialization:** Boots Redis in-memory (Kaggle sessions are ephemeral).
 * **Auto-Healing Threads:** Launches the UI Server and Model Engine in isolated threads. If either worker crashes, the Watchdog catches the failure and resurrects the process in 3 seconds.
 * **Stream Filtering:** Captures standard output from all workers, aggressively filters out raw library noise (like HuggingFace progress bars), and renders a clean, unified, zero-latency console for the developer.
 
@@ -126,7 +126,7 @@ print(f"✅ [GIT] On {BRANCH} @ "
 print("⚙️  [SYSTEM] Provisioning — tail setup_logs.txt if this stalls...")
 os.system("bash setup.sh > setup_logs.txt 2>&1")
 
-# ── Ignite: Redis (AOF) → UI Server → Model Engine → Omniscient Engine ──
+# ── Ignite: Redis → UI Server → Model Engine → Omniscient Engine ──
 os.system("python boot.py")
 ```
 

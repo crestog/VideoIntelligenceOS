@@ -3,13 +3,15 @@ VIOS Boot Orchestrator — Master Control Plane
 
 Phases:
   1. Pre-flight Sweep: Kill zombie processes from previous crashes
-  2. Message Broker: Boot Redis in AOF persistence mode
+  2. Message Broker: Boot Redis in-memory (no AOF — Kaggle sessions are ephemeral,
+     and a committed AOF file previously corrupted the boot; see .gitattributes)
   3. Session Init: Detect fresh session vs crash recovery
   4. Ignition: Launch all worker processes with auto-healing watchdog threads
 """
 
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -54,10 +56,32 @@ print("   ✅ Zombie sweep complete.", flush=True)
 # ══════════════════════════════════════════════════════════
 # PHASE 2: MESSAGE BROKER
 # ══════════════════════════════════════════════════════════
-print("🗄️ [SYSTEM] Phase 2: Booting Redis Message Broker (AOF mode)...", flush=True)
-os.system("redis-server --daemonize yes --appendonly yes")
-time.sleep(0.5)  # Give Redis a moment to boot
-print("   ✅ Redis broker online.", flush=True)
+print("🗄️ [SYSTEM] Phase 2: Booting Redis Message Broker...", flush=True)
+os.system("redis-server --daemonize yes > /dev/null 2>&1")
+
+# Verify Redis actually answers. The old code slept 0.5s and printed "online"
+# unconditionally, so a failed start was invisible and every worker then died on
+# ECONNREFUSED inside an endless watchdog reboot loop.
+redis_ready = False
+for _ in range(10):
+    try:
+        probe = subprocess.run(["redis-cli", "ping"], capture_output=True,
+                               text=True, timeout=3)
+        if probe.returncode == 0 and "PONG" in probe.stdout:
+            redis_ready = True
+            break
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    time.sleep(1)
+
+if not redis_ready:
+    print("   ❌ Redis did not answer PING after 10s. Aborting boot.", flush=True)
+    print("      Diagnose with:  redis-server --daemonize no", flush=True)
+    print("      Common causes:  port 6379 already in use · redis-server not", flush=True)
+    print("                      installed (rerun setup.sh) · stale appendonly.aof", flush=True)
+    sys.exit(1)
+
+print("   ✅ Redis broker online (in-memory, no AOF).", flush=True)
 
 # ══════════════════════════════════════════════════════════
 # PHASE 3: SESSION INIT — Fresh Session vs Crash Recovery

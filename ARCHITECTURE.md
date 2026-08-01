@@ -41,7 +41,7 @@ GPU split: **GPU 0** = vision (YOLO11x, DINOv2, SigLIP2, CLIP, RAFT, EasyOCR),
 **GPU 1** = Whisper-Large-v3 (audio/reasoning lane). Both run simultaneously —
 audio transcription of video *N* overlaps frame analysis of video *N*.
 
-## 3. Queue Dataflow (Redis, AOF)
+## 3. Queue Dataflow (Redis, in-memory)
 
 ```
 Ghost Worker ──▶ QUEUE_VISION ──▶ frame_worker ──▶ QUEUE_ANALYZE ──▶ model_manager
@@ -52,7 +52,10 @@ Ghost Worker ──▶ QUEUE_VISION ──▶ frame_worker ──▶ QUEUE_ANALY
 * **Atomic claims (v3):** `BRPOPLPUSH queue → PROCESSING` — one Redis op, so a
   crash can never lose a job (v2 used two ops with a fatal window between them).
 * Retry ×3 → dead-letter queue, replayable from the admin panel.
-* Boot recovery re-queues orphaned PROCESSING jobs for **both** queues.
+* Boot recovery re-queues orphaned PROCESSING jobs for **both** queues
+  (within-session only — Redis runs in-memory; a Redis crash loses pending
+  jobs, but the Ghost Worker rescans the channel and the dedup set is rebuilt
+  from the DB, so the worst case is a re-download, not data loss).
 * Dedup: `PROCESSED_VIDEOS_SET` is **rebuilt from the DB** at every boot —
   Redis is ephemeral, the DB is truth. This is what makes "never reprocess" real.
 

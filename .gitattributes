@@ -1,0 +1,71 @@
+# ═══════════════════════════════════════════════════════════
+# LINE-ENDING POLICY
+#
+# History: appendonly.aof was committed from Windows with core.autocrlf=true.
+# Git stripped every CR (2112 of them) on the way into the object store, so a
+# Linux checkout produced an LF-only file. Redis's AOF loader consumes exactly
+# two bytes after each argument to skip the CRLF terminator — with the CR gone
+# it ate the \n plus the first byte of the next token, hit a format error, and
+# aborted at startup. Every worker then died on ECONNREFUSED.
+#
+# Rule: source is normalized to LF; anything binary or wire-format is never
+# touched. Data files should not be committed at all (see .gitignore) — these
+# entries are the second line of defence.
+# ═══════════════════════════════════════════════════════════
+
+# Default: let git normalize text, detect binary automatically.
+* text=auto
+
+# ── Source: explicit LF. These run on Linux (Kaggle). ──
+*.py    text eol=lf
+*.sh    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# ── Wire-format / binary: byte-exact, NEVER munged. ──
+# Redis persistence (RESP protocol — CRLF is structural, not cosmetic)
+*.aof   binary
+*.rdb   binary
+
+# SQLite
+*.db      binary
+*.db-wal  binary
+*.db-shm  binary
+*.sqlite  binary
+*.sqlite3 binary
+
+# Media / model artifacts
+*.mp4  binary
+*.mov  binary
+*.mkv  binary
+*.webm binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.gif  binary
+*.webp binary
+*.pt   binary
+*.pth  binary
+*.bin  binary
+*.onnx binary
+*.safetensors binary
+
+# Python bytecode / archives
+*.pyc  binary
+*.pyo  binary
+*.zst  binary
+*.gz   binary
+*.tar  binary
+*.zip  binary
+
+# Telegram session files (Pyrogram SQLite)
+*.session          binary
+*.session-journal  binary
