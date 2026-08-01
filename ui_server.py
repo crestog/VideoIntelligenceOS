@@ -227,18 +227,36 @@ async def background_downloader():
         custom_print("⚡ Scanning Telegram for new Posts...")
 
         try:
-            # Read the newest id instead of posting-then-deleting a ping every
-            # cycle. The old probe wrote to the channel on each scan and the
-            # deleted id then sat in the "missing" list forever.
-            latest_id = 0
-            async for m in app_client.get_chat_history(CHANNEL_ID, limit=1):
-                latest_id = m.id
-            if not latest_id:
-                custom_print("⚠️ Channel appears empty — nothing to scan.")
+            # Discover the newest message id by posting a throwaway message and
+            # reading its id. This looks roundabout, but a bot account CANNOT
+            # read chat history — messages.getHistory is a user-only MTProto
+            # method and returns BOT_METHOD_INVALID, so get_chat_history() is
+            # not an option here. (messages.getMessages, used by the batch loop
+            # below, *is* allowed for bots — that asymmetry is the whole reason
+            # for the ping.) The id it leaves behind is recorded in scanned_ids
+            # immediately, so the gap never shows up as "missing" again.
+            try:
+                ping = await app_client.send_message(CHANNEL_ID, ".", disable_notification=True)
+                latest_id = ping.id
+                await ping.delete()
+            except FloodWait as e:
+                custom_print(f"⚠️ FloodWait probing newest id: sleeping {e.value}s")
+                SCAN_TRIGGER.set()
+                await asyncio.sleep(e.value)
+                continue
+            except Exception as e:
+                custom_print(f"❌ Cannot read newest message id: {str(e)[:120]}")
+                custom_print("   ↳ The bot must be an ADMIN of the channel with "
+                             "permission to post. Retrying in 30s.")
+                SCAN_TRIGGER.set()
                 await asyncio.sleep(30)
                 continue
 
             async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
+                # Close out the ping's own id before computing the gap.
+                await conn.execute('INSERT OR IGNORE INTO scanned_ids (video_id) VALUES (?)',
+                                   (latest_id,))
+                await conn.commit()
                 # One set-difference instead of one SELECT per id. The old loop
                 # ran `latest_id` queries per scan (tens of thousands on a real
                 # channel) just to build this list. Full range is still covered
@@ -256,8 +274,13 @@ async def background_downloader():
                 custom_print(f"✅ Channel fully scanned — all {latest_id} ids covered.")
 
             BATCH_SIZE = 200
+            total_batches = (len(missing_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+            found_videos = 0
             for i in range(0, len(missing_ids), BATCH_SIZE):
                 chunk = missing_ids[i:i + BATCH_SIZE]
+                batch_no = i // BATCH_SIZE + 1
+                GLOBAL_STATUS = (f"⚡ Scanning batch {batch_no}/{total_batches} "
+                                 f"({found_videos} videos found)")
                 try:
                     msgs = await app_client.get_messages(CHANNEL_ID, chunk)
                     if not isinstance(msgs, list): msgs = [msgs]
@@ -280,17 +303,26 @@ async def background_downloader():
                                 creator_row = await cursor.fetchone()
                                 creator_id = creator_row[0] if creator_row else 1
                             await conn.execute('INSERT OR IGNORE INTO posts (video_id, category_id, creator_id, likes, caption, status) VALUES (?, ?, ?, ?, ?, ?)', (msg.id, cat_id, creator_id, likes, clean_caption, 'Metadata_Only'))
+                            found_videos += 1
                         # Mark the whole chunk covered, including non-video ids,
                         # so the next scan starts where this one finished.
                         await conn.executemany('INSERT OR IGNORE INTO scanned_ids (video_id) VALUES (?)',
                                                [(cid,) for cid in chunk])
                         await conn.commit()
+                    # A long scan should not look like a hang. Report every 10th
+                    # batch (~2000 ids) so there is always visible motion.
+                    if batch_no % 10 == 0 or batch_no == total_batches:
+                        custom_print(f"   🔍 Scanned {batch_no}/{total_batches} batches "
+                                     f"— {found_videos} videos found so far")
                     await asyncio.sleep(0.5)
                 except FloodWait as e:
                     custom_print(f"⚠️ FloodWait during scan: sleeping {e.value}s")
                     await asyncio.sleep(e.value)
                 except Exception as e:
-                    custom_print(f"⚠️ Scan Network Error: {str(e)[:50]}")
+                    # 50 chars truncated the useful half of most Telegram
+                    # errors (the method name and reason live at the end).
+                    custom_print(f"⚠️ Scan error on batch {batch_no}/{total_batches}: "
+                                 f"{type(e).__name__}: {str(e)[:160]}")
                     await asyncio.sleep(5)
 
             while True:
@@ -387,8 +419,17 @@ async def background_downloader():
                     await asyncio.sleep(15)
 
         except Exception as e:
+            # This used to swallow the error in silence: it set GLOBAL_STATUS,
+            # slept, and looped — and since SCAN_TRIGGER had already been
+            # cleared, the worker then parked in the idle branch forever. The
+            # console showed "Scanning Telegram for new Posts..." and then
+            # nothing at all, with no hint that anything had failed. Always say
+            # what broke, and always re-arm the trigger so the cycle retries.
             GLOBAL_STATUS = f"❌ Worker Error: {str(e)[:50]}"
-            await asyncio.sleep(5)
+            custom_print(f"❌ Ghost Worker cycle failed: {type(e).__name__}: {str(e)[:160]}")
+            custom_print("   ↳ Retrying in 15s.")
+            SCAN_TRIGGER.set()
+            await asyncio.sleep(15)
 
 # --- FASTAPI APP ---
 app = FastAPI(title="Insta-Vault Modular OS")
