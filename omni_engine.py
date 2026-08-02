@@ -353,6 +353,21 @@ def vision_worker_loop():
 # ═══════════════════════════════════════════════════════════
 # WORKER 2 — ORACLE (chunks → Qwen narrative → PG + BGE + Neo4j GraphRAG)
 # ═══════════════════════════════════════════════════════════
+# Cross-video memory of recent narratives. Greedy decoding plus an identical
+# prompt made Qwen collapse visually similar reels onto the same paragraph,
+# and ON CONFLICT DO NOTHING then froze those rows forever.
+from collections import deque
+_RECENT_NARRATIVES = deque(maxlen=24)
+
+
+def _near_duplicate(norm_text, pool):
+    from difflib import SequenceMatcher
+    for prior in pool:
+        if SequenceMatcher(None, norm_text, prior).ratio() > 0.90:
+            return True
+    return False
+
+
 def process_oracle_job(payload):
     v_uuid, path, mode = payload["uuid"], payload["path"], payload.get("mode", "blitz")
     REDIS.hset(f"status:{v_uuid}", "oracle", "Thinking 🧠")
@@ -360,6 +375,16 @@ def process_oracle_job(payload):
     cap = cv2.VideoCapture(path)
     duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / (cap.get(cv2.CAP_PROP_FPS) or 30.0)
     cap.release()
+
+    # A file OpenCV cannot probe yields 0/NaN here. The chunk loop then runs
+    # zero iterations, the job ACKs "successfully" with 0 chunks, and the video
+    # sits in the library forever with an empty timeline and no error anywhere.
+    # Fail loudly so it retries and, if the file really is broken, dead-letters
+    # with a reason the DLQ can show.
+    if not (duration > 0) or math.isnan(duration) or math.isinf(duration):
+        raise RuntimeError(
+            f"unreadable duration ({duration!r}) for {path} — "
+            f"cannot chunk; file may be truncated or still downloading")
 
     cfg = OMNI_MODE_OMNI if mode == "omni" else OMNI_MODE_BLITZ
     chunk_size, qwen_fps, qwen_tokens = cfg["chunk"], cfg["fps"], cfg["tokens"]
@@ -370,12 +395,55 @@ def process_oracle_job(payload):
     from qdrant_client.models import PointStruct
     bge_points = []
     pg_conn = get_pg_conn_optional()
+    reused = 0
     try:
+        # Reprocess economics: re-narrating a 500-reel corpus is thousands of
+        # Qwen calls. Reuse an existing narrative only when it is trustworthy —
+        # non-empty, written by the current code path (created_at is set), and
+        # not one of the corpus-wide duplicates this fix exists to remove.
+        # Rows from the broken era have created_at NULL, so they always
+        # regenerate. Pass {"force": true} in the job to regenerate everything.
+        existing = {}
+        if not payload.get("force"):
+            try:
+                with pg_conn.cursor() as probe:
+                    probe.execute(
+                        """SELECT c.start_t, c.description, c.created_at, d.copies
+                           FROM chunks c
+                           LEFT JOIN (SELECT md5(description) AS h, COUNT(*) AS copies
+                                      FROM chunks GROUP BY 1) d
+                                  ON d.h = md5(c.description)
+                           WHERE c.video_uuid = %s""", (v_uuid,))
+                    for st, desc, created, copies in (probe.fetchall() or []):
+                        existing[round(float(st), 3)] = (desc, created, copies or 1)
+            except Exception as e:
+                log(f"Oracle {v_uuid}: reuse probe failed ({e}) — regenerating all", "WARN")
+
         with pg_conn.cursor() as pg_cursor:
             for start_t in range(0, int(math.ceil(duration)), int(chunk_size)):
                 if duration - start_t < 1.0:
                     break
                 end_t = min(start_t + chunk_size, duration)
+
+                prior = existing.get(round(float(start_t), 3))
+                if prior:
+                    p_desc, p_created, p_copies = prior
+                    if p_desc and p_desc.strip() and p_created and p_copies <= 1:
+                        # Trustworthy row — keep the text, but re-embed so the
+                        # vector payload picks up the description field added
+                        # above. bge_encode is cheap next to a Qwen call.
+                        c_id_str = f"chunk_{v_uuid}_{start_t}"
+                        bge_points.append(PointStruct(
+                            id=stable_id64(c_id_str),
+                            vector=bge_encode(p_desc),
+                            payload={"chunk_id": c_id_str, "video_uuid": v_uuid,
+                                     "video_path": path, "start_t": start_t,
+                                     "end_t": end_t, "description": p_desc}))
+                        previous_context = p_desc[:400]
+                        _RECENT_NARRATIVES.append(" ".join(p_desc.lower().split()))
+                        reused += 1
+                        continue
+
                 chunk_file = os.path.join(chunks_dir, f"chunk_{start_t}.mp4")
                 subprocess.run(
                     ["ffmpeg", "-ss", str(start_t), "-i", path, "-t", str(end_t - start_t),
@@ -386,24 +454,65 @@ def process_oracle_job(payload):
                     log(f"⚠️ Oracle {v_uuid}: chunk @{start_t}s failed to render — skipping", "WARN")
                     continue
 
+                chunk_prompt = (
+                    f"This clip covers {start_t:.0f}s-{end_t:.0f}s of a "
+                    f"{duration:.0f}s video. Previous part: '{previous_context}'. "
+                    f"Describe ONLY what is concretely visible and audible in THIS "
+                    f"clip — name the subjects, actions, setting, and any on-screen "
+                    f"text. Do not repeat the previous part.")
+                _gen_start = time.time()
                 narrative = qwen_describe_video(
-                    chunk_file,
-                    f"Context: '{previous_context}'. Write a highly intelligent, "
-                    f"continuous narrative explaining what is occurring now.",
-                    fps=qwen_fps, max_new_tokens=qwen_tokens)
-                previous_context = narrative
+                    chunk_file, chunk_prompt, fps=qwen_fps, max_new_tokens=qwen_tokens)
+                norm = " ".join(narrative.lower().split())
+                if _near_duplicate(norm, _RECENT_NARRATIVES):
+                    log(f"⚠️ Oracle {v_uuid} @{start_t}s: narrative near-duplicates "
+                        f"a recent one — regenerating hotter", "WARN")
+                    narrative = qwen_describe_video(
+                        chunk_file, chunk_prompt, fps=qwen_fps,
+                        max_new_tokens=qwen_tokens, temperature=1.0)
+                    norm = " ".join(narrative.lower().split())
+                    if _near_duplicate(norm, _RECENT_NARRATIVES):
+                        log(f"⚠️ Oracle {v_uuid} @{start_t}s: duplicate persisted "
+                            f"after retry — inspect chunk render / vision input",
+                            "ERROR")
+                gen_ms = int((time.time() - _gen_start) * 1000)
+                _RECENT_NARRATIVES.append(norm)
+                previous_context = narrative[:400]
 
                 c_id_str = f"chunk_{v_uuid}_{start_t}"
                 c_id_int = stable_id64(c_id_str)
 
+                # DO UPDATE, not DO NOTHING: reprocessing must be able to heal
+                # rows written while generation was broken (pre-53dafa5 CUDA
+                # era left identical narratives that DO NOTHING kept forever).
+                #
+                # Conflict target is (video_uuid, start_t), not chunk_id:
+                # chunk_id embeds the chunk length, so a blitz→omni mode change
+                # writes a whole second generation of rows for the same video
+                # and the timeline shows both at once.
                 pg_cursor.execute(
                     """INSERT INTO chunks (chunk_id, video_uuid, video_path, start_t, end_t,
-                       description) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
-                    (c_id_str, v_uuid, path, start_t, end_t, narrative))
+                       description, created_at, gen_ms, mode)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (video_uuid, start_t) DO UPDATE SET
+                         chunk_id    = EXCLUDED.chunk_id,
+                         description = EXCLUDED.description,
+                         video_path  = EXCLUDED.video_path,
+                         end_t       = EXCLUDED.end_t,
+                         created_at  = EXCLUDED.created_at,
+                         gen_ms      = EXCLUDED.gen_ms,
+                         mode        = EXCLUDED.mode""",
+                    (c_id_str, v_uuid, path, start_t, end_t, narrative,
+                     time.time(), gen_ms, mode))
                 bge_points.append(PointStruct(
                     id=c_id_int, vector=bge_encode(narrative),
                     payload={"chunk_id": c_id_str, "video_uuid": v_uuid, "video_path": path,
-                             "start_t": start_t, "end_t": end_t}))
+                             "start_t": start_t, "end_t": end_t,
+                             # The narrative itself, not just a pointer to it.
+                             # Postgres is optional (get_pg_conn_optional), so
+                             # without this a PG outage means the text is gone
+                             # for good even though the vector indexed fine.
+                             "description": narrative}))
 
                 driver = get_neo4j()
                 if driver:
@@ -428,7 +537,11 @@ def process_oracle_job(payload):
     if qdrant and bge_points:
         qdrant.upsert(collection_name="chunks_bge", points=bge_points)
     torch.cuda.empty_cache()
-    return len(bge_points)
+    if reused:
+        log(f"🧠 Oracle {v_uuid}: reused {reused} trustworthy chunk narratives "
+            f"(pass force=true to regenerate)", "INFO")
+    return {"chunks": len(bge_points), "generated": len(bge_points) - reused,
+            "reused": reused}
 
 
 def oracle_worker_loop():
@@ -447,7 +560,8 @@ def oracle_worker_loop():
                 n = process_oracle_job(payload)
                 REDIS.hset(f"status:{v_uuid}", "oracle", "DONE ✅")
                 ack_job(QUEUE_OMNI_ORACLE, job, job_raw)
-                log(f"🧠 Oracle {v_uuid}: {n} narrative chunks indexed", "SUCCESS")
+                log(f"🧠 Oracle {v_uuid}: {n['chunks']} narrative chunks indexed "
+                    f"({n['generated']} generated, {n['reused']} reused)", "SUCCESS")
             except Exception as e:
                 # Checked before fail_job: a lost context is not this job's
                 # fault, so it must not consume a retry or reach the DLQ.

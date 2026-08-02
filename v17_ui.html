@@ -288,6 +288,100 @@ header.topbar {
   font-size: 12px; color: var(--text-dim); font-style: italic;
 }
 .intel-speech.off { display: none; }
+.omni-meta {
+  margin-top: 9px; display: flex; flex-wrap: wrap; gap: 5px;
+  font-family: var(--font-mono); font-size: 9.5px;
+}
+.omni-meta span {
+  padding: 2px 6px; border-radius: 4px; background: var(--surface-2);
+  border: 1px solid var(--border); color: var(--text-dim);
+}
+.omni-meta span.warn { color: var(--warn); border-color: rgba(251,191,36,.35); }
+
+/* ═══════ PER-VIDEO TIMELINE ═══════
+   Three lanes, one per store, sharing the transport's time axis. Lane colour
+   IS the provenance: cyan = Postgres chunks, violet = SQLite transcripts,
+   green = SQLite frame_notes. Amber overrides any block whose text is
+   duplicated elsewhere in the corpus. */
+.tl {
+  border-top: 1px solid var(--border); background: var(--bg);
+  padding: 10px 20px 12px; flex-shrink: 0;
+}
+.tl-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.tl-head h3 {
+  font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--text-faint);
+}
+.tl-legend {
+  flex: 1; display: flex; gap: 12px; font-family: var(--font-mono);
+  font-size: 9.5px; color: var(--text-faint);
+}
+.tl-legend b { color: var(--text-dim); font-weight: 500; }
+.tl-legend i { font-style: normal; }
+.tl-legend span::before {
+  content: ''; display: inline-block; width: 8px; height: 8px;
+  border-radius: 2px; margin-right: 5px; vertical-align: -1px;
+}
+.tl-legend .lg-narr::before   { background: var(--accent); }
+.tl-legend .lg-speech::before { background: #a78bfa; }
+.tl-legend .lg-visual::before { background: var(--ok); }
+.tl-legend .lg-dup::before    { background: var(--warn); }
+
+.tl-lanes { position: relative; display: flex; flex-direction: column; gap: 4px; }
+.tl-row { display: flex; align-items: center; gap: 10px; }
+.tl-label {
+  width: 74px; flex-shrink: 0; text-align: right;
+  font-family: var(--font-mono); font-size: 9.5px; color: var(--text-dim);
+}
+.tl-label em {
+  display: block; font-style: normal; font-size: 8.5px; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.tl-track {
+  position: relative; flex: 1; height: 22px; border-radius: 5px;
+  background: var(--surface); border: 1px solid var(--border); overflow: hidden;
+}
+.tl-track[data-empty]:empty::after {
+  content: attr(data-empty); position: absolute; inset: 0;
+  display: flex; align-items: center; padding-left: 9px;
+  font-size: 10px; font-style: italic; color: var(--text-faint);
+}
+.tl-blk {
+  position: absolute; top: 3px; bottom: 3px; border-radius: 3px;
+  cursor: pointer; opacity: .5; transition: opacity .12s;
+  min-width: 2px; border: 1px solid transparent;
+}
+.tl-blk:hover { opacity: .85; }
+.tl-blk.sel { opacity: 1; border-color: var(--text); }
+.tl-blk.narr   { background: var(--accent); }
+.tl-blk.speech { background: #a78bfa; }
+.tl-blk.visual { background: var(--ok); }
+.tl-blk.dup    { background: var(--warn); }
+
+.tl-axis {
+  position: relative; height: 13px; margin-left: 84px;
+  font-family: var(--font-mono); font-size: 9px; color: var(--text-faint);
+}
+.tl-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.tl-playhead {
+  position: absolute; top: 0; bottom: 13px; width: 1px;
+  background: var(--danger); pointer-events: none; display: none;
+}
+.tl-playhead::before {
+  content: ''; position: absolute; top: -2px; left: -3px;
+  border-left: 3.5px solid transparent; border-right: 3.5px solid transparent;
+  border-top: 5px solid var(--danger);
+}
+.tl-detail {
+  margin-top: 9px; margin-left: 84px; min-height: 32px; font-size: 12px;
+  line-height: 1.5; color: var(--text);
+}
+.tl-detail .dim { color: var(--text-faint); font-style: italic; }
+.tl-detail .src {
+  font-family: var(--font-mono); font-size: 9.5px; color: var(--text-faint);
+  display: block; margin-top: 3px;
+}
+.tl-detail .flag { color: var(--warn); font-weight: 500; }
 #histCanvas { width: 100%; height: 96px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); display: block; }
 .hist-legend { display: flex; gap: 12px; margin-top: 8px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); }
 .hist-legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
@@ -496,6 +590,37 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
             </div>
           </div>
         </div>
+
+        <!-- ═══════ PER-VIDEO TIMELINE — every store, time-aligned ═══════ -->
+        <div class="tl" id="timeline">
+          <div class="tl-head">
+            <h3>Timeline</h3>
+            <div class="tl-legend" id="tlLegend"></div>
+            <button class="btn-icon" id="tlSqlBtn" onclick="openTimelineInDb()"
+                    title="Open the rows behind this timeline in the Database browser">
+              Rows in DB ›
+            </button>
+          </div>
+          <div class="tl-lanes" id="tlLanes">
+            <div class="tl-row">
+              <span class="tl-label" title="PostgreSQL · chunks">Narrative<em>pg</em></span>
+              <div class="tl-track" id="tlNarr" data-empty="waiting for the Oracle worker"></div>
+            </div>
+            <div class="tl-row">
+              <span class="tl-label" title="SQLite · transcripts">Speech<em>sq</em></span>
+              <div class="tl-track" id="tlSpeech" data-empty="no transcript yet"></div>
+            </div>
+            <div class="tl-row">
+              <span class="tl-label" title="SQLite · frame_notes">Visual<em>sq</em></span>
+              <div class="tl-track" id="tlVisual" data-empty="no frame notes yet"></div>
+            </div>
+            <div class="tl-axis" id="tlAxis"></div>
+            <div class="tl-playhead" id="tlPlayhead"></div>
+          </div>
+          <div class="tl-detail" id="tlDetail">
+            <span class="dim">Click any block to inspect the exact row — or scrub, the timeline follows the playhead.</span>
+          </div>
+        </div>
       </div>
 
       <aside class="ws-side">
@@ -504,6 +629,11 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
           <div class="intel-ts" id="intelTs">— </div>
           <div class="intel-desc dim" id="intelDesc">No analysis yet — GPU engine will describe each frame after processing.</div>
           <div class="intel-speech off" id="intelSpeech"></div>
+        </div>
+        <div class="panel">
+          <h3>Omni Narrative <span id="omniSrc" style="letter-spacing:0;text-transform:none;color:var(--accent)"></span></h3>
+          <div class="intel-desc dim" id="omniDesc">No narrative chunks yet — the Oracle worker describes the video after processing.</div>
+          <div class="omni-meta" id="omniMeta"></div>
         </div>
         <div class="panel">
           <h3>Histogram <span id="histMode" style="letter-spacing:0;text-transform:none;color:var(--accent)">RGB</span></h3>
@@ -884,8 +1014,9 @@ async function openWorkspace(folderId, push = true) {
       return;
     }
 
-    // Frame intel loads in parallel with frames (non-blocking)
+    // Frame intel + omni narrative load in parallel with frames (non-blocking)
     loadFrameNotes(folderId, mySession);
+    loadOmniTimeline(folderId, mySession);
 
     // ── PASS 0: instant single-frame first paint ──
     paintFirstFrame(folderId, mySession);
@@ -1125,7 +1256,11 @@ function sizeCanvas() {
     canvas.width = w * dpr; canvas.height = h * dpr;
   }
 }
-window.addEventListener('resize', () => { sizeCanvas(); if (lastBitmap) drawBitmap(lastBitmap); });
+window.addEventListener('resize', () => {
+  sizeCanvas();
+  if (lastBitmap) drawBitmap(lastBitmap);
+  updateTimelinePlayhead();   // playhead is pixel-positioned over the lanes
+});
 
 function drawBitmap(bm) {
   sizeCanvas();
@@ -1206,7 +1341,257 @@ async function loadFrameNotes(folderId, mySession) {
     transcript = (data.transcript || []).sort((a, b) => a.start_sec - b.start_sec);
     $('intelSrc').textContent = frameNotes.length ? `${frameNotes.length} notes` : '';
     updateIntel();
+    // This call races /api/timeline and owns `transcript`. Whichever finishes
+    // last must redraw the lanes, or the speech lane renders empty.
+    if (tlDuration > 0) renderTimeline();
   } catch (e) { /* notes are non-critical */ }
+}
+
+/* ═══════════ PER-VIDEO TIMELINE ═══════════
+   One request returns every store's rows for this reel. Each lane renders its
+   own rows positioned on a shared time axis, so "what does the database hold
+   for this video, and when" is answerable at a glance. Every block carries the
+   store + table + key it came from. */
+let omniChunks = [];             // postgres: chunks
+let tlNotes = [];                // sqlite: frame_notes
+let tlDuration = 0;
+let tlSources = {};
+let tlPinned = null;             // {lane, i} when the user clicks a block
+
+async function loadOmniTimeline(folderId, mySession) {
+  omniChunks = []; tlNotes = []; tlSources = {}; tlPinned = null;
+  $('omniDesc').textContent = 'Loading narrative…';
+  $('omniDesc').classList.add('dim');
+  $('omniSrc').textContent = '';
+  $('omniMeta').innerHTML = '';
+  for (const id of ['tlNarr', 'tlSpeech', 'tlVisual']) $(id).innerHTML = '';
+  $('tlDetail').innerHTML = '<span class="dim">Loading timeline…</span>';
+
+  try {
+    const data = await (await apiFetch(`/api/timeline/${folderId}`)).json();
+    if (mySession !== session) return;
+
+    omniChunks = (data.chunks || []).slice().sort((a, b) => a.start_t - b.start_t);
+    tlNotes = data.notes || [];
+    tlSources = data.sources || {};
+    // transcript[] is already loaded by loadFrameNotes; prefer whichever has
+    // rows so the lane still draws if one of the two calls failed.
+    if ((data.transcript || []).length > transcript.length) transcript = data.transcript;
+
+    const clipEnd = frameNames.length ? frameTs(frameNames.length - 1) : 0;
+    tlDuration = Math.max(
+      clipEnd, data.duration || 0,
+      omniChunks.length ? omniChunks[omniChunks.length - 1].end_t : 0,
+      transcript.length ? transcript[transcript.length - 1].end_sec : 0,
+      tlNotes.length ? tlNotes[tlNotes.length - 1].ts_sec : 0);
+
+    $('omniSrc').textContent = omniChunks.length
+      ? `${omniChunks.length} chunk${omniChunks.length === 1 ? '' : 's'}`
+      : (data.pg !== 'online' ? 'PG offline' : 'no chunks');
+
+    if (!omniChunks.length) {
+      $('omniDesc').textContent = data.pg !== 'online'
+        ? `Postgres offline — narrative chunks unavailable.${data.pg_error ? ' ' + data.pg_error : ''}`
+        : 'No narrative chunks yet — the Oracle worker describes the video after processing.';
+      $('omniDesc').classList.add('dim');
+    }
+
+    renderTimeline();
+    updateOmniPanel();
+  } catch (e) {
+    if (mySession !== session) return;
+    $('tlDetail').innerHTML = '<span class="dim">Timeline unavailable — /api/timeline failed.</span>';
+  }
+}
+
+function tlPct(t) {
+  return tlDuration > 0 ? Math.min(100, Math.max(0, (t / tlDuration) * 100)) : 0;
+}
+
+function renderTimeline() {
+  const dupCount = omniChunks.filter(c => c.corpus_copies > 1).length;
+
+  // Legend doubles as the row-count readout — the number of rows per store is
+  // part of what the panel is here to show.
+  $('tlLegend').innerHTML =
+    `<span class="lg-narr"><b>${omniChunks.length}</b> <i>narrative · pg.chunks</i></span>` +
+    `<span class="lg-speech"><b>${transcript.length}</b> <i>speech · sqlite.transcripts</i></span>` +
+    `<span class="lg-visual"><b>${tlNotes.length}</b> <i>visual · sqlite.frame_notes</i></span>` +
+    (dupCount ? `<span class="lg-dup"><b>${dupCount}</b> <i>duplicated corpus-wide</i></span>` : '');
+
+  // ── narrative lane (postgres) ──
+  const narr = $('tlNarr');
+  narr.innerHTML = '';
+  omniChunks.forEach((c, i) => {
+    const b = document.createElement('div');
+    b.className = 'tl-blk narr' + (c.corpus_copies > 1 ? ' dup' : '');
+    b.style.left = tlPct(c.start_t) + '%';
+    b.style.width = Math.max(0.4, tlPct(c.end_t) - tlPct(c.start_t)) + '%';
+    b.title = `${c.start_t.toFixed(1)}s–${c.end_t.toFixed(1)}s` +
+              (c.corpus_copies > 1 ? `\n⚠ identical text on ${c.corpus_copies} chunks corpus-wide` : '');
+    b.onclick = () => pinTimeline('narr', i, c.start_t);
+    narr.appendChild(b);
+  });
+
+  // ── speech lane (sqlite) ──
+  const sp = $('tlSpeech');
+  sp.innerHTML = '';
+  transcript.forEach((s, i) => {
+    const b = document.createElement('div');
+    b.className = 'tl-blk speech';
+    b.style.left = tlPct(s.start_sec) + '%';
+    b.style.width = Math.max(0.3, tlPct(s.end_sec) - tlPct(s.start_sec)) + '%';
+    b.title = `${s.start_sec.toFixed(1)}s–${s.end_sec.toFixed(1)}s\n${s.text}`;
+    b.onclick = () => pinTimeline('speech', i, s.start_sec);
+    sp.appendChild(b);
+  });
+
+  // ── visual lane (sqlite) — point events, so give them a hit target ──
+  const vis = $('tlVisual');
+  vis.innerHTML = '';
+  tlNotes.forEach((n, i) => {
+    const b = document.createElement('div');
+    b.className = 'tl-blk visual';
+    b.style.left = tlPct(n.ts_sec) + '%';
+    b.style.width = '0.6%';
+    b.title = `${n.ts_sec.toFixed(1)}s\n${n.description || '—'}`;
+    b.onclick = () => pinTimeline('visual', i, n.ts_sec);
+    vis.appendChild(b);
+  });
+
+  // ── axis ──
+  const axis = $('tlAxis');
+  axis.innerHTML = '';
+  if (tlDuration > 0) {
+    const ticks = 6;
+    for (let i = 0; i <= ticks; i++) {
+      const t = (tlDuration / ticks) * i;
+      const s = document.createElement('span');
+      s.style.left = tlPct(t) + '%';
+      s.textContent = t.toFixed(t < 10 ? 1 : 0) + 's';
+      axis.appendChild(s);
+    }
+  }
+  updateTimelinePlayhead();
+}
+
+function updateTimelinePlayhead() {
+  const ph = $('tlPlayhead');
+  if (!tlDuration || !frameNames.length) { ph.style.display = 'none'; return; }
+  const track = $('tlNarr');
+  if (!track.offsetWidth) { ph.style.display = 'none'; return; }
+  // Lanes share one geometry: label column (84px) + flexible track.
+  const left = track.offsetLeft + (tlPct(frameTs(curIdx)) / 100) * track.offsetWidth;
+  ph.style.display = 'block';
+  ph.style.left = left + 'px';
+}
+
+function pinTimeline(lane, i, seekTo) {
+  // Seek FIRST: scrubTo() clears tlPinned (so ordinary scrubbing releases the
+  // pin), so setting the pin before seeking would immediately undo it.
+  if (typeof seekTo === 'number' && nativeFps > 0) {
+    scrubTo(Math.round(seekTo * nativeFps));
+  }
+  tlPinned = { lane, i };
+  renderTimelineDetail();
+}
+
+function renderTimelineDetail() {
+  const el = $('tlDetail');
+  const ts = frameTs(curIdx);
+
+  // Pinned row wins; otherwise follow the playhead down the narrative lane.
+  let lane, row;
+  if (tlPinned) {
+    lane = tlPinned.lane;
+    row = lane === 'narr' ? omniChunks[tlPinned.i]
+        : lane === 'speech' ? transcript[tlPinned.i]
+        : tlNotes[tlPinned.i];
+  } else if (omniChunks.length) {
+    lane = 'narr';
+    let k = 0;
+    for (let j = 0; j < omniChunks.length; j++) if (omniChunks[j].start_t <= ts + 1e-6) k = j;
+    row = omniChunks[k];
+  }
+
+  if (!row) {
+    el.innerHTML = '<span class="dim">No rows for this video yet — run the pipeline, then reopen.</span>';
+    return;
+  }
+
+  const meta = tlSources[lane === 'narr' ? 'chunks' : lane === 'speech' ? 'transcript' : 'notes'] || {};
+  const srcLine = `${meta.store || '—'} · ${meta.table || '—'} · ${meta.key || ''}`;
+
+  if (lane === 'narr') {
+    const dup = row.corpus_copies > 1;
+    const when = row.created_at
+      ? new Date(row.created_at * 1000).toLocaleString('en-GB')
+      : 'unknown (pre-fix row)';
+    el.innerHTML =
+      (dup ? `<span class="flag">⚠ this exact text is on ${row.corpus_copies} chunks corpus-wide — regenerate this reel</span><br>` : '') +
+      escapeHtml(row.description || '—') +
+      `<span class="src">${escapeHtml(row.chunk_id || '')} · ${row.start_t.toFixed(1)}s–${row.end_t.toFixed(1)}s` +
+      ` · generated ${escapeHtml(when)}${row.gen_ms ? ` in ${row.gen_ms} ms` : ''}${row.mode ? ` · ${escapeHtml(row.mode)}` : ''}` +
+      `<br>${escapeHtml(srcLine)}</span>`;
+  } else if (lane === 'speech') {
+    el.innerHTML = `🎙 “${escapeHtml(row.text || '')}”` +
+      `<span class="src">${row.start_sec.toFixed(2)}s–${row.end_sec.toFixed(2)}s · ${escapeHtml(srcLine)}</span>`;
+  } else {
+    let objs = '';
+    try {
+      const parsed = JSON.parse(row.objects || '[]');
+      objs = parsed.map(o => `${o.label} ${o.conf}`).join(', ');
+    } catch (e) { /* objects column is free-form on legacy rows */ }
+    el.innerHTML = escapeHtml(row.description || '—') +
+      `<span class="src">frame ${row.frame_idx} · ${row.ts_sec.toFixed(2)}s` +
+      (objs ? ` · yolo: ${escapeHtml(objs)}` : '') +
+      (row.ocr_text ? ` · ocr: “${escapeHtml(row.ocr_text.slice(0, 120))}”` : '') +
+      `<br>${escapeHtml(srcLine)}</span>`;
+  }
+
+  // Selection highlight
+  document.querySelectorAll('.tl-blk.sel').forEach(b => b.classList.remove('sel'));
+  const trackId = lane === 'narr' ? 'tlNarr' : lane === 'speech' ? 'tlSpeech' : 'tlVisual';
+  const idx = tlPinned ? tlPinned.i : omniChunks.indexOf(row);
+  const blk = $(trackId).children[idx];
+  if (blk) blk.classList.add('sel');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* Jump to the exact rows behind this timeline in the Database browser. */
+function openTimelineInDb() {
+  if (!currentFolder) return;
+  const msgId = currentFolder.replace('frames_', '');
+  switchView('db');
+  // selectDbTable() clears the search box, so filter after it, not before.
+  dbActiveTable = 'frame_notes';
+  dbOffset = 0;
+  $('dbTableSelect').value = 'frame_notes';
+  $('dbSearch').value = msgId;
+  loadDbRows();
+  showToast(`Database → frame_notes filtered to msg_id ${msgId}`, 'ok');
+}
+
+function updateOmniPanel() {
+  if (!omniChunks.length) return;
+  const ts = frameTs(curIdx);
+  let active = omniChunks[0];
+  for (const c of omniChunks) if (c.start_t <= ts + 1e-6) active = c;
+  const el = $('omniDesc');
+  const dup = active.corpus_copies > 1;
+  el.textContent = active.description || '—';
+  el.classList.toggle('dim', !active.description);
+
+  const bits = [`${active.start_t.toFixed(1)}s–${active.end_t.toFixed(1)}s`];
+  if (active.mode) bits.push(active.mode);
+  if (active.gen_ms) bits.push(`${active.gen_ms} ms`);
+  $('omniMeta').innerHTML =
+    bits.map(b => `<span>${escapeHtml(b)}</span>`).join('') +
+    (dup ? `<span class="warn">⚠ ${active.corpus_copies}× corpus-wide</span>` : '');
 }
 
 function _lastAtOrBefore(arr, key, t) {
@@ -1241,6 +1626,9 @@ function updateIntel() {
       sEl.classList.remove('off');
     } else sEl.classList.add('off');
   } else sEl.classList.add('off');
+  updateOmniPanel();
+  updateTimelinePlayhead();
+  renderTimelineDetail();
 }
 
 /* ═══════════ TRANSPORT ═══════════ */
@@ -1248,6 +1636,7 @@ function scrubTo(idx, force = false) {
   idx = Math.max(0, Math.min(idx, frameNames.length - 1));
   if (idx === curIdx && !force) return;
   curIdx = idx;
+  tlPinned = null;              // moving the playhead releases a pinned row
   $('scrubber').value = idx;
   const ts = frameTs(idx);
   $('tcCur').textContent = ts.toFixed(3);

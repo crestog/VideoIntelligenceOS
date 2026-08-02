@@ -317,8 +317,59 @@ def init_pg_schema():
                     chunk_id TEXT PRIMARY KEY, video_uuid TEXT, video_path TEXT,
                     start_t REAL, end_t REAL, description TEXT
                 )''')
+                # Generation provenance — the Job-detail panel reads these to
+                # show WHEN a narrative was produced and how long it took, so a
+                # stale row from a broken run is visible instead of silent.
+                for col, coltype in (("created_at", "DOUBLE PRECISION"),
+                                     ("gen_ms", "INTEGER"),
+                                     ("mode", "TEXT")):
+                    cur.execute(f"ALTER TABLE chunks ADD COLUMN IF NOT EXISTS {col} {coltype}")
+
+                # chunk_id embeds start_t, so switching blitz(15s)→omni(5s)
+                # inserts a SECOND set of rows for the same video instead of
+                # replacing the first. The video then shows both generations
+                # interleaved on the timeline — one of the ways the same
+                # narrative appeared to repeat. Position is the real identity.
+                #
+                # Existing databases already hold those duplicates, and CREATE
+                # UNIQUE INDEX would just fail on them, so collapse first:
+                # keep exactly ONE row per (video, position).
+                #
+                # This must be a total ranking, not a pairwise comparison. An
+                # earlier version deleted `a` only when a.description was no
+                # longer than b's, so a pair where the older row had the longer
+                # text matched in neither direction, both rows survived, the
+                # unique index below failed, and schema init fell into the
+                # except branch — disabling Postgres entirely on every boot.
+                # row_number() over a deterministic order can only ever keep one.
+                cur.execute("""
+                    DELETE FROM chunks WHERE ctid IN (
+                        SELECT ctid FROM (
+                            SELECT ctid, row_number() OVER (
+                                PARTITION BY video_uuid, start_t
+                                ORDER BY COALESCE(created_at, 0) DESC,
+                                         COALESCE(length(description), 0) DESC,
+                                         ctid DESC) AS rn
+                            FROM chunks) ranked
+                        WHERE rn > 1)""")
+                removed = cur.rowcount
+                if removed and removed > 0:
+                    log(f"Collapsed {removed} duplicate chunk rows "
+                        f"(same video + start time)", "WARN")
+                cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS
+                               chunks_video_start_uniq ON chunks (video_uuid, start_t)""")
+                # The timeline endpoint filters by video_uuid on every open.
+                cur.execute("""CREATE INDEX IF NOT EXISTS chunks_video_idx
+                               ON chunks (video_uuid)""")
+                cur.execute("""CREATE INDEX IF NOT EXISTS frames_video_idx
+                               ON frames (video_uuid)""")
+                # Corpus-wide duplicate detection joins on the description text.
+                # md5 keeps the index small; TEXT itself can exceed the 8 KB
+                # btree row limit on a long narrative.
+                cur.execute("""CREATE INDEX IF NOT EXISTS chunks_desc_md5_idx
+                               ON chunks (md5(description))""")
             conn.commit()
-        log("PostgreSQL schema ready (frames, chunks)", "SUCCESS")
+        log("PostgreSQL schema ready (frames, chunks + timeline indexes)", "SUCCESS")
         return True
     except Exception as e:
         log(f"PostgreSQL schema init failed: {e}", "ERROR")

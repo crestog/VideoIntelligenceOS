@@ -411,6 +411,97 @@ def get_frame_notes(folder_name: str):
 
 
 # ═══════════════════════════════════════════════════════════
+# OMNI TIMELINE — everything the DBs hold for one video, time-ordered
+# ═══════════════════════════════════════════════════════════
+@v17_router.get("/api/timeline/{folder_name}")
+def get_video_timeline(folder_name: str):
+    """Merged per-video timeline: SQLite transcript + frame-note count joined
+    with the Omniscient narrative chunks from Postgres. The join key is
+    video_uuid = 'tg<msg_id>' (set at enqueue time in ui_server). Postgres
+    being offline degrades to chunks: [] — the CV lanes still render."""
+    msg_id_str = folder_name.replace('frames_', '')
+    if not msg_id_str.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    msg_id = int(msg_id_str)
+
+    out = {"chunks": [], "transcript": [], "notes": [], "notes_count": 0,
+           "duration": None, "pg": "offline", "pg_error": None,
+           "sources": {}, "video_uuid": f"tg{msg_id}"}
+
+    # ── SQLite lanes: speech + per-frame visual notes ──
+    try:
+        conn = _db()
+        row = conn.execute(
+            'SELECT frames, fps, duration_sec FROM videos WHERE msg_id = ?',
+            (msg_id,)).fetchone()
+        if row:
+            # duration_sec is written from the real frame timestamps; the
+            # frames/fps division is only a fallback for legacy rows.
+            if row['duration_sec']:
+                out["duration"] = round(float(row['duration_sec']), 2)
+            elif row['fps']:
+                out["duration"] = round((row['frames'] or 0) / row['fps'], 2)
+        out["transcript"] = [dict(r) for r in conn.execute(
+            'SELECT start_sec, end_sec, text FROM transcripts '
+            'WHERE msg_id = ? ORDER BY start_sec', (msg_id,)).fetchall()]
+        # Only notes that carry real signal — a reel of "no salient objects or
+        # text detected" rows would otherwise bury the useful ones.
+        out["notes"] = [dict(r) for r in conn.execute(
+            '''SELECT frame_idx, ts_sec, description, ocr_text, objects
+               FROM frame_notes WHERE msg_id = ? ORDER BY ts_sec''',
+            (msg_id,)).fetchall()]
+        out["notes_count"] = len(out["notes"])
+        conn.close()
+    except sqlite3.OperationalError:
+        pass                                     # tables not created yet
+
+    # ── Postgres lane: Omniscient narrative chunks ──
+    # One aggregate join, not a COUNT(*) per chunk: the old shape scanned the
+    # whole chunks table once per row, which at corpus scale (10k reels ≈ 100k
+    # chunks) made opening a workspace take seconds.
+    try:
+        import omni_db
+        pg = omni_db.get_pg_conn()
+        try:
+            with pg.cursor() as cur:
+                cur.execute(
+                    """SELECT c.chunk_id, c.start_t, c.end_t, c.description,
+                              COALESCE(d.copies, 1), c.created_at, c.gen_ms, c.mode
+                       FROM chunks c
+                       LEFT JOIN (SELECT md5(description) AS h, COUNT(*) AS copies
+                                  FROM chunks GROUP BY 1) d
+                              ON d.h = md5(c.description)
+                       WHERE c.video_uuid = %s
+                       ORDER BY c.start_t""", (f"tg{msg_id}",))
+                out["chunks"] = [
+                    {"chunk_id": cid, "start_t": st, "end_t": et,
+                     "description": desc, "corpus_copies": copies,
+                     "created_at": created, "gen_ms": gen_ms, "mode": mode}
+                    for cid, st, et, desc, copies, created, gen_ms, mode
+                    in cur.fetchall()]
+            out["pg"] = "online"
+        finally:
+            pg.close()
+    except Exception as e:
+        # Surfaced to the UI instead of only the log: "PG offline" with no
+        # reason is the kind of silence this project's design law forbids.
+        out["pg_error"] = f"{type(e).__name__}: {e}"[:180]
+        vios_log(f"Timeline PG fetch skipped: {e}", "SYS", "WARN")
+
+    # Which store each lane came from — the UI labels every row with its origin
+    # so "where does this text live?" is answerable without reading the code.
+    out["sources"] = {
+        "chunks": {"store": "postgres", "table": "chunks",
+                   "key": f"video_uuid='tg{msg_id}'", "rows": len(out["chunks"])},
+        "transcript": {"store": "sqlite", "table": "transcripts",
+                       "key": f"msg_id={msg_id}", "rows": len(out["transcript"])},
+        "notes": {"store": "sqlite", "table": "frame_notes",
+                  "key": f"msg_id={msg_id}", "rows": out["notes_count"]},
+    }
+    return out
+
+
+# ═══════════════════════════════════════════════════════════
 # DATABASE VIEWER — read-only browser over EVERY table
 # ═══════════════════════════════════════════════════════════
 @v17_router.get("/api/db/tables")
