@@ -41,8 +41,9 @@ def custom_print(*args, **kwargs):
         loop.create_task(ws_mgr.broadcast({"type": "log", "message": f"[{time.strftime('%H:%M:%S')}] {msg}"}))
     except: pass
 
-# --- CREDENTIALS (single source of truth: config.py, env-overridable) ---
-from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID
+# --- CREDENTIALS (single source of truth: config.py, env-only) ---
+from config import (API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID,
+                    missing_telegram_secrets)
 
 # --- DIRECTORY ROUTING (from config.py) ---
 SESSION_PATH = os.path.join(LAKE_DIR, 'bot_session')
@@ -172,6 +173,20 @@ async def background_downloader():
     custom_print("\n=======================================")
     custom_print("🚀 GHOST WORKER: SYSTEMS ONLINE")
     custom_print("=======================================\n")
+
+    # Without credentials pyrogram fails several frames deep with an opaque
+    # auth error, and the watchdog then restarts this process forever. The web
+    # UI, the API and the frame pipeline do not need Telegram, so park the
+    # harvester instead of taking the server down with it.
+    absent = missing_telegram_secrets()
+    if absent:
+        GLOBAL_STATUS = f"⚠️ Telegram disabled — missing {', '.join(absent)}"
+        custom_print(f"⚠️ Ghost Worker idle: {', '.join(absent)} not set.")
+        custom_print("   Add them as Kaggle Secrets and restart the notebook to "
+                     "resume channel harvesting. The UI and CV pipeline are unaffected.")
+        while True:
+            await asyncio.sleep(3600)
+
     app_client = Client(SESSION_PATH, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     await app_client.start()
 

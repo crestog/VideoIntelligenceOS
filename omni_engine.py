@@ -36,7 +36,8 @@ import uuid as uuid_lib
 from config import (ARCHIVE_DIR, LAKE_DIR, API_ID, API_HASH, BOT_TOKEN,
                     QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE, OMNI_DEDUP_SET,
                     NIM_API_KEY, NIM_BASE_URL, NIM_MODEL, OMNI_DASHBOARD_PORT,
-                    OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS)
+                    OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS,
+                    missing_telegram_secrets)
 
 import cv2
 import numpy as np
@@ -870,8 +871,39 @@ from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-app = Client(os.path.join(LAKE_DIR, "omni_bot"),
-             api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# The bot is one of four things this process runs — the two worker loops and the
+# God-Mode dashboard do not need Telegram at all. So a missing credential
+# disables the bot and leaves the rest running, rather than taking down the
+# engine and handing the watchdog an unfixable restart loop. `app` becomes a
+# stand-in whose only job is to absorb the @app.on_message decorators below.
+TELEGRAM_MISSING = missing_telegram_secrets()
+
+
+class _DisabledBot:
+    """No-op stand-in for the pyrogram Client when credentials are absent."""
+
+    def __init__(self, missing):
+        self.missing = missing
+
+    def _noop_decorator(self, *_a, **_k):
+        def wrap(fn):
+            return fn
+        return wrap
+
+    on_message = on_callback_query = _noop_decorator
+
+    async def start(self):
+        raise RuntimeError(f"Telegram credentials missing: {', '.join(self.missing)}")
+
+    async def send_message(self, *_a, **_k):
+        return None
+
+
+if TELEGRAM_MISSING:
+    app = _DisabledBot(TELEGRAM_MISSING)
+else:
+    app = Client(os.path.join(LAKE_DIR, "omni_bot"),
+                 api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 pending_videos = {}
 
@@ -1302,6 +1334,14 @@ def main():
 
     # 4. Telegram bot (main asyncio loop)
     async def _run():
+        if TELEGRAM_MISSING:
+            log(f"⚠️ Telegram bot disabled — missing {', '.join(TELEGRAM_MISSING)}.", "WARN")
+            log("   Set them as Kaggle Secrets and restart to enable uploads and "
+                "bot search. Workers, dashboard and queues are unaffected.", "WARN")
+            log("⚡ OMNISCIENT ENGINE RUNNING — queues hot, bot off.", "SUCCESS")
+            asyncio.create_task(ui_updater_daemon())
+            while True:
+                await asyncio.sleep(3600)
         await app.start()
         asyncio.create_task(ui_updater_daemon())
         log("⚡ OMNISCIENT ENGINE RUNNING — bot online, queues hot.", "SUCCESS")

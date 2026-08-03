@@ -102,7 +102,14 @@ secrets   = UserSecretsClient()
 # ── Credentials (all injected as env vars; nothing is hardcoded in the repo) ──
 repo = f"https://crestog:{secrets.get_secret('github_token')}@github.com/crestog/VideoIntelligenceOS.git"
 
-for env_key, secret_name in [("HF_TOKEN", "hf_token"), ("VIOS_NIM_API_KEY", "nim_api_key")]:
+for env_key, secret_name in [
+    ("HF_TOKEN",             "hf_token"),
+    ("VIOS_NIM_API_KEY",     "nim_api_key"),
+    # Telegram credentials are env-only — config.py has no fallback.
+    ("VIOS_API_ID",          "TELEGRAM_API_ID"),
+    ("VIOS_API_HASH",        "TELEGRAM_API_HASH"),
+    ("VIOS_BOT_TOKEN",       "TELEGRAM_BOT_TOKEN"),
+]:
     try:
         os.environ[env_key] = secrets.get_secret(secret_name)
     except Exception:
@@ -137,7 +144,17 @@ a missing backend disables only the features that depend on it. Once cloudflared
 prints the tunnel URL, the **Omniscient** tab in the Command Deck serves the
 God-Mode Explorer, and the Telegram bot accepts video uploads on the priority lane.
 
-**Required Kaggle Secrets:** `github_token` (mandatory), `hf_token` (optional —
-all models are currently public), `nim_api_key` (optional — without it, GraphRAG
-extraction and answer synthesis are skipped and raw visual output is returned).
+**Required Kaggle Secrets:** `github_token` (mandatory), `TELEGRAM_API_ID` /
+`TELEGRAM_API_HASH` / `TELEGRAM_BOT_TOKEN` (needed for the upload bot and channel
+harvesting — without them both stay disabled and everything else runs normally),
+`hf_token` (optional — all models are currently public), `nim_api_key` (optional —
+without it, GraphRAG extraction and answer synthesis are skipped and raw visual
+output is returned).
+
+> **Credentials are env-only.** `config.py` carries no fallback values. An earlier
+> revision hardcoded a working bot token and API hash as defaults, which published
+> them in this repository's history — treat any credential from before this commit
+> as compromised and rotate it. `boot.py` prints which secrets are absent during
+> preflight, so a forgotten export shows up as one clear line rather than two
+> workers failing deep inside pyrogram.
 

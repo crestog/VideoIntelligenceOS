@@ -235,10 +235,54 @@ SQLITE_TIMEOUT = 30  # seconds; ALL sqlite3.connect calls must pass this
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM (shared by Ghost Worker + Snapshot Manager)
 # ═══════════════════════════════════════════════════════════
-API_ID     = int(os.environ.get('VIOS_API_ID', 37392880))
-API_HASH   = os.environ.get('VIOS_API_HASH', '4037344084ae998be2cdaee3192bd8f8')
-BOT_TOKEN  = os.environ.get('VIOS_BOT_TOKEN', '8269867642:AAH76B2_aFbqc6OqNiCAm-NenTTmG_SWavU')
-CHANNEL_ID = int(os.environ.get('VIOS_CHANNEL_ID', -1003762735924))
+# Env-only. These used to carry live credentials as literal defaults, which
+# meant the working token sat in a public repository — anyone could drive the
+# bot and read the channel. There is deliberately no fallback now: a missing
+# secret must fail loudly at boot rather than silently authenticate as whatever
+# was last committed. The launcher maps Kaggle Secrets onto these names.
+#
+# Accepts either prefix so the notebook can export the obvious TELEGRAM_* names
+# or the internal VIOS_* ones.
+def _secret(*names: str, default: str = '') -> str:
+    for name in names:
+        val = os.environ.get(name)
+        if val:
+            return val.strip()
+    return default
+
+
+def _int_secret(*names: str, default: int = 0) -> int:
+    raw = _secret(*names)
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+API_ID     = _int_secret('VIOS_API_ID', 'TELEGRAM_API_ID')
+API_HASH   = _secret('VIOS_API_HASH', 'TELEGRAM_API_HASH')
+BOT_TOKEN  = _secret('VIOS_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN')
+# Not a credential — the channel id is an address, not a key.
+CHANNEL_ID = _int_secret('VIOS_CHANNEL_ID', 'TELEGRAM_CHANNEL_ID',
+                         default=-1003762735924)
+
+# Names as the launcher/Kaggle Secrets should provide them, for error messages.
+_TELEGRAM_SECRETS = (
+    ('API_ID', API_ID, 'TELEGRAM_API_ID'),
+    ('API_HASH', API_HASH, 'TELEGRAM_API_HASH'),
+    ('BOT_TOKEN', BOT_TOKEN, 'TELEGRAM_BOT_TOKEN'),
+)
+
+
+def missing_telegram_secrets() -> list:
+    """Which Telegram secrets are absent. Callers that need the bot check this
+    before constructing a Client; pyrogram's own failure for a blank token is
+    an opaque AuthKeyUnregistered several frames deep."""
+    return [env for _attr, val, env in _TELEGRAM_SECRETS if not val]
+
+
+def telegram_ready() -> bool:
+    return not missing_telegram_secrets()
 
 # ═══════════════════════════════════════════════════════════
 # REDIS

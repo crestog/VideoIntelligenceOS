@@ -189,6 +189,29 @@ try:
 except Exception:
     OMNI_ENABLED = False
 
+# ── Credential preflight ──────────────────────────────────────────────────
+# Reported here, once, before the workers start. Telegram credentials are
+# env-only (they used to be committed literals, which put a live bot token in
+# a public repo), so a notebook that forgets to export the secrets would
+# otherwise show up as two separate workers failing deep inside pyrogram.
+try:
+    from config import missing_telegram_secrets, NIM_API_KEY
+
+    _absent = missing_telegram_secrets()
+    if _absent:
+        print("", flush=True)
+        print(f"⚠️ [SECRETS] Telegram disabled — not set: {', '.join(_absent)}", flush=True)
+        print("      The web UI, CV pipeline, dashboard and queues all still run.", flush=True)
+        print("      To enable channel harvesting and the upload bot, add these as", flush=True)
+        print("      Kaggle Secrets and export them in the launch cell.", flush=True)
+    else:
+        print("🔑 [SECRETS] Telegram credentials present.", flush=True)
+    if not NIM_API_KEY:
+        print("⚠️ [SECRETS] VIOS_NIM_API_KEY not set — GraphRAG entity extraction "
+              "and answer synthesis are skipped.", flush=True)
+except Exception as e:
+    print(f"⚠️ [SECRETS] Preflight unavailable: {e}", flush=True)
+
 print("", flush=True)
 print("=" * 60, flush=True)
 print("🚀 IGNITING VIDEO INTELLIGENCE OS", flush=True)
