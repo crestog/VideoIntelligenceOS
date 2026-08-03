@@ -336,8 +336,19 @@ JAVA_HOME  = os.environ.get('VIOS_JAVA_HOME', '/usr/lib/jvm/java-17-openjdk-amd6
 OMNI_DASHBOARD_PORT = int(os.environ.get('VIOS_OMNI_DASHBOARD_PORT', 5000))
 
 # Processing modes: (chunk_seconds, qwen_fps, qwen_max_tokens, frame_step_fps)
-OMNI_MODE_OMNI  = {'chunk': 5.0,  'fps': 2.0, 'tokens': 150}
-OMNI_MODE_BLITZ = {'chunk': 15.0, 'fps': 1.0, 'tokens': 75}
+#
+# `tokens` is a HARD generation stop, not a target. At 75 the model was cut
+# mid-sentence — and often mid-quoted-string — on almost every blitz chunk,
+# because a 15-second chunk has far more to describe than 75 tokens can hold.
+# Since blitz is the mode every harvested video runs in (ui_server queues
+# "blitz"), that made truncation the normal case rather than the exception.
+#
+# These are sized so the model finishes its thought and hits the EOS token on
+# its own; qwen_describe_video also trims back to the last complete sentence,
+# so a chunk that genuinely does run to the cap degrades to a slightly shorter
+# narrative instead of a broken one. Blitz stays materially cheaper than omni.
+OMNI_MODE_OMNI  = {'chunk': 5.0,  'fps': 2.0, 'tokens': 320}
+OMNI_MODE_BLITZ = {'chunk': 15.0, 'fps': 1.0, 'tokens': 220}
 OMNI_BLITZ_SAMPLE_FPS = 0.4       # blitz-mode frame sampling rate
 
 # ═══════════════════════════════════════════════════════════

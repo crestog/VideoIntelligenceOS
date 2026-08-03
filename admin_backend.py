@@ -50,18 +50,62 @@ def _bytes_to_gb(b) -> float:
     return round(b / (1024 ** 3), 3)
 
 
-def _dir_size(path: str) -> int:
-    """Total size in bytes of all files under *path* (recursive, error-safe)."""
+def _dir_size(path: str, _seen: set = None) -> int:
+    """Bytes of real storage consumed under *path*.
+
+    Two things this must not do, both of which the previous version did:
+
+      * Follow symlinks. `os.path.getsize` stats the TARGET, so a HuggingFace
+        cache — which stores every weight once in `blobs/` and then points at
+        it from `snapshots/<rev>/<name>` — had each blob counted once as the
+        real file and again for every snapshot referencing it. That is why the
+        panel claimed 54 GB of model cache over roughly 5.5 GB of weights.
+      * Count hardlinked files more than once, for the same reason.
+
+    Both are handled by stat'ing without following links and skipping any
+    (device, inode) pair already counted. Symlinks themselves contribute
+    nothing: their target is counted wherever it actually lives.
+
+    `os.scandir` is used over `os.walk` because it returns stat data from the
+    directory read itself — on a cache with tens of thousands of entries that
+    is roughly an order of magnitude fewer syscalls.
+    """
+    if _seen is None:
+        _seen = set()
     total = 0
-    try:
-        for dirpath, _dirnames, filenames in os.walk(path):
-            for f in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, f))
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue          # pointer, not storage
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                        # Windows serves DirEntry.stat() from the directory
+                        # listing and leaves st_ino/st_dev at 0, so hardlinks
+                        # would go undetected. Pay for one real stat in that
+                        # case; on Linux (the deployment target) st_ino is
+                        # already populated and this never fires.
+                        if not st.st_ino:
+                            try:
+                                st = os.stat(entry.path, follow_symlinks=False)
+                            except OSError:
+                                pass
+                        key = (st.st_dev, st.st_ino)
+                        if st.st_ino:
+                            if key in _seen:
+                                continue
+                            _seen.add(key)
+                        total += st.st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return total
 
 
@@ -93,6 +137,34 @@ def _host_usage() -> dict:
                 "path": probe}
     except OSError:
         return {"total_gb": 0, "used_gb": 0, "free_gb": 0, "path": "?"}
+
+
+# Kaggle caps /kaggle/working at 19.5 GiB (20 GB) regardless of what the
+# underlying mount reports. shutil.disk_usage() sees the HOST filesystem —
+# roughly 8 TB shared across tenants — so "free space" on the output tier was
+# off by three orders of magnitude and could never warn before the quota hit.
+# That quota is what actually kills a session ("No space left on device"), so
+# it is tracked explicitly. Override with VIOS_OUTPUT_QUOTA_GB when running
+# somewhere with different limits; 0 disables quota tracking.
+_OUTPUT_QUOTA_BYTES = int(
+    float(os.environ.get("VIOS_OUTPUT_QUOTA_GB", "19.5")) * (1024 ** 3))
+
+
+def _output_quota(used_bytes: int) -> dict:
+    """Remaining OUTPUT budget: the quota, not the host mount's free space."""
+    if _OUTPUT_QUOTA_BYTES <= 0:
+        return {"tracked": False}
+    free = max(0, _OUTPUT_QUOTA_BYTES - used_bytes)
+    # Never promise more room than the physical mount actually has.
+    physical_free = _free_bytes(BASE_DIR)
+    effective = min(free, physical_free) if physical_free else free
+    pct = (used_bytes / _OUTPUT_QUOTA_BYTES * 100) if _OUTPUT_QUOTA_BYTES else 0
+    return {"tracked": True,
+            "quota_gb": _bytes_to_gb(_OUTPUT_QUOTA_BYTES),
+            "used_gb": _bytes_to_gb(used_bytes),
+            "free_gb": _bytes_to_gb(effective),
+            "pct_used": round(pct, 1),
+            "state": "critical" if pct >= 90 else "warn" if pct >= 75 else "ok"}
 
 
 def _get_db() -> sqlite3.Connection:
@@ -166,25 +238,45 @@ _DISK_CATEGORIES = (
 
 
 @admin_router.get("/api/admin/disk")
-def get_disk_usage():
+def get_disk_usage(refresh: int = 0):
+    """VIOS's own storage footprint, per tier.
+
+    `refresh=1` bypasses the TTL cache — the panel's Refresh button was
+    otherwise a no-op for up to 20 seconds, which read as a frozen UI.
+    """
     global _disk_cache, _disk_cache_ts
     try:
         now = time.time()
-        if _disk_cache and (now - _disk_cache_ts) < _DISK_CACHE_TTL:
-            return _disk_cache
+        if not refresh and _disk_cache and (now - _disk_cache_ts) < _DISK_CACHE_TTL:
+            return dict(_disk_cache, cached=True,
+                        age_s=round(now - _disk_cache_ts, 1))
 
         videos_bytes = 0
         frames_bytes = 0
         video_file_count = 0
         frame_folder_count = 0
+        # One inode ledger for the whole sweep. Categories can overlap on disk
+        # (LAKE_DIR nested under BASE_DIR, a blob hardlinked into two caches),
+        # and counting a file under two categories would inflate the total the
+        # same way following symlinks did. First category to reach a byte owns
+        # it, so the breakdown always sums to the headline.
+        seen_inodes: set = set()
         if os.path.isdir(VIDEO_DIR):
             for entry in os.scandir(VIDEO_DIR):
                 try:
+                    if entry.is_symlink():
+                        continue
                     if entry.is_file() and entry.name.endswith(".mp4"):
-                        videos_bytes += entry.stat().st_size
+                        st = entry.stat(follow_symlinks=False)
+                        key = (st.st_dev, st.st_ino)
+                        if st.st_ino and key in seen_inodes:
+                            continue
+                        if st.st_ino:
+                            seen_inodes.add(key)
+                        videos_bytes += st.st_size
                         video_file_count += 1
                     elif entry.is_dir() and entry.name.startswith("frames_"):
-                        frames_bytes += _dir_size(entry.path)
+                        frames_bytes += _dir_size(entry.path, seen_inodes)
                         frame_folder_count += 1
                 except OSError:
                     pass
@@ -193,7 +285,8 @@ def get_disk_usage():
         for key, _label, path, _tier in _DISK_CATEGORIES:
             if key in sizes:
                 continue
-            sizes[key] = _dir_size(path) if path and os.path.isdir(path) else 0
+            sizes[key] = (_dir_size(path, seen_inodes)
+                          if path and os.path.isdir(path) else 0)
 
         vios_bytes = sum(sizes.values())
 
@@ -217,8 +310,13 @@ def get_disk_usage():
                             "used_gb": _bytes_to_gb(tier_bytes["scratch"]),
                             "note": "ephemeral — cleared when the session ends"},
                 "output": {"path": BASE_DIR,
-                           "free_gb": _bytes_to_gb(_free_bytes(BASE_DIR)),
+                           # Quota-aware: the host mount has terabytes free but
+                           # Kaggle stops writes at the quota, so that is the
+                           # number the panel must show.
+                           "free_gb": _output_quota(tier_bytes["output"]).get(
+                               "free_gb", _bytes_to_gb(_free_bytes(BASE_DIR))),
                            "used_gb": _bytes_to_gb(tier_bytes["output"]),
+                           "quota": _output_quota(tier_bytes["output"]),
                            "note": "kept across sessions — counts against quota"},
             },
             # Kept for callers that still read the old field names. These are

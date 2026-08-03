@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>Omniscient God-Mode Explorer</title>
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <style>
@@ -32,9 +33,63 @@
 
         .raw-dump { background: #010409; border: 1px solid var(--border); padding: 10px; font-family: monospace; font-size: 0.8em; color: #79c0ff; overflow-y: auto; display: none; word-wrap: break-word; }
 
-        #network-canvas, #global-canvas { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 6px; background: #000; }
-        #graph-inspector, #global-inspector { width: 320px; background: var(--card); border-left: 1px solid var(--border); padding: 15px; display: none; overflow-y: auto; }
-        .graph-container { display: flex; height: 100%; gap: 15px; min-height: 0; }
+        #network-canvas, #global-canvas { flex: 1 1 auto; min-width: 0; height: 100%; border: 1px solid var(--border); border-radius: 6px; background: #000; }
+
+        /* The graph must claim the height left over after the scope line and
+           legend, not 100% of the pane. height:100% overflowed the bottom of
+           .main-content, whose overflow:hidden then clipped the inspector —
+           which is why clicking a node showed only its opening brace. */
+        .graph-container { display: flex; flex: 1 1 auto; min-height: 0; gap: 15px; position: relative; }
+        /* #view-graph is switched to display:flex so the canvas can be sized;
+           without an explicit direction the scope line, legend and graph lay
+           out side by side in a row. */
+        #view-graph { flex-direction: column; }
+
+        /* ── Selection inspector ──
+           Overlays the canvas instead of taking a flex column of its own. As
+           an in-flow 340px column it stole that width from the graph the
+           moment you clicked, squeezing a 435px canvas to ~95px and throwing
+           the layout vis had already fitted. Overlaying keeps the graph the
+           same size whether or not something is selected.
+           Header pinned, body scrolls — a paragraph-long narrative property
+           can't push the close button out of reach. */
+        #graph-inspector, #global-inspector { position: absolute; top: 0; right: 0; bottom: 0;
+            width: 340px; max-width: 55%; z-index: 5;
+            background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+            box-shadow: 0 8px 28px rgba(1, 4, 9, 0.75);
+            display: none; flex-direction: column; min-height: 0; overflow: hidden; }
+        .insp-head { display: flex; align-items: center; gap: 8px; padding: 11px 14px;
+            border-bottom: 1px solid var(--border); }
+        .insp-head h3 { margin: 0; flex: 1; font-size: 0.95em; }
+        .insp-close { background: transparent; border: 0; color: #8b949e; cursor: pointer;
+            font-size: 1em; line-height: 1; padding: 3px 7px; border-radius: 4px; }
+        .insp-close:hover { background: #30363d; color: var(--text); }
+        .insp-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 12px 14px; }
+        .insp-hint { font-size: 0.85em; color: #8b949e; margin: 0; line-height: 1.5; }
+
+        .insp-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+        .chip { font-size: 0.72em; padding: 3px 9px; border-radius: 12px;
+            border: 1px solid var(--border); background: #0f141a; color: #fff; }
+        /* Key column sized by content rather than a fixed 92px, so a narrow
+           overlay does not give a short key the same width as "indexed_at"
+           and squeeze the value into a 4-word ribbon. */
+        .prow { display: grid; grid-template-columns: minmax(64px, max-content) 1fr; gap: 12px;
+            padding: 7px 0; border-bottom: 1px solid #21262d; font-size: 0.8em; }
+        .prow:last-of-type { border-bottom: 0; }
+        .prow .k { color: #8b949e; word-break: break-word; }
+        .prow .v { color: var(--text); font-family: ui-monospace, SFMono-Regular, monospace;
+            word-break: break-word; white-space: pre-wrap; }
+        .prow .v.long { max-height: 9em; overflow-y: auto; }
+        .insp-act { width: 100%; margin-top: 14px; background: #21262d; color: var(--accent);
+            border: 1px solid var(--border); padding: 8px; border-radius: 4px;
+            cursor: pointer; font-size: 0.85em; }
+        .insp-act:hover { background: #30363d; }
+        .rawwrap summary { cursor: pointer; font-size: 0.7em; text-transform: uppercase;
+            letter-spacing: 0.06em; color: #6e7681; margin: 14px 0 6px; }
+        .insp-raw { background: #010409; border: 1px solid var(--border); border-radius: 4px;
+            padding: 8px; margin: 0; font-size: 0.72em; color: #79c0ff;
+            white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; }
+        .ghint { font-size: 0.78em; color: #6e7681; margin-bottom: 10px; }
 
         /* ── Node-type legend ──
            Colours are defined once server-side (_NODE_STYLE in omni_engine)
@@ -98,12 +153,15 @@
             </div>
             <div class="banner off" id="graph-banner"></div>
             <div class="legend" id="global-legend"></div>
+            <div class="ghint">Click a node or edge to inspect its database row. Double-click a Video node to open its forensic view.</div>
             <div class="graph-container">
                 <div id="global-canvas"></div>
                 <div id="global-inspector">
-                    <h3 style="margin-top:0;">Node Properties</h3>
-                    <p style="font-size:0.85em; color:#8b949e;">Click a node or edge. Double-click a Video node to open its forensic view.</p>
-                    <pre id="global-raw-json" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; color: #79c0ff;"></pre>
+                    <div class="insp-head">
+                        <h3 id="global-insp-title">Selection</h3>
+                        <button class="insp-close" onclick="closeInspector('global-inspector')" title="Close">✕</button>
+                    </div>
+                    <div class="insp-body" id="global-insp-body"></div>
                 </div>
             </div>
         </div>
@@ -162,12 +220,15 @@
             <div id="view-graph" class="scroll-area" style="display:none;">
                 <div style="font-size:0.85em;color:#8b949e;margin-bottom:8px;" id="graph-scope">—</div>
                 <div class="legend" id="graph-legend"></div>
+                <div class="ghint">Click a node or edge to inspect its database row.</div>
                 <div class="graph-container">
                     <div id="network-canvas"></div>
                     <div id="graph-inspector">
-                        <h3 style="margin-top:0;">Raw Node/Edge Data</h3>
-                        <p style="font-size:0.85em; color:#8b949e;">Click any item in the graph to view its database properties.</p>
-                        <pre id="graph-raw-json" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; color: #79c0ff;"></pre>
+                        <div class="insp-head">
+                            <h3 id="graph-insp-title">Selection</h3>
+                            <button class="insp-close" onclick="closeInspector('graph-inspector')" title="Close">✕</button>
+                        </div>
+                        <div class="insp-body" id="graph-insp-body"></div>
                     </div>
                 </div>
             </div>
@@ -188,11 +249,64 @@
         const esc = s => String(s ?? '').replace(/[&<>"']/g,
             c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+        /* ── Selection inspector rendering ──
+           The inspector used to be a JSON.stringify dump, which for a
+           Narrative node is one unreadable paragraph on a single line and
+           never said which label you had picked. Rendered as a property
+           table now, with the raw row still available underneath. */
+        function closeInspector(id) {
+            document.getElementById(id).style.display = 'none';
+        }
+
+        const PROP_ORDER = ['uuid', 'name', 'id', 'chunk_id', 'start_t', 'end_t', 'text'];
+
+        function propRows(props) {
+            const keys = Object.keys(props || {}).sort((a, b) => {
+                const ia = PROP_ORDER.indexOf(a), ib = PROP_ORDER.indexOf(b);
+                if (ia !== ib) return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+                return a.localeCompare(b);
+            });
+            if (!keys.length) return '<p class="insp-hint">No properties stored on this item.</p>';
+            return keys.map(k => {
+                const raw = props[k];
+                const val = (raw !== null && typeof raw === 'object')
+                    ? JSON.stringify(raw, null, 2) : String(raw ?? '');
+                return `<div class="prow"><span class="k">${esc(k)}</span>`
+                     + `<span class="v${val.length > 220 ? ' long' : ''}">${esc(val)}</span></div>`;
+            }).join('');
+        }
+
+        /* Both graphs share one inspector shape. `action` is an optional
+           {label, run} pair — used for the drill-into-video button, wired as a
+           real listener rather than an inline onclick so a uuid can never be
+           read back as markup. */
+        function showInspector(prefix, title, chips, props, raw, action) {
+            const panel = document.getElementById(prefix);
+            document.getElementById(prefix.replace('-inspector', '-insp-title')).innerText = title;
+            const body = document.getElementById(prefix.replace('-inspector', '-insp-body'));
+            const chipHtml = (chips || []).filter(Boolean)
+                .map(c => `<span class="chip">${esc(c)}</span>`).join('');
+            body.innerHTML =
+                (chipHtml ? `<div class="insp-chips">${chipHtml}</div>` : '')
+                + propRows(props)
+                + '<details class="rawwrap"><summary>Raw database row</summary>'
+                + `<pre class="insp-raw">${esc(JSON.stringify(raw, null, 2))}</pre></details>`;
+            if (action) {
+                const btn = document.createElement('button');
+                btn.className = 'insp-act';
+                btn.innerText = action.label;
+                btn.addEventListener('click', action.run);
+                body.appendChild(btn);
+            }
+            panel.style.display = 'flex';
+            body.scrollTop = 0;
+        }
+
         /* Shared vis-network setup for both graph views. Kept in one place so
            the corpus graph and the per-video graph cannot drift apart in
            styling or interaction. Returns the network so callers can bind
            extra handlers. */
-        function renderGraph(canvasId, inspectorId, jsonId, data, onDoubleClickNode) {
+        function renderGraph(canvasId, inspectorId, data, onDoubleClickNode) {
             const nodeProps = {}, edgeProps = {};
             (data.nodes || []).forEach(n => nodeProps[n.id] = n.raw_properties);
             (data.edges || []).forEach(e => edgeProps[e.id] = e.raw_properties);
@@ -219,16 +333,25 @@
                 });
 
             net.on('click', params => {
-                const insp = document.getElementById(inspectorId);
-                const out = document.getElementById(jsonId);
                 if (params.nodes.length) {
-                    insp.style.display = 'block';
-                    out.innerText = JSON.stringify(nodeProps[params.nodes[0]], null, 2);
+                    const p = nodeProps[params.nodes[0]] || {};
+                    const labels = p.labels || [];
+                    // A Video node can be drilled into; every other label just
+                    // shows its row. Offered as a button because double-click
+                    // on a physics canvas is easy to miss.
+                    const uuid = p.properties && p.properties.uuid;
+                    const action = (onDoubleClickNode && labels.includes('Video') && uuid)
+                        ? { label: `Open forensic view for ${uuid} →`,
+                            run: () => onDoubleClickNode(p, params.nodes[0]) }
+                        : null;
+                    showInspector(inspectorId, labels[0] || 'Node', labels,
+                                  p.properties, p, action);
                 } else if (params.edges.length) {
-                    insp.style.display = 'block';
-                    out.innerText = JSON.stringify(edgeProps[params.edges[0]], null, 2);
+                    const e = edgeProps[params.edges[0]] || {};
+                    showInspector(inspectorId, e.type || 'Relationship',
+                                  [e.type, 'relationship'], e.properties, e, null);
                 } else {
-                    insp.style.display = 'none';
+                    closeInspector(inspectorId);
                 }
             });
             if (onDoubleClickNode) {
@@ -237,6 +360,28 @@
                     const p = nodeProps[params.nodes[0]];
                     onDoubleClickNode(p, params.nodes[0]);
                 });
+            }
+
+            /* A network constructed while its container is display:none
+               measures 0x0, and vis-network hit-tests against that stale size —
+               so clicks land on nothing even once the pane is visible. The tab
+               switcher redraws the per-video graph, but the graph can also
+               finish loading while another tab is open, so watch for the
+               container gaining a size and re-measure once. */
+            const canvas = document.getElementById(canvasId);
+            if (!canvas.clientWidth || !canvas.clientHeight) {
+                if (typeof ResizeObserver === 'function') {
+                    const ro = new ResizeObserver(() => {
+                        if (canvas.clientWidth && canvas.clientHeight) {
+                            ro.disconnect();
+                            net.redraw();
+                            net.fit();
+                        }
+                    });
+                    ro.observe(canvas);
+                } else {
+                    setTimeout(() => { net.redraw(); net.fit(); }, 300);
+                }
             }
             return net;
         }
@@ -303,8 +448,7 @@
                       + (data.truncated ? ' (capped at 400 — click a video for its own graph)' : '')
                     : 'Graph is empty — no video has been narrated yet.';
                 renderLegend('global-legend', data.counts);
-                globalNet = renderGraph('global-canvas', 'global-inspector',
-                                        'global-raw-json', data, props => {
+                globalNet = renderGraph('global-canvas', 'global-inspector', data, props => {
                     // Double-clicking a Video node drills into that reel.
                     const uuid = props && props.properties && props.properties.uuid;
                     if (uuid) loadDeepDive(uuid);
@@ -389,20 +533,18 @@
             //    video rendered the same corpus-wide slice — the reason each
             //    reel's knowledge graph looked identical. The corpus view now
             //    has its own home screen; this one is scoped to the reel.
-            document.getElementById('graph-raw-json').innerText = '';
             document.getElementById('graph-inspector').style.display = 'none';
             fetch(`api/neo4j/graph/${encodeURIComponent(uuid)}`).then(r => r.json()).then(data => {
                 if (data.error) {
-                    document.getElementById('graph-inspector').style.display = 'block';
-                    document.getElementById('graph-raw-json').innerText = data.error;
+                    showInspector('graph-inspector', 'Graph unavailable', ['error'],
+                                  { error: data.error }, data, null);
                     return;
                 }
                 document.getElementById('graph-scope').innerText = (data.nodes || []).length
                     ? `${data.nodes.length} nodes · ${(data.edges || []).length} edges for ${uuid}`
                     : (data.empty_reason || 'No graph rows for this video yet.');
                 renderLegend('graph-legend', null);
-                videoNet = renderGraph('network-canvas', 'graph-inspector',
-                                       'graph-raw-json', data);
+                videoNet = renderGraph('network-canvas', 'graph-inspector', data);
                 renderSharedEntities(data.shared_entities || []);
             }).catch(() => {
                 document.getElementById('graph-scope').innerText = 'Graph fetch failed.';
@@ -461,9 +603,21 @@
                 });
         }
 
+        /* Deep-link support: #tg1236 opens straight into that reel's forensic
+           view. The workstation's Explore DB drills in this way — it owns the
+           iframe and can only address the dashboard through its URL. */
+        function applyDeepLink() {
+            const uuid = decodeURIComponent((location.hash || '').replace(/^#/, '')).trim();
+            if (uuid) loadDeepDive(uuid); else showHome();
+        }
+        // Setting the hash on an already-loaded frame fires this instead of a
+        // full reload, so drilling into a second reel stays instant.
+        window.addEventListener('hashchange', applyDeepLink);
+
         // The corpus graph is the landing view — the main area used to sit
-        // blank until a video was clicked.
+        // blank until a video was clicked. A deep link overrides it.
         loadGlobalGraph();
+        if ((location.hash || '').length > 1) applyDeepLink();
     </script>
 </body>
 </html>

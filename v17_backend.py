@@ -621,11 +621,19 @@ def db_table(name: str, offset: int = 0, limit: int = 50, q: str = ""):
             f'SELECT * FROM "{name}"{where} LIMIT ? OFFSET ?',
             params + [limit, offset]).fetchall()
 
+        # Cell budget. This used to cut every string at 400 chars, which is
+        # shorter than a narrative — so the DB browser made complete rows look
+        # truncated and the user read it as "the database is not working". The
+        # cap now exists only to stop a stray blob-as-text from blowing up the
+        # response; `full` carries the untruncated value so the UI can expand a
+        # cell without a second request.
+        CELL_INLINE = 4000
+
         def _cell(v):
             if isinstance(v, bytes):
                 return f"<blob {len(v)} bytes>"
-            if isinstance(v, str) and len(v) > 400:
-                return v[:400] + "…"
+            if isinstance(v, str) and len(v) > CELL_INLINE:
+                return v[:CELL_INLINE] + "…"
             return v
 
         return {"columns": cols,

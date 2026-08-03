@@ -80,6 +80,12 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 .disk-legend .lg b { color: var(--text); font-weight: 600; }
 .disk-host { margin-top: 10px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); opacity: 0.75; }
 
+/* Output-quota meter. Kaggle stops writes at ~19.5 GB no matter what the host
+   mount reports, so this is the number that actually ends a session. */
+.qbar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 7px; overflow: hidden; }
+.qbar::after { content: ''; display: block; height: 100%; width: var(--pct, 0%); background: var(--qc, var(--ok)); transition: width 0.35s ease; }
+.qnote { font-family: var(--font-mono); font-size: 9.5px; color: var(--text-dim); margin-top: 4px; }
+
 /* buttons */
 .btn {
   display: inline-flex; align-items: center; gap: 7px; justify-content: center;
@@ -204,7 +210,10 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
   <section class="card">
     <div class="card-head">
       <h2>Storage Overview</h2>
-      <span class="sub" id="diskSub">loading…</span>
+      <div style="display:flex;align-items:center;gap:10px;margin-left:auto">
+        <span class="sub" id="diskSub">loading…</span>
+        <button class="btn sm" onclick="loadDisk(true)" title="Re-walk the directories now, bypassing the 20s cache">Refresh</button>
+      </div>
     </div>
     <div class="card-body">
       <div class="stat-grid" id="diskStats">
@@ -365,25 +374,40 @@ const DISK_SEGS = [
   ['datalake',   'Data lake',    '#9aa7b8'],
 ];
 
-async function loadDisk() {
+async function loadDisk(manual = false) {
   try {
-    const d = await api('/api/admin/disk');
+    const d = await api('/api/admin/disk' + (manual ? '?refresh=1' : ''));
     const b = d.breakdown || {};
     const labels = d.labels || {};
     const tiers = d.tiers || {};
     const host = d.host || {};
+    const quota = tiers.output?.quota || {};
     const used = d.vios_used_gb ?? 0;
 
     $('diskSub').textContent =
-      `${used} GB held by VIOS · ${tiers.scratch?.free_gb ?? 0} GB free on scratch`;
+      `${used} GB held by VIOS · ${tiers.scratch?.free_gb ?? 0} GB free on scratch`
+      + (quota.tracked ? ` · output ${quota.pct_used}% of quota` : '');
 
+    // The output quota leads, because it is the number that ends the session.
+    // Scratch has ~1 TB free and is ephemeral; output is capped at ~19.5 GB and
+    // is what "No space left on device" actually refers to.
+    const qState = quota.state || 'ok';
+    const qColor = qState === 'critical' ? 'var(--danger)'
+                 : qState === 'warn' ? 'var(--warn)' : 'var(--ok)';
     $('diskStats').innerHTML = `
-      <div class="stat" title="Sum of every directory VIOS writes — videos, frames, thumbnails, model cache, vectors, graph, archive and the data lake.">
+      <div class="stat" title="Sum of every directory VIOS writes — videos, frames, thumbnails, model cache, vectors, graph, archive and the data lake. Symlinked and hardlinked files are counted once.">
         <div class="lbl">VIOS footprint</div><div class="val">${used}<small> GB</small></div></div>
       <div class="stat" title="Free space on ${esc(tiers.scratch?.path || '?')} — ephemeral, cleared when the session ends.">
         <div class="lbl">Scratch free</div><div class="val">${tiers.scratch?.free_gb ?? 0}<small> GB</small></div></div>
-      <div class="stat" title="Free space on ${esc(tiers.output?.path || '?')} — kept across sessions, counts against the output quota.">
-        <div class="lbl">Output free</div><div class="val">${tiers.output?.free_gb ?? 0}<small> GB</small></div></div>
+      ${quota.tracked ? `
+      <div class="stat" style="border-color:${qColor}33" title="Kaggle caps the output directory at ${quota.quota_gb} GB. This is the real limit — the host mount reports terabytes free, but writes fail at the quota.">
+        <div class="lbl">Output quota</div>
+        <div class="val" style="color:${qColor}">${quota.free_gb}<small> GB free</small></div>
+        <div class="qbar" style="--pct:${Math.min(quota.pct_used, 100)}%;--qc:${qColor}"></div>
+        <div class="qnote">${quota.used_gb} / ${quota.quota_gb} GB used</div>
+      </div>` : `
+      <div class="stat" title="Free space on ${esc(tiers.output?.path || '?')}.">
+        <div class="lbl">Output free</div><div class="val">${tiers.output?.free_gb ?? 0}<small> GB</small></div></div>`}
       <div class="stat"><div class="lbl">Videos</div><div class="val">${d.video_file_count ?? 0}</div></div>
       <div class="stat"><div class="lbl">Frame folders</div><div class="val">${d.frame_folder_count ?? 0}</div></div>`;
 
@@ -405,8 +429,10 @@ async function loadDisk() {
                 ${esc(labels[k] || name)} <b>${gb}</b> GB</span>`;
     }).join('');
 
+    // Host mount is infrastructure trivia, not a VIOS measurement — kept for
+    // context but never presented as this system's usage.
     $('diskHost').textContent = host.total_gb
-      ? `Host mount ${esc(host.path || '')}: ${host.used_gb} GB used of ${host.total_gb} GB `
+      ? `Host mount ${esc(host.path || '')}: ${host.free_gb} GB free of ${host.total_gb} GB `
         + `(shared infrastructure — not VIOS's data)`
       : '';
   } catch (e) { showToast(`Disk info failed: ${e.message}`, 'error'); }

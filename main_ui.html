@@ -66,28 +66,63 @@
         .queue-status-bar .qs-item { display: flex; align-items: center; gap: 4px; }
         .queue-status-bar .qs-val { color: var(--accent); font-weight: 800; }
         .explore-container { display: flex; gap: 24px; }
-        .explore-left { flex: 2; }
+        .explore-left { flex: 2; min-width: 0; }
         .explore-right { flex: 1; position: sticky; top: 20px; align-self: flex-start;}
-        .search-row { display: flex; gap: 12px; margin-bottom: 20px; }
+        .search-row { display: flex; gap: 12px; margin-bottom: 12px; }
         .search-row input { flex: 3; padding: 18px 22px; background: var(--surface); color: white; border: 1px solid #2a2a2a; border-radius: 14px; outline: none; font-size: 15px; font-family: 'Inter'; transition: all 0.2s; box-shadow: 0 4px 15px rgba(0,0,0,0.2);}
         .search-row input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+
+        /* Result count + active-filter chips. The search matches every column,
+           so the user needs to see which filter is actually applied. */
+        .search-meta { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--text-dim); font-weight: 600; }
+        .fchip { display: inline-flex; align-items: center; gap: 7px; background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(34,211,238,0.35); padding: 5px 10px; border-radius: 20px; font-size: 12px; font-weight: 700; }
+        .fchip button { background: none; border: none; color: inherit; cursor: pointer; padding: 0; font-size: 14px; line-height: 1; opacity: 0.7; }
+        .fchip button:hover { opacity: 1; }
+
         table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--surface); border-radius: 14px; overflow: hidden; border: 1px solid #2a2a2a; box-shadow: 0 10px 30px rgba(0,0,0,0.4);}
-        th { background-color: #0a0a0a; color: var(--text-dim); padding: 16px; text-align: left; position: sticky; top: 0; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;}
-        td { padding: 16px; border-bottom: 1px solid #1a1a1a; color: #ccc; cursor: pointer; font-size: 14px; transition: background 0.2s;}
+        th { background-color: #0a0a0a; color: var(--text-dim); padding: 14px 16px; text-align: left; position: sticky; top: 0; z-index: 2; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;}
+        td { padding: 13px 16px; border-bottom: 1px solid #1a1a1a; color: #ccc; font-size: 14px; transition: background 0.15s; vertical-align: middle; }
         tr:last-child td { border-bottom: none; }
-        tr:hover td { background-color: #1a1a1a; color: #fff;}
+        tbody tr { cursor: pointer; }
+        tbody tr:hover td { background-color: #17171b; color: #fff;}
+        tbody tr.sel td { background-color: rgba(34,211,238,0.08); }
+        tbody tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
         .sentinel-row { text-align: center; padding: 20px; color: var(--accent); font-weight: 600; }
-        @media (max-width: 768px) { .explore-container { flex-direction: column; } .explore-right { position: relative; top: 0; } }
+        .empty-row { text-align: center; padding: 36px 20px; color: var(--text-dim); font-weight: 500; line-height: 1.7; }
+
+        /* Cells that navigate somewhere other than the row default get an
+           underline on hover, so a click target is visible before clicking. */
+        .cell-act { cursor: pointer; border-radius: 6px; padding: 2px 4px; margin: -2px -4px; transition: all 0.15s; }
+        .cell-act:hover { background: rgba(34,211,238,0.12); color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+        .id-cell { font-family: ui-monospace, monospace; font-weight: 700; color: var(--accent); }
+        .cat-pill { background: #222; padding: 4px 9px; border-radius: 6px; font-size: 12px; font-weight: 600; color: var(--accent); display: inline-block; }
+        .cap-cell { color: #9a9aa2; max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .st-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+
+        /* Detail panel under the preview player — item #11's "everything
+           displayed in the ui" for whichever row is selected. */
+        .detail-card { background: var(--surface); border: 1px solid #2a2a2a; border-radius: 14px; padding: 18px; margin-top: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+        .detail-card h4 { margin: 0 0 14px 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-dim); }
+        .drow { display: flex; gap: 12px; padding: 9px 0; border-bottom: 1px solid #1a1a1a; font-size: 13px; align-items: baseline; }
+        .drow:last-of-type { border-bottom: none; }
+        .drow .dk { color: var(--text-dim); min-width: 78px; flex-shrink: 0; font-weight: 600; }
+        .drow .dv { color: #e4e4e7; word-break: break-word; font-weight: 500; }
+        .drow .dv.mono { font-family: ui-monospace, monospace; font-size: 12.5px; }
+        .drow .dv.cap { white-space: pre-wrap; max-height: 160px; overflow-y: auto; line-height: 1.6; }
+        .detail-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+        .detail-actions .action-btn { padding: 12px; font-size: 13px; border-radius: 11px; }
+        .detail-empty { color: var(--text-dim); font-size: 13.5px; line-height: 1.7; text-align: center; padding: 22px 10px; }
+        @media (max-width: 900px) { .explore-container { flex-direction: column; } .explore-right { position: relative; top: 0; } .cap-cell { max-width: 200px; } }
     </style>
 </head>
 <body>
     <div id="toast-container"></div>
     <div class="tabs">
-        <button class="tab-btn active" onclick="switchTab('reels')">📱 View Reels</button>
-        <button class="tab-btn" onclick="switchTab('explore')">🔍 Explore DB</button>
-        <button class="tab-btn" onclick="switchTab('v17_workspace')">🎬 V17 Workspace</button>
-        <button class="tab-btn" onclick="switchTab('omniscient')">🔮 Omniscient</button>
-        <button class="tab-btn" onclick="switchTab('admin')">🛡️ Admin</button>
+        <button class="tab-btn active" data-tab="reels" onclick="switchTab('reels', this)">📱 View Reels</button>
+        <button class="tab-btn" data-tab="explore" onclick="switchTab('explore', this)">🔍 Explore DB</button>
+        <button class="tab-btn" data-tab="v17_workspace" onclick="switchTab('v17_workspace', this)">🎬 V17 Workspace</button>
+        <button class="tab-btn" data-tab="omniscient" onclick="switchTab('omniscient', this)">🔮 Omniscient</button>
+        <button class="tab-btn" data-tab="admin" onclick="switchTab('admin', this)">🛡️ Admin</button>
     </div>
 
     <div id="reels" class="tab-content active">
@@ -135,20 +170,32 @@
     </div>
 
     <div id="explore" class="tab-content">
-        <p style="color: var(--text-dim); font-size: 14px; margin-bottom: 20px;">Live FTS5 Search Index.</p>
         <div class="explore-container">
             <div class="explore-left">
-                <div class="search-row"><input type="text" id="search-input" placeholder="Type to instantly filter captions, creators..."></div>
-                <div style="overflow-x: auto; max-height: 70vh; overflow-y: auto; border-radius: 14px; border: 1px solid #222;" id="explore-table-container">
+                <div class="search-row"><input type="text" id="search-input" placeholder="Search anything — id, creator, category, caption, filename, likes…"></div>
+                <!-- Which filter is live, and how it got there. Cell clicks set
+                     the query, so without this the table looks arbitrarily
+                     filtered with no way back. -->
+                <div class="search-meta">
+                    <span id="explore-count">—</span>
+                    <span id="explore-chips"></span>
+                </div>
+                <div style="overflow-x: auto; max-height: 66vh; overflow-y: auto; border-radius: 14px; border: 1px solid #222;" id="explore-table-container">
                     <table id="explore-table">
-                        <thead><tr><th>ID</th><th>Creator</th><th>Category</th><th>Likes</th><th>Caption</th></tr></thead>
+                        <thead><tr><th>ID</th><th>Creator</th><th>Category</th><th>Likes</th><th>Status</th><th>Caption</th></tr></thead>
                         <tbody id="explore-tbody"></tbody>
                     </table>
                 </div>
             </div>
             <div class="explore-right">
                 <div class="player-wrapper" style="margin-bottom:0;">
-                    <video id="explore-vid" class="reel-video" autoplay controls playsinline preload="auto" decoding="async"></video>
+                    <video id="explore-vid" class="reel-video" controls playsinline preload="metadata" decoding="async"></video>
+                </div>
+                <!-- Every column of the selected row, in full: the table
+                     truncates captions and hides the uuid/filename, so the row
+                     click has to lead somewhere that shows the whole record. -->
+                <div class="detail-card" id="explore-detail">
+                    <div class="detail-empty">Click any row to load the video and see its full database record.<br>Click a <b>creator</b>, <b>category</b> or <b>id</b> cell to filter by that value.</div>
                 </div>
             </div>
         </div>
@@ -200,11 +247,15 @@
         document.addEventListener('click', (e) => { if (!selectWrapper.contains(e.target)) { selectWrapper.classList.remove('open'); selectTrigger.classList.remove('open'); } });
         function populateCustomDropdown(categories, queueArray) { optionsContainer.innerHTML = ''; let queuedCats = []; let unqueuedCats = []; categories.forEach(cat => { let qIndex = queueArray.indexOf(cat); if (qIndex !== -1) { queuedCats.push({name: cat, rank: qIndex}); } else { unqueuedCats.push(cat); } }); queuedCats.sort((a, b) => a.rank - b.rank); let finalCats = queuedCats.map(c => c.name).concat(unqueuedCats); finalCats.forEach(cat => { const opt = document.createElement('div'); opt.className = 'custom-option'; let qIndex = queueArray.indexOf(cat); if (qIndex !== -1) { opt.innerHTML = `<span style="color:var(--accent); font-weight:800; min-width:24px; font-size:13px;">${qIndex + 1}.</span> <span>${cat}</span>`; opt.style.backgroundColor = 'rgba(0,229,255,0.05)'; } else { opt.innerHTML = `<span style="min-width:24px;"></span> <span>${cat}</span>`; } opt.addEventListener('click', async (e) => { e.stopPropagation(); selectWrapper.classList.remove('open'); selectTrigger.classList.remove('open'); await fetch(`/api/scan?category=${encodeURIComponent(cat)}`, { method: 'POST' }); showToast(`🚀 Queued at #1 Priority: ${cat}`); pendingCategorySwitch = cat; loadCategories(); }); optionsContainer.appendChild(opt); }); selectLabel.innerHTML = `🎵 Playing: <span style="color:var(--accent);">${currentPlayingCat}</span>`; }
 
-        function switchTab(tabId) {
+        /* `btn` is passed explicitly rather than read off the implicit global
+           `event`: openForensicView() switches tabs from code, where there is
+           no click event and `event.currentTarget` would throw. */
+        function switchTab(tabId, btn) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
             document.getElementById(tabId).classList.add('active');
-            event.currentTarget.classList.add('active');
+            const active = btn || document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+            if (active) active.classList.add('active');
             if(tabId === 'explore' && document.getElementById('explore-tbody').innerHTML === '') searchExplore();
             if(tabId === 'omniscient') { const fr = document.getElementById('omniRootFrame'); if(!fr.src) fr.src = '/omni/'; }
         }
@@ -221,12 +272,218 @@
         async function autoSyncFeed() { if (pendingCategorySwitch) { const pRes = await fetch(`/api/playlist?category=${encodeURIComponent(pendingCategorySwitch)}`); const pData = await pRes.json(); if (pData.playlist && pData.playlist.length > 0) { currentPlaylist = pData.playlist; currentIndex = 0; currentPlayingCat = pendingCategorySwitch; localStorage.setItem('instaVaultCategory', currentPlayingCat); pendingCategorySwitch = null; loadVideo(0); showToast(`✅ Now Playing: ${currentPlayingCat}`); loadCategories(); } } else { const res = await fetch(`/api/playlist?category=${encodeURIComponent(currentPlayingCat)}`); const data = await res.json(); if (data.playlist && data.playlist.length > currentPlaylist.length) { let wasEmpty = currentPlaylist.length === 0; currentPlaylist = data.playlist; if (wasEmpty) { currentIndex = 0; loadVideo(0); } } } loadCategories(); }
         async function triggerScan() { await fetch('/api/scan', { method: 'POST' }); showToast("📡 Forced Full Telegram Scan."); }
 
+        /* ═══════════ EXPLORE DB ═══════════
+           Captions, creator handles and category names are harvested from
+           Telegram — untrusted text that lands in innerHTML below, so every
+           interpolation goes through esc(). */
+        const esc = s => String(s ?? '').replace(/[&<>"']/g,
+            c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
         let exploreObserver = new IntersectionObserver((entries) => { if(entries[0].isIntersecting) { renderExploreChunk(); } });
-        let debounceTimer; document.getElementById('search-input').addEventListener('input', (e) => { clearTimeout(debounceTimer); debounceTimer = setTimeout(() => searchExplore(e.target.value), 200); });
+        const searchInput = document.getElementById('search-input');
+        let debounceTimer;
+        searchInput.addEventListener('input', (e) => { clearTimeout(debounceTimer); debounceTimer = setTimeout(() => searchExplore(e.target.value), 200); });
         let currentExploreQuery = ""; let isFetchingExplore = false; let hasMoreExplore = true;
-        async function searchExplore(query = "") { currentExploreQuery = query; exploreData = []; exploreRendered = 0; hasMoreExplore = true; document.getElementById('explore-tbody').innerHTML = ''; await renderExploreChunk(); }
-        async function renderExploreChunk() { if (isFetchingExplore || !hasMoreExplore) return; isFetchingExplore = true; const oldSentinel = document.getElementById('sentinel-row'); if (oldSentinel) oldSentinel.remove(); const tbody = document.getElementById('explore-tbody'); const loadSentinel = document.createElement('tr'); loadSentinel.id = 'sentinel-row'; loadSentinel.innerHTML = `<td colspan="5" class="sentinel-row">Fetching from API...</td>`; tbody.appendChild(loadSentinel); const res = await fetch(`/api/explore?q=${encodeURIComponent(currentExploreQuery)}&offset=${exploreRendered}`); const data = await res.json(); const newRows = data.data; loadSentinel.remove(); if (newRows.length === 0) { hasMoreExplore = false; } else { const fragment = document.createDocumentFragment(); newRows.forEach(row => { const tr = document.createElement('tr'); tr.onclick = () => playExploreVideo(row.filename, row.id); tr.innerHTML = `<td>${row.id}</td><td style="font-weight:600;">@${row.creator}</td><td><span style="background:#222; padding:4px 8px; border-radius:6px; font-size:12px; font-weight:600; color:var(--accent);">${row.category}</span></td><td style="font-weight:600;">${row.likes}</td><td>${row.caption.substring(0,60)}...</td>`; fragment.appendChild(tr); }); exploreData = exploreData.concat(newRows); exploreRendered += newRows.length; if (newRows.length === 30) { const sentinel = document.createElement('tr'); sentinel.id = 'sentinel-row'; sentinel.innerHTML = `<td colspan="5" class="sentinel-row">Scroll for more...</td>`; fragment.appendChild(sentinel); } tbody.appendChild(fragment); const newSentinel = document.getElementById('sentinel-row'); if (newSentinel) exploreObserver.observe(newSentinel); } isFetchingExplore = false; }
-        function playExploreVideo(filename, id) { document.getElementById('explore-vid').src = "/videos/" + filename; }
+        let selectedExploreId = null;
+
+        /* Status → colour. Anything unrecognised stays grey rather than being
+           silently dropped, so a new pipeline state is still visible. */
+        const ST_COLORS = { done: '#22c55e', completed: '#22c55e', indexed: '#22d3ee',
+                            processing: '#eab308', pending: '#8b8b94', queued: '#8b8b94',
+                            failed: '#ef4444', dead: '#ef4444', error: '#ef4444' };
+        const statusColor = s => ST_COLORS[String(s || '').toLowerCase().trim()] || '#5b5b63';
+
+        async function searchExplore(query = "") {
+            currentExploreQuery = query;
+            exploreData = []; exploreRendered = 0; hasMoreExplore = true;
+            document.getElementById('explore-tbody').innerHTML = '';
+            renderExploreChips();
+            await renderExploreChunk();
+        }
+
+        /* Set the query from a cell click and keep the input box in sync — an
+           invisible filter is worse than no filter. */
+        function filterExploreBy(value) {
+            searchInput.value = value;
+            clearTimeout(debounceTimer);
+            searchExplore(value);
+            document.getElementById('explore-table-container').scrollTop = 0;
+        }
+
+        function clearExploreFilter() { filterExploreBy(''); }
+
+        function renderExploreChips() {
+            const chips = document.getElementById('explore-chips');
+            chips.innerHTML = currentExploreQuery
+                ? `<span class="fchip">🔍 ${esc(currentExploreQuery)}` +
+                  `<button onclick="clearExploreFilter()" title="Clear filter">✕</button></span>`
+                : '';
+        }
+
+        function updateExploreCount() {
+            const el = document.getElementById('explore-count');
+            const n = exploreData.length;
+            el.textContent = n === 0 ? 'No matches'
+                : `${n}${hasMoreExplore ? '+' : ''} ${n === 1 ? 'row' : 'rows'}`
+                  + (currentExploreQuery ? ' matching' : ' indexed');
+        }
+
+        async function renderExploreChunk() {
+            if (isFetchingExplore || !hasMoreExplore) return;
+            isFetchingExplore = true;
+            const tbody = document.getElementById('explore-tbody');
+            const oldSentinel = document.getElementById('sentinel-row');
+            if (oldSentinel) oldSentinel.remove();
+            const loadSentinel = document.createElement('tr');
+            loadSentinel.id = 'sentinel-row';
+            loadSentinel.innerHTML = `<td colspan="6" class="sentinel-row">Searching…</td>`;
+            tbody.appendChild(loadSentinel);
+
+            let newRows = [];
+            try {
+                const res = await fetch(`/api/explore?q=${encodeURIComponent(currentExploreQuery)}&offset=${exploreRendered}`);
+                const data = await res.json();
+                newRows = data.data || [];
+            } catch (err) {
+                loadSentinel.innerHTML = `<td colspan="6" class="sentinel-row" style="color:#ef4444;">Search failed — server may be busy. Scroll to retry.</td>`;
+                isFetchingExplore = false;
+                return;
+            }
+            loadSentinel.remove();
+
+            if (newRows.length === 0) {
+                hasMoreExplore = false;
+                if (exploreData.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="empty-row">`
+                        + (currentExploreQuery
+                            ? `No row matches <b>${esc(currentExploreQuery)}</b>.<br>`
+                              + `Search covers id, creator, category, likes, caption, filename and status.`
+                            : `No videos downloaded yet. Harvest from the Reels tab first.`)
+                        + `</td></tr>`;
+                }
+                updateExploreCount();
+                isFetchingExplore = false;
+                return;
+            }
+
+            const fragment = document.createDocumentFragment();
+            newRows.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.dataset.id = row.id;
+                if (String(row.id) === String(selectedExploreId)) tr.classList.add('sel');
+                const cap = row.caption || '';
+                const short = cap.length > 64 ? cap.slice(0, 64) + '…' : (cap || '—');
+                tr.innerHTML =
+                    `<td><span class="cell-act id-cell" data-act="id" title="Open forensic view for ${esc(row.uuid)}">${esc(row.uuid)}</span></td>`
+                  + `<td style="font-weight:600;"><span class="cell-act" data-act="creator" title="Show every reel by @${esc(row.creator)}">@${esc(row.creator)}</span></td>`
+                  + `<td><span class="cell-act cat-pill" data-act="category" title="Show every reel in ${esc(row.category)}">${esc(row.category)}</span></td>`
+                  + `<td style="font-weight:600;">${esc(row.likes)}</td>`
+                  + `<td style="font-size:12.5px;color:#9a9aa2;font-weight:600;"><span class="st-dot" style="background:${statusColor(row.status)}"></span>${esc(row.status || 'stored')}</td>`
+                  + `<td class="cap-cell" title="${esc(cap)}">${esc(short)}</td>`;
+
+                tr.addEventListener('click', (ev) => {
+                    const act = ev.target.closest('[data-act]');
+                    if (act) {
+                        ev.stopPropagation();
+                        if (act.dataset.act === 'id') { openForensicView(row.uuid); return; }
+                        if (act.dataset.act === 'creator') { filterExploreBy(row.creator); return; }
+                        if (act.dataset.act === 'category') { filterExploreBy(row.category); return; }
+                    }
+                    selectExploreRow(row, tr);
+                });
+                fragment.appendChild(tr);
+            });
+
+            exploreData = exploreData.concat(newRows);
+            exploreRendered += newRows.length;
+            if (newRows.length === 30) {
+                const sentinel = document.createElement('tr');
+                sentinel.id = 'sentinel-row';
+                sentinel.innerHTML = `<td colspan="6" class="sentinel-row">Scroll for more…</td>`;
+                fragment.appendChild(sentinel);
+            } else {
+                hasMoreExplore = false;
+            }
+            tbody.appendChild(fragment);
+            const newSentinel = document.getElementById('sentinel-row');
+            if (newSentinel) exploreObserver.observe(newSentinel);
+            updateExploreCount();
+            isFetchingExplore = false;
+        }
+
+        /* Row click: load the reel AND show the complete record. The table
+           truncates the caption and hides uuid/filename entirely, so the
+           detail panel is where the row actually "opens". */
+        function selectExploreRow(row, tr) {
+            selectedExploreId = row.id;
+            document.querySelectorAll('#explore-tbody tr').forEach(el => el.classList.remove('sel'));
+            if (tr) tr.classList.add('sel');
+
+            const vid = document.getElementById('explore-vid');
+            if (row.filename) {
+                vid.src = '/videos/' + encodeURIComponent(row.filename);
+                vid.play().catch(() => {});   // autoplay may be blocked; controls remain
+            } else {
+                vid.removeAttribute('src'); vid.load();
+            }
+
+            const cap = row.caption || '';
+            document.getElementById('explore-detail').innerHTML =
+                `<h4>Database record</h4>`
+              + drow('UUID', row.uuid, 'mono')
+              + drow('Post ID', row.id, 'mono')
+              + drow('Creator', '@' + (row.creator || '—'))
+              + drow('Category', row.category)
+              + drow('Likes', row.likes)
+              + drow('Status', row.status || 'stored')
+              + drow('File', row.filename || '—', 'mono')
+              + (cap ? drow('Caption', cap, 'cap') : '')
+              + `<div class="detail-actions">`
+              + `<button class="action-btn" onclick="openForensicView('${esc(row.uuid)}')">🔮 Forensic view</button>`
+              + `<button class="action-btn" onclick="copyExploreCaption()">📋 Copy caption</button>`
+              + `</div>`;
+            window.__exploreSelected = row;
+        }
+
+        const drow = (k, v, cls) =>
+            `<div class="drow"><span class="dk">${esc(k)}</span>`
+          + `<span class="dv ${cls || ''}">${esc(v === '' || v == null ? '—' : v)}</span></div>`;
+
+        function copyExploreCaption() {
+            const row = window.__exploreSelected;
+            if (!row || !row.caption) { showToast('No caption on this row.'); return; }
+            navigator.clipboard.writeText(row.caption)
+                .then(() => showToast('📋 Caption copied.'))
+                .catch(() => showToast('Clipboard blocked by the browser.'));
+        }
+
+        /* Jump to the Omniscient tab scoped to one reel. The dashboard lives in
+           an iframe and reads the uuid off its own location hash, so this works
+           whether or not the frame has loaded yet. */
+        function openForensicView(uuid) {
+            if (!uuid) return;
+            const btn = document.querySelector('.tab-btn[data-tab="omniscient"]');
+            switchTab('omniscient', btn);
+            const fr = document.getElementById('omniRootFrame');
+            const hash = encodeURIComponent(uuid);
+            const target = '/omni/#' + hash;
+            if (!fr.src) {
+                fr.src = target;                       // first open — loads the dashboard
+            } else {
+                // Already loaded: set only the hash so the frame fires
+                // hashchange instead of reloading the whole dashboard. Same-hash
+                // fires nothing, so re-dispatch the drill-in explicitly.
+                try {
+                    const w = fr.contentWindow;
+                    if (w.location.hash === '#' + hash) {
+                        if (typeof w.applyDeepLink === 'function') w.applyDeepLink();
+                    } else {
+                        w.location.hash = hash;
+                    }
+                } catch (e) { fr.src = target; }       // cross-origin fallback
+            }
+            showToast(`🔮 Opening forensic view for ${uuid}`);
+        }
 
         init(); searchExplore();
     </script>

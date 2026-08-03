@@ -1,4 +1,5 @@
-import os, sqlite3, aiosqlite, redis, re, builtins, time, asyncio, urllib.request, json, uvicorn, threading, subprocess
+import os, sqlite3, aiosqlite, redis, re, time, asyncio, urllib.request, json, uvicorn, threading, subprocess
+from collections import deque
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 import logging
@@ -23,23 +24,133 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', '%H:%M:%S'))
     logger.addHandler(ch)
 
-class WsManager:
-    def __init__(self): self.clients = []
-    async def connect(self, ws: WebSocket): await ws.accept(); self.clients.append(ws)
-    def disconnect(self, ws: WebSocket): self.clients.remove(ws)
-    async def broadcast(self, msg: dict):
-        for c in self.clients.copy():
-            try: await c.send_json(msg)
-            except: pass
-ws_mgr = WsManager()
+# ═══════════════════════════════════════════════════════════════════════════
+# LOG BUS — why the UI used to stall
+# ═══════════════════════════════════════════════════════════════════════════
+# This process runs TWO event loops: uvicorn owns one in a daemon thread, and
+# the Ghost Worker owns the main thread's loop. WebSocket objects are created
+# by uvicorn, so their transports belong to uvicorn's loop.
+#
+# The old code called, from the Ghost Worker's loop:
+#     loop.create_task(ws_mgr.broadcast(...))
+# i.e. it awaited `ws.send_json()` on transports owned by the *other* loop, once
+# per log line, sequentially across every connected client. Three consequences,
+# all of which the user sees as "buffering" and "getting stuck":
+#
+#   1. Writing to a transport from a foreign loop is undefined behaviour. It is
+#      the direct source of the `socket.send() raised exception.` flood, and the
+#      bare `except: pass` hid every one of them.
+#   2. One WS frame per log line. A retry storm emits thousands of lines a
+#      second, so the browser spent its main thread parsing JSON instead of
+#      responding to clicks.
+#   3. The Ghost Worker awaited that I/O, so network stalls and UI stalls fed
+#      each other.
+#
+# The fix inverts the direction. Producers never touch a socket: they append to
+# a bounded ring buffer under a plain threading.Lock (no awaits, no loop
+# affinity, O(1)). Each WebSocket connection runs its own drain task ON UVICORN'S
+# LOOP, keeps a cursor into the ring, and ships whatever is new as ONE batched
+# frame a few times a second. Slow or dead clients can no longer back-pressure
+# the harvester, and a flood costs the browser 4 frames/sec instead of 4000.
+_LOG_RING_SIZE = 400          # lines retained for late joiners
+_LOG_FLUSH_INTERVAL = 0.25    # seconds between batched pushes (4 Hz)
+
+
+class LogBus:
+    """Bounded, loop-agnostic fan-out buffer for console lines."""
+
+    def __init__(self, size=_LOG_RING_SIZE):
+        self._lock = threading.Lock()
+        self._buf = deque(maxlen=size)
+        self._seq = 0            # total lines ever published
+        # Repeat suppression. A wedged network emits the same line forever;
+        # collapsing it keeps the signal ("this is still happening") without
+        # the volume, and without inventing a line the producer never wrote.
+        self._last_msg = None
+        self._last_at = 0.0
+        self._repeats = 0
+
+    def publish(self, msg: str):
+        now = time.time()
+        with self._lock:
+            if msg == self._last_msg and (now - self._last_at) < 30.0:
+                self._repeats += 1
+                # Emit a running tally on a geometric ladder (2,4,8,...) so a
+                # storm is visible but bounded.
+                if self._repeats & (self._repeats - 1):
+                    return
+                msg = f"{msg}   (×{self._repeats + 1})"
+            else:
+                if self._repeats:
+                    self._buf.append((self._seq, f"[{time.strftime('%H:%M:%S')}] "
+                                      f"↑ previous line repeated "
+                                      f"{self._repeats} more time(s)"))
+                    self._seq += 1
+                self._last_msg = msg
+                self._repeats = 0
+            self._last_at = now
+            self._buf.append((self._seq, f"[{time.strftime('%H:%M:%S')}] {msg}"))
+            self._seq += 1
+
+    @property
+    def seq(self):
+        with self._lock:
+            return self._seq
+
+    def since(self, cursor):
+        """(lines, new_cursor) for everything published after `cursor`."""
+        with self._lock:
+            if cursor >= self._seq:
+                return [], self._seq
+            # A cursor older than the ring means the client fell behind; it
+            # resumes from the oldest line still held rather than replaying
+            # history it can no longer get.
+            return [text for seq, text in self._buf if seq >= cursor], self._seq
+
+    def tail(self, n=120):
+        with self._lock:
+            lines = [text for _seq, text in self._buf][-n:]
+            return lines, self._seq
+
+
+log_bus = LogBus()
+
 
 def custom_print(*args, **kwargs):
     msg = " ".join(map(str, args))
     logger.info(msg)
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(ws_mgr.broadcast({"type": "log", "message": f"[{time.strftime('%H:%M:%S')}] {msg}"}))
-    except: pass
+    log_bus.publish(msg)
+
+
+# ── Library log-spam rate limiter ──────────────────────────────────────────
+# pyrogram re-logs every MTProto retry at WARNING. When the session's socket
+# dies it retries indefinitely, and the boot console filled with hundreds of
+# identical `Retrying "channels.GetMessages" due to: [Errno 32] Broken pipe`
+# lines. Silencing the logger outright would hide a real fault, so allow the
+# first few and then throttle each distinct message to one line per interval.
+class _RateLimitFilter(logging.Filter):
+    def __init__(self, burst=3, interval=20.0):
+        super().__init__()
+        self.burst, self.interval = burst, interval
+        self._seen = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record):
+        key = record.getMessage()[:120]
+        now = time.time()
+        with self._lock:
+            count, first_at = self._seen.get(key, (0, now))
+            if now - first_at > self.interval:
+                count, first_at = 0, now
+            self._seen[key] = (count + 1, first_at)
+            if len(self._seen) > 512:        # keep the map from growing forever
+                self._seen.clear()
+        return count < self.burst
+
+
+for _noisy in ("pyrogram.session.session", "pyrogram.connection.connection",
+               "pyrogram.session.auth", "asyncio"):
+    logging.getLogger(_noisy).addFilter(_RateLimitFilter())
 
 # --- CREDENTIALS (single source of truth: config.py, env-only) ---
 from config import (API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID,
@@ -101,6 +212,55 @@ def persist_category_queue():
     except Exception:
         pass
 
+# ═══════════════════════════════════════════════════════════════════════════
+# READ CACHE — the second half of the "buffering" fix
+# ═══════════════════════════════════════════════════════════════════════════
+# No browser in this repo connects to /ws; every UI polls over HTTP instead.
+# main_ui alone fires /api/status every 1.5s and /api/playlist + /api/categories
+# every 3s, and each open tab multiplies that. Those three queries were hitting
+# SQLite and Redis on every single tick, so a click had to wait behind whatever
+# poll was already holding the read lock.
+#
+# These payloads are all "recent state" — a second of staleness is invisible to
+# the user but removes almost all of the duplicated work. Writers bump
+# `_feed_epoch` so a finished download shows up immediately instead of waiting
+# out the TTL.
+_cache_lock = threading.Lock()
+_cache: dict = {}
+_feed_epoch = 0
+
+
+def bump_feed_epoch():
+    """Invalidate every feed-derived cache entry (call after a DB write)."""
+    global _feed_epoch
+    with _cache_lock:
+        _feed_epoch += 1
+
+
+def cache_get(key, ttl):
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and hit[0] > time.time() and hit[1] == _feed_epoch:
+            return hit[2]
+    return None
+
+
+def cache_put(key, value, ttl):
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, _feed_epoch, value)
+        if len(_cache) > 256:
+            for k in [k for k, v in _cache.items() if v[0] < time.time()]:
+                _cache.pop(k, None)
+    return value
+
+
+# How many entries the player feed carries. `get_playlist_data` had no LIMIT at
+# all: every 3s poll serialized every row in the table, captions included, and
+# the response grew without bound as the archive filled. The player only ever
+# renders a window of this, and new posts sort to the front.
+PLAYLIST_LIMIT = 400
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -117,26 +277,48 @@ def init_db():
     # re-fetched them — the channel gap never closed and every cycle replayed
     # the whole history, which is what triggered the FloodWait storms.
     cursor.execute("CREATE TABLE IF NOT EXISTS scanned_ids (video_id INTEGER PRIMARY KEY)")
+
+    # ── Indexes ────────────────────────────────────────────────────────────
+    # Every hot read filters on `local_video_path IS NOT NULL` and then joins
+    # creators/categories. Without these three, each poll from the player (once
+    # per 1.5-3s) was a full table scan plus two nested-loop joins with no index
+    # on either foreign key. That is the bulk of the click latency the UI shows
+    # as "buffering": SQLite held the read lock long enough that the next
+    # request queued behind it.
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS idx_posts_have_file ON posts(local_video_path)",
+        "CREATE INDEX IF NOT EXISTS idx_posts_category  ON posts(category_id)",
+        "CREATE INDEX IF NOT EXISTS idx_posts_creator   ON posts(creator_id)",
+    ):
+        try:
+            cursor.execute(ddl)
+        except sqlite3.Error as e:
+            logger.warning(f"index skipped ({e})")
+
     conn.commit()
     conn.close()
 
 async def get_playlist_data(category):
+    cache_key = f"playlist:{category}"
+    cached = cache_get(cache_key, 3.0)
+    if cached is not None:
+        return cached
     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
         base_query = '''SELECT cr.username, c.name, p.likes, p.caption, p.local_video_path, p.video_id FROM posts p JOIN creators cr ON p.creator_id = cr.id JOIN categories c ON p.category_id = c.id WHERE p.local_video_path IS NOT NULL'''
         if category and category != "All Categories":
-            base_query += " AND c.name = ? ORDER BY p.video_id DESC"
-            async with conn.execute(base_query, (category,)) as cursor:
+            base_query += " AND c.name = ? ORDER BY p.video_id DESC LIMIT ?"
+            async with conn.execute(base_query, (category, PLAYLIST_LIMIT)) as cursor:
                 rows = await cursor.fetchall()
         else:
-            base_query += " ORDER BY p.video_id DESC"
-            async with conn.execute(base_query) as cursor:
+            base_query += " ORDER BY p.video_id DESC LIMIT ?"
+            async with conn.execute(base_query, (PLAYLIST_LIMIT,)) as cursor:
                 rows = await cursor.fetchall()
-        
+
     playlist = []
     for row in rows:
         filename = os.path.basename(row[4]) if row[4] else ""
         playlist.append({'username': row[0], 'name': row[1], 'likes': row[2], 'caption': row[3], 'filename': filename, 'id': row[5]})
-    return playlist
+    return cache_put(cache_key, playlist, 3.0)
 
 def extract_text(pattern, text):
     match = re.search(pattern, text)
@@ -395,6 +577,9 @@ async def background_downloader():
                     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
                         await conn.execute("UPDATE posts SET local_video_path = ?, status = 'Harvested' WHERE video_id = ?", (target_video, target_vid))
                         await conn.commit()
+                    # A new playable video must appear in the feed at once, not
+                    # after the read cache expires.
+                    bump_feed_epoch()
 
                     # Any admin-activated category gets CV priority (old code
                     # only honored position 0, so 2nd/3rd active categories
@@ -499,18 +684,27 @@ app.include_router(admin_router)
 
 @app.get("/api/status")
 def get_status():
-    try:
-        metrics = get_queue_metrics("QUEUE_VISION")
-    except:
-        metrics = {}
-    # Disk usage
-    try:
-        import shutil
-        disk = shutil.disk_usage(LAKE_DIR)
-        free_gb = f"{disk.free / (1024**3):.1f} GB"
-    except:
-        free_gb = "N/A"
-    return {"status": GLOBAL_STATUS, "queue": metrics, "disk_free": free_gb}
+    """Polled every 1.5s per open tab, so it must be nearly free.
+
+    `get_queue_metrics` is a multi-key blocking Redis round-trip and
+    `disk_usage` is a syscall against a network-backed mount; neither result
+    changes meaningfully inside one second. GLOBAL_STATUS is read live so the
+    status line still updates on every tick.
+    """
+    cached = cache_get("status:payload", 1.0)
+    if cached is None:
+        try:
+            metrics = get_queue_metrics("QUEUE_VISION")
+        except Exception:
+            metrics = {}
+        try:
+            import shutil
+            disk = shutil.disk_usage(LAKE_DIR)
+            free_gb = f"{disk.free / (1024**3):.1f} GB"
+        except Exception:
+            free_gb = "N/A"
+        cached = cache_put("status:payload", {"queue": metrics, "disk_free": free_gb}, 1.0)
+    return {"status": GLOBAL_STATUS, **cached}
 
 # ── OMNISCIENT DASHBOARD PROXY ──
 # The God-Mode Explorer (Flask) lives inside omni_engine.py on localhost so it
@@ -568,30 +762,73 @@ async def omni_proxy(request: Request, path: str = ""):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    await ws_mgr.connect(ws)
-    async def push_status():
-        last_s = ""
+    """One drain task per client, running on uvicorn's own loop.
+
+    Everything this socket sends originates here, so no other thread ever
+    touches the transport. Logs go out as batched arrays on a 4 Hz tick;
+    status and queue metrics ride the same tick instead of each holding
+    their own timer. `get_queue_metrics` is a blocking Redis call, so it is
+    pushed to a worker thread — on the old code a Redis hiccup froze the
+    socket, and with it the UI's status bar.
+    """
+    await ws.accept()
+
+    # Late joiners get the recent tail immediately rather than an empty console.
+    backlog, cursor = log_bus.tail(120)
+    try:
+        await ws.send_json({"type": "log_batch", "lines": backlog})
+    except Exception:
+        return
+
+    async def pump():
+        nonlocal cursor
+        last_status = None
         tick = 0
         while True:
-            gs = globals().get("GLOBAL_STATUS", "")
-            if gs != last_s:
-                last_s = gs
-                try: await ws.send_json({"type":"status", "message":gs})
-                except: break
-            # Broadcast queue metrics every 5 seconds (25 × 0.2s)
-            tick += 1
-            if tick % 25 == 0:
-                try:
-                    m = get_queue_metrics("QUEUE_VISION")
-                    await ws.send_json({"type": "queue", "data": m})
-                except: pass
-            await asyncio.sleep(0.2)
-    t = asyncio.create_task(push_status())
+            try:
+                lines, cursor = log_bus.since(cursor)
+                if lines:
+                    # Hard cap per frame: a burst larger than this is already
+                    # unreadable, and shipping it whole is what locked up the
+                    # browser's main thread.
+                    if len(lines) > 200:
+                        dropped = len(lines) - 200
+                        lines = ([f"… {dropped} lines dropped (flood) …"]
+                                 + lines[-200:])
+                    await ws.send_json({"type": "log_batch", "lines": lines})
+
+                gs = globals().get("GLOBAL_STATUS", "")
+                if gs != last_status:
+                    last_status = gs
+                    await ws.send_json({"type": "status", "message": gs})
+
+                tick += 1
+                if tick % 20 == 0:      # every ~5s
+                    try:
+                        m = await asyncio.to_thread(get_queue_metrics, "QUEUE_VISION")
+                        await ws.send_json({"type": "queue", "data": m})
+                    except Exception:
+                        pass            # Redis down must not kill the socket
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except Exception:
+                break
+            await asyncio.sleep(_LOG_FLUSH_INTERVAL)
+
+    t = asyncio.create_task(pump())
     try:
-        while True: await ws.receive_text()
+        while True:
+            await ws.receive_text()
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        # Always cancel the pump. The old code only did this on a clean
+        # WebSocketDisconnect, so any other error left an orphan task looping
+        # against a dead socket for the life of the process — one more per
+        # browser refresh. That accumulation is the other half of the slowdown.
         t.cancel()
-        ws_mgr.disconnect(ws)
 
 @app.post("/api/prioritize/{video_id}")
 def prioritize_video(video_id: int):
@@ -627,22 +864,80 @@ def trigger_scan(category: str = None):
     SCAN_TRIGGER.set(); return {"message": "Scan triggered"}
 @app.get("/api/categories")
 async def api_categories():
-    async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
-        async with conn.execute("SELECT DISTINCT c.name FROM categories c JOIN posts p ON c.id = p.category_id") as cursor:
-            cats = sorted([row[0] for row in await cursor.fetchall()])
+    # DISTINCT over a join with no GROUP BY forced a scan of `posts` per call,
+    # and main_ui calls this on every feed sync (3s) plus after every switch.
+    # The category set changes only when a new category is harvested.
+    cats = cache_get("categories:list", 15.0)
+    if cats is None:
+        async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
+            async with conn.execute("SELECT DISTINCT c.name FROM categories c JOIN posts p ON c.id = p.category_id") as cursor:
+                cats = sorted([row[0] for row in await cursor.fetchall()])
+        cache_put("categories:list", cats, 15.0)
     return {"categories": ["All Categories"] + cats, "queue": CATEGORY_QUEUE}
 @app.get("/api/playlist")
 async def api_playlist(category: str = "All Categories"): return {"playlist": await get_playlist_data(category)}
 @app.get("/api/explore")
 async def api_explore(q: str = "", offset: int = 0):
+    """Search every piece of metadata a post carries, ids included.
+
+    The old implementation ran `posts_search MATCH ?` against an FTS5 table
+    declared with `video_id UNINDEXED` — stored but not searchable — so typing
+    an id could never return that video. Worse, `f"{q}*"` is spliced straight
+    into FTS5 query syntax: a quote, hyphen, colon or parenthesis raises
+    sqlite3.OperationalError, which the global handler turns into a 503 and the
+    UI renders as an empty table. That is the "search is not working" report.
+
+    LIKE over the joined columns is the honest fix here. It matches ids,
+    creators, categories, captions, filenames and status, it treats the query
+    as a literal, and at this table size it is well under a millisecond. Digit
+    queries also match the id numerically so "1236" finds tg1236.
+    """
+    q = (q or "").strip()
+    cache_key = f"explore:{q}:{offset}"
+    cached = cache_get(cache_key, 3.0)
+    if cached is not None:
+        return cached
+
+    base = '''SELECT p.video_id, cr.username, c.name, p.likes, p.caption,
+                     p.local_video_path, COALESCE(p.status, '')
+              FROM posts p
+              JOIN creators cr   ON p.creator_id = cr.id
+              JOIN categories c  ON p.category_id = c.id
+              WHERE p.local_video_path IS NOT NULL'''
+    params: list = []
+    if q:
+        # Escape LIKE wildcards so a literal % or _ in the query means itself.
+        esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{esc}%"
+        cols = ["CAST(p.video_id AS TEXT)", "cr.username", "c.name",
+                "p.caption", "p.local_video_path", "COALESCE(p.status,'')",
+                "CAST(p.likes AS TEXT)"]
+        base += " AND (" + " OR ".join(
+            f"{c} LIKE ? ESCAPE '\\'" for c in cols) + ")"
+        params += [like] * len(cols)
+        # Exact-id hits sort first, then newest.
+        base += " ORDER BY (CAST(p.video_id AS TEXT) = ?) DESC, p.video_id DESC"
+        params.append(q)
+    else:
+        base += " ORDER BY p.video_id DESC"
+    base += " LIMIT 30 OFFSET ?"
+    params.append(offset)
+
     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
-        if q.strip():
-            async with conn.execute('''SELECT p.video_id AS "ID", ps.creator AS "Creator", ps.category AS "Category", p.likes AS "Likes", ps.caption AS "Caption", p.local_video_path FROM posts_search ps JOIN posts p ON ps.video_id = p.video_id WHERE ps.posts_search MATCH ? AND p.local_video_path IS NOT NULL ORDER BY ps.rank LIMIT 30 OFFSET ?''', (f"{q}*", offset)) as cursor:
-                rows = await cursor.fetchall()
-        else:
-            async with conn.execute('''SELECT p.video_id AS "ID", cr.username AS "Creator", c.name AS "Category", p.likes AS "Likes", p.caption AS "Caption", p.local_video_path FROM posts p JOIN creators cr ON p.creator_id = cr.id JOIN categories c ON p.category_id = c.id WHERE p.local_video_path IS NOT NULL ORDER BY p.video_id DESC LIMIT 30 OFFSET ?''', (offset,)) as cursor:
-                rows = await cursor.fetchall()
-    return {"data": [{"id": r[0], "creator": r[1], "category": r[2], "likes": f"{r[3]:,}", "caption": r[4], "filename": os.path.basename(r[5])} for r in rows]}
+        async with conn.execute(base, params) as cursor:
+            rows = await cursor.fetchall()
+
+    payload = {"query": q, "count": len(rows), "data": [{
+        "id": r[0],
+        "creator": r[1],
+        "category": r[2],
+        "likes": f"{r[3]:,}" if isinstance(r[3], int) else (r[3] or "0"),
+        "caption": r[4] or "",
+        "status": r[6],
+        "uuid": f"tg{r[0]}",
+        "filename": os.path.basename(r[5]) if r[5] else "",
+    } for r in rows]}
+    return cache_put(cache_key, payload, 3.0)
 @app.post("/api/state")
 def set_state(index: int):
     with open(STATE_FILE, 'w') as f: f.write(str(index))

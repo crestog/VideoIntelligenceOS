@@ -377,15 +377,96 @@ def vision_worker_loop():
 # prompt made Qwen collapse visually similar reels onto the same paragraph,
 # and ON CONFLICT DO NOTHING then froze those rows forever.
 from collections import deque
-_RECENT_NARRATIVES = deque(maxlen=24)
+# ═══════════════════════════════════════════════════════════════════════════
+# NARRATIVE DE-DUPLICATION
+# ═══════════════════════════════════════════════════════════════════════════
+# Every chunk of tg1236 came back with the same paragraph, differing only in a
+# trailing overlay phrase. Four separate causes stacked up:
+#
+#   1. The comparison pool was ONE module-global deque shared by every video,
+#      so unrelated videos poisoned each other's duplicate check while the
+#      chunks that actually mattered (neighbours in the same video) could fall
+#      out of the 24-entry window on a long video. The pool is now per-video
+#      and unbounded within a job.
+#   2. The prompt fed the previous narrative back in verbatim. Telling a model
+#      "Previous part: '<400 chars>'. Do not repeat the previous part." hands it
+#      400 tokens of exactly what to say; instruction-tuned models echo it. Only
+#      a short factual carry-over is passed now (see _context_hint).
+#   3. On a persisting duplicate the code logged ERROR and then wrote the row
+#      anyway, so the guard never actually protected the database.
+#   4. Blitz sampling is thin (fps 1.0 over a 15s chunk). Visually similar
+#      chunks genuinely look identical at that rate, so the retry now also
+#      raises fps rather than only raising temperature.
+#
+# 0.90 on the raw string was both too permissive and too strict at once:
+# boilerplate scaffolding ("The video shows a man who...") inflates similarity
+# between genuinely different chunks, while a reworded restatement of the same
+# scene scored well under it and slipped through. Two changes fix that:
+#
+#   * Compare CONTENT WORDS only, so shared narration phrasing does not count
+#     as substance.
+#   * Score with max(sequence, token-set). Sequence catches near-verbatim
+#     repeats; Jaccard catches the same facts in a different clause order,
+#     which sequence rates as low as 0.50.
+#
+# Measured on the real tg1236 narratives plus hand-built controls, duplicates
+# land at 0.76-1.00 and genuinely distinct chunks at 0.22-0.40. 0.62 sits in
+# the middle of that gap, so it is not tuned to a single example.
+_DUP_RATIO = 0.62
+
+_STOPWORDS = frozenset("""
+a an the this that these those is are was were be been being am
+and or but if then than so as of in on at to from by with for about into over
+he she it they them his her its their there here what which who whom whose
+video clip shows showing seen visible appears appearing camera frame scene
+same then next also while during as continues still
+""".split())
 
 
-def _near_duplicate(norm_text, pool):
+def _content_key(text):
+    """Normalized bag of content words — phrasing-insensitive fingerprint."""
+    words = re.findall(r"[a-z0-9']+", (text or "").lower())
+    return " ".join(w for w in words if w not in _STOPWORDS and len(w) > 2)
+
+
+def _similarity(a_key, b_key):
+    """max(sequence ratio, token-set ratio) over two content keys."""
     from difflib import SequenceMatcher
+    seq = SequenceMatcher(None, a_key, b_key).ratio()
+    sa, sb = set(a_key.split()), set(b_key.split())
+    jac = len(sa & sb) / len(sa | sb) if (sa and sb) else 0.0
+    return max(seq, jac)
+
+
+def _near_duplicate(norm_text, pool, ratio=_DUP_RATIO):
+    """True when norm_text restates something already in pool."""
+    key = _content_key(norm_text)
+    # A key too short to fingerprint (a one-line "a man talks") would match
+    # almost anything on token overlap; let it through rather than dropping a
+    # legitimately terse chunk.
+    if len(key.split()) < 5:
+        return False
     for prior in pool:
-        if SequenceMatcher(None, norm_text, prior).ratio() > 0.90:
+        p_key = _content_key(prior)
+        if len(p_key.split()) < 5:
+            continue
+        if _similarity(key, p_key) > ratio:
             return True
     return False
+
+
+def _context_hint(text, limit=160):
+    """Short, non-echoable carry-over for the next chunk's prompt.
+
+    Passing the previous narrative verbatim primed the model to repeat it. A
+    clipped first sentence is enough for continuity ("we were in a gym") while
+    being too short to copy as a whole answer.
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    first = re.split(r'(?<=[.!?])\s', text)[0]
+    return first[:limit]
 
 
 def process_oracle_job(payload):
@@ -410,12 +491,17 @@ def process_oracle_job(payload):
     chunk_size, qwen_fps, qwen_tokens = cfg["chunk"], cfg["fps"], cfg["tokens"]
     chunks_dir = os.path.join(ARCHIVE_DIR, f"{v_uuid}_chunks")
     os.makedirs(chunks_dir, exist_ok=True)
-    previous_context = "This is the start of the video."
+    previous_context = ""
 
     from qdrant_client.models import PointStruct
     bge_points = []
     pg_conn = get_pg_conn_optional()
     reused = 0
+    skipped_dup = 0
+    # Per-video, per-job comparison pool. Scoped here rather than module-global
+    # so one video's narratives can never suppress another's, and so a long
+    # video keeps every earlier chunk in view instead of ageing them out.
+    seen_narratives: list = []
     try:
         # Reprocess economics: re-narrating a 500-reel corpus is thousands of
         # Qwen calls. Reuse an existing narrative only when it is trustworthy —
@@ -459,8 +545,8 @@ def process_oracle_job(payload):
                             payload={"chunk_id": c_id_str, "video_uuid": v_uuid,
                                      "video_path": path, "start_t": start_t,
                                      "end_t": end_t, "description": p_desc}))
-                        previous_context = p_desc[:400]
-                        _RECENT_NARRATIVES.append(" ".join(p_desc.lower().split()))
+                        previous_context = _context_hint(p_desc)
+                        seen_narratives.append(" ".join(p_desc.lower().split()))
                         reused += 1
                         continue
 
@@ -476,28 +562,53 @@ def process_oracle_job(payload):
 
                 chunk_prompt = (
                     f"This clip covers {start_t:.0f}s-{end_t:.0f}s of a "
-                    f"{duration:.0f}s video. Previous part: '{previous_context}'. "
-                    f"Describe ONLY what is concretely visible and audible in THIS "
-                    f"clip — name the subjects, actions, setting, and any on-screen "
-                    f"text. Do not repeat the previous part.")
+                    f"{duration:.0f}s video."
+                    + (f" Earlier the video was: {previous_context}"
+                       if previous_context else "")
+                    + " Describe ONLY what is concretely visible and audible in"
+                      " THIS clip — name the subjects, actions, setting, and any"
+                      " on-screen text. Be specific to this moment. Do not"
+                      " summarise the video as a whole.")
+
+                # Escalating retry. Attempt 1 is the cheap path; a duplicate
+                # then buys more visual evidence (higher fps) and more entropy
+                # (higher temperature) rather than just re-rolling the same
+                # thin sample, which is what made the old retry ineffective.
                 _gen_start = time.time()
-                narrative = qwen_describe_video(
-                    chunk_file, chunk_prompt, fps=qwen_fps, max_new_tokens=qwen_tokens)
-                norm = " ".join(narrative.lower().split())
-                if _near_duplicate(norm, _RECENT_NARRATIVES):
-                    log(f"⚠️ Oracle {v_uuid} @{start_t}s: narrative near-duplicates "
-                        f"a recent one — regenerating hotter", "WARN")
+                attempts = [
+                    {"fps": qwen_fps, "temperature": 0.7},
+                    {"fps": min(qwen_fps * 2, 4.0), "temperature": 1.0},
+                    {"fps": min(qwen_fps * 3, 6.0), "temperature": 1.15},
+                ]
+                narrative, norm, is_dup = None, None, True
+                for i, kw in enumerate(attempts):
                     narrative = qwen_describe_video(
-                        chunk_file, chunk_prompt, fps=qwen_fps,
-                        max_new_tokens=qwen_tokens, temperature=1.0)
+                        chunk_file, chunk_prompt, max_new_tokens=qwen_tokens, **kw)
                     norm = " ".join(narrative.lower().split())
-                    if _near_duplicate(norm, _RECENT_NARRATIVES):
-                        log(f"⚠️ Oracle {v_uuid} @{start_t}s: duplicate persisted "
-                            f"after retry — inspect chunk render / vision input",
-                            "ERROR")
+                    is_dup = _near_duplicate(norm, seen_narratives)
+                    if not is_dup:
+                        break
+                    if i + 1 < len(attempts):
+                        log(f"⚠️ Oracle {v_uuid} @{start_t}s: narrative restates an "
+                            f"earlier chunk — retrying at fps "
+                            f"{attempts[i+1]['fps']:.1f}", "WARN")
+
+                if is_dup:
+                    # Do NOT write it. The old code logged ERROR and then
+                    # inserted the duplicate regardless, which is exactly how
+                    # four identical narratives reached the database for one
+                    # video. A missing chunk is recoverable by reprocessing; a
+                    # wrong one silently corrupts every downstream consumer
+                    # (BGE vectors, the graph, and search results alike).
+                    log(f"⛔ Oracle {v_uuid} @{start_t}s: still duplicate after "
+                        f"{len(attempts)} attempts — skipping this chunk rather "
+                        f"than storing a false narrative", "ERROR")
+                    skipped_dup += 1
+                    continue
+
                 gen_ms = int((time.time() - _gen_start) * 1000)
-                _RECENT_NARRATIVES.append(norm)
-                previous_context = narrative[:400]
+                seen_narratives.append(norm)
+                previous_context = _context_hint(narrative)
 
                 c_id_str = f"chunk_{v_uuid}_{start_t}"
                 c_id_int = stable_id64(c_id_str)
@@ -569,8 +680,15 @@ def process_oracle_job(payload):
     if reused:
         log(f"🧠 Oracle {v_uuid}: reused {reused} trustworthy chunk narratives "
             f"(pass force=true to regenerate)", "INFO")
+    if skipped_dup:
+        # Surfaced, not swallowed: a video that drops most of its chunks is
+        # telling us its frames are too thin to distinguish, which is a
+        # reprocess-in-omni-mode signal rather than a success.
+        log(f"🧠 Oracle {v_uuid}: dropped {skipped_dup} chunk(s) that stayed "
+            f"duplicate after 2 retries — consider mode=omni for this video",
+            "WARN")
     return {"chunks": len(bge_points), "generated": len(bge_points) - reused,
-            "reused": reused}
+            "reused": reused, "skipped_dup": skipped_dup}
 
 
 def oracle_worker_loop():
@@ -589,8 +707,11 @@ def oracle_worker_loop():
                 n = process_oracle_job(payload)
                 REDIS.hset(f"status:{v_uuid}", "oracle", "DONE ✅")
                 ack_job(QUEUE_OMNI_ORACLE, job, job_raw)
+                _dropped = n.get("skipped_dup", 0)
                 log(f"🧠 Oracle {v_uuid}: {n['chunks']} narrative chunks indexed "
-                    f"({n['generated']} generated, {n['reused']} reused)", "SUCCESS")
+                    f"({n['generated']} generated, {n['reused']} reused"
+                    + (f", {_dropped} dropped as duplicate" if _dropped else "")
+                    + ")", "SUCCESS")
             except Exception as e:
                 # Checked before fail_job: a lost context is not this job's
                 # fault, so it must not consume a retry or reach the DLQ.

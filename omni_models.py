@@ -20,6 +20,7 @@ one 4-bit model are a corruption/OOM hazard.
 """
 
 import os
+import re
 import threading
 
 # config before torch: importing it runs configure_environment(), which sets
@@ -213,6 +214,48 @@ def clip_text_vec(text):
 # ═══════════════════════════════════════════════════════════
 # QWEN ORACLE — serialized video-to-text generation
 # ═══════════════════════════════════════════════════════════
+def _trim_to_sentence(text, min_keep=0.4):
+    """Drop a trailing fragment left behind by a max_new_tokens cutoff.
+
+    Generation stops on a token count, not on grammar, so a capped narrative
+    ends mid-word or mid-quote — the UI showed things like `such as: 1. "YOU `.
+    If the text already ends on terminal punctuation it is returned untouched.
+    Otherwise we cut back to the last real sentence end, but only when that
+    keeps `min_keep` of the text: for a single long unpunctuated sentence,
+    trimming would throw away everything the model actually saw, so it is kept
+    with an ellipsis marking the truncation honestly.
+    """
+    text = (text or "").strip()
+    if not text:
+        return text
+
+    def _terminal(s):
+        """True when s ends a real sentence — a period right after a digit is
+        a list marker ("1.") or a decimal, not an ending."""
+        if s[-1:] not in ".!?…":
+            return False
+        return not (s[-1] == "." and len(s) > 1 and s[-2].isdigit())
+
+    # Unbalanced quote from a cut-off on-screen-text citation.
+    if text.count('"') % 2:
+        text = text[:text.rfind('"')].rstrip()
+        if not text:
+            return text
+    if _terminal(text):
+        return text
+
+    # Candidate sentence ends, latest first.
+    best = -1
+    for m in re.finditer(r'[.!?](?=[\s"]|$)', text):
+        i = m.start()
+        if text[i] == "." and i and text[i - 1].isdigit():
+            continue
+        best = i
+    if best > len(text) * min_keep:
+        return text[:best + 1].strip()
+    return text.rstrip(" ,;:-—([{\"'0123456789.") + "…"
+
+
 def qwen_describe_video(video_path, prompt_text, fps=2.0, max_new_tokens=150,
                         max_pixels=360000, temperature=0.7):
     """Run Qwen2.5-VL over a video file. Thread-safe (QWEN_LOCK)."""
@@ -244,7 +287,7 @@ def qwen_describe_video(video_path, prompt_text, fps=2.0, max_new_tokens=150,
                 do_sample=True, temperature=temperature, top_p=0.9,
                 repetition_penalty=1.05)
     trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
-    return processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+    return _trim_to_sentence(processor.batch_decode(trimmed, skip_special_tokens=True)[0])
 
 
 # ═══════════════════════════════════════════════════════════
