@@ -103,6 +103,11 @@
            displayed in the ui" for whichever row is selected. */
         .detail-card { background: var(--surface); border: 1px solid #2a2a2a; border-radius: 14px; padding: 18px; margin-top: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
         .detail-card h4 { margin: 0 0 14px 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-dim); }
+        /* Omniscient counts inside the record — the Postgres/Qdrant side of a
+           row that SQLite alone can't answer for. */
+        .omni-pending { font-size: 12px; color: var(--text-dim); line-height: 1.55; padding: 4px 0; }
+        .omni-bar { height: 5px; border-radius: 3px; background: #1e1e1e; overflow: hidden; margin-top: 10px; }
+        .omni-bar i { display: block; height: 100%; border-radius: 3px; transition: width 0.25s; }
         .drow { display: flex; gap: 12px; padding: 9px 0; border-bottom: 1px solid #1a1a1a; font-size: 13px; align-items: baseline; }
         .drow:last-of-type { border-bottom: none; }
         .drow .dk { color: var(--text-dim); min-width: 78px; flex-shrink: 0; font-weight: 600; }
@@ -438,11 +443,76 @@
               + drow('Status', row.status || 'stored')
               + drow('File', row.filename || '—', 'mono')
               + (cap ? drow('Caption', cap, 'cap') : '')
+              + `<div id="omni-facts"><div class="omni-pending">Checking the Omniscient stores…</div></div>`
               + `<div class="detail-actions">`
               + `<button class="action-btn" onclick="openForensicView('${esc(row.uuid)}')">🔮 Forensic view</button>`
               + `<button class="action-btn" onclick="copyExploreCaption()">📋 Copy caption</button>`
               + `</div>`;
             window.__exploreSelected = row;
+            renderOmniFacts(row.uuid);
+        }
+
+        /* ── The Omniscient half of the record ──
+           A row in this table is one Telegram post in SQLite. The same reel also
+           exists in Postgres/Qdrant/Neo4j as chunks, frames and vectors, and
+           until now nothing in Explore DB said whether any of that had been
+           built. These counts come from the engine's own /api/videos, fetched
+           once per session and matched by uuid. */
+        let omniIndex = null;          // uuid -> record, or null until loaded
+        let omniIndexPromise = null;
+
+        function loadOmniIndex() {
+            if (omniIndexPromise) return omniIndexPromise;
+            omniIndexPromise = fetch('/omni/api/videos')
+                .then(r => r.ok ? r.json() : Promise.reject(new Error(String(r.status))))
+                .then(data => {
+                    if (!Array.isArray(data)) throw new Error(data.error || 'engine offline');
+                    omniIndex = {};
+                    data.forEach(v => { omniIndex[v.video_uuid] = v; });
+                    return omniIndex;
+                })
+                .catch(err => {
+                    // The dashboard is proxied, so a down engine is a 502 here.
+                    // Retry on the next selection rather than caching failure.
+                    omniIndexPromise = null;
+                    throw err;
+                });
+            return omniIndexPromise;
+        }
+
+        const OMNI_STAGE = {
+            'complete':    ['#22c55e', 'fully narrated'],
+            'partial':     ['#eab308', 'narration incomplete'],
+            'frames-only': ['#8b8b94', 'frames only — not narrated']
+        };
+
+        function renderOmniFacts(uuid) {
+            loadOmniIndex().then(idx => {
+                const box = document.getElementById('omni-facts');
+                // The user may have clicked another row while this was in flight.
+                if (!box || !window.__exploreSelected
+                    || window.__exploreSelected.uuid !== uuid) return;
+                const v = idx[uuid];
+                if (!v) {
+                    box.innerHTML = `<h4 style="margin-top:18px">Omniscient stores</h4>`
+                        + `<div class="omni-pending">Not indexed yet — this reel has no chunks `
+                        + `or frames in Postgres. It enters the queue on the next pipeline run.</div>`;
+                    return;
+                }
+                const [col, label] = OMNI_STAGE[v.stage] || ['#8b8b94', v.stage];
+                box.innerHTML = `<h4 style="margin-top:18px">Omniscient stores</h4>`
+                    + drow('Narration', `${v.narrated} of ${v.chunks} chunks · ${label}`)
+                    + drow('Frames indexed', v.frames)
+                    + drow('Duration', v.duration ? v.duration + 's' : '—')
+                    + (v.mode ? drow('Vision mode', v.mode) : '')
+                    + `<div class="omni-bar"><i style="width:${v.chunks
+                        ? Math.round(100 * v.narrated / v.chunks) : 0}%;background:${col}"></i></div>`;
+            }).catch(() => {
+                const box = document.getElementById('omni-facts');
+                if (box) box.innerHTML = `<h4 style="margin-top:18px">Omniscient stores</h4>`
+                    + `<div class="omni-pending">Engine unreachable — Postgres counts unavailable. `
+                    + `SQLite metadata above is unaffected.</div>`;
+            });
         }
 
         const drow = (k, v, cls) =>

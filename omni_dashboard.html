@@ -17,6 +17,45 @@
         .nav-link { display: block; padding: 10px; color: var(--accent); cursor: pointer; border-radius: 4px; border: 1px solid transparent; margin-bottom: 5px; }
         .nav-link:hover { background: #1f2428; border-color: var(--border); }
 
+        /* ── Video index ──
+           Was a flat list of identical '🎥 tg1200' links: nothing to tell a
+           fully narrated reel from one holding frames and no text, and no way
+           to find a reel without scrolling. Each entry is now a small card
+           carrying the counts /api/videos returns, and the box above filters
+           them as you type. */
+        .vsearch-wrap { position: relative; margin-bottom: 10px; }
+        .vsearch {
+            width: 100%; box-sizing: border-box; background: #0d1117;
+            border: 1px solid var(--border); border-radius: 6px; color: var(--text);
+            font-size: 0.82em; padding: 7px 26px 7px 9px; outline: none;
+        }
+        .vsearch:focus { border-color: var(--accent); }
+        .vsearch-clear {
+            position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+            background: none; border: none; color: #6e7681; cursor: pointer;
+            font-size: 0.9em; padding: 2px 5px; display: none;
+        }
+        .vsearch-clear.on { display: block; }
+        .vsearch-clear:hover { color: var(--text); }
+        .vcount { font-size: 0.72em; color: #6e7681; margin: 0 0 8px; font-family: monospace; }
+
+        .vcard {
+            border: 1px solid var(--border); background: #0f141a; border-radius: 6px;
+            padding: 8px 10px; margin-bottom: 6px; cursor: pointer;
+            transition: border-color 0.12s, background 0.12s;
+        }
+        .vcard:hover { background: #1f2428; border-color: var(--accent); }
+        .vcard.sel { border-color: var(--accent); background: #17222e; }
+        .vcard .vid { font-family: monospace; font-size: 0.85em; color: var(--accent); font-weight: 600; }
+        .vcard .vstat { display: flex; gap: 8px; margin-top: 5px; font-size: 0.7em; color: #8b949e; font-family: monospace; }
+        .vcard .vstat b { color: var(--text); font-weight: 600; }
+        /* Narration coverage, stated in colour so the list reads at a glance. */
+        .vdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; vertical-align: middle; }
+        .vdot.complete { background: #3fb950; }
+        .vdot.partial { background: #d29922; }
+        .vdot.frames-only { background: #6e7681; }
+        .vempty { font-size: 0.78em; color: #6e7681; padding: 8px 2px; }
+
         .tabs { display: flex; gap: 10px; margin-bottom: 15px; }
         .tab-btn { background: var(--card); color: var(--text); border: 1px solid var(--border); padding: 8px 15px; border-radius: 4px; cursor: pointer; }
         .tab-btn.active { background: var(--green); color: #fff; border-color: var(--green); }
@@ -134,6 +173,12 @@
         <div class="sidebar">
             <div class="nav-link sel" id="nav-home" onclick="showHome()">🕸️ Knowledge Graph</div>
             <h3 style="margin-top:18px;">Indexed Videos</h3>
+            <div class="vsearch-wrap">
+                <input class="vsearch" id="vsearch" type="search" placeholder="Filter reels…"
+                       oninput="renderVideoList()" autocomplete="off">
+                <button class="vsearch-clear" id="vsearch-clear" onclick="clearVideoFilter()" title="Clear">✕</button>
+            </div>
+            <p class="vcount" id="vlist-count"></p>
             <div id="vlist-content">Loading database...</div>
             <div id="shared-panel" style="display:none; margin-top:18px;">
                 <h3>Shares entities with</h3>
@@ -404,7 +449,8 @@
             document.getElementById('dashboard-main').style.display = 'none';
             document.getElementById('shared-panel').style.display = 'none';
             document.getElementById('nav-home').classList.add('sel');
-            document.querySelectorAll('#vlist-content .nav-link')
+            currentVideoUuid = '';
+            document.querySelectorAll('#vlist-content .vcard')
                 .forEach(el => el.classList.remove('sel'));
             if (!globalNet) loadGlobalGraph();
         }
@@ -456,21 +502,87 @@
             }).catch(e => { scope.innerText = 'Graph fetch failed — engine may still be booting.'; });
         }
 
-        // Load Videos
-        fetch('api/videos').then(r => r.json()).then(data => {
-            let html = '';
-            if (data.error) {
-                document.getElementById('vlist-content').innerHTML = `<p style="color:#f85149;">${esc(data.error)}</p>`;
+        /* ═══════ VIDEO INDEX ═══════
+           Held in memory so filtering is instant and never re-hits Postgres. */
+        let videoIndex = [];
+
+        const STAGE_TITLE = {
+            'complete':    'every chunk narrated',
+            'partial':     'narration incomplete — the Oracle worker is still running or stalled',
+            'frames-only': 'frames indexed, no narrative written yet'
+        };
+
+        function fmtDur(s) {
+            if (!s) return '—';
+            const m = Math.floor(s / 60), r = Math.round(s % 60);
+            return m ? `${m}m${String(r).padStart(2, '0')}s` : `${r}s`;
+        }
+
+        function renderVideoList() {
+            const box = document.getElementById('vlist-content');
+            const countEl = document.getElementById('vlist-count');
+            const term = (document.getElementById('vsearch').value || '').trim().toLowerCase();
+            document.getElementById('vsearch-clear').classList.toggle('on', !!term);
+
+            // Matches the uuid, the bare message number and the stage word, so
+            // "partial" pulls up every reel the Oracle has not finished.
+            const shown = term
+                ? videoIndex.filter(v => v.video_uuid.toLowerCase().includes(term)
+                                      || String(v.stage).includes(term))
+                : videoIndex;
+
+            countEl.textContent = videoIndex.length
+                ? (term ? `${shown.length} of ${videoIndex.length} reels`
+                        : `${videoIndex.length} reels indexed`)
+                : '';
+
+            if (!shown.length) {
+                box.innerHTML = `<p class="vempty">${videoIndex.length
+                    ? 'No reel matches that filter.'
+                    : 'No videos indexed yet — run the pipeline.'}</p>`;
                 return;
             }
-            data.forEach(v => {
+
+            box.innerHTML = shown.map(v => {
                 const u = esc(v.video_uuid);
-                html += `<div class="nav-link" data-uuid="${u}" onclick="loadDeepDive('${u}')">🎥 ${u}</div>`;
-            });
-            document.getElementById('vlist-content').innerHTML = html || '<p>No videos found.</p>';
-        }).catch(e => {
-            document.getElementById('vlist-content').innerHTML = '<p style="color:#f85149;">Engine still booting — refresh shortly.</p>';
+                const cov = v.chunks ? `${v.narrated}/${v.chunks}` : '0';
+                return `<div class="vcard${u === currentVideoUuid ? ' sel' : ''}" data-uuid="${u}"`
+                     + ` title="${esc(STAGE_TITLE[v.stage] || '')}">`
+                     + `<span class="vid"><i class="vdot ${esc(v.stage)}"></i>${u}</span>`
+                     + `<div class="vstat"><span><b>${cov}</b> narrated</span>`
+                     + `<span><b>${v.frames}</b> frames</span>`
+                     + `<span>${esc(fmtDur(v.duration))}</span></div></div>`;
+            }).join('');
+        }
+
+        function clearVideoFilter() {
+            document.getElementById('vsearch').value = '';
+            renderVideoList();
+        }
+
+        // One delegated listener rather than an inline onclick per card: the
+        // list re-renders on every keystroke, so per-node handlers would be
+        // rebuilt constantly.
+        document.getElementById('vlist-content').addEventListener('click', e => {
+            const card = e.target.closest('.vcard');
+            if (card && card.dataset.uuid) loadDeepDive(card.dataset.uuid);
         });
+
+        function loadVideoIndex() {
+            fetch('api/videos').then(r => r.json()).then(data => {
+                if (data.error) {
+                    document.getElementById('vlist-content').innerHTML =
+                        `<p style="color:#f85149;">${esc(data.error)}</p>`;
+                    return;
+                }
+                videoIndex = Array.isArray(data) ? data : [];
+                renderVideoList();
+            }).catch(e => {
+                document.getElementById('vlist-content').innerHTML =
+                    '<p style="color:#f85149;">Engine still booting — refresh shortly.</p>';
+            });
+        }
+        loadVideoIndex();
 
         function switchTab(tab) {
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -494,7 +606,7 @@
             document.getElementById('dashboard-home').style.display = 'none';
             document.getElementById('dashboard-main').style.display = 'flex';
             document.getElementById('nav-home').classList.remove('sel');
-            document.querySelectorAll('#vlist-content .nav-link').forEach(el =>
+            document.querySelectorAll('#vlist-content .vcard').forEach(el =>
                 el.classList.toggle('sel', el.dataset.uuid === uuid));
             document.getElementById('dd-title').innerText = `Forensic View: ${uuid}`;
             document.getElementById('chunk-grid').innerHTML = 'Loading chunks from Postgres...';

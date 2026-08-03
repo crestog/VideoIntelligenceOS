@@ -78,6 +78,26 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
    and the bar can never drift out of sync the way two hardcoded lists did. */
 .disk-legend .lg::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--c, var(--border-strong)); }
 .disk-legend .lg b { color: var(--text); font-weight: 600; }
+
+/* ── Database Health ──
+   One chip per store, each stating reachability and its own headline number,
+   so a single store being down reads as exactly that rather than as the whole
+   database being broken. */
+.store-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.store {
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 11px 13px; display: flex; flex-direction: column; gap: 3px;
+}
+.store.down { border-color: rgba(248,113,113,0.35); }
+.store .nm { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; }
+.store .nm .dot { flex-shrink: 0; }
+.store .num { font-family: var(--font-mono); font-size: 15px; font-weight: 600; letter-spacing: -0.02em; }
+.store .cap { font-size: 10.5px; color: var(--text-dim); font-family: var(--font-mono); }
+/* Narrative uniqueness: the direct measure of the repeated-narrative defect. */
+.qual { font-family: var(--font-mono); font-size: 11px; }
+.qual.good { color: var(--ok); }
+.qual.warn { color: var(--warn); }
+.qual.bad  { color: var(--danger); }
 .disk-host { margin-top: 10px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); opacity: 0.75; }
 
 /* Output-quota meter. Kaggle stops writes at ~19.5 GB no matter what the host
@@ -355,6 +375,22 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
         </div>
       </section>
 
+      <!-- DATABASE HEALTH -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Database Health</h2>
+          <div style="display:flex;align-items:center;gap:10px;margin-left:auto">
+            <span class="sub" id="dbhSub">loading…</span>
+            <button class="btn sm" onclick="loadDbHealth()">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="store-row" id="dbhStores"></div>
+          <div class="stat-grid" id="dbhStats" style="margin-top:14px"></div>
+          <div class="qnote" id="dbhNote" style="margin-top:10px"></div>
+        </div>
+      </section>
+
       <!-- LOGS -->
       <section class="card">
         <div class="card-head">
@@ -505,6 +541,93 @@ async function loadDisk(manual = false) {
         + `(shared infrastructure — not VIOS's data)`
       : '';
   } catch (e) { showToast(`Disk info failed: ${e.message}`, 'error'); }
+}
+
+/* ═══════ DATABASE HEALTH ═══════
+   Disk says how many bytes VIOS holds; this says whether those bytes are a
+   good database. Counts come from the engine's own connections via /omni, so
+   the UI process never opens a second Postgres pool of its own. Each store
+   renders independently — Neo4j being down must not hide the Postgres row
+   counts, which is exactly the failure mode of a single combined status. */
+const N = n => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+
+async function loadDbHealth() {
+  const sub = $('dbhSub'), stores = $('dbhStores'), stats = $('dbhStats'), note = $('dbhNote');
+  try {
+    const res = await fetch('/omni/api/db/stats');
+    if (!res.ok) throw new Error(`engine ${res.status}`);
+    const d = await res.json();
+    const pg = d.postgres || {}, qd = d.qdrant || {}, n4 = d.neo4j || {};
+
+    const vec = qd.collections || {};
+    const vecTotal = Object.values(vec).reduce((a, b) => a + (b || 0), 0);
+    const graphNodes = Object.values(n4.labels || {}).reduce((a, b) => a + (b || 0), 0);
+
+    const chip = (name, online, num, cap, tip) =>
+      `<div class="store${online ? '' : ' down'}" title="${esc(tip)}">`
+      + `<span class="nm"><span class="dot ${online ? 'on' : 'off'}"></span>${esc(name)}</span>`
+      + `<span class="num">${online ? num : 'offline'}</span>`
+      + `<span class="cap">${esc(online ? cap : 'not reachable')}</span></div>`;
+
+    stores.innerHTML =
+        chip('PostgreSQL', pg.online, N(pg.chunks) + ' chunks',
+             `${N(pg.frames)} frames · ${N(pg.videos)} reels`,
+             'Relational store: one row per frame and per narrated chunk.')
+      + chip('Qdrant', qd.online, N(vecTotal) + ' vectors',
+             Object.entries(vec).map(([k, v]) => `${k.split('_')[1]} ${N(v)}`).join(' · ') || 'no collections',
+             'Vector store: SigLIP + CLIP frame embeddings and BGE chunk embeddings.')
+      + chip('Neo4j', n4.online, N(graphNodes) + ' nodes',
+             `${N(n4.edges)} edges`,
+             'Knowledge graph: Video → Chunk → Narrative, plus Entity nodes when a NIM key is set.');
+
+    if (pg.online) {
+      // Narrative coverage and uniqueness are the two numbers that say whether
+      // the Oracle is doing its job. Uniqueness below ~0.9 means the model is
+      // repeating itself across chunks.
+      const cov = pg.chunks ? Math.round(100 * pg.narrated / pg.chunks) : 0;
+      const uq = pg.unique_ratio;
+      const uqCls = uq == null ? '' : uq >= 0.95 ? 'good' : uq >= 0.8 ? 'warn' : 'bad';
+      stats.innerHTML = `
+        <div class="stat" title="Chunks carrying a written narrative, out of all chunks recorded.">
+          <div class="lbl">Narration coverage</div>
+          <div class="val">${cov}<small>%</small></div>
+          <div class="qnote">${N(pg.narrated)} of ${N(pg.chunks)} chunks</div></div>
+        <div class="stat" title="Distinct narratives divided by narratives written. Below 1.00 means the same text was written for more than one chunk — the repeated-narrative defect.">
+          <div class="lbl">Narrative uniqueness</div>
+          <div class="val ${uqCls ? 'qual ' + uqCls : ''}" style="font-size:18px">${
+            uq == null ? '—' : uq.toFixed(3)}</div>
+          <div class="qnote">${N(pg.duplicate_groups)} repeated text${
+            pg.duplicate_groups === 1 ? '' : 's'}</div></div>
+        <div class="stat" title="Mean narrative length. A sharp drop suggests the model is being cut off mid-sentence.">
+          <div class="lbl">Avg narrative</div>
+          <div class="val">${N(pg.avg_narrative_chars)}<small> chars</small></div></div>
+        <div class="stat" title="Vectors per frame recorded in Postgres. Two embeddings per frame (SigLIP + CLIP) is the target.">
+          <div class="lbl">Vectors per frame</div>
+          <div class="val">${pg.frames ? (vecTotal / pg.frames).toFixed(2) : '—'}</div></div>`;
+    } else {
+      stats.innerHTML = '';
+    }
+
+    const problems = [];
+    if (!pg.online) problems.push('Postgres unreachable — narratives and frame rows cannot be read');
+    if (!qd.online) problems.push('Qdrant unreachable — semantic search is unavailable');
+    if (!n4.online) problems.push('Neo4j unreachable — the knowledge graph is unavailable');
+    if (pg.online && pg.duplicate_groups > 0)
+      problems.push(`${pg.duplicate_groups} narrative${pg.duplicate_groups === 1 ? '' : 's'} `
+                  + 'written for more than one chunk — rerun the Oracle on those reels to regenerate');
+    note.innerHTML = problems.length
+      ? problems.map(p => `⚠ ${esc(p)}`).join('<br>')
+      : 'All three stores online and consistent.';
+
+    const up = [pg.online, qd.online, n4.online].filter(Boolean).length;
+    sub.textContent = `${up}/3 stores online`;
+  } catch (e) {
+    sub.textContent = 'engine unreachable';
+    stores.innerHTML = '';
+    stats.innerHTML = '';
+    note.textContent = 'The Omniscient engine is not answering — it may still be loading models. '
+                     + 'Disk, queue and category controls above are unaffected.';
+  }
 }
 
 /* ═══════ CATEGORY CONTROL ═══════ */
@@ -820,11 +943,14 @@ async function loadLogs() {
 
 /* ═══════ BOOT + POLLING ═══════ */
 (function boot() {
-  loadDisk(); loadCategories(); loadSystem(); loadLogs();
+  loadDisk(); loadCategories(); loadSystem(); loadLogs(); loadDbHealth();
   pollExport(); loadBundles();   // pollExport self-schedules: 1.5s busy, 15s idle
   setInterval(() => { if (!document.hidden) { loadSystem(); } }, 6000);
   setInterval(() => { if (!document.hidden) { loadLogs(); } }, 4000);
   setInterval(() => { if (!document.hidden) { loadDisk(); } }, 30000);
+  // Counts move only as the pipeline writes, and each poll runs three
+  // aggregate queries — a slow beat is the right one here.
+  setInterval(() => { if (!document.hidden) { loadDbHealth(); } }, 45000);
 })();
 </script>
 </body>

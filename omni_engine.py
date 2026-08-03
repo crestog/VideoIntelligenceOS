@@ -747,15 +747,62 @@ def build_dashboard():
 
     @app_dashboard.route("/api/videos")
     def get_videos():
+        """Per-video index with the counts the sidebar actually needs.
+
+        This used to return nothing but `video_uuid`, so the sidebar could only
+        render a flat list of identical '🎥 tg1200' links — no way to tell a
+        fully narrated reel from one that has frames and nothing else, and no
+        way to search. One grouped query per store costs the same round trip
+        and carries chunk/frame counts, duration and narration coverage.
+        """
         if not omni_db.AVAILABLE["postgres"]:
             return jsonify({"error": "PostgreSQL offline — no video index available"})
         try:
             conn = get_pg_conn()
+            stats = {}
             with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT video_uuid FROM frames "
-                            "UNION SELECT DISTINCT video_uuid FROM chunks")
-                data = [{"video_uuid": r[0]} for r in cur.fetchall()]
+                cur.execute("""SELECT video_uuid, COUNT(*), MAX(end_t),
+                                      COUNT(description) FILTER (
+                                          WHERE description IS NOT NULL
+                                            AND description <> ''),
+                                      MAX(created_at), MIN(mode)
+                               FROM chunks GROUP BY video_uuid""")
+                for uuid, n, dur, narrated, created, mode in cur.fetchall():
+                    stats.setdefault(uuid, {})["chunks"] = n
+                    stats[uuid]["duration"] = float(dur or 0)
+                    stats[uuid]["narrated"] = narrated
+                    stats[uuid]["created_at"] = float(created) if created else None
+                    stats[uuid]["mode"] = mode
+
+                cur.execute("SELECT video_uuid, COUNT(*) FROM frames GROUP BY video_uuid")
+                for uuid, n in cur.fetchall():
+                    stats.setdefault(uuid, {})["frames"] = n
             conn.close()
+
+            data = []
+            for uuid, s in stats.items():
+                chunks = s.get("chunks", 0)
+                narrated = s.get("narrated", 0)
+                # Three honest states: nothing narrated, partially narrated, done.
+                stage = ("complete" if chunks and narrated >= chunks
+                         else "partial" if narrated else "frames-only")
+                data.append({
+                    "video_uuid": uuid,
+                    "chunks": chunks,
+                    "frames": s.get("frames", 0),
+                    "narrated": narrated,
+                    "duration": round(s.get("duration", 0), 1),
+                    "created_at": s.get("created_at"),
+                    "mode": s.get("mode"),
+                    "stage": stage,
+                })
+
+            # 'tg1200' sorts lexically before 'tg989', so rank on the numeric
+            # tail — newest reel first, which is what the harvester appends.
+            def msg_no(rec):
+                digits = "".join(ch for ch in rec["video_uuid"] if ch.isdigit())
+                return int(digits) if digits else 0
+            data.sort(key=msg_no, reverse=True)
             return jsonify(data)
         except Exception as e:
             return jsonify({"error": str(e)})
@@ -972,6 +1019,90 @@ def build_dashboard():
             except Exception as e:
                 health["error"] = str(e)[:200]
         return jsonify(health)
+
+    @app_dashboard.route("/api/db/stats")
+    def get_db_stats():
+        """Corpus-wide quality read across all three Omniscient stores.
+
+        The admin panel reports disk, queues and logs but has never been able
+        to say anything about the database itself — whether narratives are
+        actually being written, whether vectors exist for the frames that were
+        indexed, whether the graph has more than structure. Those are the
+        numbers that say if the database is any good, so they belong in one
+        payload the admin tab can poll.
+
+        Each store is reported independently: one being down must not blank the
+        other two, which is why every block has its own try.
+        """
+        out = {"postgres": {"online": False}, "qdrant": {"online": False},
+               "neo4j": {"online": False}}
+
+        # ── Postgres: rows, narration coverage, and duplicate narratives ──
+        if omni_db.AVAILABLE["postgres"]:
+            try:
+                conn = get_pg_conn()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*), COUNT(DISTINCT video_uuid) FROM frames")
+                    frames, frame_vids = cur.fetchone()
+                    cur.execute("""SELECT COUNT(*), COUNT(DISTINCT video_uuid),
+                                          COUNT(*) FILTER (WHERE description IS NOT NULL
+                                                             AND description <> ''),
+                                          COALESCE(AVG(LENGTH(description)), 0),
+                                          COUNT(DISTINCT description)
+                                   FROM chunks""")
+                    chunks, chunk_vids, narrated, avg_len, distinct_desc = cur.fetchone()
+                    # A narrative repeated across chunks is the "repeated
+                    # narrative" defect the user reported. Distinct/narrated is
+                    # the honest measure of it and survives any future dedup
+                    # change, unlike a hardcoded threshold.
+                    cur.execute("""SELECT COUNT(*) FROM (
+                                       SELECT description FROM chunks
+                                       WHERE description IS NOT NULL AND description <> ''
+                                       GROUP BY description HAVING COUNT(*) > 1
+                                   ) d""")
+                    dupe_groups = cur.fetchone()[0]
+                conn.close()
+                out["postgres"] = {
+                    "online": True, "frames": frames, "chunks": chunks,
+                    "narrated": narrated,
+                    "videos": max(frame_vids or 0, chunk_vids or 0),
+                    "avg_narrative_chars": int(avg_len or 0),
+                    "distinct_narratives": distinct_desc or 0,
+                    "duplicate_groups": dupe_groups,
+                    "unique_ratio": round((distinct_desc or 0) / narrated, 4) if narrated else None,
+                }
+            except Exception as e:
+                out["postgres"] = {"online": False, "error": str(e)[:200]}
+
+        # ── Qdrant: one count per collection ──
+        try:
+            client = get_qdrant()
+            if client:
+                cols = {}
+                for name in ("frames_siglip", "frames_clip", "chunks_bge"):
+                    try:
+                        cols[name] = client.count(name, exact=True).count
+                    except Exception:
+                        cols[name] = None      # collection not created yet
+                out["qdrant"] = {"online": True, "collections": cols}
+        except Exception as e:
+            out["qdrant"] = {"online": False, "error": str(e)[:200]}
+
+        # ── Neo4j: node labels and edge total ──
+        try:
+            driver = get_neo4j()
+            if driver:
+                with driver.session() as session:
+                    labels = {r["label"]: r["n"] for r in session.run("""
+                        MATCH (n) UNWIND labels(n) AS l
+                        RETURN l AS label, count(*) AS n
+                    """).data()}
+                    edges = session.run("MATCH ()-[r]->() RETURN count(r) AS n").single()["n"]
+                out["neo4j"] = {"online": True, "labels": labels, "edges": edges}
+        except Exception as e:
+            out["neo4j"] = {"online": False, "error": str(e)[:200]}
+
+        return jsonify(out)
 
     return app_dashboard
 
