@@ -232,6 +232,30 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 .exp-warn { display: none; margin-top: 10px; padding: 9px 12px; border-radius: 7px; font-size: 12px;
             background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.35); color: var(--warn); }
 .exp-warn.on { display: block; }
+
+/* ── Database restore ──
+   The plan block is the whole reason this card is two steps: it is what lets
+   the user see that restoring a 40-post bundle over a 900-post local database
+   would lose 860 rows, before anything is overwritten. */
+.rst-plan { display: none; margin-top: 12px; padding: 11px 13px; border-radius: 8px;
+            background: var(--surface-2); border: 1px solid var(--border); }
+.rst-plan.on { display: block; }
+.rst-plan.risk { border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.06); }
+.rst-hd { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
+.rst-hd .sq { font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; }
+.rst-hd .mt { font-size: 10.5px; color: var(--text-dim); font-family: var(--font-mono); }
+.rst-cmp { display: grid; grid-template-columns: 1fr auto auto auto; gap: 4px 12px;
+           font-size: 11.5px; font-family: var(--font-mono); align-items: baseline; }
+.rst-cmp .h { font-size: 9.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; }
+.rst-cmp .k { font-family: var(--font-sans); color: var(--text-dim); font-size: 12px; }
+.rst-cmp .n { text-align: right; }
+.rst-cmp .d { text-align: right; }
+.rst-cmp .d.up { color: var(--ok); }
+.rst-cmp .d.dn { color: var(--danger); }
+.rst-cmp .d.eq { color: var(--text-faint); }
+.rst-verdict { margin-top: 10px; font-size: 12px; line-height: 1.5; }
+.rst-verdict.ok { color: var(--ok); }
+.rst-verdict.bad { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -371,6 +395,35 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
             <div class="exp-detail" id="expDetail"></div>
             <div class="exp-bar" id="expBar"><div></div></div>
             <div class="exp-log" id="expLog"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- DATABASE RESTORE -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Database Restore</h2>
+          <span class="sub" id="rstSub">← Telegram channel</span>
+        </div>
+        <div class="card-body">
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">
+            Pulls the newest bundle back out of the channel. Kaggle wipes the container
+            between sessions — PostgreSQL included — so this is how a session continues
+            the database instead of starting an empty one.
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="rstCheckBtn" onclick="checkRestore()"
+                    title="Reads only the manifest. Nothing is downloaded and nothing is overwritten.">Check for a Bundle</button>
+            <button class="btn danger" id="rstApplyBtn" onclick="askRestore()" disabled
+                    title="Check for a bundle first">Restore &amp; Overwrite</button>
+          </div>
+          <div class="exp-warn" id="rstWarn"></div>
+          <div class="rst-plan" id="rstPlan"></div>
+          <div class="exp-prog" id="rstProg">
+            <div class="exp-stage"><b id="rstStage">—</b><span class="pc" id="rstPct">0%</span></div>
+            <div class="exp-detail" id="rstDetail"></div>
+            <div class="exp-bar" id="rstBar"><div></div></div>
+            <div class="exp-log" id="rstLog"></div>
           </div>
         </div>
       </section>
@@ -899,6 +952,184 @@ async function pollExport() {
   }
 }
 
+/* ═══════ DATABASE RESTORE ═══════
+   Two buttons, deliberately. "Check" reads the manifest and nothing else, so
+   the plan below it is real information rather than a promise; "Restore" is
+   only enabled once that plan exists, and still goes through the confirm modal
+   with the row delta spelled out. Restoring is the one action in this panel
+   that overwrites the database rather than adding to it. */
+let rstTimer = null;
+let rstPolling = false;
+let rstPlan = null;          // last inspect result, gates the apply button
+
+async function checkRestore() {
+  const btn = $('rstCheckBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Checking…';
+  try {
+    await api('/api/admin/restore/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'inspect' }),
+    }, 0);
+    rstPolling = true;
+    pollRestore();
+  } catch (e) {
+    showToast(`Could not check: ${e.message}`, 'error');
+    btn.disabled = false; btn.textContent = 'Check for a Bundle';
+  }
+}
+
+function askRestore() {
+  if (!rstPlan) return;
+  const p = rstPlan;
+  const d = p.posts_delta;
+  // The honest sentence depends entirely on which way the delta points.
+  const impact = d === null || d === undefined
+    ? 'Local row counts could not be read, so the effect is unknown.'
+    : d < 0
+      ? `The local database has <b>${Math.abs(d)} more posts</b> than this bundle. `
+        + `Restoring discards them.`
+      : d > 0
+        ? `The bundle has ${d} more posts than the local database — restoring recovers them.`
+        : 'The bundle and the local database hold the same number of posts.';
+  askConfirm({
+    title: 'Overwrite the database?',
+    html: `Bundle <b>${esc(p.seq || '?')}</b> will <b>replace</b> the harvest database`
+        + (p.has_postgres ? ' and the entire Omniscient PostgreSQL store' : '')
+        + `. ${impact}`
+        + `<br><br>${p.download_mb} MB will be downloaded from the channel. `
+        + `A copy of the current database is kept on scratch until the session ends.`,
+    confirmLabel: 'Restore & Overwrite',
+    onConfirm: () => { closeModal(); startRestore(p.seq); },
+  });
+}
+
+async function startRestore(seq) {
+  const btn = $('rstApplyBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Starting…';
+  try {
+    await api('/api/admin/restore/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'apply', seq: seq || null }),
+    }, 0);                       // never auto-retry: a retry would re-overwrite
+    showToast('Restore started — downloading bundle', 'ok');
+    rstPolling = true;
+    pollRestore();
+  } catch (e) {
+    showToast(`Restore failed to start: ${e.message}`, 'error');
+    btn.disabled = false; btn.textContent = 'Restore & Overwrite';
+  }
+}
+
+/* Bundle counts against local counts, one row per table, with the difference
+   the restore would make. */
+function renderPlan(p) {
+  const box = $('rstPlan');
+  if (!p) { box.classList.remove('on'); return; }
+  const bc = p.bundle_counts || {}, lc = p.local_counts || {};
+  const keys = ['posts', 'posts_with_file', 'creators', 'categories']
+    .filter(k => k in bc || k in lc);
+  const label = { posts: 'Posts', posts_with_file: 'With video file',
+                  creators: 'Creators', categories: 'Categories' };
+
+  const rows = keys.map(k => {
+    const b = bc[k], l = lc[k];
+    let cls = 'eq', txt = '—';
+    if (typeof b === 'number' && typeof l === 'number') {
+      const d = b - l;
+      cls = d > 0 ? 'up' : d < 0 ? 'dn' : 'eq';
+      txt = d === 0 ? '=' : (d > 0 ? '+' : '') + d;
+    }
+    return `<div class="k">${label[k] || k}</div>`
+         + `<div class="n">${l ?? '—'}</div>`
+         + `<div class="n">${b ?? '—'}</div>`
+         + `<div class="d ${cls}">${txt}</div>`;
+  }).join('');
+
+  const files = (p.files || [])
+    .map(f => `${esc(f.name)} (${f.parts} part${f.parts === 1 ? '' : 's'})`)
+    .join(' · ');
+
+  box.className = 'rst-plan on' + (p.destructive ? ' risk' : '');
+  box.innerHTML =
+      `<div class="rst-hd"><span class="sq">bundle ${esc(p.seq || '?')}</span>`
+    + `<span class="mt">${esc(p.created_at || '')} · code ${esc(p.code_commit || '?')} · `
+    + `schema v${p.schema} · ${p.download_mb} MB</span></div>`
+    + `<div class="rst-cmp">`
+    + `<div class="h">table</div><div class="h n">local</div>`
+    + `<div class="h n">bundle</div><div class="h d">change</div>`
+    + rows + `</div>`
+    + (files ? `<div class="qnote" style="margin-top:9px">${files}</div>` : '')
+    + `<div class="rst-verdict ${p.destructive ? 'bad' : 'ok'}">`
+    + (p.destructive
+        ? '⚠ This bundle is older than what is on disk — restoring it loses rows.'
+        : '✓ Restoring recovers rows the local database does not have.')
+    + (p.has_postgres ? '' : ' The bundle carries no PostgreSQL dump, so narratives will not be restored.')
+    + `</div>`;
+}
+
+function renderRestore(st) {
+  const running = st.state === 'running';
+  const check = $('rstCheckBtn'), apply = $('rstApplyBtn');
+  check.disabled = running;
+  check.innerHTML = running ? '<span class="spin"></span> Working…' : 'Check for a Bundle';
+
+  const missing = st.telegram_missing || [];
+  const warn = $('rstWarn');
+  warn.classList.toggle('on', missing.length > 0);
+  if (missing.length) {
+    warn.textContent = `Telegram is not configured (${missing.join(', ')}). `
+                     + `Bundles live in the channel, so restore cannot run without it.`;
+  }
+  $('rstSub').textContent = missing.length ? 'unavailable' : '← Telegram channel';
+
+  // A plan only authorises the bundle it describes. An applied restore clears
+  // it so the button cannot be pressed twice on stale information.
+  if (st.state === 'ready' && st.mode === 'inspect') rstPlan = st.plan || null;
+  else if (st.state === 'done' && st.mode === 'apply') rstPlan = null;
+  renderPlan(rstPlan);
+  apply.disabled = running || !rstPlan || missing.length > 0;
+  apply.innerHTML = running && st.mode === 'apply'
+    ? '<span class="spin"></span> Restoring…' : 'Restore &amp; Overwrite';
+  apply.title = rstPlan ? `Restore bundle ${rstPlan.seq}` : 'Check for a bundle first';
+
+  if (st.state === 'idle') { $('rstProg').classList.remove('on'); return; }
+  $('rstProg').classList.add('on');
+  $('rstStage').textContent = st.stage || '—';
+  $('rstPct').textContent = (st.pct ?? 0) + '%';
+  $('rstDetail').textContent = st.detail || '';
+  const bar = $('rstBar');
+  bar.className = 'exp-bar' + (st.state === 'error' ? ' err'
+                             : (st.state === 'done' || st.state === 'ready') ? ' done' : '');
+  bar.firstElementChild.style.width =
+    (st.state === 'done' || st.state === 'ready' ? 100 : (st.pct ?? 0)) + '%';
+  $('rstLog').innerHTML = (st.log || []).map(l => `<div>${esc(l)}</div>`).join('');
+  $('rstLog').scrollTop = $('rstLog').scrollHeight;
+}
+
+async function pollRestore() {
+  if (rstTimer) { clearTimeout(rstTimer); rstTimer = null; }
+  try {
+    const st = await api('/api/admin/restore/status', {}, 0);
+    renderRestore(st);
+    const running = st.state === 'running';
+    if (rstPolling && !running) {
+      if (st.state === 'done') {
+        showToast(`Restore complete — ${st.detail || 'database replaced'}`, 'ok');
+        // Everything downstream now reads different rows.
+        loadDbHealth(); loadCategories(); loadDisk(true);
+      } else if (st.state === 'ready') {
+        showToast(`Found bundle ${st.plan?.seq || '?'}`, 'ok');
+      } else if (st.state === 'error') {
+        showToast(`Restore failed: ${st.error || 'unknown'}`, 'error');
+      }
+    }
+    rstPolling = running;
+    rstTimer = setTimeout(pollRestore, running ? 1500 : 20000);
+  } catch (e) {
+    rstTimer = setTimeout(pollRestore, 20000);
+  }
+}
+
 /* ═══════ PIPELINE / HEALTH ═══════ */
 async function loadSystem() {
   try {
@@ -945,6 +1176,9 @@ async function loadLogs() {
 (function boot() {
   loadDisk(); loadCategories(); loadSystem(); loadLogs(); loadDbHealth();
   pollExport(); loadBundles();   // pollExport self-schedules: 1.5s busy, 15s idle
+  // Same self-scheduling shape: a restore started before a page refresh, or
+  // from another tab, has to reappear here on its own.
+  pollRestore();
   setInterval(() => { if (!document.hidden) { loadSystem(); } }, 6000);
   setInterval(() => { if (!document.hidden) { loadLogs(); } }, 4000);
   setInterval(() => { if (!document.hidden) { loadDisk(); } }, 30000);

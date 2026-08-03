@@ -810,3 +810,50 @@ def export_bundles():
         return {"bundles": db_export.list_local_bundles()}
     except Exception as exc:
         return _error(exc)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 14.-15. Database restore — pull the newest bundle back out of the channel.
+#
+# The other half of export, and the half that makes it worth running. Postgres
+# lives on the container's ephemeral disk, so without this every session starts
+# with an empty Omniscient store and re-narrates reels the GPU already did.
+#
+# Two steps on purpose. `inspect` reads only the manifest and reports what a
+# restore would do — which bundle, how much to download, and how its row counts
+# compare to the local ones. `apply` overwrites. The panel will not offer apply
+# until inspect has run, so nobody destroys a database from a single click.
+# ───────────────────────────────────────────────────────────────────────────
+@admin_router.post("/api/admin/restore/start")
+async def restore_start(request: Request):
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass          # no body means inspect, the non-destructive default
+        mode = (body.get("mode") or "inspect").strip()
+        seq = body.get("seq") or None
+        import db_restore
+        res = db_restore.start_restore(mode=mode, seq=seq)
+        if not res.get("ok"):
+            return _error(res.get("error", "Could not start restore"), 409)
+        vios_log(f"Database restore ({mode}) started from admin panel"
+                 + (f" for bundle {seq}" if seq else ""), "ADMIN",
+                 "WARN" if mode == "apply" else "INFO")
+        return res
+    except Exception as exc:
+        vios_log(f"Error starting restore: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+
+
+@admin_router.get("/api/admin/restore/status")
+def restore_status():
+    try:
+        import db_restore
+        st = db_restore.restore_status()
+        from config import missing_telegram_secrets
+        st["telegram_missing"] = missing_telegram_secrets()
+        return st
+    except Exception as exc:
+        return _error(exc)

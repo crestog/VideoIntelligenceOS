@@ -212,6 +212,39 @@ try:
 except Exception as e:
     print(f"⚠️ [SECRETS] Preflight unavailable: {e}", flush=True)
 
+# ── Restore hint ───────────────────────────────────────────────────────────
+# A fresh container has an empty database: scratch is wiped and PostgreSQL runs
+# from the Debian default data directory on that same ephemeral disk, so last
+# session's narratives are gone. The bundles in the channel are the only copy.
+#
+# Deliberately a hint and not an automatic restore. It would have to run here,
+# before ignition, and at this point omni_engine has not started PostgreSQL
+# yet — so the Postgres half of a bundle could not be loaded, and a restore
+# that silently recovers the harvest DB while dropping the narratives is worse
+# than none. Restore is a two-step action in the admin panel instead, where it
+# runs against live services and states what it will overwrite first.
+if is_fresh_session:
+    try:
+        import sqlite3
+        from config import DB_PATH as _DBP
+        _posts = 0
+        if os.path.exists(_DBP):
+            _c = sqlite3.connect(_DBP, timeout=10)
+            try:
+                _posts = _c.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+            except sqlite3.Error:
+                pass
+            finally:
+                _c.close()
+        if _posts == 0:
+            print("", flush=True)
+            print("📦 [RESTORE] Empty database on a fresh container.", flush=True)
+            print("      If a bundle was exported previously, open /admin →", flush=True)
+            print("      Database Restore → Check for a Bundle to continue that", flush=True)
+            print("      database instead of re-narrating every reel.", flush=True)
+    except Exception:
+        pass          # a hint that cannot be printed is not worth a warning
+
 print("", flush=True)
 print("=" * 60, flush=True)
 print("🚀 IGNITING VIDEO INTELLIGENCE OS", flush=True)
