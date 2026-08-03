@@ -234,6 +234,10 @@ _DISK_CATEGORIES = (
     ("neo4j",      "Graph",       NEO4J_DATA_DIR,   "scratch"),
     ("archive",    "Omni archive", ARCHIVE_DIR,     "scratch"),
     ("datalake",   "Data lake",   LAKE_DIR,         "output"),
+    # Export bundles kept with "keep a local copy". They sit in the output tier
+    # and so consume the same 19.5 GB quota the data lake does — invisible bytes
+    # here would show up as an unexplained quota drop.
+    ("exports",    "DB exports",  os.path.join(BASE_DIR, "exports"), "output"),
 )
 
 
@@ -754,4 +758,55 @@ def queue_resume():
         return {"ok": True, "paused": False}
     except Exception as exc:
         vios_log(f"Error resuming queue: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 11.-13. Database export — seal the DB into a bundle, upload it to the same
+#         Telegram channel the reels are harvested from.
+#
+# Kaggle sessions are disposable: scratch is wiped between them and even the
+# 19.5 GB OUTPUT tier goes when the notebook is deleted. The channel is the only
+# storage in this system that outlives the machine, so it doubles as the backup
+# target. db_export owns the work; these three routes only start it and report.
+# ───────────────────────────────────────────────────────────────────────────
+@admin_router.post("/api/admin/export/start")
+async def export_start(request: Request):
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass          # no body is the normal case — keep_local defaults off
+        import db_export
+        res = db_export.start_export(keep_local=bool(body.get("keep_local")))
+        if not res.get("ok"):
+            return _error(res.get("error", "Could not start export"), 409)
+        vios_log("Database export started from admin panel", "ADMIN", "INFO")
+        return res
+    except Exception as exc:
+        vios_log(f"Error starting export: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+
+
+@admin_router.get("/api/admin/export/status")
+def export_status():
+    try:
+        import db_export
+        st = db_export.export_status()
+        # Telegram readiness is reported alongside the job so the panel can warn
+        # before a run rather than after it has already built a bundle.
+        from config import missing_telegram_secrets
+        st["telegram_missing"] = missing_telegram_secrets()
+        return st
+    except Exception as exc:
+        return _error(exc)
+
+
+@admin_router.get("/api/admin/export/bundles")
+def export_bundles():
+    try:
+        import db_export
+        return {"bundles": db_export.list_local_bundles()}
+    except Exception as exc:
         return _error(exc)

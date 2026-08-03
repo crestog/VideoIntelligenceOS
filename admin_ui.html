@@ -182,7 +182,36 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 .modal h3 { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
 .modal p { font-size: 13px; color: var(--text-dim); margin-bottom: 18px; }
 .modal p b { color: var(--danger); font-family: var(--font-mono); }
+.modal.safe p b { color: var(--accent); }
 .modal .acts { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ── Database export ──
+   Publishing to Telegram is the one action here that leaves the machine, so the
+   card states plainly what will be sent before the button is reachable. */
+.exp-what { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.exp-item { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.exp-item .ic { width: 14px; flex-shrink: 0; text-align: center; font-size: 11px; }
+.exp-item .nm { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); }
+.exp-item .ds { color: var(--text-dim); font-size: 12px; }
+.exp-item.skip .nm, .exp-item.skip .ds { color: var(--text-faint); }
+.exp-prog { display: none; margin-top: 14px; }
+.exp-prog.on { display: block; }
+.exp-stage { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12.5px; margin-bottom: 6px; }
+.exp-stage b { font-weight: 600; }
+.exp-stage .pc { font-family: var(--font-mono); font-size: 11px; color: var(--accent); }
+.exp-detail { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); margin-bottom: 8px;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.exp-bar { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.exp-bar > div { height: 100%; background: var(--accent); width: 0%; transition: width 0.4s ease; }
+.exp-bar.err > div { background: var(--danger); }
+.exp-bar.done > div { background: var(--ok); }
+.exp-log { max-height: 118px; overflow-y: auto; margin-top: 10px; padding: 8px 10px;
+           background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+           font-family: var(--font-mono); font-size: 10px; line-height: 1.7; color: var(--text-dim); }
+.exp-log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.exp-warn { display: none; margin-top: 10px; padding: 9px 12px; border-radius: 7px; font-size: 12px;
+            background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.35); color: var(--warn); }
+.exp-warn.on { display: block; }
 </style>
 </head>
 <body>
@@ -287,6 +316,45 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
         </div>
       </section>
 
+      <!-- DATABASE EXPORT -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Database Export</h2>
+          <span class="sub" id="expSub">→ Telegram channel</span>
+        </div>
+        <div class="card-body">
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">
+            Seals the database into a versioned bundle and posts it to the same
+            channel the reels come from — the only storage that outlives a Kaggle session.
+          </div>
+          <div class="exp-what">
+            <div class="exp-item"><span class="ic" style="color:var(--ok)">✓</span>
+              <span class="nm">index.sqlite</span>
+              <span class="ds">harvest DB — posts, creators, categories</span></div>
+            <div class="exp-item"><span class="ic" style="color:var(--ok)">✓</span>
+              <span class="nm">omnidb.sql</span>
+              <span class="ds">frames, chunks and Qwen narratives</span></div>
+            <div class="exp-item skip"><span class="ic">–</span>
+              <span class="nm">vectors, graph</span>
+              <span class="ds">omitted — rebuildable from the above</span></div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn primary" id="expBtn" onclick="askExport()">Export &amp; Upload</button>
+            <label class="chk-line" style="padding:0" title="Keep the bundle in the output directory after uploading. Costs quota; useful if you want to download it from the notebook too.">
+              <input type="checkbox" id="expKeep"> Keep a local copy
+            </label>
+          </div>
+          <div class="exp-warn" id="expWarn"></div>
+          <div class="qnote" id="expBundles" style="margin-top:9px"></div>
+          <div class="exp-prog" id="expProg">
+            <div class="exp-stage"><b id="expStage">—</b><span class="pc" id="expPct">0%</span></div>
+            <div class="exp-detail" id="expDetail"></div>
+            <div class="exp-bar" id="expBar"><div></div></div>
+            <div class="exp-log" id="expLog"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- LOGS -->
       <section class="card">
         <div class="card-head">
@@ -302,8 +370,8 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 <div class="toasts" id="toasts"></div>
 
 <div class="modal-bg" id="modalBg">
-  <div class="modal">
-    <h3>Confirm destructive cleanup</h3>
+  <div class="modal" id="modalCard">
+    <h3 id="modalTitle">Confirm destructive cleanup</h3>
     <p id="modalText"></p>
     <div class="acts">
       <button class="btn" onclick="closeModal()">Cancel</button>
@@ -372,6 +440,7 @@ const DISK_SEGS = [
   ['neo4j',      'Graph',        '#7fe3d4'],
   ['archive',    'Omni archive', '#ff9f6e'],
   ['datalake',   'Data lake',    '#9aa7b8'],
+  ['exports',    'DB exports',   '#c4b5fd'],
 ];
 
 async function loadDisk(manual = false) {
@@ -555,13 +624,29 @@ async function previewCleanup() {
   finally { btn.disabled = false; btn.textContent = 'Preview Impact'; }
 }
 
+/* One modal, two callers. The cleanup path deletes and the export path
+   publishes; both are irreversible enough to deserve a confirm, so the copy and
+   the button styling are parameters rather than markup. */
+function askConfirm({ title, html, confirmLabel, danger = true, onConfirm }) {
+  $('modalTitle').textContent = title;
+  $('modalText').innerHTML = html;
+  $('modalCard').classList.toggle('safe', !danger);
+  const btn = $('modalConfirm');
+  btn.textContent = confirmLabel;
+  btn.className = 'btn ' + (danger ? 'danger' : 'primary');
+  btn.onclick = onConfirm;
+  $('modalBg').classList.add('on');
+}
+
 function askCleanup() {
   const p = cleanupPayload();
-  $('modalText').innerHTML =
-    `This permanently deletes ${p.delete_frames ? '<b>frames</b>' : ''}${p.delete_frames && p.delete_videos ? ' and ' : ''}${p.delete_videos ? '<b>videos</b>' : ''} ` +
-    `for: <b>${p.categories.join(', ')}</b>. Database and Redis state will be updated so content can be re-processed later.`;
-  $('modalBg').classList.add('on');
-  $('modalConfirm').onclick = runCleanup;
+  askConfirm({
+    title: 'Confirm destructive cleanup',
+    html: `This permanently deletes ${p.delete_frames ? '<b>frames</b>' : ''}${p.delete_frames && p.delete_videos ? ' and ' : ''}${p.delete_videos ? '<b>videos</b>' : ''} ` +
+          `for: <b>${esc(p.categories.join(', '))}</b>. Database and Redis state will be updated so content can be re-processed later.`,
+    confirmLabel: 'Delete Permanently',
+    onConfirm: runCleanup,
+  });
 }
 function closeModal() { $('modalBg').classList.remove('on'); }
 $('modalBg').addEventListener('click', e => { if (e.target === $('modalBg')) closeModal(); });
@@ -583,6 +668,112 @@ async function runCleanup() {
     loadCategories();
   } catch (e) { showToast(`Cleanup failed: ${e.message}`, 'error'); }
   finally { btn.disabled = true; btn.textContent = 'Run Cleanup'; }
+}
+
+/* ═══════ DATABASE EXPORT ═══════
+   The export runs in a background thread on the server, so the button only
+   starts it; everything the user sees afterwards comes from polling status.
+   Polling is 1.5s while a job runs and 15s otherwise — a run started from
+   another tab (or one still going from before a refresh) has to show up here
+   without the user doing anything. */
+let expTimer = null;
+let expPolling = false;
+
+function askExport() {
+  const keep = $('expKeep').checked;
+  askConfirm({
+    title: 'Upload the database to Telegram?',
+    html: 'A snapshot of the harvest database and the Omniscient narratives will be '
+        + 'compressed and <b>posted to the source channel</b>, ending with a manifest '
+        + 'message that commits the bundle. Anyone with access to that channel can '
+        + 'download it.'
+        + (keep ? '<br><br>A local copy will also be kept in the output directory.' : ''),
+    confirmLabel: 'Export & Upload',
+    danger: false,
+    onConfirm: () => { closeModal(); startExport(keep); },
+  });
+}
+
+async function startExport(keep) {
+  const btn = $('expBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Starting…';
+  try {
+    await api('/api/admin/export/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep_local: !!keep }),
+    }, 0);                       // never auto-retry: a retry would double-post
+    showToast('Export started — building bundle', 'ok');
+    // Take over the idle poll immediately so the first stage shows up now
+    // rather than up to 15s later.
+    expPolling = true;
+    pollExport();
+  } catch (e) {
+    showToast(`Export failed to start: ${e.message}`, 'error');
+    btn.disabled = false; btn.textContent = 'Export & Upload';
+  }
+}
+
+function renderExport(st) {
+  const running = st.state === 'running';
+  const btn = $('expBtn');
+  btn.disabled = running;
+  btn.innerHTML = running ? '<span class="spin"></span> Exporting…' : 'Export &amp; Upload';
+
+  // Secrets missing means the bundle still builds but never leaves the machine.
+  // Say so before the run, not after.
+  const missing = st.telegram_missing || [];
+  const warn = $('expWarn');
+  warn.classList.toggle('on', missing.length > 0);
+  if (missing.length) {
+    warn.textContent = `Telegram is not configured (${missing.join(', ')}). `
+                     + `An export will still build the bundle on disk, but cannot upload it.`;
+  }
+  $('expSub').textContent = missing.length ? 'local bundle only' : '→ Telegram channel';
+
+  if (st.state === 'idle') { $('expProg').classList.remove('on'); return; }
+  $('expProg').classList.add('on');
+  $('expStage').textContent = st.stage || '—';
+  $('expPct').textContent = (st.pct ?? 0) + '%';
+  $('expDetail').textContent = st.detail || '';
+  const bar = $('expBar');
+  bar.className = 'exp-bar' + (st.state === 'error' ? ' err' : st.state === 'done' ? ' done' : '');
+  bar.firstElementChild.style.width = (st.state === 'done' ? 100 : (st.pct ?? 0)) + '%';
+  $('expLog').innerHTML = (st.log || []).map(l => `<div>${esc(l)}</div>`).join('');
+  $('expLog').scrollTop = $('expLog').scrollHeight;
+}
+
+/* Bundles still on disk. These count against the output quota, so the panel
+   names them rather than letting them accumulate unseen. */
+async function loadBundles() {
+  try {
+    const d = await api('/api/admin/export/bundles', {}, 0);
+    const list = d.bundles || [];
+    const el = $('expBundles');
+    if (!list.length) { el.textContent = ''; return; }
+    const total = list.reduce((s, b) => s + (b.size_mb || 0), 0);
+    el.textContent = `${list.length} bundle(s) on disk · ${total >= 1024 ? (total / 1024).toFixed(2) + ' GB' : total.toFixed(0) + ' MB'}`
+                   + ` · newest ${list[0].name}`;
+  } catch (e) { /* non-critical */ }
+}
+
+async function pollExport() {
+  if (expTimer) { clearTimeout(expTimer); expTimer = null; }
+  try {
+    const st = await api('/api/admin/export/status', {}, 0);
+    renderExport(st);
+    const running = st.state === 'running';
+    // Announce the terminal state once, on the transition into it.
+    if (expPolling && !running) {
+      if (st.state === 'done') showToast(`Export complete — ${st.detail || 'bundle sealed'}`, 'ok');
+      else if (st.state === 'error') showToast(`Export failed: ${st.error || 'unknown'}`, 'error');
+      if (st.state === 'done') loadDisk(true);   // the bundle changed the footprint
+      loadBundles();
+    }
+    expPolling = running;
+    expTimer = setTimeout(pollExport, running ? 1500 : 15000);
+  } catch (e) {
+    expTimer = setTimeout(pollExport, 15000);
+  }
 }
 
 /* ═══════ PIPELINE / HEALTH ═══════ */
@@ -630,6 +821,7 @@ async function loadLogs() {
 /* ═══════ BOOT + POLLING ═══════ */
 (function boot() {
   loadDisk(); loadCategories(); loadSystem(); loadLogs();
+  pollExport(); loadBundles();   // pollExport self-schedules: 1.5s busy, 15s idle
   setInterval(() => { if (!document.hidden) { loadSystem(); } }, 6000);
   setInterval(() => { if (!document.hidden) { loadLogs(); } }, 4000);
   setInterval(() => { if (!document.hidden) { loadDisk(); } }, 30000);
