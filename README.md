@@ -59,6 +59,67 @@ To survive the hostile environment of cloud scraping and ephemeral servers, this
 
 ---
 
+## 💾 Durability: how the database survives a session
+
+Every tier this OS runs on is disposable. `/kaggle/temp` is wiped between
+sessions, and PostgreSQL starts from the Debian default data directory on that
+same ephemeral disk — so the Omniscient store, and with it every Qwen narrative
+the GPU produced, does not survive on its own. The `/kaggle/working` OUTPUT tier
+(~19.5 GB) persists while the notebook exists, but goes when the notebook is
+deleted. **The Telegram channel is the only storage in this system that outlives
+the machine**, so it doubles as the backup target.
+
+| Tier | Path | Lifetime | Holds |
+|---|---|---|---|
+| Scratch | `/kaggle/temp/vios_scratch` | the session | models, videos, frames, Qdrant, Neo4j |
+| Output | `/kaggle/working/Insta-Vault` | the notebook | `lake.db`, bot session, bundles |
+| Channel | Telegram | indefinite | reels, and the database bundles |
+
+### Export → bundle → channel (`db_export.py`)
+
+A bundle is `index.sqlite.zst` (a `VACUUM INTO` snapshot of the harvest DB) plus
+`omnidb.sql.zst` (`pg_dump` of frames, chunks and narratives), zstd-compressed
+and split into ≤480 MB parts. Qdrant vectors and the Neo4j graph are deliberately
+omitted: both are derived from the frames and narratives, and rebuilding beats
+replicating gigabytes.
+
+The invariant that makes it safe: **a bundle exists if and only if its manifest
+message is posted.** Parts upload first and are inert on their own, so a run that
+dies halfway leaves unreferenced parts rather than a corrupt bundle that restore
+might believe. The manifest carries every part's `message_id` and SHA-256, so the
+channel is self-describing given only a bot token — no external metadata store.
+
+### Restore → channel → database (`db_restore.py`)
+
+Two steps, on purpose. **Check** reads only the manifest and reports how the
+bundle's row counts compare to the local ones; **Restore** overwrites, and is
+only reachable once that comparison exists. Restoring a 40-post bundle over a
+900-post database is data loss, and the admin panel says so in those terms
+before the confirm rather than after. A pre-restore snapshot lands on scratch, so
+a regretted restore is recoverable for the rest of the session.
+
+Two implementation details worth knowing before changing either file:
+
+* **The fallback scan cannot use `get_chat_history`.** `messages.getHistory` is a
+  user-only MTProto method and returns `BOT_METHOD_INVALID` for a bot account —
+  the same asymmetry the harvester's scanner works around. Restore probes the
+  newest id the way the harvester does and walks backwards with `getMessages`,
+  which bots *are* allowed to call. The pinned manifest is the fast path; this
+  runs when the bot lacks the rights to pin.
+* **SQLite is replaced through the backup API, not by moving the file.** Every
+  module opens `DB_PATH` per call and workers are mid-query at any moment; a file
+  swap strands those handles on a deleted inode and orphans the WAL sidecars.
+  `backup()` replaces pages inside the destination's own locking, so open
+  connections either wait or see the new content — never a mixture.
+
+Restore is **not** run automatically at boot. It would have to happen before
+ignition, and `omni_engine` has not started PostgreSQL by then — a restore that
+recovers the harvest DB while silently dropping the narratives is worse than
+none. `boot.py` prints a hint when a fresh container has an empty database, and
+the work happens in `/admin` against live services.
+
+---
+
 ## 🚀 The Kaggle Launchpad (CI/CD)
 
 The repository relies on Infrastructure as Code (IaC) via `setup.sh` and `requirements.txt`. The entire OS can be bootstrapped from a factory-reset Kaggle instance using this single cell:
