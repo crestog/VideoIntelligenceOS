@@ -97,7 +97,12 @@ def nim_chat(messages, temperature=0.2, max_tokens=1024):
 # ═══════════════════════════════════════════════════════════
 # GRAPHRAG — narrative → entities/relationships → Neo4j
 # ═══════════════════════════════════════════════════════════
-def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_id):
+_graphrag_warned = False
+
+
+def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_id,
+                               start_t=None, end_t=None):
+    global _graphrag_warned
     extraction_prompt = PROMPTS["entity_extraction"].format(
         entity_types=", ".join(PROMPTS["DEFAULT_ENTITY_TYPES"]),
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
@@ -108,7 +113,14 @@ def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_i
         graph_output = nim_chat([{"role": "user", "content": extraction_prompt}],
                                 temperature=0.1, max_tokens=2048)
     except Exception as e:
-        log(f"GraphRAG NIM extraction skipped for {chunk_id}: {e}", "WARN")
+        # Once, not once per chunk. With no NIM key this fires for every chunk
+        # of every video — thousands of identical WARN lines that buried the
+        # real errors. The UI reports the degraded state via /api/graph/health.
+        if not _graphrag_warned:
+            log(f"GraphRAG entity extraction unavailable ({e}) — the graph keeps "
+                f"Video→Chunk→Narrative structure but gains no Entity nodes. "
+                f"Set VIOS_NIM_API_KEY to enable it.", "WARN")
+            _graphrag_warned = True
         return
 
     try:
@@ -125,13 +137,20 @@ def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_i
 
                 if record_type == "entity":
                     name, e_type, desc = parts[1].strip('"'), parts[2].strip('"'), parts[3].strip('"')
+                    # Entity nodes stay GLOBAL on purpose — one "skateboard"
+                    # shared across every reel that shows one is the whole
+                    # point of a knowledge graph. What was missing is the
+                    # per-video edge below carrying its timestamp, which is
+                    # how a single video's own subgraph gets selected.
                     session.run("""
                         MERGE (e:Entity {name: $name})
                         SET e.type = $type, e.description = $desc
                         WITH e
                         MATCH (c:Chunk {id: $cid})
-                        MERGE (c)-[:CONTAINS_ENTITY]->(e)
-                    """, name=name, type=e_type, desc=desc, cid=chunk_id)
+                        MERGE (c)-[r:CONTAINS_ENTITY]->(e)
+                        SET r.video_uuid = $vid, r.start = $start, r.end = $end
+                    """, name=name, type=e_type, desc=desc, cid=chunk_id,
+                         vid=video_uuid, start=start_t, end=end_t)
 
                 elif record_type == "relationship" and len(parts) >= 5:
                     src, tgt, desc, weight = (parts[1].strip('"'), parts[2].strip('"'),
@@ -518,15 +537,24 @@ def process_oracle_job(payload):
                 if driver:
                     try:
                         with driver.session() as session:
+                            # Narrative is keyed by chunk, NOT by text. Keying
+                            # on text alone made every video that produced an
+                            # identical description share one Narrative node,
+                            # so unrelated reels appeared wired together and
+                            # each video's graph looked like every other's.
                             session.run("""
                                 MERGE (v:Video {uuid: $vid})
-                                MERGE (c:Chunk {id: $cid, start: $start, end: $end})
+                                MERGE (c:Chunk {id: $cid})
+                                SET c.start = $start, c.end = $end,
+                                    c.video_uuid = $vid
                                 MERGE (v)-[:CONTAINS]->(c)
-                                MERGE (n:Narrative {text: $desc})
+                                MERGE (n:Narrative {chunk_id: $cid})
+                                SET n.text = $desc, n.video_uuid = $vid
                                 MERGE (c)-[:DESCRIBED_BY]->(n)
                             """, vid=v_uuid, cid=c_id_str, start=start_t, end=end_t,
                                 desc=narrative)
-                        extract_and_store_graphrag(driver, narrative, v_uuid, c_id_str)
+                        extract_and_store_graphrag(driver, narrative, v_uuid, c_id_str,
+                                                   start_t=start_t, end_t=end_t)
                     except Exception as e:
                         log(f"Neo4j insert failed for {c_id_str}: {e}", "WARN")
         pg_conn.commit()
@@ -584,7 +612,7 @@ def oracle_worker_loop():
 # GOD-MODE FLASK DASHBOARD (proxied by ui_server at /omni)
 # ═══════════════════════════════════════════════════════════
 def build_dashboard():
-    from flask import Flask, jsonify, send_file
+    from flask import Flask, jsonify, request, send_file
 
     app_dashboard = Flask("OmniGodMode")
     dash_html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -669,54 +697,159 @@ def build_dashboard():
         except Exception as e:
             return jsonify({"error": str(e)})
 
+    # ── Knowledge graph ──
+    # Node colours live here, not in the dashboard, so the per-video and
+    # global views cannot drift apart. Keyed by label, most specific first.
+    _NODE_STYLE = {
+        "Video":     ("#c084fc", 26),
+        "Chunk":     ("#00ffcc", 18),
+        "Narrative": ("#ff9900", 14),
+        "Entity":    ("#ff0066", 20),
+    }
+
+    def _shape_graph(results):
+        """Neo4j rows → vis-network {nodes, edges}, deduped by elementId.
+
+        elementId(), not id(): id() is deprecated in Neo4j 5 and the server
+        emits a GqlStatusObject warning per call, so one dashboard refresh
+        printed three warnings. The ids are only ever opaque keys — node
+        dedup here, vis-network ids and rawNodes/rawEdges keys in the
+        dashboard — so elementId()'s string form drops straight in.
+        """
+        def add(nodes, nid, labels, props):
+            if nid in nodes:
+                return
+            label_name = props.get("name") or props.get("text") or props.get(
+                "uuid") or props.get("id") or (labels[0] if labels else "?")
+            colour, size = "#8b949e", 14
+            for lbl, (c, s) in _NODE_STYLE.items():
+                if lbl in labels:
+                    colour, size = c, s
+                    break
+            text = str(label_name)
+            nodes[nid] = {
+                "id": nid,
+                # Narrative text is a paragraph — truncate the drawn label but
+                # keep the whole thing in the inspector payload.
+                "label": text if len(text) <= 42 else text[:39] + "…",
+                "color": colour, "size": size,
+                "group": labels[0] if labels else "?",
+                "raw_properties": {"labels": labels, "properties": props}}
+
+        nodes, edges = {}, []
+        for row in results:
+            add(nodes, row["src_id"], row["src_lbl"], row["src_props"])
+            add(nodes, row["tgt_id"], row["tgt_lbl"], row["tgt_props"])
+            edges.append({"id": row["rel_id"], "from": row["src_id"],
+                          "to": row["tgt_id"], "label": row["rel_type"],
+                          "raw_properties": {"type": row["rel_type"],
+                                             "properties": row["rel_props"]}})
+        return {"nodes": list(nodes.values()), "edges": edges}
+
+    _GRAPH_RETURN = """
+        RETURN elementId(n) AS src_id, labels(n) AS src_lbl, properties(n) AS src_props,
+               elementId(m) AS tgt_id, labels(m) AS tgt_lbl, properties(m) AS tgt_props,
+               elementId(r) AS rel_id, type(r) AS rel_type, properties(r) AS rel_props
+    """
+
     @app_dashboard.route("/api/neo4j/graph")
     def get_neo4j_graph():
+        """Whole-corpus graph — the main screen of the graph tab.
+
+        Was also serving the per-video view, unfiltered, which is why every
+        video rendered an identical picture. Per-video now lives below.
+        """
+        driver = get_neo4j()
+        if not driver:
+            return jsonify({"error": "Neo4j offline — knowledge graph unavailable"})
+        try:
+            limit = min(int(request.args.get("limit", 400)), 2000)
+        except (TypeError, ValueError):
+            limit = 400
+        try:
+            with driver.session() as session:
+                results = session.run(
+                    "MATCH (n)-[r]->(m) " + _GRAPH_RETURN + " LIMIT $limit",
+                    limit=limit).data()
+                counts = session.run("""
+                    MATCH (n) UNWIND labels(n) AS l
+                    RETURN l AS label, count(*) AS n ORDER BY n DESC
+                """).data()
+            out = _shape_graph(results)
+            out["scope"] = "global"
+            out["counts"] = {r["label"]: r["n"] for r in counts}
+            out["truncated"] = len(results) >= limit
+            return jsonify(out)
+        except Exception as e:
+            return jsonify({"error": str(e)})
+
+    @app_dashboard.route("/api/neo4j/graph/<video_uuid>")
+    def get_neo4j_graph_for_video(video_uuid):
+        """One video's own subgraph: its chunks, their narratives, and the
+        entities those chunks mention — plus one hop out to the other videos
+        that share an entity, which is the part that makes the graph worth
+        having. Nothing here is corpus-wide."""
         driver = get_neo4j()
         if not driver:
             return jsonify({"error": "Neo4j offline — knowledge graph unavailable"})
         try:
             with driver.session() as session:
-                # elementId(), not id(): id() is deprecated in Neo4j 5 and the
-                # server emits a GqlStatusObject warning for every call, so a
-                # single dashboard refresh printed three warnings to the
-                # console. The ids are only ever used as opaque keys — here for
-                # node dedup, and in the dashboard as vis-network ids and
-                # rawNodes/rawEdges object keys — so the string form elementId()
-                # returns drops straight in.
                 results = session.run("""
+                    MATCH (v:Video {uuid: $vid})
                     MATCH (n)-[r]->(m)
-                    RETURN elementId(n) AS src_id, labels(n) AS src_lbl, properties(n) AS src_props,
-                           elementId(m) AS tgt_id, labels(m) AS tgt_lbl, properties(m) AS tgt_props,
-                           elementId(r) AS rel_id, type(r) AS rel_type, properties(r) AS rel_props
-                    LIMIT 300
-                """).data()
-
-            nodes_dict, edges = {}, []
-            for row in results:
-                src_id = row["src_id"]
-                if src_id not in nodes_dict:
-                    label_name = row["src_props"].get("name", row["src_props"].get(
-                        "id", row["src_lbl"][0] if row["src_lbl"] else "?"))
-                    nodes_dict[src_id] = {
-                        "id": src_id, "label": str(label_name),
-                        "color": "#00ffcc" if "Chunk" in row["src_lbl"] else "#ff0066",
-                        "raw_properties": {"labels": row["src_lbl"],
-                                           "properties": row["src_props"]}}
-                tgt_id = row["tgt_id"]
-                if tgt_id not in nodes_dict:
-                    label_name = row["tgt_props"].get("name", row["tgt_props"].get(
-                        "id", row["tgt_lbl"][0] if row["tgt_lbl"] else "?"))
-                    nodes_dict[tgt_id] = {
-                        "id": tgt_id, "label": str(label_name), "color": "#ff9900",
-                        "raw_properties": {"labels": row["tgt_lbl"],
-                                           "properties": row["tgt_props"]}}
-                edges.append({"id": row["rel_id"], "from": src_id, "to": tgt_id,
-                              "label": row["rel_type"],
-                              "raw_properties": {"type": row["rel_type"],
-                                                 "properties": row["rel_props"]}})
-            return jsonify({"nodes": list(nodes_dict.values()), "edges": edges})
+                    WHERE (n = v AND (m:Chunk))
+                       OR (n:Chunk AND n.video_uuid = $vid)
+                    """ + _GRAPH_RETURN + """
+                    LIMIT 600
+                """, vid=video_uuid).data()
+                shared = session.run("""
+                    MATCH (v:Video {uuid: $vid})-[:CONTAINS]->(:Chunk)
+                          -[:CONTAINS_ENTITY]->(e:Entity)
+                    MATCH (other:Video)-[:CONTAINS]->(:Chunk)
+                          -[:CONTAINS_ENTITY]->(e)
+                    WHERE other.uuid <> $vid
+                    RETURN e.name AS entity, collect(DISTINCT other.uuid)[..8] AS videos,
+                           count(DISTINCT other) AS n
+                    ORDER BY n DESC LIMIT 25
+                """, vid=video_uuid).data()
+            out = _shape_graph(results)
+            out["scope"] = "video"
+            out["video_uuid"] = video_uuid
+            # "This reel's skateboard also appears in 6 others" — the cross-video
+            # links, listed explicitly so they are readable without graph mining.
+            out["shared_entities"] = shared
+            if not out["nodes"]:
+                out["empty_reason"] = (
+                    "No graph rows for this video yet — the Oracle writes "
+                    "Video→Chunk→Narrative when it narrates the reel.")
+            return jsonify(out)
         except Exception as e:
             return jsonify({"error": str(e)})
+
+    @app_dashboard.route("/api/graph/health")
+    def get_graph_health():
+        """Why the graph looks thin. Entity extraction needs a NIM key; without
+        one the structural half still writes and this says so out loud instead
+        of leaving an empty canvas to interpret."""
+        driver = get_neo4j()
+        health = {"neo4j": bool(driver),
+                  "entity_extraction": bool(NIM_API_KEY),
+                  "extraction_backend": "nvidia-nim" if NIM_API_KEY else None,
+                  "counts": {}}
+        if not NIM_API_KEY:
+            health["note"] = ("VIOS_NIM_API_KEY is unset — Video/Chunk/Narrative "
+                              "nodes are written, Entity nodes are not.")
+        if driver:
+            try:
+                with driver.session() as session:
+                    rows = session.run("""
+                        MATCH (n) UNWIND labels(n) AS l
+                        RETURN l AS label, count(*) AS n ORDER BY n DESC
+                    """).data()
+                health["counts"] = {r["label"]: r["n"] for r in rows}
+            except Exception as e:
+                health["error"] = str(e)[:200]
+        return jsonify(health)
 
     return app_dashboard
 

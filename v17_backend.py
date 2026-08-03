@@ -502,6 +502,76 @@ def get_video_timeline(folder_name: str):
 
 
 # ═══════════════════════════════════════════════════════════
+# PIPELINE STATE — live per-video stage status + queue position
+#
+# The empty-state string "the Oracle worker describes the video after
+# processing" cannot tell "queued", "running", "failed" and "genuinely done
+# and empty" apart, so a backlog (the Oracle lags the CV engine by ~5x) reads
+# identically to a bug. This endpoint returns what each pipeline stage is
+# doing RIGHT NOW for one video, and where it sits in line.
+# ═══════════════════════════════════════════════════════════
+@v17_router.get("/api/pipeline-state/{folder_name}")
+def get_pipeline_state(folder_name: str):
+    msg_id_str = folder_name.replace('frames_', '')
+    if not msg_id_str.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    msg_id = int(msg_id_str)
+
+    try:
+        from config import OMNI_ENABLED
+    except Exception:
+        OMNI_ENABLED = True
+
+    if not OMNI_ENABLED:
+        return {"omni_enabled": False, "redis": "n/a", "stages": [],
+                "video_uuid": f"tg{msg_id}"}
+
+    # Redis is optional at runtime (the whole system degrades without it), so a
+    # missing client must not take this endpoint down — it reports "offline"
+    # and the UI says so instead of showing a misleading "not processed yet".
+    try:
+        from queue_manager import get_queue_metrics, get_redis
+        r = get_redis()
+        r.ping()
+        # decode_responses=True on the shared pool, so these are already str.
+        status = r.hgetall(f"status:tg{msg_id}") or {}
+        metrics = get_queue_metrics()
+    except Exception as e:
+        return {"omni_enabled": True, "redis": "offline", "stages": [],
+                "redis_error": f"{type(e).__name__}: {e}"[:140],
+                "video_uuid": f"tg{msg_id}"}
+
+    stages = []
+    for queue, key, label in (("QUEUE_OMNI_VISION", "vision", "Vision"),
+                              ("QUEUE_OMNI_ORACLE", "oracle", "Oracle")):
+        meta = metrics.get(queue, {})
+        raw = status.get(key)
+        # No status field means the job was never enqueued for this video —
+        # distinct from "queued", and the distinction is the whole point here.
+        if raw is None:
+            state = "unqueued"
+        elif raw.startswith("ERROR"):
+            state = "error"
+        elif "DONE" in raw:
+            state = "done"
+        elif "Queued" in raw:
+            state = "queued"
+        else:
+            state = "running"
+        stages.append({
+            "stage": key, "label": label, "queue": queue,
+            "state": state, "detail": raw or "never enqueued",
+            "queue_depth": meta.get("pending_total", 0),
+            "in_flight": meta.get("processing", 0),
+            "completed": meta.get("total_completed", 0),
+            "dead_letter": meta.get("dead_letter", 0),
+        })
+
+    return {"omni_enabled": True, "redis": "online", "stages": stages,
+            "mode": status.get("mode"), "video_uuid": f"tg{msg_id}"}
+
+
+# ═══════════════════════════════════════════════════════════
 # DATABASE VIEWER — read-only browser over EVERY table
 # ═══════════════════════════════════════════════════════════
 @v17_router.get("/api/db/tables")

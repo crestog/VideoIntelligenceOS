@@ -72,15 +72,13 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 .stat .val small { font-size: 11px; color: var(--text-dim); font-weight: 400; }
 
 .disk-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--surface-2); margin: 14px 0 8px; }
-.disk-bar div { height: 100%; }
-.seg-videos { background: var(--accent); }
-.seg-frames { background: #0891b2; }
-.seg-thumbs { background: #155e75; }
-.seg-other { background: var(--border-strong); }
+.disk-bar div { height: 100%; transition: width 0.35s ease; }
 .disk-legend { display: flex; flex-wrap: wrap; gap: 14px; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); }
-.disk-legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
-.lg-videos::before { background: var(--accent); } .lg-frames::before { background: #0891b2; }
-.lg-thumbs::before { background: #155e75; } .lg-other::before { background: var(--border-strong); }
+/* Colour comes from the --c custom property each segment sets, so the legend
+   and the bar can never drift out of sync the way two hardcoded lists did. */
+.disk-legend .lg::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--c, var(--border-strong)); }
+.disk-legend .lg b { color: var(--text); font-weight: 600; }
+.disk-host { margin-top: 10px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); opacity: 0.75; }
 
 /* buttons */
 .btn {
@@ -210,18 +208,15 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
     </div>
     <div class="card-body">
       <div class="stat-grid" id="diskStats">
-        <div class="stat"><div class="lbl">Used</div><div class="val skel" style="width:70px">&nbsp;</div></div>
-        <div class="stat"><div class="lbl">Free</div><div class="val skel" style="width:70px">&nbsp;</div></div>
+        <div class="stat"><div class="lbl">VIOS footprint</div><div class="val skel" style="width:70px">&nbsp;</div></div>
+        <div class="stat"><div class="lbl">Scratch free</div><div class="val skel" style="width:70px">&nbsp;</div></div>
+        <div class="stat"><div class="lbl">Output free</div><div class="val skel" style="width:70px">&nbsp;</div></div>
         <div class="stat"><div class="lbl">Videos</div><div class="val skel" style="width:50px">&nbsp;</div></div>
         <div class="stat"><div class="lbl">Frame folders</div><div class="val skel" style="width:50px">&nbsp;</div></div>
       </div>
       <div class="disk-bar" id="diskBar"></div>
-      <div class="disk-legend">
-        <span class="lg-videos" id="lgVideos">Videos —</span>
-        <span class="lg-frames" id="lgFrames">Frames —</span>
-        <span class="lg-thumbs" id="lgThumbs">Thumbs —</span>
-        <span class="lg-other" id="lgOther">Other —</span>
-      </div>
+      <div class="disk-legend" id="diskLegend"></div>
+      <div class="disk-host" id="diskHost"></div>
     </div>
   </section>
 
@@ -312,6 +307,11 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 'use strict';
 const $ = id => document.getElementById(id);
 
+/* Escape anything interpolated into innerHTML. Disk paths and category names
+   come from the filesystem, so they are not trusted markup. */
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 /* ═══════ RESILIENT API LAYER ═══════
    Every call: 12s timeout, one automatic retry on network failure,
    structured error extraction — no more silent/opaque "API error". */
@@ -349,28 +349,66 @@ function showToast(msg, type = 'info') {
   setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; setTimeout(() => t.remove(), 320); }, 3800);
 }
 
-/* ═══════ DISK ═══════ */
+/* ═══════ DISK ═══════
+   Every number here is VIOS's own footprint, measured by walking the
+   directories VIOS writes. The host mount's usage is shown separately as
+   headroom — on shared infrastructure most of it is other tenants' bytes,
+   and reporting it as "used" made the panel read 7075 GB when VIOS held 9. */
+const DISK_SEGS = [
+  ['videos',     'Videos',       '#4ea1ff'],
+  ['frames',     'Frames',       '#37d39b'],
+  ['thumbnails', 'Thumbs',       '#ffc857'],
+  ['models',     'Model cache',  '#b78cff'],
+  ['qdrant',     'Vectors',      '#ff8ac4'],
+  ['neo4j',      'Graph',        '#7fe3d4'],
+  ['archive',    'Omni archive', '#ff9f6e'],
+  ['datalake',   'Data lake',    '#9aa7b8'],
+];
+
 async function loadDisk() {
   try {
     const d = await api('/api/admin/disk');
-    $('diskSub').textContent = `${d.used_gb} GB used of ${d.total_gb} GB`;
-    $('diskStats').innerHTML = `
-      <div class="stat"><div class="lbl">Used</div><div class="val">${d.used_gb}<small> GB</small></div></div>
-      <div class="stat"><div class="lbl">Free</div><div class="val">${d.free_gb}<small> GB</small></div></div>
-      <div class="stat"><div class="lbl">Videos</div><div class="val">${d.video_file_count}</div></div>
-      <div class="stat"><div class="lbl">Frame folders</div><div class="val">${d.frame_folder_count}</div></div>`;
     const b = d.breakdown || {};
-    const total = Math.max(d.used_gb, 0.001);
+    const labels = d.labels || {};
+    const tiers = d.tiers || {};
+    const host = d.host || {};
+    const used = d.vios_used_gb ?? 0;
+
+    $('diskSub').textContent =
+      `${used} GB held by VIOS · ${tiers.scratch?.free_gb ?? 0} GB free on scratch`;
+
+    $('diskStats').innerHTML = `
+      <div class="stat" title="Sum of every directory VIOS writes — videos, frames, thumbnails, model cache, vectors, graph, archive and the data lake.">
+        <div class="lbl">VIOS footprint</div><div class="val">${used}<small> GB</small></div></div>
+      <div class="stat" title="Free space on ${esc(tiers.scratch?.path || '?')} — ephemeral, cleared when the session ends.">
+        <div class="lbl">Scratch free</div><div class="val">${tiers.scratch?.free_gb ?? 0}<small> GB</small></div></div>
+      <div class="stat" title="Free space on ${esc(tiers.output?.path || '?')} — kept across sessions, counts against the output quota.">
+        <div class="lbl">Output free</div><div class="val">${tiers.output?.free_gb ?? 0}<small> GB</small></div></div>
+      <div class="stat"><div class="lbl">Videos</div><div class="val">${d.video_file_count ?? 0}</div></div>
+      <div class="stat"><div class="lbl">Frame folders</div><div class="val">${d.frame_folder_count ?? 0}</div></div>`;
+
+    // Bar segments are proportional to VIOS's footprint, so they always sum
+    // to 100% of something meaningful.
+    const total = Math.max(used, 0.001);
     const pct = x => Math.max((x / total) * 100, 0).toFixed(2) + '%';
-    $('diskBar').innerHTML = `
-      <div class="seg-videos" style="width:${pct(b.videos_gb || 0)}"></div>
-      <div class="seg-frames" style="width:${pct(b.frames_gb || 0)}"></div>
-      <div class="seg-thumbs" style="width:${pct(b.thumbnails_gb || 0)}"></div>
-      <div class="seg-other" style="width:${pct(b.other_gb || 0)}"></div>`;
-    $('lgVideos').textContent = `Videos ${b.videos_gb ?? 0} GB`;
-    $('lgFrames').textContent = `Frames ${b.frames_gb ?? 0} GB`;
-    $('lgThumbs').textContent = `Thumbs ${b.thumbnails_gb ?? 0} GB`;
-    $('lgOther').textContent = `Other ${b.other_gb ?? 0} GB`;
+    $('diskBar').innerHTML = DISK_SEGS
+      .filter(([k]) => (b[`${k}_gb`] || 0) > 0)
+      .map(([k, name, color]) => {
+        const gb = b[`${k}_gb`] || 0;
+        return `<div style="width:${pct(gb)};background:${color}"
+                     title="${esc(labels[k] || name)}: ${gb} GB (${pct(gb)} of VIOS's footprint)"></div>`;
+      }).join('') || '<div style="width:100%;background:var(--line)"></div>';
+
+    $('diskLegend').innerHTML = DISK_SEGS.map(([k, name, color]) => {
+      const gb = b[`${k}_gb`] || 0;
+      return `<span class="lg" style="--c:${color}${gb > 0 ? '' : ';opacity:.45'}">
+                ${esc(labels[k] || name)} <b>${gb}</b> GB</span>`;
+    }).join('');
+
+    $('diskHost').textContent = host.total_gb
+      ? `Host mount ${esc(host.path || '')}: ${host.used_gb} GB used of ${host.total_gb} GB `
+        + `(shared infrastructure — not VIOS's data)`
+      : '';
   } catch (e) { showToast(`Disk info failed: ${e.message}`, 'error'); }
 }
 

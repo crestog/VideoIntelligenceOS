@@ -296,6 +296,33 @@ header.topbar {
   padding: 2px 6px; border-radius: 4px; background: var(--surface-2);
   border: 1px solid var(--border); color: var(--text-dim);
 }
+
+/* ── Pipeline stage state ──
+   Shown when a panel has nothing to display. "Empty" has four very different
+   causes — never enqueued, waiting in a queue, running now, or failed — and a
+   single static sentence made a 5x Oracle backlog look identical to a bug.
+   This strip names the actual state and, when queued, how deep the line is. */
+.stage-state { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.stage-state:empty { display: none; }
+.stage-row {
+  display: flex; align-items: center; gap: 7px;
+  font-family: var(--font-mono); font-size: 10px; color: var(--text-dim);
+  padding: 5px 8px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+}
+.stage-row .nm { color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+.stage-row .qd { margin-left: auto; opacity: 0.8; }
+.stage-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  background: var(--border-strong);
+}
+.stage-dot.done    { background: #37d39b; }
+.stage-dot.running { background: #ffc857; animation: stagePulse 1.4s ease-in-out infinite; }
+.stage-dot.queued  { background: #4ea1ff; }
+.stage-dot.error   { background: #ff5c5c; }
+.stage-dot.unqueued{ background: var(--border-strong); }
+@keyframes stagePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .stage-dot.running { animation: none; } }
 .omni-meta span.warn { color: var(--warn); border-color: rgba(251,191,36,.35); }
 
 /* ═══════ PER-VIDEO TIMELINE ═══════
@@ -627,13 +654,15 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
         <div class="panel">
           <h3>Frame Intel <span id="intelSrc" style="letter-spacing:0;text-transform:none;color:var(--accent)"></span></h3>
           <div class="intel-ts" id="intelTs">— </div>
-          <div class="intel-desc dim" id="intelDesc">No analysis yet — GPU engine will describe each frame after processing.</div>
+          <div class="intel-desc dim" id="intelDesc">Loading frame analysis…</div>
           <div class="intel-speech off" id="intelSpeech"></div>
+          <div class="stage-state" id="intelStage"></div>
         </div>
         <div class="panel">
           <h3>Omni Narrative <span id="omniSrc" style="letter-spacing:0;text-transform:none;color:var(--accent)"></span></h3>
-          <div class="intel-desc dim" id="omniDesc">No narrative chunks yet — the Oracle worker describes the video after processing.</div>
+          <div class="intel-desc dim" id="omniDesc">Loading narrative…</div>
           <div class="omni-meta" id="omniMeta"></div>
+          <div class="stage-state" id="omniStage"></div>
         </div>
         <div class="panel">
           <h3>Histogram <span id="histMode" style="letter-spacing:0;text-transform:none;color:var(--accent)">RGB</span></h3>
@@ -956,6 +985,7 @@ function teardownWorkspace() {
   $('btnPlay').textContent = 'Play';
   if (networkAborter) { networkAborter.abort(); networkAborter = null; }
   if (extractionTimer) { clearInterval(extractionTimer); extractionTimer = null; }
+  if (pipelineTimer) { clearTimeout(pipelineTimer); pipelineTimer = null; }
   for (const entry of bitmapCache.values()) entry.bm.close && entry.bm.close();
   bitmapCache.clear();
   prevBlobs = []; fullBlobs = []; frameNames = []; blobBytes = 0;
@@ -1398,9 +1428,72 @@ async function loadOmniTimeline(folderId, mySession) {
 
     renderTimeline();
     updateOmniPanel();
+    loadPipelineState(folderId, mySession);   // live stage state, fire-and-forget
   } catch (e) {
     if (mySession !== session) return;
     $('tlDetail').innerHTML = '<span class="dim">Timeline unavailable — /api/timeline failed.</span>';
+  }
+}
+
+/* ═══════ PIPELINE STATE — what each GPU stage is doing for THIS video ═══════
+   Populates the small strips under the Omni Narrative and Frame Intel panels.
+   The timeline endpoint tells you what has landed; this tells you what has
+   not, and why not — queued / running / errored / never enqueued. Re-reads
+   on every playhead scrub that pauses, plus the once-per-workspace call. */
+let pipelineTimer = null;
+async function loadPipelineState(folderId, mySession) {
+  if (mySession !== session) return;
+  let st;
+  try {
+    const resp = await apiFetch(`/api/pipeline-state/${folderId}`);
+    st = await resp.json();
+  } catch (e) { return; }
+  if (mySession !== session) return;
+  if (!st.omni_enabled) {
+    $('omniStage').innerHTML = '<div class="stage-row"><span class="nm">Omniscient layer disabled</span></div>';
+    return;
+  }
+  if (st.redis !== 'online') {
+    const why = st.redis_error ? ` — ${st.redis_error}` : '';
+    $('omniStage').innerHTML = `<div class="stage-row"><span class="nm">Pipeline state offline</span><span>${escapeHtml(why)}</span></div>`;
+    return;
+  }
+  const byStage = {};
+  (st.stages || []).forEach(s => { byStage[s.stage] = s; });
+
+  const omni = byStage.oracle;
+  const intel = byStage.vision;
+  const renderRow = s => {
+    if (!s) return '';
+    const dot = `<span class="stage-dot ${s.state}" title="${escapeHtml(s.detail || s.state)}"></span>`;
+    if (s.state === 'done') {
+      return `<div class="stage-row">${dot}<span class="nm">${s.label}</span><span>done</span></div>`;
+    }
+    if (s.state === 'running') {
+      return `<div class="stage-row">${dot}<span class="nm">${s.label}</span><span>running now</span></div>`;
+    }
+    if (s.state === 'queued') {
+      const pos = Math.max(s.queue_depth, 1);
+      return `<div class="stage-row">${dot}<span class="nm">${s.label}</span>` +
+             `<span>waiting · #${pos} in line</span>` +
+             `<span class="qd">${s.in_flight} in flight</span></div>`;
+    }
+    if (s.state === 'error') {
+      return `<div class="stage-row">${dot}<span class="nm">${s.label}</span>` +
+             `<span class="qd">${escapeHtml((s.detail || '').slice(0, 60))}</span></div>`;
+    }
+    return `<div class="stage-row">${dot}<span class="nm">${s.label}</span><span>never enqueued</span></div>`;
+  };
+  $('omniStage').innerHTML = renderRow(omni);
+  $('intelStage').innerHTML = renderRow(intel);
+
+  // Keep polling only while something is still moving. A video whose stages
+  // are all done or all errored will never change on its own, so polling it
+  // forever would just be background noise against the GPU box.
+  const live = (st.stages || []).some(s => s.state === 'queued' || s.state === 'running');
+  clearTimeout(pipelineTimer);
+  if (live) {
+    pipelineTimer = setTimeout(() => loadPipelineState(folderId, mySession), 6000);
   }
 }
 

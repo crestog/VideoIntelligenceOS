@@ -32,9 +32,36 @@
 
         .raw-dump { background: #010409; border: 1px solid var(--border); padding: 10px; font-family: monospace; font-size: 0.8em; color: #79c0ff; overflow-y: auto; display: none; word-wrap: break-word; }
 
-        #network-canvas { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 6px; background: #000; }
-        #graph-inspector { width: 300px; background: var(--card); border-left: 1px solid var(--border); padding: 15px; display: none; overflow-y: auto; }
-        .graph-container { display: flex; height: 100%; gap: 15px; }
+        #network-canvas, #global-canvas { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 6px; background: #000; }
+        #graph-inspector, #global-inspector { width: 320px; background: var(--card); border-left: 1px solid var(--border); padding: 15px; display: none; overflow-y: auto; }
+        .graph-container { display: flex; height: 100%; gap: 15px; min-height: 0; }
+
+        /* ── Node-type legend ──
+           Colours are defined once server-side (_NODE_STYLE in omni_engine)
+           and mirrored here; a swatch the reader can't map to a label makes
+           the graph decorative rather than informative. */
+        .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center; }
+        .lg { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78em; color: #8b949e;
+              background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 4px 10px; }
+        .lg i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+        .lg b { color: var(--text); font-weight: 600; }
+
+        /* Health banner — why the graph looks thin, stated rather than implied. */
+        .banner { border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; font-size: 0.85em;
+                  border: 1px solid var(--border); background: var(--card); line-height: 1.5; }
+        .banner.warn { border-color: #9e6a03; background: #2d2000; color: #e3b341; }
+        .banner.err  { border-color: #6e2020; background: #2d0f0f; color: #f85149; }
+        .banner.off  { display: none; }
+
+        /* Clickable rows in the shared-entity / stats lists. */
+        .krow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 4px;
+                border: 1px solid var(--border); background: #0f141a; margin-bottom: 6px;
+                font-size: 0.82em; cursor: pointer; }
+        .krow:hover { background: #1f2428; border-color: var(--accent); }
+        .krow .n { margin-left: auto; color: #8b949e; font-family: monospace; }
+        .home-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+        .home-head .sub { color: #8b949e; font-size: 0.85em; }
+        .nav-link.sel { background: #1f2428; border-color: var(--accent); }
 
         /* Scrubber Styles */
         .frame-player { position: relative; width: 100%; background: #000; border: 1px solid var(--border); border-radius: 6px; aspect-ratio: 16/9; display: flex; justify-content: center; align-items: center; }
@@ -50,8 +77,35 @@
 
     <div class="layout">
         <div class="sidebar">
-            <h3>Indexed Videos</h3>
+            <div class="nav-link sel" id="nav-home" onclick="showHome()">🕸️ Knowledge Graph</div>
+            <h3 style="margin-top:18px;">Indexed Videos</h3>
             <div id="vlist-content">Loading database...</div>
+            <div id="shared-panel" style="display:none; margin-top:18px;">
+                <h3>Shares entities with</h3>
+                <p style="font-size:0.78em;color:#8b949e;margin-top:-6px;">Other reels that mention the same things.</p>
+                <div id="shared-list"></div>
+            </div>
+        </div>
+
+        <!-- HOME — the whole-corpus knowledge graph. Shown until a video is
+             picked, and reachable again from the sidebar. Previously this pane
+             did not exist: the main area was blank until a video was selected,
+             so the corpus-wide graph had nowhere to live. -->
+        <div class="main-content" id="dashboard-home">
+            <div class="home-head">
+                <h2 style="margin-bottom:4px;">🕸️ Knowledge Graph</h2>
+                <span class="sub" id="global-scope">loading…</span>
+            </div>
+            <div class="banner off" id="graph-banner"></div>
+            <div class="legend" id="global-legend"></div>
+            <div class="graph-container">
+                <div id="global-canvas"></div>
+                <div id="global-inspector">
+                    <h3 style="margin-top:0;">Node Properties</h3>
+                    <p style="font-size:0.85em; color:#8b949e;">Click a node or edge. Double-click a Video node to open its forensic view.</p>
+                    <pre id="global-raw-json" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; color: #79c0ff;"></pre>
+                </div>
+            </div>
         </div>
 
         <div class="main-content" id="dashboard-main" style="display:none;">
@@ -106,6 +160,8 @@
             </div>
 
             <div id="view-graph" class="scroll-area" style="display:none;">
+                <div style="font-size:0.85em;color:#8b949e;margin-bottom:8px;" id="graph-scope">—</div>
+                <div class="legend" id="graph-legend"></div>
                 <div class="graph-container">
                     <div id="network-canvas"></div>
                     <div id="graph-inspector">
@@ -122,21 +178,150 @@
         // NOTE: all URLs are RELATIVE (no leading slash) so this page works both
         // served directly by the engine's Flask app AND behind the /omni proxy
         // inside the unified VIOS workstation.
-        let rawNodes = {};
-        let rawEdges = {};
         let globalFrames = [];
         let currentFrameIndex = 0;
         let currentVideoUuid = '';
+        let globalNet = null, videoNet = null;
+
+        // Narratives, OCR text and uuids all come from the database and land in
+        // innerHTML below. None of it is trusted markup.
+        const esc = s => String(s ?? '').replace(/[&<>"']/g,
+            c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+        /* Shared vis-network setup for both graph views. Kept in one place so
+           the corpus graph and the per-video graph cannot drift apart in
+           styling or interaction. Returns the network so callers can bind
+           extra handlers. */
+        function renderGraph(canvasId, inspectorId, jsonId, data, onDoubleClickNode) {
+            const nodeProps = {}, edgeProps = {};
+            (data.nodes || []).forEach(n => nodeProps[n.id] = n.raw_properties);
+            (data.edges || []).forEach(e => edgeProps[e.id] = e.raw_properties);
+
+            const net = new vis.Network(
+                document.getElementById(canvasId),
+                { nodes: new vis.DataSet(data.nodes || []),
+                  edges: new vis.DataSet(data.edges || []) },
+                {
+                    nodes: { shape: 'dot', font: { color: '#e6edf3', size: 13 },
+                             borderWidth: 0, scaling: { min: 10, max: 34 } },
+                    edges: { font: { color: '#7d8590', size: 10, strokeWidth: 0 },
+                             color: { color: '#30363d', highlight: '#58a6ff' },
+                             arrows: 'to', smooth: { type: 'continuous' } },
+                    // Barnes-Hut with a settle cap: stabilization:true alone let
+                    // a 400-node corpus graph spin for many seconds on the
+                    // shared Kaggle vCPUs before it drew anything.
+                    physics: { solver: 'barnesHut',
+                               barnesHut: { gravitationalConstant: -8000,
+                                            springLength: 130, avoidOverlap: 0.2 },
+                               stabilization: { iterations: 220, fit: true } },
+                    interaction: { hover: true, tooltipDelay: 150, navigationButtons: true,
+                                   keyboard: { enabled: true, bindToWindow: false } },
+                });
+
+            net.on('click', params => {
+                const insp = document.getElementById(inspectorId);
+                const out = document.getElementById(jsonId);
+                if (params.nodes.length) {
+                    insp.style.display = 'block';
+                    out.innerText = JSON.stringify(nodeProps[params.nodes[0]], null, 2);
+                } else if (params.edges.length) {
+                    insp.style.display = 'block';
+                    out.innerText = JSON.stringify(edgeProps[params.edges[0]], null, 2);
+                } else {
+                    insp.style.display = 'none';
+                }
+            });
+            if (onDoubleClickNode) {
+                net.on('doubleClick', params => {
+                    if (!params.nodes.length) return;
+                    const p = nodeProps[params.nodes[0]];
+                    onDoubleClickNode(p, params.nodes[0]);
+                });
+            }
+            return net;
+        }
+
+        /* Legend built from the labels actually present, with corpus counts
+           when the endpoint supplies them. */
+        const NODE_COLORS = { Video: '#c084fc', Chunk: '#00ffcc',
+                              Narrative: '#ff9900', Entity: '#ff0066' };
+        function renderLegend(elId, counts) {
+            document.getElementById(elId).innerHTML = Object.entries(NODE_COLORS)
+                .map(([lbl, col]) => {
+                    const n = counts && counts[lbl] != null ? ` <b>${counts[lbl]}</b>` : '';
+                    return `<span class="lg"><i style="background:${col}"></i>${lbl}${n}</span>`;
+                }).join('');
+        }
+
+        /* ═══════ HOME — corpus-wide graph ═══════ */
+        function showHome() {
+            document.getElementById('dashboard-home').style.display = 'flex';
+            document.getElementById('dashboard-main').style.display = 'none';
+            document.getElementById('shared-panel').style.display = 'none';
+            document.getElementById('nav-home').classList.add('sel');
+            document.querySelectorAll('#vlist-content .nav-link')
+                .forEach(el => el.classList.remove('sel'));
+            if (!globalNet) loadGlobalGraph();
+        }
+
+        /* The graph can be empty for three unrelated reasons — Neo4j down, no
+           videos narrated yet, or entity extraction disabled. An empty canvas
+           looks the same in all three, so name the actual one. */
+        function loadGraphHealth() {
+            const el = document.getElementById('graph-banner');
+            fetch('api/graph/health').then(r => r.json()).then(h => {
+                if (!h.neo4j) {
+                    el.className = 'banner err';
+                    el.innerHTML = '<b>Neo4j offline.</b> The knowledge graph is unavailable; '
+                        + 'Postgres and Qdrant are unaffected. Check the boot log for the JVM error.';
+                    return;
+                }
+                if (!h.entity_extraction) {
+                    el.className = 'banner warn';
+                    el.innerHTML = '<b>Entity extraction disabled.</b> ' + esc(h.note || '')
+                        + ' Video → Chunk → Narrative structure is live; concept-level '
+                        + '<i>Entity</i> nodes need <code>VIOS_NIM_API_KEY</code> in Kaggle Secrets.';
+                    return;
+                }
+                el.className = 'banner off';
+            }).catch(() => { el.className = 'banner off'; });
+        }
+
+        function loadGlobalGraph() {
+            const scope = document.getElementById('global-scope');
+            scope.innerText = 'loading corpus graph…';
+            loadGraphHealth();
+            fetch('api/neo4j/graph?limit=400').then(r => r.json()).then(data => {
+                if (data.error) {
+                    scope.innerText = data.error;
+                    renderLegend('global-legend', null);
+                    return;
+                }
+                const nodes = (data.nodes || []).length, edges = (data.edges || []).length;
+                scope.innerText = nodes
+                    ? `${nodes} nodes · ${edges} edges across the whole corpus`
+                      + (data.truncated ? ' (capped at 400 — click a video for its own graph)' : '')
+                    : 'Graph is empty — no video has been narrated yet.';
+                renderLegend('global-legend', data.counts);
+                globalNet = renderGraph('global-canvas', 'global-inspector',
+                                        'global-raw-json', data, props => {
+                    // Double-clicking a Video node drills into that reel.
+                    const uuid = props && props.properties && props.properties.uuid;
+                    if (uuid) loadDeepDive(uuid);
+                });
+            }).catch(e => { scope.innerText = 'Graph fetch failed — engine may still be booting.'; });
+        }
 
         // Load Videos
         fetch('api/videos').then(r => r.json()).then(data => {
             let html = '';
             if (data.error) {
-                document.getElementById('vlist-content').innerHTML = `<p style="color:#f85149;">${data.error}</p>`;
+                document.getElementById('vlist-content').innerHTML = `<p style="color:#f85149;">${esc(data.error)}</p>`;
                 return;
             }
             data.forEach(v => {
-                html += `<div class="nav-link" onclick="loadDeepDive('${v.video_uuid}')">🎥 ${v.video_uuid}</div>`;
+                const u = esc(v.video_uuid);
+                html += `<div class="nav-link" data-uuid="${u}" onclick="loadDeepDive('${u}')">🎥 ${u}</div>`;
             });
             document.getElementById('vlist-content').innerHTML = html || '<p>No videos found.</p>';
         }).catch(e => {
@@ -151,29 +336,41 @@
             document.getElementById('view-micro').style.display = 'none';
             document.getElementById('view-graph').style.display = 'none';
 
-            document.getElementById(`view-${tab}`).style.display = 'block';
+            // The graph pane is a column flex (scope line, legend, then a
+            // canvas that must fill the remaining height). vis-network sizes
+            // its canvas to the container, so 'block' here would collapse it.
+            document.getElementById(`view-${tab}`).style.display =
+                tab === 'graph' ? 'flex' : 'block';
+            // A network built while its container was display:none has zero
+            // measured size; redraw once it is visible.
+            if (tab === 'graph' && videoNet) { videoNet.redraw(); videoNet.fit(); }
         }
 
         function loadDeepDive(uuid) {
+            document.getElementById('dashboard-home').style.display = 'none';
             document.getElementById('dashboard-main').style.display = 'flex';
+            document.getElementById('nav-home').classList.remove('sel');
+            document.querySelectorAll('#vlist-content .nav-link').forEach(el =>
+                el.classList.toggle('sel', el.dataset.uuid === uuid));
             document.getElementById('dd-title').innerText = `Forensic View: ${uuid}`;
             document.getElementById('chunk-grid').innerHTML = 'Loading chunks from Postgres...';
             currentVideoUuid = uuid;
 
             // 1. Load Postgres Content
-            fetch(`api/video/${uuid}`).then(r => r.json()).then(data => {
-                // Render Chunks (Macro)
+            fetch(`api/video/${encodeURIComponent(uuid)}`).then(r => r.json()).then(data => {
+                // Render Chunks (Macro). Narrative text is model output stored in
+                // the database — escaped, not injected as markup.
                 let cHtml = '';
                 (data.chunks || []).forEach(c => {
                     cHtml += `<div class="card">
-                        <video controls preload="metadata" src="media/chunk/${uuid}/${c.start_t}"></video>
+                        <video controls preload="metadata" src="media/chunk/${encodeURIComponent(uuid)}/${encodeURIComponent(c.start_t)}"></video>
                         <div style="margin-top:10px;">
-                            <span class="meta-tag">ID: ${c.chunk_id}</span>
-                            <span class="meta-tag">Time: ${c.start_t}s - ${c.end_t}s</span>
+                            <span class="meta-tag">ID: ${esc(c.chunk_id)}</span>
+                            <span class="meta-tag">Time: ${esc(c.start_t)}s - ${esc(c.end_t)}s</span>
                         </div>
                         <div style="margin-top:15px; font-size:0.9em;">
                             <strong style="color:#ff0066;">Qwen Narrative Transcript:</strong><br>
-                            ${c.description}
+                            ${esc(c.description)}
                         </div>
                     </div>`;
                 });
@@ -187,39 +384,46 @@
                 }
             });
 
-            // 2. Load Neo4j Graph
-            fetch('api/neo4j/graph').then(r => r.json()).then(data => {
+            // 2. Load THIS video's own subgraph.
+            //    This used to call api/neo4j/graph with no filter, so every
+            //    video rendered the same corpus-wide slice — the reason each
+            //    reel's knowledge graph looked identical. The corpus view now
+            //    has its own home screen; this one is scoped to the reel.
+            document.getElementById('graph-raw-json').innerText = '';
+            document.getElementById('graph-inspector').style.display = 'none';
+            fetch(`api/neo4j/graph/${encodeURIComponent(uuid)}`).then(r => r.json()).then(data => {
                 if (data.error) {
+                    document.getElementById('graph-inspector').style.display = 'block';
                     document.getElementById('graph-raw-json').innerText = data.error;
                     return;
                 }
-                rawNodes = {}; rawEdges = {};
-                data.nodes.forEach(n => rawNodes[n.id] = n.raw_properties);
-                data.edges.forEach(e => rawEdges[e.id] = e.raw_properties);
-
-                let nodes = new vis.DataSet(data.nodes);
-                let edges = new vis.DataSet(data.edges);
-                let container = document.getElementById('network-canvas');
-                let options = {
-                    nodes: { shape: 'dot', font: {color: 'white'} },
-                    edges: { font: {color: '#888'}, arrows: 'to' },
-                    physics: { stabilization: true },
-                    interaction: { hover: true }
-                };
-                let network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
-
-                // On Click: Show raw JSON properties in the side panel
-                network.on("click", function (params) {
-                    document.getElementById('graph-inspector').style.display = 'block';
-                    if (params.nodes.length > 0) {
-                        document.getElementById('graph-raw-json').innerText = JSON.stringify(rawNodes[params.nodes[0]], null, 2);
-                    } else if (params.edges.length > 0) {
-                        document.getElementById('graph-raw-json').innerText = JSON.stringify(rawEdges[params.edges[0]], null, 2);
-                    } else {
-                        document.getElementById('graph-inspector').style.display = 'none';
-                    }
-                });
+                document.getElementById('graph-scope').innerText = (data.nodes || []).length
+                    ? `${data.nodes.length} nodes · ${(data.edges || []).length} edges for ${uuid}`
+                    : (data.empty_reason || 'No graph rows for this video yet.');
+                renderLegend('graph-legend', null);
+                videoNet = renderGraph('network-canvas', 'graph-inspector',
+                                       'graph-raw-json', data);
+                renderSharedEntities(data.shared_entities || []);
+            }).catch(() => {
+                document.getElementById('graph-scope').innerText = 'Graph fetch failed.';
             });
+        }
+
+        /* Cross-video links, listed rather than left to be discovered by
+           dragging nodes around. Clicking one opens that reel. */
+        function renderSharedEntities(shared) {
+            const panel = document.getElementById('shared-panel');
+            const list = document.getElementById('shared-list');
+            if (!shared.length) { panel.style.display = 'none'; return; }
+            panel.style.display = 'block';
+            list.innerHTML = shared.map(s => {
+                const others = (s.videos || []).map(v =>
+                    `<div class="krow" onclick="loadDeepDive('${esc(v)}')">🎥 ${esc(v)}</div>`).join('');
+                return `<div style="margin-bottom:10px;">
+                    <div style="font-size:0.82em;color:#ff0066;margin-bottom:4px;">
+                        ${esc(s.entity)} <span style="color:#8b949e;">· ${esc(s.n)} other${s.n === 1 ? '' : 's'}</span>
+                    </div>${others}</div>`;
+            }).join('');
         }
 
         // Scrubber Logic
@@ -256,6 +460,10 @@
                     else { div.innerText = JSON.stringify(data.vector, null, 1); }
                 });
         }
+
+        // The corpus graph is the landing view — the main area used to sit
+        // blank until a video was clicked.
+        loadGlobalGraph();
     </script>
 </body>
 </html>

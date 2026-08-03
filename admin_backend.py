@@ -28,7 +28,9 @@ import shutil
 import json
 import time
 
-from config import LAKE_DIR, DB_PATH, VIDEO_DIR, THUMB_DIR, SQLITE_TIMEOUT
+from config import (LAKE_DIR, DB_PATH, VIDEO_DIR, THUMB_DIR, SQLITE_TIMEOUT,
+                    BASE_DIR, SCRATCH_DIR, MODEL_CACHE_DIR, QDRANT_PATH,
+                    NEO4J_DATA_DIR, ARCHIVE_DIR)
 from logger import vios_log, get_recent_logs
 from queue_manager import get_redis, get_queue_metrics
 
@@ -36,10 +38,12 @@ admin_router = APIRouter()
 
 # ---------------------------------------------------------------------------
 # Disk-usage cache (avoids re-walking the filesystem on every request)
+# The walk now covers the model cache and vector store too — tens of thousands
+# of files — so the TTL is longer than the original 5 s.
 # ---------------------------------------------------------------------------
 _disk_cache: dict = {}
 _disk_cache_ts: float = 0.0
-_DISK_CACHE_TTL: float = 5.0  # seconds
+_DISK_CACHE_TTL: float = 20.0  # seconds
 
 
 def _bytes_to_gb(b) -> float:
@@ -59,6 +63,36 @@ def _dir_size(path: str) -> int:
     except OSError:
         pass
     return total
+
+
+def _free_bytes(path: str) -> int:
+    """Free bytes on the mount holding *path*, walking up to the first real
+    directory (the path may not exist yet on a cold boot)."""
+    try:
+        probe = path
+        while probe and not os.path.isdir(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        return shutil.disk_usage(probe).free
+    except OSError:
+        return 0
+
+
+def _host_usage() -> dict:
+    """The physical mount's own numbers, kept strictly separate from VIOS's
+    footprint. On shared infrastructure most of `used` belongs to other
+    tenants, so this is context for headroom — never a VIOS measurement."""
+    try:
+        probe = SCRATCH_DIR if os.path.isdir(SCRATCH_DIR) else "/"
+        usage = shutil.disk_usage(probe)
+        return {"total_gb": _bytes_to_gb(usage.total),
+                "used_gb": _bytes_to_gb(usage.used),
+                "free_gb": _bytes_to_gb(usage.free),
+                "path": probe}
+    except OSError:
+        return {"total_gb": 0, "used_gb": 0, "free_gb": 0, "path": "?"}
 
 
 def _get_db() -> sqlite3.Connection:
@@ -108,8 +142,29 @@ def serve_admin_ui():
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# 2. GET /api/admin/disk — Disk usage breakdown (cached 5 s)
+# 2. GET /api/admin/disk — VIOS's own storage footprint (cached)
+#
+# This reports what VIOS is using, NOT what the host disk holds. The previous
+# version took shutil.disk_usage(VIDEO_DIR).used as the headline, which on
+# Kaggle is the whole /kaggle mount — every other tenant's data included. It
+# read "7075 GB used of 8062 GB" with "Other 7065 GB", i.e. 99.9% of the panel
+# was somebody else's bytes and the four real numbers were invisible next to
+# them. `used` is now the sum of the directories VIOS actually writes, and
+# host free space is reported separately as headroom, clearly labelled.
 # ───────────────────────────────────────────────────────────────────────────
+_DISK_CATEGORIES = (
+    # (key, label, path, tier)  — tier is where the bytes live
+    ("videos",     "Videos",      None,             "scratch"),  # computed below
+    ("frames",     "Frames",      None,             "scratch"),  # computed below
+    ("thumbnails", "Thumbnails",  THUMB_DIR,        "scratch"),
+    ("models",     "Model cache", MODEL_CACHE_DIR,  "scratch"),
+    ("qdrant",     "Vectors",     QDRANT_PATH,      "scratch"),
+    ("neo4j",      "Graph",       NEO4J_DATA_DIR,   "scratch"),
+    ("archive",    "Omni archive", ARCHIVE_DIR,     "scratch"),
+    ("datalake",   "Data lake",   LAKE_DIR,         "output"),
+)
+
+
 @admin_router.get("/api/admin/disk")
 def get_disk_usage():
     global _disk_cache, _disk_cache_ts
@@ -134,23 +189,41 @@ def get_disk_usage():
                 except OSError:
                     pass
 
-        thumbnails_bytes = _dir_size(THUMB_DIR) if os.path.isdir(THUMB_DIR) else 0
+        sizes = {"videos": videos_bytes, "frames": frames_bytes}
+        for key, _label, path, _tier in _DISK_CATEGORIES:
+            if key in sizes:
+                continue
+            sizes[key] = _dir_size(path) if path and os.path.isdir(path) else 0
 
-        usage = shutil.disk_usage(VIDEO_DIR if os.path.exists(VIDEO_DIR) else "/")
-        known = videos_bytes + frames_bytes + thumbnails_bytes
+        vios_bytes = sum(sizes.values())
+
+        # Free space per tier: the OUTPUT quota and the SCRATCH pool are
+        # different mounts with different lifetimes, so a single "free" number
+        # can't answer "will the next download fit?". Both are reported.
+        tier_bytes = {"scratch": 0, "output": 0}
+        for key, _label, _path, tier in _DISK_CATEGORIES:
+            tier_bytes[tier] = tier_bytes.get(tier, 0) + sizes.get(key, 0)
 
         _disk_cache = {
-            "total_gb": _bytes_to_gb(usage.total),
-            "used_gb": _bytes_to_gb(usage.used),
-            "free_gb": _bytes_to_gb(usage.free),
+            # Headline: VIOS's footprint, not the host's.
+            "vios_used_gb": _bytes_to_gb(vios_bytes),
             "video_file_count": video_file_count,
             "frame_folder_count": frame_folder_count,
-            "breakdown": {
-                "videos_gb": _bytes_to_gb(videos_bytes),
-                "frames_gb": _bytes_to_gb(frames_bytes),
-                "thumbnails_gb": _bytes_to_gb(thumbnails_bytes),
-                "other_gb": _bytes_to_gb(max(usage.used - known, 0)),
+            "breakdown": {f"{k}_gb": _bytes_to_gb(v) for k, v in sizes.items()},
+            "labels": {k: label for k, label, _p, _t in _DISK_CATEGORIES},
+            "tiers": {
+                "scratch": {"path": SCRATCH_DIR,
+                            "free_gb": _bytes_to_gb(_free_bytes(SCRATCH_DIR)),
+                            "used_gb": _bytes_to_gb(tier_bytes["scratch"]),
+                            "note": "ephemeral — cleared when the session ends"},
+                "output": {"path": BASE_DIR,
+                           "free_gb": _bytes_to_gb(_free_bytes(BASE_DIR)),
+                           "used_gb": _bytes_to_gb(tier_bytes["output"]),
+                           "note": "kept across sessions — counts against quota"},
             },
+            # Kept for callers that still read the old field names. These are
+            # the HOST's numbers and are labelled as such in the UI.
+            "host": _host_usage(),
         }
         _disk_cache_ts = now
         return _disk_cache
