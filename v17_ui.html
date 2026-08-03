@@ -261,6 +261,25 @@ header.topbar {
 }
 .speed-group button + button { border-left: 1px solid var(--border); }
 .speed-group button.sel { background: var(--accent-dim); color: var(--accent); }
+/* ── Reel audio ──
+   The viewer is a canvas frame scrubber, so sound comes from a detached
+   <audio> pointed at the source mp4 and slaved to the playhead. These style
+   the mute toggle + volume slider that ride in the control row. */
+.aud-wrap { display: flex; align-items: center; gap: 6px; }
+.aud-wrap.off { opacity: 0.45; }
+.aud-vol {
+  width: 74px; height: 4px; -webkit-appearance: none; appearance: none;
+  background: var(--border); border-radius: 2px; outline: none; cursor: pointer;
+}
+.aud-vol::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); cursor: pointer;
+}
+.aud-vol::-moz-range-thumb {
+  width: 12px; height: 12px; border: none; border-radius: 50%;
+  background: var(--accent); cursor: pointer;
+}
+.tbtn.on { border-color: var(--accent); color: var(--accent); }
 .jump-wrap { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .jump-input {
   width: 72px; background: var(--surface); border: 1px solid var(--border);
@@ -409,6 +428,28 @@ header.topbar {
   display: block; margin-top: 3px;
 }
 .tl-detail .flag { color: var(--warn); font-weight: 500; }
+
+/* ── Chunk clip player ──
+   The narrative lane describes an audio+video slice, so the row detail carries
+   the slice itself: hear the speech while reading what the model wrote about
+   it. Laid out beside the text rather than above it, to keep the timeline
+   from pushing the transport off-screen. */
+.tl-clip { display: flex; gap: 12px; align-items: flex-start; }
+.tl-clip-body { flex: 1; min-width: 0; }
+.tl-clip video {
+  width: 168px; flex-shrink: 0; border-radius: 6px; background: #000;
+  border: 1px solid var(--border); display: block;
+}
+.tl-clip-miss {
+  width: 168px; flex-shrink: 0; border-radius: 6px; background: var(--surface);
+  border: 1px dashed var(--border); font-family: var(--font-mono);
+  font-size: 9.5px; color: var(--text-faint); padding: 14px 10px;
+  text-align: center; line-height: 1.5;
+}
+.tl-clip-note {
+  font-family: var(--font-mono); font-size: 9px; color: var(--text-faint);
+  margin-top: 4px; text-align: center;
+}
 #histCanvas { width: 100%; height: 96px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); display: block; }
 .hist-legend { display: flex; gap: 12px; margin-top: 8px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); }
 .hist-legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
@@ -611,6 +652,15 @@ table.db-table { border-collapse: collapse; width: 100%; font-size: 12px; }
               <button data-sp="2" onclick="setSpeed(2)">2x</button>
               <button data-sp="4" onclick="setSpeed(4)">4x</button>
             </div>
+            <!-- Sound for the frame scrubber. The <audio> itself is created in
+                 JS and never enters the layout; these only drive it. -->
+            <div class="aud-wrap off" id="audWrap" title="Reel audio, locked to the playhead">
+              <button class="tbtn" id="btnMute" onclick="toggleAudio()" title="Toggle reel audio (M)">
+                <span id="audIcon">🔇</span>
+              </button>
+              <input class="aud-vol" id="audVol" type="range" min="0" max="1" step="0.05" value="1"
+                     oninput="setAudioVolume(this.value)" title="Volume">
+            </div>
             <div class="jump-wrap">
               <input class="jump-input" id="jumpInput" type="number" min="0" step="0.1" placeholder="sec">
               <button class="tbtn" onclick="jumpToSecond()">Jump</button>
@@ -784,6 +834,10 @@ let transcript = [];             // [{start_sec, end_sec, text}] sorted
 
 /* realtime fps measurement */
 let fpsWindowStart = 0, fpsDrawCount = 0, measuredFps = 0;
+
+/* set while playLoop drives the playhead from the audio clock, so scrubTo
+   knows not to seek the audio back to where it already is */
+let syncingFromAudio = false;
 
 /* canvas view */
 const canvas = document.getElementById('viewer');
@@ -993,6 +1047,8 @@ function teardownWorkspace() {
   frameNotes = []; transcript = [];
   lastBitmap = null; lastDrawn = -1; curIdx = 0; frameW = 0; frameH = 0;
   measuredFps = 0; fpsDrawCount = 0; fpsWindowStart = 0;
+  syncingFromAudio = false;
+  attachAudio(null);            // stops the reel and cancels its range request
   currentFolder = null; currentMeta = null;
   updateRamPanel();
 }
@@ -1034,6 +1090,9 @@ async function openWorkspace(folderId, push = true) {
     $('tcEnd').textContent = dur.toFixed(3);
     $('scrubber').max = Math.max(0, frameNames.length - 1);
     $('scrubber').value = 0;
+    // Metadata only — the mp4 streams by range request when playback starts,
+    // so this costs a few KB even on a long reel.
+    attachAudio(folderId);
 
     if (!data.is_complete) startExtractionPoll(folderId, data.total_expected);
     else $('extractChip').classList.remove('on');
@@ -1387,9 +1446,13 @@ let tlNotes = [];                // sqlite: frame_notes
 let tlDuration = 0;
 let tlSources = {};
 let tlPinned = null;             // {lane, i} when the user clicks a block
+let tlDetailKey = '';            // identity of the row currently rendered
 
 async function loadOmniTimeline(folderId, mySession) {
   omniChunks = []; tlNotes = []; tlSources = {}; tlPinned = null;
+  // Opening a different reel must force a re-render even if the new reel's
+  // first chunk happens to produce the same identity key.
+  tlDetailKey = ''; tlClipKey = ''; tlClipEl = null;
   $('omniDesc').textContent = 'Loading narrative…';
   $('omniDesc').classList.add('dim');
   $('omniSrc').textContent = '';
@@ -1586,6 +1649,7 @@ function pinTimeline(lane, i, seekTo) {
     scrubTo(Math.round(seekTo * nativeFps));
   }
   tlPinned = { lane, i };
+  tlDetailKey = '';             // force a redraw: the pin changes what is shown
   renderTimelineDetail();
 }
 
@@ -1609,8 +1673,16 @@ function renderTimelineDetail() {
 
   if (!row) {
     el.innerHTML = '<span class="dim">No rows for this video yet — run the pipeline, then reopen.</span>';
+    tlDetailKey = '';
     return;
   }
+
+  // This runs on every frame step during playback. Nothing below changes until
+  // the resolved row does, so re-rendering the same row would only flicker the
+  // panel and re-lay-out the clip player 30 times a second.
+  const key = `${lane}|${row.chunk_id || row.frame_idx || row.start_sec}|${tlPinned ? 'p' : ''}`;
+  if (key === tlDetailKey) return;
+  tlDetailKey = key;
 
   const meta = tlSources[lane === 'narr' ? 'chunks' : lane === 'speech' ? 'transcript' : 'notes'] || {};
   const srcLine = `${meta.store || '—'} · ${meta.table || '—'} · ${meta.key || ''}`;
@@ -1621,11 +1693,14 @@ function renderTimelineDetail() {
       ? new Date(row.created_at * 1000).toLocaleString('en-GB')
       : 'unknown (pre-fix row)';
     el.innerHTML =
+      `<div class="tl-clip"><div id="tlClipSlot"></div><div class="tl-clip-body">` +
       (dup ? `<span class="flag">⚠ this exact text is on ${row.corpus_copies} chunks corpus-wide — regenerate this reel</span><br>` : '') +
       escapeHtml(row.description || '—') +
       `<span class="src">${escapeHtml(row.chunk_id || '')} · ${row.start_t.toFixed(1)}s–${row.end_t.toFixed(1)}s` +
       ` · generated ${escapeHtml(when)}${row.gen_ms ? ` in ${row.gen_ms} ms` : ''}${row.mode ? ` · ${escapeHtml(row.mode)}` : ''}` +
-      `<br>${escapeHtml(srcLine)}</span>`;
+      `<br>${escapeHtml(srcLine)}</span>` +
+      `</div></div>`;
+    mountChunkClip($('tlClipSlot'), row);
   } else if (lane === 'speech') {
     el.innerHTML = `🎙 “${escapeHtml(row.text || '')}”` +
       `<span class="src">${row.start_sec.toFixed(2)}s–${row.end_sec.toFixed(2)}s · ${escapeHtml(srcLine)}</span>`;
@@ -1648,6 +1723,54 @@ function renderTimelineDetail() {
   const idx = tlPinned ? tlPinned.i : omniChunks.indexOf(row);
   const blk = $(trackId).children[idx];
   if (blk) blk.classList.add('sel');
+}
+
+/* ── Chunk clip player, preserved across re-renders ──
+   renderTimelineDetail() runs on every frame step (scrubTo → updateIntel), so
+   rebuilding the <video> each time would kill playback the moment it started
+   and re-request the file dozens of times a second. The element is created
+   once per chunk and re-parented into each fresh detail block; only a genuine
+   change of chunk swaps its src. */
+let tlClipEl = null;         // the live <video>, or a placeholder div
+let tlClipKey = '';          // folder + start_t currently mounted
+
+function mountChunkClip(slot, row) {
+  if (!slot) return;
+  const key = `${currentFolder}@${row.start_t}`;
+
+  if (tlClipKey !== key || !tlClipEl) {
+    tlClipKey = key;
+    const v = document.createElement('video');
+    v.controls = true;
+    v.playsInline = true;
+    v.preload = 'metadata';
+    v.src = `/api/chunk-media/${encodeURIComponent(currentFolder)}`
+          + `/${encodeURIComponent(row.start_t)}`;
+    // Chunk clips live in scratch, which Kaggle wipes between sessions, so a
+    // missing file is expected on an older reel. Say that rather than leaving
+    // a dead player on screen.
+    v.addEventListener('error', () => {
+      const miss = document.createElement('div');
+      miss.className = 'tl-clip-miss';
+      miss.innerHTML = 'clip not in scratch<br>reprocess to restore';
+      if (tlClipEl && tlClipEl.parentNode) tlClipEl.parentNode.replaceChild(miss, tlClipEl);
+      tlClipEl = miss;
+    }, { once: true });
+    // Two sources, one pair of ears: playing the chunk clip stops the reel.
+    v.addEventListener('play', () => {
+      stopPlayback();
+      if (reelAudio) reelAudio.pause();
+    });
+    tlClipEl = v;
+  }
+
+  slot.appendChild(tlClipEl);
+  if (tlClipEl.tagName === 'VIDEO') {
+    const note = document.createElement('div');
+    note.className = 'tl-clip-note';
+    note.textContent = '▶ audio + video for this chunk';
+    slot.appendChild(note);
+  }
 }
 
 function escapeHtml(s) {
@@ -1724,6 +1847,120 @@ function updateIntel() {
   renderTimelineDetail();
 }
 
+/* ═══════════ REEL AUDIO ═══════════
+   The viewer paints JPEGs onto a canvas, so there is no media element to carry
+   sound. A detached <audio> pointed at the source mp4 supplies it: during
+   playback the audio element is the clock and the frame index follows it, which
+   keeps picture and speech locked together no matter how far the rAF loop
+   drifts. Outside playback the relationship inverts and the playhead seeks the
+   audio. The element is never appended to the DOM — nothing about it should be
+   visible except the mute toggle. */
+let reelAudio = null;            // HTMLAudioElement once a reel is open
+let audioReady = false;          // metadata arrived, so duration/seek are usable
+let audioOn = false;             // user has unmuted for this session
+let audioVol = 1;
+
+function renderAudioBtn() {
+  const wrap = $('audWrap'), icon = $('audIcon'), btn = $('btnMute');
+  const live = audioOn && audioReady;
+  wrap.classList.toggle('off', !live);
+  btn.classList.toggle('on', live);
+  icon.textContent = live ? '🔊' : '🔇';
+  wrap.title = !reelAudio ? 'No reel audio for this dataset'
+    : !audioReady ? 'Loading reel audio…'
+    : live ? 'Reel audio on — locked to the playhead'
+    : 'Reel audio muted — click to hear the reel while it plays';
+}
+
+/* Point the audio at a reel, or tear the current one down with attachAudio(null). */
+function attachAudio(folderId) {
+  if (reelAudio) {
+    reelAudio.pause();
+    reelAudio.removeAttribute('src');   // stops an in-flight range request
+    reelAudio.load();
+    reelAudio = null;
+  }
+  audioReady = false;
+  if (!folderId) { renderAudioBtn(); return; }
+
+  const msgId = folderId.replace('frames_', '');
+  const a = new Audio();
+  a.preload = 'metadata';
+  a.volume = audioVol;
+  // Muted until the user asks for sound: opening a reel should never make
+  // noise on its own, and browsers block unprompted audible playback anyway.
+  a.muted = !audioOn;
+  a.addEventListener('loadedmetadata', () => {
+    if (a !== reelAudio) return;
+    audioReady = true;
+    renderAudioBtn();
+  });
+  // A reel harvested without an audio track, or an mp4 evicted from storage.
+  a.addEventListener('error', () => {
+    if (a !== reelAudio) return;
+    audioReady = false;
+    renderAudioBtn();
+  });
+  // The frame loop wraps to 0 at the end of the reel, so the sound has to wrap
+  // with it — otherwise the second pass round plays silently.
+  a.addEventListener('ended', () => {
+    if (a !== reelAudio || !playing) return;
+    a.currentTime = 0;
+    a.play().catch(() => {});
+  });
+  a.src = `/data/video_${encodeURIComponent(msgId)}.mp4`;
+  reelAudio = a;
+  renderAudioBtn();
+}
+
+function toggleAudio() {
+  audioOn = !audioOn;
+  if (reelAudio) {
+    reelAudio.muted = !audioOn;
+    if (audioOn) {
+      syncAudioToFrame(true);
+      // Unmuting mid-playback should start the sound immediately, not at the
+      // next play press.
+      if (playing) reelAudio.play().catch(() => {});
+    } else {
+      reelAudio.pause();
+    }
+  }
+  renderAudioBtn();
+  showToast(audioOn ? '🔊 Reel audio on' : '🔇 Reel audio muted');
+}
+
+function setAudioVolume(v) {
+  audioVol = Math.max(0, Math.min(1, parseFloat(v) || 0));
+  if (reelAudio) reelAudio.volume = audioVol;
+}
+
+/* Move the audio to wherever the playhead is. Small drifts are ignored:
+   seeking on every frame step would stutter the decoder into silence. */
+function syncAudioToFrame(force = false) {
+  if (!reelAudio || !audioReady) return;
+  const ts = frameTs(curIdx);
+  if (force || Math.abs(reelAudio.currentTime - ts) > 0.12) {
+    try { reelAudio.currentTime = ts; } catch (e) { /* seek before ready */ }
+  }
+}
+
+/* Frame index whose timestamp is the first at or after `sec`. */
+function frameIdxAtSec(sec) {
+  let lo = 0, hi = frameNames.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frameTs(mid) < sec) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/* Two players, one pair of ears. A chunk clip in the Timeline detail takes
+   priority: starting it stops the reel. */
+function pauseChunkClip() {
+  if (tlClipEl && tlClipEl.tagName === 'VIDEO' && !tlClipEl.paused) tlClipEl.pause();
+}
+
 /* ═══════════ TRANSPORT ═══════════ */
 function scrubTo(idx, force = false) {
   idx = Math.max(0, Math.min(idx, frameNames.length - 1));
@@ -1740,6 +1977,9 @@ function scrubTo(idx, force = false) {
   requestDraw(idx);
   decodeAhead(idx);
   updateIntel();
+  // During playback the audio is the clock, so seeking it here would fight the
+  // element and stutter. Every other move of the playhead drags it along.
+  if (!syncingFromAudio) syncAudioToFrame();
 }
 
 $('scrubber').addEventListener('input', e => { stopPlayback(); scrubTo(parseInt(e.target.value, 10)); });
@@ -1759,13 +1999,27 @@ function playLoop(ts) {
     $('miPlayFps').textContent = `${measuredFps.toFixed(1)} fps`;
   }
 
-  playAccum += dt * nativeFps * speed;
-  if (playAccum >= 1) {
-    const step = Math.floor(playAccum);
-    playAccum -= step;
-    let next = curIdx + step;
-    if (next >= frameNames.length) { next = 0; } // loop
-    if (hasAnyBlob(next) || bitmapCache.has(next)) scrubTo(next);
+  // With sound on, the audio element is the clock: the frame index is derived
+  // from its currentTime so speech never slides out of step with the picture,
+  // however unevenly the rAF loop or the decoder runs. Muted, the original
+  // accumulator drives playback exactly as before.
+  const audible = audioOn && audioReady && reelAudio && !reelAudio.paused;
+  if (audible) {
+    const next = frameIdxAtSec(reelAudio.currentTime);
+    if (next !== curIdx && (hasAnyBlob(next) || bitmapCache.has(next))) {
+      syncingFromAudio = true;
+      scrubTo(next);
+      syncingFromAudio = false;
+    }
+  } else {
+    playAccum += dt * nativeFps * speed;
+    if (playAccum >= 1) {
+      const step = Math.floor(playAccum);
+      playAccum -= step;
+      let next = curIdx + step;
+      if (next >= frameNames.length) { next = 0; } // loop
+      if (hasAnyBlob(next) || bitmapCache.has(next)) scrubTo(next);
+    }
   }
   requestAnimationFrame(playLoop);
 }
@@ -1774,26 +2028,39 @@ function togglePlay() {
   if (!frameNames.length) return;
   playing = !playing;
   $('btnPlay').textContent = playing ? 'Pause' : 'Play';
-  if (playing) { lastRaf = 0; playAccum = 0; fpsWindowStart = 0; fpsDrawCount = 0; requestAnimationFrame(playLoop); }
-  else { $('hudFps').textContent = '—'; $('miPlayFps').textContent = '—'; }
+  if (playing) {
+    lastRaf = 0; playAccum = 0; fpsWindowStart = 0; fpsDrawCount = 0;
+    if (audioOn && reelAudio && audioReady) {
+      pauseChunkClip();
+      reelAudio.playbackRate = speed;
+      syncAudioToFrame(true);
+      // Rejected autoplay leaves the reel silent rather than stuck: the frame
+      // loop falls back to its accumulator on the very next tick.
+      reelAudio.play().catch(() => {});
+    }
+    requestAnimationFrame(playLoop);
+  } else {
+    if (reelAudio) reelAudio.pause();
+    $('hudFps').textContent = '—'; $('miPlayFps').textContent = '—';
+  }
 }
 function stopPlayback() {
   if (playing) { playing = false; $('btnPlay').textContent = 'Play'; $('hudFps').textContent = '—'; $('miPlayFps').textContent = '—'; }
+  if (reelAudio) reelAudio.pause();
 }
 function setSpeed(m) {
   speed = m;
+  // Browsers only pitch-correct roughly 0.25x–4x; outside that they mute the
+  // track, which is the same range the transport offers, so a plain assignment
+  // is safe here.
+  if (reelAudio) reelAudio.playbackRate = m;
   document.querySelectorAll('#speedGroup button').forEach(b => b.classList.toggle('sel', parseFloat(b.dataset.sp) === m));
 }
 function jumpToSecond() {
   const sec = parseFloat($('jumpInput').value);
   if (isNaN(sec) || !frameNames.length) return;
   stopPlayback();
-  let lo = 0, hi = frameNames.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (frameTs(mid) < sec) lo = mid + 1; else hi = mid;
-  }
-  scrubTo(lo);
+  scrubTo(frameIdxAtSec(sec));
 }
 $('jumpInput').addEventListener('keydown', e => { if (e.key === 'Enter') jumpToSecond(); });
 
@@ -1820,6 +2087,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') { stopPlayback(); scrubTo(curIdx + (e.shiftKey ? 10 : 1)); }
   else if (e.key === 'Home') { stopPlayback(); scrubTo(0); }
   else if (e.key === 'End') { stopPlayback(); scrubTo(frameNames.length - 1); }
+  else if (e.key === 'm' || e.key === 'M') { toggleAudio(); }
 });
 
 /* ═══════════ ZOOM / PAN ═══════════ */

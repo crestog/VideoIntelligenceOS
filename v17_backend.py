@@ -34,7 +34,7 @@ import time
 from fastapi import APIRouter, Response, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from config import (DB_PATH, VIDEO_DIR, THUMB_DIR, BATCH_FRAME_COUNT,
-                    PREVIEW_DIR_NAME, SQLITE_TIMEOUT)
+                    PREVIEW_DIR_NAME, SQLITE_TIMEOUT, ARCHIVE_DIR)
 from logger import vios_log, get_recent_logs
 
 v17_router = APIRouter()
@@ -348,6 +348,51 @@ def get_single_frame(folder_name: str, idx: int, tier: str = "preview"):
         raise HTTPException(status_code=404, detail="Frame not found")
     return FileResponse(path, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+# ═══════════════════════════════════════════════════════════
+# CHUNK MEDIA — the audio+video slice a narrative was generated from
+#
+# omni_engine's Flask app serves the same files, but v17 is same-origin with
+# this FastAPI app and can only reach Flask through the /omni proxy — which
+# 502s whenever the Omniscient engine is down, taking chunk playback with it.
+# The chunk files are plain files on disk, so serve them here directly.
+# ═══════════════════════════════════════════════════════════
+@v17_router.get("/api/chunk-media/{folder_name}/{start_t}")
+def get_chunk_media(folder_name: str, start_t: str):
+    """Serve chunk_<start_t>.mp4 for a reel. Carries the AAC track ffmpeg
+    muxed in at split time, so the caller hears the audio under the transcript.
+
+    folder_name is v17's 'frames_<msg_id>'; the archive is keyed by the
+    Omniscient 'tg<msg_id>' uuid.
+    """
+    if not FOLDER_RE.match(folder_name):
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    try:
+        t = float(start_t)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid start time")
+
+    v_uuid = f"tg{folder_name.replace('frames_', '')}"
+    chunk_dir = os.path.join(ARCHIVE_DIR, f"{v_uuid}_chunks")
+    # omni_engine names files from the float that produced them, so 10.0s is
+    # written as either chunk_10.mp4 or chunk_10.0.mp4 depending on the mode's
+    # chunk length. Try the integer form first, then the exact float.
+    names = []
+    if t.is_integer():
+        names.append(f"chunk_{int(t)}.mp4")
+    names.append(f"chunk_{t}.mp4")
+    names.append(f"chunk_{start_t}.mp4")
+
+    for name in names:
+        path = os.path.join(chunk_dir, name)
+        if os.path.exists(path):
+            # conditional=True gives Range support, without which <video>
+            # seeking inside the clip does not work in Chrome.
+            return FileResponse(path, media_type="video/mp4",
+                                headers={"Cache-Control": "public, max-age=86400"})
+    raise HTTPException(status_code=404,
+                        detail="Chunk clip not on disk — scratch may have been cleared")
 
 
 # ═══════════════════════════════════════════════════════════
