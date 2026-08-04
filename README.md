@@ -79,15 +79,35 @@ the machine**, so it doubles as the backup target.
 
 A bundle is `index.sqlite.zst` (a `VACUUM INTO` snapshot of the harvest DB) plus
 `omnidb.sql.zst` (`pg_dump` of frames, chunks and narratives), zstd-compressed
-and split into ≤480 MB parts. Qdrant vectors and the Neo4j graph are deliberately
+and split into ≤18 MB parts. Qdrant vectors and the Neo4j graph are deliberately
 omitted: both are derived from the frames and narratives, and rebuilding beats
 replicating gigabytes.
 
 The invariant that makes it safe: **a bundle exists if and only if its manifest
 message is posted.** Parts upload first and are inert on their own, so a run that
 dies halfway leaves unreferenced parts rather than a corrupt bundle that restore
-might believe. The manifest carries every part's `message_id` and SHA-256, so the
-channel is self-describing given only a bot token — no external metadata store.
+might believe. The manifest carries every part's `message_id`, `file_id` and
+SHA-256, so the channel is self-describing given only a bot token — no external
+metadata store.
+
+**Why 18 MB parts, and why HTTP instead of pyrogram.** Transfers go through the
+Bot API (`tg_transport.py`), not MTProto. MTProto allows 2 GB files, but its
+`send_document` has no timeout anywhere in its path: a stalled upload blocks
+forever while the job still reports `running`, which is exactly how an export
+came to sit at "72%" indefinitely. The Bot API gives a deadline on every request,
+bounded retries, and byte-level progress — at the cost of a 50 MB upload cap and,
+the binding one, a **20 MB cap on `getFile`**. A part that cannot be downloaded
+is not a backup, so the part size is set by the download limit, not the upload
+one. Bots also cannot look up an arbitrary message id, hence the `file_id` in the
+manifest.
+
+Progress is real: bytes sent against bytes total, a measured rate, an ETA, and a
+stall counter that starts at the last byte rather than the last part. Past 45 s
+of no movement the panel says so. **Cancel** stops between parts and keeps the
+finished ones, so the next run resumes — the manifest is still posted only at the
+end, so a resumed bundle is as valid as an uninterrupted one. **Test Connection**
+answers in one second whether the token can reach the channel at all, which
+otherwise took a whole failed export to discover.
 
 ### Restore → channel → database (`db_restore.py`)
 
@@ -117,6 +137,62 @@ ignition, and `omni_engine` has not started PostgreSQL by then — a restore tha
 recovers the harvest DB while silently dropping the narratives is worse than
 none. `boot.py` prints a hint when a fresh container has an empty database, and
 the work happens in `/admin` against live services.
+
+**What a restore will do, before it does it.** The plan lists every target with
+its verdict — *replaced*, *rebuilt from what was replaced*, or *left alone* — so
+Qdrant and Neo4j being absent from the bundle is stated rather than discovered.
+After an apply, the outcome panel reports what actually loaded, the row counts
+before and after, whether they match the manifest, where the pre-restore snapshot
+went, and what to do next.
+
+---
+
+## ⏸️ One pause, and one reset
+
+### Global pause (`system_control.py`)
+
+Pause used to be three unrelated half-measures: `CV_PAUSED` was only read in the
+queue-empty branch, so pressing Pause under load did nothing; `OMNI_PAUSED`
+covered only the Omniscient engine; and the harvester had no flag at all, so
+downloads kept filling the disk the pause was usually pressed to protect.
+
+There is now one `VIOS_PAUSED` key, ORed with a per-component key so a single
+stage can be stopped without stopping the rest. Every consumer checks it **before
+`claim_job`**, not after — including inside the harvester's inner download loop,
+which can run for hours without returning to the outer one. Components heartbeat
+each cycle (`VIOS_HB:<component>`, 90 s TTL), so the panel draws *requested* and
+*observed* state separately. That distinction matters: a dead worker also stops
+claiming jobs, and used to be indistinguishable from an obedient one.
+
+### Factory reset (`/admin` → Factory Reset)
+
+Nine targets, each **measured in real bytes before the click** — on a Kaggle box
+the only question is how much this frees. The re-derivable ones (media, vectors,
+graph, queues, exports, session files) default on; PostgreSQL, `lake.db` and the
+28 GB model cache are opt-in per click. The confirmation phrase `DELETE
+EVERYTHING` is validated inside `start_reset`, not in the route, so it cannot be
+skipped by calling the module directly.
+
+Order is load-bearing:
+
+* **Neo4j is stopped before its store is deleted.** A live store manager rewrites
+  the files it was told to forget, and the restart then finds a half-deleted
+  database it refuses to open.
+* **Redis' `flushall` takes the pause flags with it,** so they are re-applied
+  immediately after — the reset is not over.
+* **Workers are killed, not reasoned with.** `boot.py`'s watchdog restarts them
+  in 3 s against a machine that no longer holds what they had open. `ui_server`
+  is deliberately *not* killed: it is the process running the reset.
+* **That exception is why `lake_schema.py` exists.** `lake.db`'s schema was only
+  ever created by `ui_server`'s `__main__`, so deleting the file left the
+  harvester's next INSERT hitting `no such table: posts` until the container was
+  rebooted. The reset re-applies the schema the moment the file is gone — the
+  database comes back *empty*, not *missing*. Every other target self-heals when
+  the watchdog restarts its owner.
+
+**The Telegram channel is never touched.** Reels and uploaded bundles stay
+exactly where they are; the panel says so on screen next to the button, because
+a reset with no bundle anywhere is permanent and that belongs before the click.
 
 ---
 
