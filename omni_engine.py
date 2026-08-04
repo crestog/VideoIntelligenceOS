@@ -174,10 +174,30 @@ def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_i
 # WORKER 1 — VISION (frames → depth/motion → SigLIP/CLIP → PG + Qdrant)
 # ═══════════════════════════════════════════════════════════
 def _paused():
+    """True when the Omniscient workers should hold.
+
+    Delegates to system_control so the global VIOS_PAUSED switch stops these
+    loops too — OMNI_PAUSED alone only ever covered this engine, and "pause
+    everything" has to mean everything. The old direct Redis read is the
+    fallback for the case where system_control cannot be imported.
+    """
     try:
-        return REDIS.get("OMNI_PAUSED") == "1"
+        from system_control import is_paused
+        return is_paused("omni")
     except Exception:
-        return False
+        try:
+            return REDIS.get("OMNI_PAUSED") == "1"
+        except Exception:
+            return False
+
+
+def _hb(component, state, detail=""):
+    """Report this worker's real state to the admin panel. Best-effort."""
+    try:
+        from system_control import heartbeat
+        heartbeat(component, state, detail)
+    except Exception:
+        pass
 
 
 def process_vision_job(payload):
@@ -340,13 +360,16 @@ def vision_worker_loop():
     while True:
         try:
             if _paused():
+                _hb("omni:vision", "paused")
                 time.sleep(2)
                 continue
             job, job_raw = claim_job(QUEUE_OMNI_VISION, timeout=3)
             if not job:
+                _hb("omni:vision", "idle", "queue empty")
                 continue
             payload = job.get("payload", job)
             v_uuid = payload.get("uuid", "?")
+            _hb("omni:vision", "running", v_uuid)
             try:
                 n = process_vision_job(payload)
                 REDIS.hset(f"status:{v_uuid}", "vision", "DONE ✅")
@@ -696,13 +719,16 @@ def oracle_worker_loop():
     while True:
         try:
             if _paused():
+                _hb("omni:oracle", "paused")
                 time.sleep(2)
                 continue
             job, job_raw = claim_job(QUEUE_OMNI_ORACLE, timeout=3)
             if not job:
+                _hb("omni:oracle", "idle", "queue empty")
                 continue
             payload = job.get("payload", job)
             v_uuid = payload.get("uuid", "?")
+            _hb("omni:oracle", "running", v_uuid)
             try:
                 n = process_oracle_job(payload)
                 REDIS.hset(f"status:{v_uuid}", "oracle", "DONE ✅")

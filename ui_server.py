@@ -262,41 +262,17 @@ PLAYLIST_LIMIT = 400
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS creators (id INTEGER PRIMARY KEY, username TEXT UNIQUE)")
-    cursor.execute('''CREATE TABLE IF NOT EXISTS posts (video_id INTEGER PRIMARY KEY, category_id INTEGER, creator_id INTEGER, likes INTEGER, caption TEXT, local_video_path TEXT, status TEXT)''')
-    cursor.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS posts_search USING fts5(video_id UNINDEXED, caption, creator, category)''')
-    cursor.execute('''CREATE TRIGGER IF NOT EXISTS sync_posts_search AFTER INSERT ON posts BEGIN INSERT INTO posts_search(video_id, caption, creator, category) VALUES (new.video_id, new.caption, (SELECT username FROM creators WHERE id = new.creator_id), (SELECT name FROM categories WHERE id = new.category_id)); END;''')
-    # Scan coverage: every message id we have ALREADY asked Telegram about,
-    # video or not. Without this, non-video ids (text posts, service messages,
-    # our own deleted ping) are absent from `posts` forever, so each scan
-    # re-fetched them — the channel gap never closed and every cycle replayed
-    # the whole history, which is what triggered the FloodWait storms.
-    cursor.execute("CREATE TABLE IF NOT EXISTS scanned_ids (video_id INTEGER PRIMARY KEY)")
+    """Create lake.db's schema if it is missing.
 
-    # ── Indexes ────────────────────────────────────────────────────────────
-    # Every hot read filters on `local_video_path IS NOT NULL` and then joins
-    # creators/categories. Without these three, each poll from the player (once
-    # per 1.5-3s) was a full table scan plus two nested-loop joins with no index
-    # on either foreign key. That is the bulk of the click latency the UI shows
-    # as "buffering": SQLite held the read lock long enough that the next
-    # request queued behind it.
-    for ddl in (
-        "CREATE INDEX IF NOT EXISTS idx_posts_have_file ON posts(local_video_path)",
-        "CREATE INDEX IF NOT EXISTS idx_posts_category  ON posts(category_id)",
-        "CREATE INDEX IF NOT EXISTS idx_posts_creator   ON posts(creator_id)",
-    ):
-        try:
-            cursor.execute(ddl)
-        except sqlite3.Error as e:
-            logger.warning(f"index skipped ({e})")
-
-    conn.commit()
-    conn.close()
+    The DDL itself lives in lake_schema so the factory reset can re-apply it:
+    a reset deletes lake.db from inside this process, and this process is
+    deliberately not restarted, so the reset — not the next boot — has to be
+    the thing that puts the tables back.
+    """
+    from lake_schema import ensure_lake_schema
+    res = ensure_lake_schema(DB_PATH)
+    for note in res["skipped"]:
+        logger.warning(f"lake schema — {note}")
 
 async def get_playlist_data(category):
     cache_key = f"playlist:{category}"
@@ -349,6 +325,40 @@ async def ensure_web_safe(video_path):
             os.replace(temp_path, video_path)
     except Exception as e: 
         custom_print(f"❌ FFmpeg Error: {e}")
+
+def harvest_heartbeat(state, detail=""):
+    """Tell the admin panel what the harvester is really doing.
+
+    Synchronous and best-effort. It runs on the Ghost Worker's event loop, so
+    it must not block: system_control's Redis handle has a short socket timeout
+    and every failure path there returns rather than raising.
+    """
+    try:
+        from system_control import heartbeat
+        heartbeat("harvest", state, detail)
+    except Exception:
+        pass
+
+
+async def _harvest_paused():
+    """True if the harvester should hold. Sleeps a beat before saying so.
+
+    Returning True means "the caller should `continue`" — the sleep is inside
+    here so a paused loop does not spin, and so the pause is reported on every
+    pass rather than once when it started.
+    """
+    global GLOBAL_STATUS
+    try:
+        from system_control import is_paused
+    except Exception:
+        return False
+    if not is_paused("harvest"):
+        return False
+    GLOBAL_STATUS = "⏸️ Paused by Admin"
+    harvest_heartbeat("paused")
+    await asyncio.sleep(2)
+    return True
+
 
 async def background_downloader():
     global GLOBAL_STATUS, CATEGORY_QUEUE
@@ -403,17 +413,27 @@ async def background_downloader():
 
     import shutil
     while True:
+        # Admin pause. The harvester used to have no pause at all: the panel
+        # could stop the CV engine and the Omniscient workers, but downloads
+        # kept running and kept filling the disk that the pause was usually
+        # pressed to protect. Checked here and again before each download, so a
+        # pause lands within seconds rather than at the end of a scan.
+        if await _harvest_paused():
+            continue
+
         # Guard the scratch tier (where videos/frames land), using the shared
         # threshold rather than a local literal — frame_worker pauses at the
         # same boundary, so the two stay in step.
         free_gb = shutil.disk_usage(VIDEO_DIR).free / (1024**3)
         if free_gb < DISK_DL_PAUSE_GB:
             GLOBAL_STATUS = f"⚠️ Storage Critical ({free_gb:.1f}GB left) - Pausing"
+            harvest_heartbeat("idle", f"disk critical — {free_gb:.1f} GB free")
             await asyncio.sleep(60)
             continue
 
         if not SCAN_TRIGGER.is_set():
             GLOBAL_STATUS = "💤 Idling. Background queue is empty."
+            harvest_heartbeat("idle", "queue empty")
             while not SCAN_TRIGGER.is_set(): await asyncio.sleep(1)
 
         SCAN_TRIGGER.clear()
@@ -523,6 +543,13 @@ async def background_downloader():
                     await asyncio.sleep(5)
 
             while True:
+                # The download loop can run for hours without returning to the
+                # outer loop, so the pause is checked here too — otherwise
+                # pressing Pause during a long harvest would not take effect
+                # until the whole pending list had been downloaded.
+                if await _harvest_paused():
+                    continue
+
                 # Pick up admin panel changes IMMEDIATELY (mid-cycle), not
                 # only at the start of a scan. This is the category-control fix.
                 sync_category_queue()

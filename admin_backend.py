@@ -735,13 +735,16 @@ def get_logs():
 # ───────────────────────────────────────────────────────────────────────────
 @admin_router.post("/api/admin/queue/pause")
 def queue_pause():
-    r = _safe_redis()
-    if r is None:
-        return _error("Redis unavailable", 503)
+    """Legacy single-queue pause, kept so old clients keep working.
+
+    It now goes through system_control so the CV worker's heartbeat and the
+    admin log say the same thing as the global button. Same Redis key as
+    before (CV_PAUSED), so nothing about the wire format changed.
+    """
     try:
-        r.set("CV_PAUSED", "1")
-        vios_log("CV queue PAUSED via admin panel", "ADMIN", "INFO")
-        return {"ok": True, "paused": True}
+        import system_control
+        res = system_control.set_component("cv", True)
+        return res if res.get("ok") else _error(res.get("error"), 503)
     except Exception as exc:
         vios_log(f"Error pausing queue: {exc}", "ADMIN", "ERROR")
         return _error(exc)
@@ -749,13 +752,10 @@ def queue_pause():
 
 @admin_router.post("/api/admin/queue/resume")
 def queue_resume():
-    r = _safe_redis()
-    if r is None:
-        return _error("Redis unavailable", 503)
     try:
-        r.delete("CV_PAUSED")
-        vios_log("CV queue RESUMED via admin panel", "ADMIN", "INFO")
-        return {"ok": True, "paused": False}
+        import system_control
+        res = system_control.set_component("cv", False)
+        return res if res.get("ok") else _error(res.get("error"), 503)
     except Exception as exc:
         vios_log(f"Error resuming queue: {exc}", "ADMIN", "ERROR")
         return _error(exc)
@@ -798,7 +798,51 @@ def export_status():
         # before a run rather than after it has already built a bundle.
         from config import missing_telegram_secrets
         st["telegram_missing"] = missing_telegram_secrets()
+        if st["state"] != "running":
+            st["resumable"] = db_export.resumable_bundle()
         return st
+    except Exception as exc:
+        return _error(exc)
+
+
+@admin_router.post("/api/admin/export/cancel")
+def export_cancel():
+    """Stop a running export.
+
+    Cooperative rather than a kill: the flag is read between stages and inside
+    the upload progress callback, so the thread unwinds cleanly and the parts it
+    already committed stay on disk for the next run to resume from.
+    """
+    try:
+        import db_export
+        res = db_export.cancel_export()
+        if not res.get("ok"):
+            return _error(res.get("error", "Nothing to cancel"), 409)
+        vios_log("Export cancellation requested from admin panel",
+                 "ADMIN", "WARN")
+        return res
+    except Exception as exc:
+        return _error(exc)
+
+
+@admin_router.get("/api/admin/telegram/probe")
+def telegram_probe():
+    """Can we actually reach the channel with the bot token we have?
+
+    Worth its own route: every previous export failure looked identical from the
+    panel (a bar that stopped moving), and about half of them were a missing or
+    wrong credential that this answers in one second without writing anything.
+    """
+    try:
+        from config import missing_telegram_secrets
+        missing = missing_telegram_secrets()
+        import tg_transport as tg
+        if not tg.available():
+            return {"ok": False, "missing": missing,
+                    "error": "VIOS_BOT_TOKEN is not set — export cannot upload."}
+        res = tg.probe()
+        res["missing"] = missing
+        return res
     except Exception as exc:
         return _error(exc)
 
@@ -855,5 +899,122 @@ def restore_status():
         from config import missing_telegram_secrets
         st["telegram_missing"] = missing_telegram_secrets()
         return st
+    except Exception as exc:
+        return _error(exc)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 16.-19. Global pause — one switch across harvest, CV, analysis and Omniscient.
+#
+# The old panel had a single "queue pause" that wrote CV_PAUSED, which the frame
+# worker only read when its queue came back empty. On a machine with a backlog
+# the button did nothing visible, and it never touched the harvester at all, so
+# downloads kept filling the disk that the pause was usually pressed to protect.
+# system_control owns the flags; these routes are a thin shell over it.
+# ───────────────────────────────────────────────────────────────────────────
+@admin_router.get("/api/admin/pause/state")
+def pause_state():
+    """Requested state and observed state, side by side.
+
+    They are reported separately because a disagreement is information: for a
+    few seconds after a click it means a worker is finishing its chunk, and
+    permanently it means that worker is dead.
+    """
+    try:
+        import system_control
+        return system_control.pause_state()
+    except Exception as exc:
+        return _error(exc)
+
+
+@admin_router.post("/api/admin/pause/all")
+async def pause_all(request: Request):
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        import system_control
+        res = system_control.pause_all(reason=str(body.get("reason") or ""))
+        return res if res.get("ok") else _error(res.get("error"), 503)
+    except Exception as exc:
+        vios_log(f"Error pausing system: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+
+
+@admin_router.post("/api/admin/resume/all")
+def resume_all():
+    try:
+        import system_control
+        res = system_control.resume_all()
+        return res if res.get("ok") else _error(res.get("error"), 503)
+    except Exception as exc:
+        vios_log(f"Error resuming system: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+
+
+@admin_router.post("/api/admin/pause/component")
+async def pause_component(request: Request):
+    """Pause or resume one stage. Useful on its own: pausing analysis while the
+    harvester keeps running is how you free the GPU without losing the scan."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("Expected JSON body {component, paused}", 400)
+    component = str(body.get("component") or "").strip()
+    try:
+        import system_control
+        res = system_control.set_component(component, bool(body.get("paused")))
+        return res if res.get("ok") else _error(res.get("error"), 400)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 20.-22. Factory reset — actually delete it, the way Kaggle's own reset does.
+#
+# Scoped, priced and confirmed. `preview` measures every target so the decision
+# is made against real numbers (the question on a Kaggle box is always "will
+# this free enough to keep going"), `start` requires the phrase typed exactly,
+# and the Telegram channel is never touched because it is the only way back.
+# ───────────────────────────────────────────────────────────────────────────
+@admin_router.get("/api/admin/reset/preview")
+def reset_preview():
+    try:
+        import system_control
+        return system_control.reset_preview()
+    except Exception as exc:
+        return _error(exc)
+
+
+@admin_router.post("/api/admin/reset/start")
+async def reset_start(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("Expected JSON body {scope, confirm}", 400)
+    try:
+        import system_control
+        # The typed phrase is re-validated inside start_reset, not here — this
+        # route only forwards it, so there is no way to reach the wipe by
+        # calling the module with the check skipped.
+        res = system_control.start_reset(
+            scope=body.get("scope") or [],
+            confirm=str(body.get("confirm") or ""),
+            restart=bool(body.get("restart", True)))
+        if not res.get("ok"):
+            return _error(res.get("error", "Could not start reset"), 409)
+        return res
+    except Exception as exc:
+        vios_log(f"Error starting factory reset: {exc}", "ADMIN", "ERROR")
+        return _error(exc)
+
+
+@admin_router.get("/api/admin/reset/status")
+def reset_status():
+    try:
+        import system_control
+        return system_control.reset_status()
     except Exception as exc:
         return _error(exc)

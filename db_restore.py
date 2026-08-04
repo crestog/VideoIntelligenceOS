@@ -37,6 +37,22 @@ Two things this deliberately does NOT do:
 Staging happens on SCRATCH_DIR, not the OUTPUT tier: a download is re-fetchable
 by definition, so it has no claim on the 19.5 GB that has to survive the
 session. The reverse of where export builds, for the same reason.
+
+Transport
+─────────
+Downloads go over the HTTP Bot API through tg_transport, matching the export
+side after MTProto wedged an upload indefinitely (see tg_transport.py). Two
+consequences shape this module:
+
+  * The Bot API cannot fetch an arbitrary message by id. So restore never looks
+    a part up — schema v2 manifests carry each part's `file_id`, and `getFile`
+    goes straight from that to the bytes. Finding the *manifest* still needs one
+    lookup, which `getChat`'s `pinned_message` provides.
+  * Downloads cap at 20 MB per file, which is why export now ships 18 MB parts.
+
+Schema v1 bundles predate all of this: 480 MB parts addressed by message_id
+only, restorable over MTProto alone. They are still accepted, through a fallback
+that is wrapped in a hard deadline — the one thing the old code never had.
 """
 
 import json
@@ -50,10 +66,21 @@ import time
 from config import (SCRATCH_DIR, DB_PATH, SQLITE_TIMEOUT, CHANNEL_ID,
                     API_ID, API_HASH, BOT_TOKEN, missing_telegram_secrets,
                     OMNI_PG_DB, OMNI_PG_USER, OMNI_PG_PASSWORD, OMNI_PG_HOST)
-from db_export import BUNDLE_SCHEMA, EXPORT_SESSION, _sha256, _CHUNK
+from db_export import BUNDLE_SCHEMA, EXPORT_SESSION, _sha256, _CHUNK, _mb
 from logger import vios_log
 
 RESTORE_DIR = os.path.join(SCRATCH_DIR, "restore")
+
+# Layouts this build can read. v1 is MTProto-only (480 MB parts, no file_id);
+# v2 adds file_id so the HTTP transport can fetch parts directly. Refusing an
+# unknown layout is deliberate — guessing is how a restore writes garbage over
+# a working database.
+SUPPORTED_SCHEMAS = (1, 2)
+
+# Ceiling on the MTProto fallback. pyrogram's session start retries an
+# unreachable DC forever, which is precisely how the exporter used to hang; a
+# v1 restore is allowed to be slow but not unbounded.
+MTPROTO_DEADLINE = 900.0
 
 # How far back to walk channel history when the manifest is not pinned. Pinning
 # needs admin rights the bot may not have, and _upload_bundle records
@@ -84,6 +111,9 @@ _job: dict = {
     "plan": None,           # what inspect found: bundle vs local
     "error": None,
     "log": [],
+    # Age of the last transferred byte is what distinguishes a slow download
+    # from a dead one — the distinction the old export UI could not make.
+    "last_progress_at": None,
 }
 
 # The manifest the last inspect read, so pressing Restore does not re-download
@@ -103,8 +133,15 @@ def _set(**kw):
 
 
 def restore_status() -> dict:
+    """Snapshot for the panel, with `stalled_s` computed the same way export
+    computes it: a frozen transfer should look different from a working one."""
     with _lock:
-        return dict(_job)
+        st = dict(_job)
+    if st["state"] == "running" and st.get("last_progress_at"):
+        st["stalled_s"] = round(time.time() - st["last_progress_at"], 1)
+    else:
+        st["stalled_s"] = 0
+    return st
 
 
 def is_running() -> bool:
@@ -198,18 +235,7 @@ async def _read_manifest(client, work: str, seq: str | None = None) -> dict:
     await client.download_media(target, file_name=path)
     with open(path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-
-    got = int(manifest.get("schema", 0))
-    if got != BUNDLE_SCHEMA:
-        # Guessing at an unknown layout is how a restore silently writes
-        # garbage over a good database. Refuse instead.
-        raise RuntimeError(
-            f"Bundle schema v{got} but this build understands v{BUNDLE_SCHEMA}. "
-            f"Update VIOS (bundle written by code {manifest.get('code_commit')}) "
-            f"or export a fresh bundle.")
-    if not manifest.get("parts"):
-        raise RuntimeError("Manifest lists no parts — the bundle is empty.")
-    return manifest
+    return _validate_manifest(manifest)
 
 
 def _local_counts() -> dict:
@@ -249,6 +275,7 @@ def _plan_from(manifest: dict) -> dict:
         f = files.setdefault(p["file"], {"parts": 0, "size": 0})
         f["parts"] += 1
         f["size"] += p.get("size", 0)
+    has_pg = any(p["file"].startswith("omnidb") for p in manifest["parts"])
 
     # The one number that decides whether this is recovery or data loss.
     delta = None
@@ -267,14 +294,191 @@ def _plan_from(manifest: dict) -> dict:
         "local_counts": local,
         "posts_delta": delta,
         "destructive": bool(delta is not None and delta < 0),
-        "has_postgres": any(p["file"].startswith("omnidb")
-                            for p in manifest["parts"]),
+        "has_postgres": has_pg,
+        "effects": _effects(manifest, has_pg, bundle_counts, local),
     }
+
+
+def _effects(manifest: dict, has_pg: bool, bundle: dict, local: dict) -> list:
+    """Exactly what an apply will and will not touch, as a list the panel
+    renders verbatim.
+
+    This exists because "restore the database" hides a lot: it replaces two
+    stores, leaves three others alone, and the ones it leaves alone are the
+    reason a restored session still has to re-derive vectors and re-download
+    video files before it behaves like the session that made the bundle.
+    Spelling that out before the click is cheaper than discovering it after.
+    """
+    posts = bundle.get("posts")
+    with_file = bundle.get("posts_with_file")
+    out = [
+        {"target": "lake.db (harvest index)", "action": "replaced",
+         "impact": "yes",
+         "detail": f"posts, creators, categories → {posts if posts is not None else '?'} "
+                   f"posts. The current index is snapshotted to scratch first, "
+                   f"so an unwanted restore can be undone within the session."},
+    ]
+    if has_pg:
+        out.append(
+            {"target": "PostgreSQL (omnidb)", "action": "replaced",
+             "impact": "yes",
+             "detail": "frames, chunks and every Qwen narrative. The schema is "
+                       "dropped and replayed, so anything narrated in this "
+                       "session and not in the bundle is lost."})
+    else:
+        out.append(
+            {"target": "PostgreSQL (omnidb)", "action": "untouched",
+             "impact": "no",
+             "detail": "This bundle carries no Postgres dump — it was exported "
+                       "from a machine with the Omniscient layer off. Local "
+                       "narratives survive."})
+    out += [
+        {"target": "Qdrant (vectors)", "action": "untouched",
+         "impact": "rebuild",
+         "detail": "Never shipped in a bundle: vectors are a deterministic "
+                   "encoder pass over the frames. Semantic search stays limited "
+                   "to whatever this machine has already embedded until the "
+                   "encoder re-runs."},
+        {"target": "Neo4j (knowledge graph)", "action": "untouched",
+         "impact": "rebuild",
+         "detail": "Projected from the Postgres narratives at ingest, so it is "
+                   "re-derivable rather than replicated. Graph queries reflect "
+                   "the local projection, not the restored rows, until it is "
+                   "re-projected."},
+        {"target": "Video files on disk", "action": "untouched",
+         "impact": "re-download",
+         "detail": f"A bundle carries the index, not the media. "
+                   f"{with_file if with_file is not None else '?'} restored "
+                   f"posts point at local paths; on a fresh container those "
+                   f"files are absent and the harvester re-fetches them from "
+                   f"the channel on demand."},
+        {"target": "Redis queues", "action": "untouched",
+         "impact": "no",
+         "detail": "In-flight jobs and dedup sets are session state. A restore "
+                   "does not enqueue work; the pipeline picks up restored rows "
+                   "the next time it scans."},
+    ]
+    return out
 
 
 # ═══════════════════════════════════════════════════════════
 # FETCH AND REASSEMBLE
 # ═══════════════════════════════════════════════════════════
+def _http_read_manifest(work: str, seq: str | None) -> dict | None:
+    """Find and parse the manifest over the HTTP Bot API.
+
+    Only the pinned message is reachable this way — the Bot API has no method
+    to walk channel history. That covers the normal case, since export pins
+    every manifest it posts for exactly this reason. Returns None when the pin
+    is absent or is not the bundle asked for, leaving the MTProto scan to it.
+    """
+    import tg_transport as tg
+
+    _set(stage="Reading pinned manifest", pct=6, detail="getChat")
+    pinned = tg.get_pinned()
+    if not pinned:
+        return None
+
+    doc = pinned.get("document") or {}
+    name = doc.get("file_name") or ""
+    if not (name.startswith("manifest-") and name.endswith(".json")):
+        vios_log(f"pinned message is not a manifest ({name or 'no document'})"
+                 " — falling back to a history scan", "RESTORE", "WARN")
+        return None
+    if seq and name != f"manifest-{seq}.json":
+        # A specific older bundle was asked for; the pin is the newest one.
+        return None
+    if not doc.get("file_id"):
+        return None
+
+    _set(stage="Reading manifest", pct=10, detail=name)
+    path = os.path.join(work, "manifest.json")
+    tg.download_file(doc["file_id"], path)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _validate_manifest(manifest: dict) -> dict:
+    got = int(manifest.get("schema", 0))
+    if got not in SUPPORTED_SCHEMAS:
+        raise RuntimeError(
+            f"Bundle schema v{got} but this build understands "
+            f"v{', v'.join(str(s) for s in SUPPORTED_SCHEMAS)}. "
+            f"Update VIOS (bundle written by code "
+            f"{manifest.get('code_commit')}) or export a fresh bundle.")
+    if not manifest.get("parts"):
+        raise RuntimeError("Manifest lists no parts — the bundle is empty.")
+    return manifest
+
+
+def _http_download_parts(manifest: dict, work: str) -> dict | None:
+    """Fetch every part over HTTPS. None if this bundle cannot go that way.
+
+    A part already on disk with the right hash is skipped, so an interrupted
+    restore resumes rather than starting over.
+    """
+    import tg_transport as tg
+
+    parts = manifest["parts"]
+    if any(not p.get("file_id") for p in parts):
+        return None                     # v1 bundle: message_id only
+    oversize = [p for p in parts if p.get("size", 0) > tg.DOWNLOAD_LIMIT]
+    if oversize:
+        vios_log(f"{len(oversize)} part(s) exceed the Bot API's "
+                 f"{tg.DOWNLOAD_LIMIT // 1048576} MB download cap — using "
+                 f"MTProto", "RESTORE", "INFO")
+        return None
+
+    total = len(parts)
+    grand = sum(p.get("size", 0) for p in parts)
+    started = time.time()
+    done = 0
+    got: dict[str, list] = {}
+
+    for n, part in enumerate(parts, 1):
+        dest = os.path.join(work, part["name"])
+        base = 12 + int(48 * (n - 1) / total)
+
+        if os.path.exists(dest) and os.path.getsize(dest) == part.get("size"):
+            _set(stage=f"Verifying part {n}/{total}", pct=base,
+                 detail=f"{part['name']} — already on disk")
+            if _sha256(dest) == part["sha256"]:
+                got.setdefault(part["file"], []).append(
+                    (part["part_index"], dest))
+                done += part.get("size", 0)
+                continue
+            os.remove(dest)        # right size, wrong bytes: a truncated resume
+
+        _set(stage=f"Downloading part {n}/{total}", pct=base,
+             detail=f"{part['name']} · {_mb(part.get('size', 0))}")
+
+        def progress(recv, size, _base=done, _p=part):
+            now = time.time()
+            rate = (_base + recv) / max(now - started, 0.001)
+            _set(detail=f"{_p['name']} · {_mb(recv)} / {_mb(size)}"
+                        f" · {_mb(rate)}/s",
+                 last_progress_at=now)
+            return True
+
+        tg.download_file(part["file_id"], dest, progress=progress)
+        done += part.get("size", 0)
+
+        _set(stage=f"Checking part {n}/{total}", pct=base + 2, detail="sha256")
+        actual = _sha256(dest)
+        if actual != part["sha256"]:
+            # Corruption here would be written straight into the live database
+            # a few steps later. Stop while the damage is still a temp file.
+            raise RuntimeError(
+                f"Checksum mismatch on {part['name']}: expected "
+                f"{part['sha256'][:16]}…, got {actual[:16]}…")
+        got.setdefault(part["file"], []).append((part["part_index"], dest))
+
+    _set(stage="All parts downloaded", pct=60,
+         detail=f"{total} part(s) · {_mb(grand)} verified")
+    return {name: [p for _, p in sorted(chunks)]
+            for name, chunks in got.items()}
+
+
 async def _download_parts(client, manifest: dict, work: str) -> dict:
     """Fetch every part, checksum it, and return {logical file: local path}.
 
@@ -457,11 +661,13 @@ def _load_postgres(dump: str) -> str:
 # ═══════════════════════════════════════════════════════════
 # THE RESTORE
 # ═══════════════════════════════════════════════════════════
-async def _fetch(mode: str, seq: str | None, work: str) -> tuple:
-    """Telegram half of the job: manifest, and for an apply, the parts too."""
+async def _fetch_mtproto(mode: str, seq: str | None, work: str,
+                         manifest: dict | None) -> tuple:
+    """MTProto half, for what the Bot API cannot reach: unpinned manifests and
+    v1 bundles with parts over the download cap."""
     from pyrogram import Client
 
-    # Same separate session file the exporter uses: the harvester holds its own
+    # Same separate session file the exporter used: the harvester holds its own
     # open for the life of the process and two Clients on one session file
     # fight over its SQLite lock. Export and restore never run together — the
     # admin routes refuse — so sharing one between them is fine.
@@ -469,7 +675,8 @@ async def _fetch(mode: str, seq: str | None, work: str) -> tuple:
                     bot_token=BOT_TOKEN)
     await client.start()
     try:
-        manifest = await _read_manifest(client, work, seq)
+        if manifest is None:
+            manifest = await _read_manifest(client, work, seq)
         if mode == "inspect":
             return manifest, {}
         return manifest, await _download_parts(client, manifest, work)
@@ -478,6 +685,81 @@ async def _fetch(mode: str, seq: str | None, work: str) -> tuple:
             await client.stop()
         except Exception:
             pass
+
+
+def _fetch(mode: str, seq: str | None, work: str) -> tuple:
+    """Get the manifest, and for an apply the parts too.
+
+    HTTPS first because it is bounded and proven from these containers;
+    MTProto only for what it cannot do, and never without a deadline.
+    """
+    manifest = None
+    try:
+        manifest = _http_read_manifest(work, seq)
+        if manifest is not None:
+            manifest = _validate_manifest(manifest)
+    except Exception as e:
+        vios_log(f"HTTP manifest read failed ({str(e)[:140]}) — trying MTProto",
+                 "RESTORE", "WARN")
+
+    if manifest is not None:
+        if mode == "inspect":
+            return manifest, {}
+        files = _http_download_parts(manifest, work)
+        if files is not None:
+            return manifest, files
+        _set(stage="Falling back to MTProto",
+             detail="parts exceed the Bot API download cap")
+
+    # Anything still unresolved needs MTProto. Bounded, unlike the code this
+    # replaced: a wedged session start now fails the job instead of parking it.
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            asyncio.wait_for(_fetch_mtproto(mode, seq, work, manifest),
+                             timeout=MTPROTO_DEADLINE))
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Telegram did not respond within {int(MTPROTO_DEADLINE / 60)} "
+            f"minutes over MTProto. The bundle is still in the channel; "
+            f"re-run the restore.")
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _outcome(plan: dict, loaded: list, snapshot: str | None) -> dict:
+    """What the restore actually did, read back from the live stores.
+
+    `_effects` is a forecast written before anything moves; this is the
+    measurement taken afterwards. They are separate on purpose — the question
+    "what will happen" and the question "what happened" have different answers
+    when Postgres declines to drop a locked schema, and reporting the forecast
+    as the result is how a half-restored database looks finished.
+    """
+    after = _local_counts()
+    bundle = plan.get("bundle_counts", {}) or {}
+    return {
+        "loaded": loaded,
+        "counts_after": after,
+        # The check that matters: the live database should now agree with the
+        # manifest. A mismatch means something did not land.
+        "matches_bundle": (after.get("posts") == bundle.get("posts")
+                           if "posts" in bundle and "posts" in after else None),
+        "snapshot": snapshot,
+        "next_steps": [
+            "The UI reads lake.db per request, so restored posts appear on the "
+            "next page load — no restart needed.",
+            "Video files are not in a bundle. Restored posts whose files are "
+            "absent get re-downloaded from the channel by the harvester.",
+            "Qdrant and Neo4j were not touched. Semantic search and graph "
+            "queries reflect this machine's own derivation until the encoder "
+            "and the projector re-run over the restored rows.",
+        ] + ([f"The pre-restore database is at {snapshot} (scratch — it dies "
+              f"with this session)."] if snapshot else []),
+    }
 
 
 def _run(mode: str, seq: str | None) -> None:
@@ -498,16 +780,7 @@ def _run(mode: str, seq: str | None) -> None:
                 f"Telegram is not configured ({', '.join(absent)}) — the "
                 f"channel is where bundles live, so restore needs it.")
 
-        import asyncio
-        # Own loop in this thread, for the same reason export needs one: the
-        # harvester owns the main loop and uvicorn owns another.
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            manifest, files = loop.run_until_complete(_fetch(mode, seq, work))
-        finally:
-            asyncio.set_event_loop(None)
-            loop.close()
+        manifest, files = _fetch(mode, seq, work)
 
         plan = _plan_from(manifest)
 
@@ -557,6 +830,7 @@ def _run(mode: str, seq: str | None) -> None:
 
         _pending = None
         tail = f" · previous database kept at {snapshot}" if snapshot else ""
+        plan["outcome"] = _outcome(plan, loaded, snapshot)
         _set(state="done", stage="Restored", pct=100, plan=plan,
              detail=f"bundle {plan['seq']} → {', '.join(loaded) or 'nothing'}"
                     + tail,

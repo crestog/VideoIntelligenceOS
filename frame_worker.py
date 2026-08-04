@@ -33,6 +33,7 @@ from config import (VIDEO_DIR, THUMB_DIR, DB_PATH, QUEUE_VISION, QUEUE_ANALYZE,
                     DISK_PAUSE_THRESHOLD_GB, DISK_WARN_THRESHOLD_GB,
                     PREVIEW_DIR_NAME, PREVIEW_WIDTH, PREVIEW_QUALITY, FULL_QUALITY,
                     SQLITE_TIMEOUT)
+from system_control import heartbeat, wait_while_paused
 from logger import vios_log
 
 QUEUE_NAME = QUEUE_VISION
@@ -208,6 +209,15 @@ def run_worker():
     total_frames = 0
 
     while True:
+        # Pause BEFORE claiming. This check used to live in the `if not job`
+        # branch, which meant it was only reached when the queue came back
+        # empty — so on a machine with a backlog, Pause did nothing until the
+        # backlog had already been processed. Checking first makes the button
+        # mean what it says.
+        wait_while_paused("cv",
+                          on_pause=lambda: log("⏸️ Paused by Admin — waiting..."),
+                          on_resume=lambda: log("▶️ Resumed by Admin"))
+
         try:
             job, job_raw = claim_job(QUEUE_NAME, timeout=5)
         except (redis_lib.exceptions.TimeoutError, redis_lib.exceptions.ConnectionError, OSError) as e:
@@ -220,16 +230,7 @@ def run_worker():
             continue
 
         if not job:
-            # Check if paused by Admin panel
-            try:
-                r = redis_lib.Redis(host='localhost', port=6379, decode_responses=True, socket_timeout=1)
-                if r.get('CV_PAUSED') == '1':
-                    log('⏸️ Paused by Admin — waiting...')
-                    while r.get('CV_PAUSED') == '1':
-                        time.sleep(5)
-                    log('▶️ Resumed by Admin')
-            except Exception:
-                pass
+            heartbeat("cv", "idle", "queue empty")
             continue
 
         payload = job.get("payload", job)
@@ -244,6 +245,7 @@ def run_worker():
 
         retry_tag = f" [RETRY #{retry_num}]" if retry_num > 0 else ""
         log(f"📥 JOB CLAIMED: Video #{msg_id}{retry_tag}")
+        heartbeat("cv", "running", f"video #{msg_id}")
 
         try:
             frames_extracted = extract_video_data(video_path, msg_id)

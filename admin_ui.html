@@ -256,6 +256,99 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
 .rst-verdict { margin-top: 10px; font-size: 12px; line-height: 1.5; }
 .rst-verdict.ok { color: var(--ok); }
 .rst-verdict.bad { color: var(--danger); }
+
+/* ── What a restore actually touches ──
+   "Restore the database" hides a lot: it replaces two stores, leaves three
+   alone, and the ones it leaves alone are why a restored session still has to
+   re-derive vectors and re-download media. The forecast (before) and the
+   measurement (after) get the same layout so they can be read against each
+   other. */
+.eff { margin-top: 11px; border-top: 1px solid var(--border); padding-top: 10px; }
+.eff-hd { font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em;
+          color: var(--text-faint); margin-bottom: 8px; }
+.eff-row { display: grid; grid-template-columns: 150px 78px 1fr; gap: 4px 10px;
+           padding: 6px 0; border-bottom: 1px solid var(--border); align-items: baseline; }
+.eff-row:last-child { border-bottom: none; }
+.eff-row .t { font-size: 12px; font-weight: 500; }
+.eff-row .a { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
+              letter-spacing: 0.05em; text-align: center; border-radius: 99px;
+              padding: 2px 0; border: 1px solid var(--border-strong); color: var(--text-dim); }
+.eff-row .a.replaced { color: var(--danger); border-color: rgba(248,113,113,0.4); background: var(--danger-dim); }
+.eff-row .a.rebuild  { color: var(--warn);   border-color: rgba(251,191,36,0.35); background: rgba(251,191,36,0.08); }
+.eff-row .a.untouched { color: var(--ok);    border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.07); }
+.eff-row .d { font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+.out-box { margin-top: 12px; padding: 11px 13px; border-radius: 8px;
+           background: rgba(52,211,153,0.06); border: 1px solid rgba(52,211,153,0.3); }
+.out-box.bad { background: var(--danger-dim); border-color: rgba(248,113,113,0.4); }
+.out-box .oh { font-size: 12.5px; font-weight: 600; margin-bottom: 7px; color: var(--ok); }
+.out-box.bad .oh { color: var(--danger); }
+.out-box ul { margin: 7px 0 0 16px; font-size: 11.5px; color: var(--text-dim); line-height: 1.65; }
+
+/* ── System control ──
+   One switch across harvest, extraction, analysis and Omniscient. Requested
+   state and observed state are drawn separately on purpose: when they disagree
+   for a few seconds a worker is finishing its chunk, and when they disagree
+   forever that worker is dead. A single green "PAUSED" label could say neither. */
+.ctl { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.ctl-big { padding: 11px 20px; font-size: 14px; font-weight: 600; }
+.ctl-state { display: flex; flex-direction: column; gap: 2px; min-width: 150px; }
+.ctl-state .s { font-family: var(--font-mono); font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.ctl-state .s.run { color: var(--ok); }
+.ctl-state .s.pause { color: var(--warn); }
+.ctl-state .s.down { color: var(--danger); }
+.ctl-state .r { font-size: 11px; color: var(--text-dim); }
+.comp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+             gap: 10px; margin-top: 15px; }
+.comp { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+        padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.comp.paused { border-color: rgba(251,191,36,0.35); }
+.comp.dead { border-color: rgba(248,113,113,0.3); }
+.comp .top { display: flex; align-items: center; gap: 7px; }
+.comp .nm { font-size: 12px; font-weight: 600; flex: 1; }
+.comp .tog { font-size: 10.5px; padding: 2px 9px; border-radius: 99px; background: var(--surface);
+             border: 1px solid var(--border-strong); color: var(--text-dim); cursor: pointer; }
+.comp .tog:hover { border-color: var(--accent); color: var(--accent); }
+.comp .obs { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); }
+.comp .obs .st { color: var(--text); }
+.comp .obs .st.running { color: var(--ok); }
+.comp .obs .st.paused { color: var(--warn); }
+.comp .obs .st.stale, .comp .obs .st.unknown { color: var(--danger); }
+.comp .dt { font-size: 10.5px; color: var(--text-faint);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Factory reset ──
+   Sized, scoped and typed. Sizes are measured rather than estimated because on
+   a Kaggle box the only question that matters is "will this free enough to keep
+   going", and a wrong estimate answers it wrongly. */
+.card.zone { border-color: rgba(248,113,113,0.35); }
+.card.zone .card-head { border-bottom-color: rgba(248,113,113,0.22); }
+.card.zone .card-head h2 { color: var(--danger); }
+.rs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 9px; }
+.rs-t { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+        background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.rs-t.sel { border-color: rgba(248,113,113,0.45); background: rgba(248,113,113,0.05); }
+.rs-t input { accent-color: var(--danger); width: 15px; height: 15px; margin-top: 2px; flex-shrink: 0; }
+.rs-t .b { min-width: 0; flex: 1; }
+.rs-t .h { display: flex; align-items: baseline; gap: 8px; }
+.rs-t .l { font-size: 12.5px; font-weight: 600; }
+.rs-t .sz { font-family: var(--font-mono); font-size: 11px; color: var(--warn); margin-left: auto; flex-shrink: 0; }
+.rs-t .sz.zero { color: var(--text-faint); }
+.rs-t .ls { font-size: 11.5px; color: var(--text-dim); line-height: 1.5; margin-top: 3px; }
+.rs-sum { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px;
+          padding: 11px 13px; border-radius: 8px; background: var(--danger-dim);
+          border: 1px solid rgba(248,113,113,0.35); }
+.rs-sum .big { font-family: var(--font-mono); font-size: 18px; font-weight: 600; color: var(--danger); }
+.rs-sum .tx { font-size: 12px; color: var(--text-dim); flex: 1; min-width: 180px; }
+.rs-confirm { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.rs-confirm input[type=text] {
+  flex: 1; min-width: 200px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 8px; padding: 9px 12px;
+  font-family: var(--font-mono); font-size: 12.5px; letter-spacing: 0.06em;
+}
+.rs-confirm input[type=text]:focus { outline: none; border-color: var(--danger); }
+.rs-safe { margin-top: 11px; padding: 9px 12px; border-radius: 7px; font-size: 11.5px; line-height: 1.55;
+           background: rgba(52,211,153,0.06); border: 1px solid rgba(52,211,153,0.28); color: var(--text-dim); }
+.rs-safe b { color: var(--ok); }
 </style>
 </head>
 <body>
@@ -324,17 +417,65 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
         </div>
       </section>
 
-      <!-- QUEUE CONTROL -->
+      <!-- SYSTEM CONTROL -->
       <section class="card">
         <div class="card-head">
-          <h2>CV Pipeline</h2>
+          <h2>System Control</h2>
           <span class="sub" id="cvState">—</span>
         </div>
         <div class="card-body">
-          <div class="qm-grid" id="qmGrid"></div>
-          <div style="display:flex; gap:10px; margin-top:14px">
-            <button class="btn danger" id="pauseBtn" onclick="pipeline('pause')">Pause Extraction</button>
-            <button class="btn" id="resumeBtn" onclick="pipeline('resume')">Resume Extraction</button>
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+            One switch across every stage — harvesting, frame extraction, GPU analysis
+            and the Omniscient engine. Each worker checks it before claiming its next
+            job, so a pause lands within seconds instead of after the backlog.
+          </div>
+          <div class="ctl">
+            <button class="btn danger ctl-big" id="pauseBtn" onclick="pauseAll()">Pause Everything</button>
+            <button class="btn primary ctl-big" id="resumeBtn" onclick="resumeAll()">Resume Everything</button>
+            <div class="ctl-state">
+              <span class="s" id="sysState">—</span>
+              <span class="r" id="sysReason"></span>
+            </div>
+          </div>
+          <div class="comp-grid" id="compGrid"></div>
+          <div class="qm-grid" id="qmGrid" style="margin-top:15px"></div>
+        </div>
+      </section>
+
+      <!-- FACTORY RESET -->
+      <section class="card zone">
+        <div class="card-head">
+          <h2>Factory Reset</h2>
+          <div style="display:flex;align-items:center;gap:10px;margin-left:auto">
+            <span class="sub" id="rsSub">nothing measured yet</span>
+            <button class="btn sm" onclick="loadResetPreview()">Measure</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+            Deletes what is on this container and puts the pipeline back to a blank
+            state — the same thing Kaggle's own factory reset does, without losing
+            the session. Pick what goes; sizes are measured, not estimated.
+          </div>
+          <div class="rs-grid" id="rsTargets">
+            <div class="rs-t"><div class="b"><div class="skel" style="width:100%">&nbsp;</div></div></div>
+            <div class="rs-t"><div class="b"><div class="skel" style="width:100%">&nbsp;</div></div></div>
+          </div>
+          <div class="rs-sum" id="rsSum" style="display:none">
+            <span class="big" id="rsFree">0 MB</span>
+            <span class="tx" id="rsTx"></span>
+          </div>
+          <div class="rs-safe" id="rsSafe"></div>
+          <div class="rs-confirm">
+            <input type="text" id="rsConfirm" placeholder="Type DELETE EVERYTHING to enable"
+                   autocomplete="off" spellcheck="false" oninput="syncResetBtn()">
+            <button class="btn danger" id="rsBtn" onclick="askReset()" disabled>Delete Everything</button>
+          </div>
+          <div class="exp-prog" id="rsProg">
+            <div class="exp-stage"><b id="rsStage">—</b><span class="pc" id="rsPct">0%</span></div>
+            <div class="exp-detail" id="rsDetail"></div>
+            <div class="exp-bar" id="rsBar"><div></div></div>
+            <div class="exp-log" id="rsLog"></div>
           </div>
         </div>
       </section>
@@ -384,16 +525,24 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="btn primary" id="expBtn" onclick="askExport()">Export &amp; Upload</button>
+            <button class="btn danger" id="expCancel" onclick="cancelExport()" style="display:none">Cancel</button>
+            <button class="btn sm" id="expProbe" onclick="probeTelegram()"
+                    title="Ask Telegram whether this bot can post to the channel. Reads only — nothing is uploaded.">Test Connection</button>
             <label class="chk-line" style="padding:0" title="Keep the bundle in the output directory after uploading. Costs quota; useful if you want to download it from the notebook too.">
               <input type="checkbox" id="expKeep"> Keep a local copy
             </label>
           </div>
           <div class="exp-warn" id="expWarn"></div>
+          <!-- A transfer that has moved no bytes for a while. The whole reason
+               this card was rewritten: the old bar showed a per-part constant,
+               so a wedged upload and a slow one looked identical. -->
+          <div class="exp-warn" id="expStall"></div>
           <div class="qnote" id="expBundles" style="margin-top:9px"></div>
           <div class="exp-prog" id="expProg">
             <div class="exp-stage"><b id="expStage">—</b><span class="pc" id="expPct">0%</span></div>
             <div class="exp-detail" id="expDetail"></div>
             <div class="exp-bar" id="expBar"><div></div></div>
+            <div class="qnote" id="expBytes"></div>
             <div class="exp-log" id="expLog"></div>
           </div>
         </div>
@@ -425,6 +574,8 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
             <div class="exp-bar" id="rstBar"><div></div></div>
             <div class="exp-log" id="rstLog"></div>
           </div>
+          <!-- Measured after the fact, not the forecast repeated back. -->
+          <div id="rstOutcome"></div>
         </div>
       </section>
 
@@ -889,11 +1040,66 @@ async function startExport(keep) {
   }
 }
 
+/* Bytes, rate and ETA formatted the way a transfer should read. The server
+   sends measured counters; nothing here is derived from the percentage. */
+const fmtMB = b => {
+  const mb = (b || 0) / 1048576;
+  return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
+};
+const fmtRate = bps => !bps ? '' : (bps / 1048576).toFixed(2) + ' MB/s';
+const fmtEta = s => {
+  if (s === null || s === undefined) return '';
+  s = Math.round(s);
+  if (s < 60) return `${s}s left`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${s % 60}s left` : `${Math.floor(m / 60)}h ${m % 60}m left`;
+};
+
+async function cancelExport() {
+  const btn = $('expCancel');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Stopping…';
+  try {
+    await api('/api/admin/export/cancel', { method: 'POST' }, 0);
+    // Parts already committed stay on disk, so the next run resumes rather
+    // than starting the upload over. Say so — otherwise cancelling feels
+    // like throwing away the twenty minutes already spent.
+    showToast('Stopping — finished parts are kept, the next run resumes', 'ok');
+    pollExport();
+  } catch (e) {
+    showToast(`Could not cancel: ${e.message}`, 'error');
+    btn.disabled = false; btn.textContent = 'Cancel';
+  }
+}
+
+/* Reachability, asked directly. Every previous failure looked the same from
+   this panel (a bar that stopped moving) and a good share of them were just a
+   missing token, which this answers in a second without writing anything. */
+async function probeTelegram() {
+  const btn = $('expProbe');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Testing…';
+  try {
+    const d = await api('/api/admin/telegram/probe', {}, 0);
+    if (d.ok) showToast(`Connected as ${d.bot || 'bot'} → ${d.channel || 'channel'}`, 'ok');
+    else showToast(`Telegram unreachable: ${d.error || 'unknown'}`, 'error');
+  } catch (e) { showToast(`Probe failed: ${e.message}`, 'error'); }
+  finally { btn.disabled = false; btn.textContent = 'Test Connection'; }
+}
+
 function renderExport(st) {
   const running = st.state === 'running';
   const btn = $('expBtn');
   btn.disabled = running;
-  btn.innerHTML = running ? '<span class="spin"></span> Exporting…' : 'Export &amp; Upload';
+  btn.innerHTML = running
+    ? '<span class="spin"></span> Exporting…'
+    : (st.resumable ? 'Resume Export' : 'Export &amp; Upload');
+  btn.title = st.resumable
+    ? `Bundle ${st.resumable} was built but never committed to the channel — `
+      + `this continues it from the last finished part.` : '';
+
+  const cancel = $('expCancel');
+  cancel.style.display = running ? '' : 'none';
+  if (running && !st.cancelling) { cancel.disabled = false; cancel.textContent = 'Cancel'; }
+  if (st.cancelling) { cancel.disabled = true; cancel.innerHTML = '<span class="spin"></span> Stopping…'; }
 
   // Secrets missing means the bundle still builds but never leaves the machine.
   // Say so before the run, not after.
@@ -906,14 +1112,37 @@ function renderExport(st) {
   }
   $('expSub').textContent = missing.length ? 'local bundle only' : '→ Telegram channel';
 
+  // A stall is stated rather than left to be inferred from a bar that stopped.
+  // 45s is past any normal chunk boundary but well inside the transport's own
+  // read timeout, so this warns before the retry rather than after it.
+  const stalled = st.stalled_s || 0;
+  const stall = $('expStall');
+  stall.classList.toggle('on', running && stalled > 45);
+  if (running && stalled > 45) {
+    stall.textContent = `No bytes have moved for ${Math.round(stalled)}s. `
+      + `The transfer has a deadline and retries on its own — if it does not `
+      + `recover, Cancel keeps the parts already finished and the next run resumes.`;
+  }
+
   if (st.state === 'idle') { $('expProg').classList.remove('on'); return; }
   $('expProg').classList.add('on');
   $('expStage').textContent = st.stage || '—';
   $('expPct').textContent = (st.pct ?? 0) + '%';
   $('expDetail').textContent = st.detail || '';
   const bar = $('expBar');
-  bar.className = 'exp-bar' + (st.state === 'error' ? ' err' : st.state === 'done' ? ' done' : '');
+  bar.className = 'exp-bar' + (st.state === 'error' || st.state === 'cancelled' ? ' err'
+                             : st.state === 'done' ? ' done' : '');
   bar.firstElementChild.style.width = (st.state === 'done' ? 100 : (st.pct ?? 0)) + '%';
+
+  // Real byte counters. The old panel showed 72% for the whole of part 1 of 2
+  // because the number was a per-part constant written before the upload began.
+  const bytes = [];
+  if (st.total_bytes) bytes.push(`${fmtMB(st.sent_bytes)} of ${fmtMB(st.total_bytes)}`);
+  if (st.part_total) bytes.push(`part ${fmtMB(st.part_sent)}/${fmtMB(st.part_total)}`);
+  if (st.rate_bps) bytes.push(fmtRate(st.rate_bps));
+  if (st.eta_s) bytes.push(fmtEta(st.eta_s));
+  $('expBytes').textContent = bytes.join(' · ');
+
   $('expLog').innerHTML = (st.log || []).map(l => `<div>${esc(l)}</div>`).join('');
   $('expLog').scrollTop = $('expLog').scrollHeight;
 }
@@ -941,6 +1170,7 @@ async function pollExport() {
     // Announce the terminal state once, on the transition into it.
     if (expPolling && !running) {
       if (st.state === 'done') showToast(`Export complete — ${st.detail || 'bundle sealed'}`, 'ok');
+      else if (st.state === 'cancelled') showToast('Export stopped — finished parts kept for the next run', 'info');
       else if (st.state === 'error') showToast(`Export failed: ${st.error || 'unknown'}`, 'error');
       if (st.state === 'done') loadDisk(true);   // the bundle changed the footprint
       loadBundles();
@@ -1020,6 +1250,50 @@ async function startRestore(seq) {
   }
 }
 
+/* One row per store, saying whether a restore replaces it, leaves it alone, or
+   leaves it alone but stale. The third case is the one worth reading: the
+   bundle carries the index, not the vectors, the graph or the media, so a
+   restored session still has work to do before it behaves like the one that
+   made the bundle. */
+function renderEffects(effects) {
+  if (!effects || !effects.length) return '';
+  const rows = effects.map(e => {
+    const a = String(e.action || '');
+    const cls = a === 'replaced' ? 'replaced'
+              : e.impact === 'rebuild' || e.impact === 're-download' ? 'rebuild' : 'untouched';
+    const tag = e.impact === 'rebuild' ? 'rebuild'
+              : e.impact === 're-download' ? 're-fetch' : a;
+    return `<div class="eff-row"><div class="t">${esc(e.target)}</div>`
+         + `<div class="a ${cls}">${esc(tag)}</div>`
+         + `<div class="d">${esc(e.detail)}</div></div>`;
+  }).join('');
+  return `<div class="eff"><div class="eff-hd">What a restore touches</div>${rows}</div>`;
+}
+
+/* The same question after the fact, answered from the live stores rather than
+   by repeating the forecast. A half-restored database otherwise looks finished. */
+function renderOutcome(o) {
+  const box = $('rstOutcome');
+  if (!o) { box.innerHTML = ''; return; }
+  const c = o.counts_after || {};
+  const ok = o.matches_bundle !== false;
+  const loaded = (o.loaded || []).map(esc).join(', ') || 'nothing';
+  box.innerHTML =
+      `<div class="out-box${ok ? '' : ' bad'}">`
+    + `<div class="oh">${ok ? '✓ Restore verified' : '⚠ Restored rows do not match the manifest'}</div>`
+    + `<div style="font-size:12px;color:var(--text-dim);line-height:1.6">`
+    + `Loaded <b style="color:var(--text);font-family:var(--font-mono)">${loaded}</b>. `
+    + `The database now holds `
+    + `<b style="color:var(--text);font-family:var(--font-mono)">${c.posts ?? '?'}</b> posts, `
+    + `<b style="color:var(--text);font-family:var(--font-mono)">${c.creators ?? '?'}</b> creators`
+    + (o.matches_bundle === false
+        ? ` — the manifest expected a different count, so something did not land.`
+        : o.matches_bundle === true ? `, matching the bundle exactly.` : `.`)
+    + `</div>`
+    + `<ul>${(o.next_steps || []).map(s => `<li>${esc(s)}</li>`).join('')}</ul>`
+    + `</div>`;
+}
+
 /* Bundle counts against local counts, one row per table, with the difference
    the restore would make. */
 function renderPlan(p) {
@@ -1064,7 +1338,8 @@ function renderPlan(p) {
         ? '⚠ This bundle is older than what is on disk — restoring it loses rows.'
         : '✓ Restoring recovers rows the local database does not have.')
     + (p.has_postgres ? '' : ' The bundle carries no PostgreSQL dump, so narratives will not be restored.')
-    + `</div>`;
+    + `</div>`
+    + renderEffects(p.effects);
 }
 
 function renderRestore(st) {
@@ -1087,6 +1362,12 @@ function renderRestore(st) {
   if (st.state === 'ready' && st.mode === 'inspect') rstPlan = st.plan || null;
   else if (st.state === 'done' && st.mode === 'apply') rstPlan = null;
   renderPlan(rstPlan);
+
+  // The forecast is replaced by the measurement once there is one. A finished
+  // apply carries `outcome`; an inspect never does, so checking the plan is
+  // enough to keep the two from being shown as if they were the same thing.
+  renderOutcome(st.state === 'done' && st.mode === 'apply'
+                ? (st.plan || {}).outcome : null);
   apply.disabled = running || !rstPlan || missing.length > 0;
   apply.innerHTML = running && st.mode === 'apply'
     ? '<span class="spin"></span> Restoring…' : 'Restore &amp; Overwrite';
@@ -1136,8 +1417,6 @@ async function loadSystem() {
     const d = await api('/api/admin/system');
     $('dotRedis').className = 'dot ' + (d.redis_online ? 'on' : 'off');
     $('dotCv').className = 'dot ' + (d.redis_online ? (d.cv_paused ? 'warn' : 'on') : 'off');
-    $('cvState').textContent = d.cv_paused ? 'PAUSED' : 'RUNNING';
-    $('cvState').style.color = d.cv_paused ? 'var(--warn)' : 'var(--ok)';
     const qm = d.queue_metrics || {};
     const entries = Object.entries(qm).filter(([k, v]) => typeof v !== 'object');
     $('qmGrid').innerHTML = entries.length
@@ -1146,15 +1425,258 @@ async function loadSystem() {
   } catch (e) { /* keep last known state */ }
 }
 
-async function pipeline(action) {
-  const btn = action === 'pause' ? $('pauseBtn') : $('resumeBtn');
-  btn.disabled = true;
+/* ═══════ SYSTEM CONTROL ═══════
+   Two facts per component, never merged: `paused` is what was asked for, and
+   `state` is what the worker last said about itself. They differ for a few
+   seconds after a click because the worker is finishing its chunk, and they
+   differ permanently when the worker is dead — which is the case worth seeing,
+   and the case a single label would hide. */
+const COMP_HINT = {
+  harvest: 'Downloads reels from the channel',
+  cv: 'ffmpeg frame extraction',
+  analyze: 'Whisper, YOLO and OCR on the GPU',
+  omni: 'Qwen2.5-VL narratives',
+};
+
+function renderPause(d) {
+  const s = $('sysState');
+  if (!d.redis) {
+    s.textContent = 'REDIS DOWN'; s.className = 's down';
+    $('sysReason').textContent = d.error || 'Pause state cannot be read.';
+    $('compGrid').innerHTML = '';
+    $('pauseBtn').disabled = $('resumeBtn').disabled = true;
+    return;
+  }
+  const paused = !!d.global_paused;
+  s.textContent = paused ? 'PAUSED' : 'RUNNING';
+  s.className = 's ' + (paused ? 'pause' : 'run');
+  $('sysReason').textContent = paused
+    ? (d.reason || 'paused from the admin panel')
+      + (d.paused_for_s ? ` · ${fmtDur(d.paused_for_s)}` : '')
+    : 'every stage is claiming work';
+  $('pauseBtn').disabled = paused;
+  $('resumeBtn').disabled = !paused && !(d.components || []).some(c => c.own_flag);
+
+  // The topbar chip and the legacy sub-label keep meaning what they always did.
+  const cv = (d.components || []).find(c => c.name === 'cv');
+  $('cvState').textContent = paused ? 'ALL PAUSED' : cv && cv.paused ? 'CV PAUSED' : 'RUNNING';
+  $('cvState').style.color = paused || (cv && cv.paused) ? 'var(--warn)' : 'var(--ok)';
+
+  $('compGrid').innerHTML = (d.components || []).map(c => {
+    const dead = c.state === 'stale' || c.state === 'unknown';
+    const age = c.heartbeat_age_s === null || c.heartbeat_age_s === undefined
+      ? 'never reported' : `${c.heartbeat_age_s}s ago`;
+    return `<div class="comp${c.paused ? ' paused' : ''}${dead ? ' dead' : ''}">
+        <div class="top">
+          <span class="nm">${esc(c.label)}</span>
+          <span class="tog" onclick="toggleComponent('${esc(c.name)}', ${c.own_flag ? 'false' : 'true'})"
+                title="${c.own_flag ? 'Resume' : 'Pause'} only this stage">
+            ${c.own_flag ? 'resume' : 'pause'}</span>
+        </div>
+        <div class="obs"><span class="st ${esc(c.state)}">${esc(c.state)}</span> · ${esc(age)}</div>
+        <div class="dt" title="${esc(c.detail || COMP_HINT[c.name] || '')}">${esc(c.detail || COMP_HINT[c.name] || '')}</div>
+      </div>`;
+  }).join('');
+}
+
+const fmtDur = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m`
+                  : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+
+async function loadPause() {
+  try { renderPause(await api('/api/admin/pause/state', {}, 0)); }
+  catch (e) { /* keep last known state */ }
+}
+
+async function pauseAll() {
+  const btn = $('pauseBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Pausing…';
   try {
-    await api(`/api/admin/queue/${action}`, { method: 'POST' });
-    showToast(action === 'pause' ? 'CV extraction paused' : 'CV extraction resumed', 'ok');
-    loadSystem();
-  } catch (e) { showToast(`${action} failed: ${e.message}`, 'error'); }
-  finally { btn.disabled = false; }
+    await api('/api/admin/pause/all', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'paused from Mission Control' }),
+    }, 0);
+    // Workers stop at their next job boundary, not mid-file. Saying so keeps
+    // the few seconds of "still running" from reading as a broken button.
+    showToast('Pausing — each stage stops after its current job', 'ok');
+  } catch (e) { showToast(`Pause failed: ${e.message}`, 'error'); }
+  finally { btn.innerHTML = 'Pause Everything'; loadPause(); }
+}
+
+async function resumeAll() {
+  const btn = $('resumeBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Resuming…';
+  try {
+    await api('/api/admin/resume/all', { method: 'POST' }, 0);
+    showToast('Resumed — every stage is claiming work again', 'ok');
+  } catch (e) { showToast(`Resume failed: ${e.message}`, 'error'); }
+  finally { btn.innerHTML = 'Resume Everything'; loadPause(); }
+}
+
+async function toggleComponent(name, paused) {
+  try {
+    await api('/api/admin/pause/component', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ component: name, paused }),
+    }, 0);
+    loadPause();
+  } catch (e) { showToast(`Could not change ${name}: ${e.message}`, 'error'); }
+}
+
+/* ═══════ FACTORY RESET ═══════
+   Scoped, priced, typed. `preview` measures every target so the decision is
+   made against real bytes rather than a guess, and the phrase is validated
+   server-side as well as here — this is the one action in VIOS with no undo on
+   the machine it runs on. The Telegram channel is never in scope, which is why
+   it is stated on screen rather than left implied. */
+let rsList = [];
+let rsSel = new Set();
+let rsTimer = null;
+let rsPolling = false;
+let rsPhrase = 'DELETE EVERYTHING';
+
+async function loadResetPreview() {
+  try {
+    const d = await api('/api/admin/reset/preview', {}, 0);
+    rsList = d.targets || [];
+    rsPhrase = d.confirm_phrase || rsPhrase;
+    $('rsConfirm').placeholder = `Type ${rsPhrase} to enable`;
+    // Nothing is pre-selected. A destructive default is how people delete the
+    // model cache they meant to keep.
+    rsSel = new Set([...rsSel].filter(id => rsList.some(t => t.id === id)));
+    $('rsSub').textContent = `${d.total_mb >= 1024 ? (d.total_mb / 1024).toFixed(2) + ' GB' : d.total_mb + ' MB'} across ${rsList.length} targets`;
+
+    const rec = d.recovery || {};
+    $('rsSafe').innerHTML =
+        `<b>${esc(d.channel_note || '')}</b> ${esc(rec.advice || '')}`
+      + (rec.local_bundles
+          ? ` Currently ${rec.local_bundles} bundle(s) on disk, newest ${esc(rec.newest_local || '?')}.`
+          : ' No local bundle exists right now.');
+    renderResetTargets();
+  } catch (e) { showToast(`Could not measure: ${e.message}`, 'error'); }
+}
+
+function renderResetTargets() {
+  $('rsTargets').innerHTML = rsList.map(t => {
+    const mb = t.size_mb || 0;
+    const size = mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(0) + ' MB';
+    return `<label class="rs-t${rsSel.has(t.id) ? ' sel' : ''}">
+        <input type="checkbox" ${rsSel.has(t.id) ? 'checked' : ''}
+               onchange="toggleResetTarget('${esc(t.id)}', this.checked)">
+        <div class="b">
+          <div class="h"><span class="l">${esc(t.label)}</span>
+            <span class="sz${mb > 0 ? '' : ' zero'}">${size}</span></div>
+          <div class="ls">${esc(t.loss)}</div>
+        </div>
+      </label>`;
+  }).join('');
+  renderResetSummary();
+}
+
+function toggleResetTarget(id, on) {
+  on ? rsSel.add(id) : rsSel.delete(id);
+  // Only the outline and the total change. Re-rendering the whole grid from
+  // inside a checkbox's own change handler would replace the element that
+  // fired the event, which is how a click lands on nothing.
+  const row = document.querySelector(`.rs-t input[onchange*="'${id}'"]`);
+  if (row) row.closest('.rs-t').classList.toggle('sel', on);
+  renderResetSummary();
+  syncResetBtn();
+}
+
+function renderResetSummary() {
+  const chosen = rsList.filter(t => rsSel.has(t.id));
+  const mb = chosen.reduce((s, t) => s + (t.size_mb || 0), 0);
+  const box = $('rsSum');
+  box.style.display = chosen.length ? '' : 'none';
+  if (!chosen.length) return;
+  $('rsFree').textContent = mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(0) + ' MB';
+  const hard = chosen.filter(t => !t.safe).map(t => t.label);
+  $('rsTx').innerHTML = `freed by deleting ${chosen.length} target(s).`
+    + (hard.length ? ` <b style="color:var(--danger)">${esc(hard.join(', '))}</b> cannot be regenerated locally.`
+                   : ' Everything selected is regenerable.');
+}
+
+function syncResetBtn() {
+  const typed = ($('rsConfirm').value || '').trim().toUpperCase() === rsPhrase;
+  $('rsBtn').disabled = !typed || rsSel.size === 0 || rsPolling;
+  $('rsBtn').title = !rsSel.size ? 'Select what to delete'
+                   : !typed ? `Type ${rsPhrase} to enable` : '';
+}
+
+function askReset() {
+  const chosen = rsList.filter(t => rsSel.has(t.id));
+  const hard = chosen.filter(t => !t.safe);
+  askConfirm({
+    title: 'Delete everything selected?',
+    html: `This permanently deletes <b>${esc(chosen.map(t => t.label).join(', '))}</b> `
+        + `from this container.`
+        + (hard.length
+            ? `<br><br>${esc(hard.map(t => t.label).join(', '))} cannot be regenerated `
+              + `from what is left on this machine — only a bundle in the channel brings them back.`
+            : '')
+        + `<br><br>Workers are paused, wiped and restarted. The Telegram channel is not touched.`,
+    confirmLabel: 'Delete Permanently',
+    onConfirm: () => { closeModal(); startReset(); },
+  });
+}
+
+async function startReset() {
+  const btn = $('rsBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Starting…';
+  try {
+    await api('/api/admin/reset/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: [...rsSel], confirm: $('rsConfirm').value, restart: true }),
+    }, 0);                       // never auto-retry: a retry would wipe twice
+    $('rsConfirm').value = '';   // the phrase authorises one run, not a session
+    showToast('Factory reset started', 'ok');
+    rsPolling = true;
+    pollReset();
+  } catch (e) {
+    showToast(`Reset failed to start: ${e.message}`, 'error');
+    btn.innerHTML = 'Delete Everything';
+    syncResetBtn();
+  }
+}
+
+function renderReset(st) {
+  const running = st.state === 'running';
+  $('rsBtn').innerHTML = running ? '<span class="spin"></span> Deleting…' : 'Delete Everything';
+  if (st.state === 'idle') { $('rsProg').classList.remove('on'); syncResetBtn(); return; }
+  $('rsProg').classList.add('on');
+  $('rsStage').textContent = st.stage || '—';
+  $('rsPct').textContent = (st.pct ?? 0) + '%';
+  $('rsDetail').textContent = st.detail || '';
+  const bar = $('rsBar');
+  bar.className = 'exp-bar' + (st.state === 'error' ? ' err' : st.state === 'done' ? ' done' : '');
+  bar.firstElementChild.style.width = (st.state === 'done' ? 100 : (st.pct ?? 0)) + '%';
+  $('rsLog').innerHTML = (st.log || []).map(l => `<div>${esc(l)}</div>`).join('');
+  $('rsLog').scrollTop = $('rsLog').scrollHeight;
+  syncResetBtn();
+}
+
+async function pollReset() {
+  if (rsTimer) { clearTimeout(rsTimer); rsTimer = null; }
+  try {
+    const st = await api('/api/admin/reset/status', {}, 0);
+    const running = st.state === 'running';
+    if (rsPolling && !running) {
+      if (st.state === 'done') {
+        showToast(`Reset complete — ${st.freed_mb} MB freed`, 'ok');
+        // Every panel below now reads a different machine.
+        rsSel.clear();
+        loadResetPreview(); loadDisk(true); loadDbHealth();
+        loadCategories(); loadBundles(); loadPause();
+      } else if (st.state === 'error') {
+        showToast(`Reset failed: ${st.error || 'unknown'}`, 'error');
+      }
+    }
+    rsPolling = running;
+    renderReset(st);
+    rsTimer = setTimeout(pollReset, running ? 1500 : 30000);
+  } catch (e) {
+    rsTimer = setTimeout(pollReset, 30000);
+  }
 }
 
 /* ═══════ LOGS ═══════ */
@@ -1175,11 +1697,19 @@ async function loadLogs() {
 /* ═══════ BOOT + POLLING ═══════ */
 (function boot() {
   loadDisk(); loadCategories(); loadSystem(); loadLogs(); loadDbHealth();
+  loadPause();
   pollExport(); loadBundles();   // pollExport self-schedules: 1.5s busy, 15s idle
   // Same self-scheduling shape: a restore started before a page refresh, or
   // from another tab, has to reappear here on its own.
   pollRestore();
+  // A reset started elsewhere must show up here too — and it kills workers, so
+  // a panel that did not know about it would report a healthy system mid-wipe.
+  pollReset();
+  loadResetPreview();
   setInterval(() => { if (!document.hidden) { loadSystem(); } }, 6000);
+  // Pause state leads the page: it is the one reading that decides whether
+  // "no progress" means idle or stopped, so it beats faster than the rest.
+  setInterval(() => { if (!document.hidden) { loadPause(); } }, 4000);
   setInterval(() => { if (!document.hidden) { loadLogs(); } }, 4000);
   setInterval(() => { if (!document.hidden) { loadDisk(); } }, 30000);
   // Counts move only as the pipeline writes, and each poll runs three

@@ -40,6 +40,7 @@ from config import (DB_PATH, VIDEO_DIR, QUEUE_ANALYZE, SQLITE_TIMEOUT,
 import torch
 
 from queue_manager import claim_job, ack_job, fail_job, pop_job, push_job, wait_for_redis
+from system_control import heartbeat, wait_while_paused
 from logger import vios_log
 
 device_0 = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -326,6 +327,12 @@ if __name__ == "__main__":
 
     # Phase 2: reliable analysis loop
     while True:
+        # Same rule as the CV engine: the pause is checked before a job is
+        # claimed, so pressing Pause stops the GPU at the next job boundary
+        # rather than after the whole backlog has run.
+        wait_while_paused("analyze",
+                          on_pause=lambda: log("⏸️ Paused by Admin — waiting..."),
+                          on_resume=lambda: log("▶️ Resumed by Admin"))
         try:
             job, job_raw = claim_job(QUEUE_ANALYZE, timeout=5)
         except Exception as e:
@@ -333,11 +340,13 @@ if __name__ == "__main__":
             time.sleep(3)
             continue
         if not job:
+            heartbeat("analyze", "idle", "queue empty")
             continue
 
         payload = job.get("payload", job)
         msg_id = payload.get("msg_id", "?")
         log(f"📥 ANALYZE JOB: Video #{msg_id}")
+        heartbeat("analyze", "running", f"video #{msg_id}")
         try:
             process_analyze_job(payload)
             ack_job(QUEUE_ANALYZE, job, job_raw)
