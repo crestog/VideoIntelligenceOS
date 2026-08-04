@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="atlas">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Atlas — moment search</title>
+<meta name="description" content="Search inside video. Every narrative, transcript, object and on-screen word from the archive, indexed to the second.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/atlas.css">
+</head>
+<body>
+
+<!-- ═══ TOP BAR ═════════════════════════════════════════════════════════ -->
+<header class="topbar">
+  <a class="brand" href="#" data-tab="search" aria-label="Atlas home">
+    <span class="brand-mark" aria-hidden="true">
+      <i></i><i></i><i></i><i></i>
+    </span>
+    <span class="brand-word">ATLAS</span>
+  </a>
+
+  <form class="finder" id="finder" role="search" autocomplete="off">
+    <label class="sr-only" for="q">Search every moment</label>
+    <input id="q" name="q" type="search" spellcheck="false"
+           placeholder="Describe the moment you are looking for"
+           aria-describedby="finder-hint">
+    <button type="submit" class="finder-go" aria-label="Search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
+    </button>
+    <div class="suggest" id="suggest" role="listbox" hidden></div>
+  </form>
+
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" data-tab="search" aria-selected="true">Search</button>
+    <button role="tab" data-tab="library" aria-selected="false">Library</button>
+    <button role="tab" data-tab="data" aria-selected="false">Data</button>
+    <button role="tab" data-tab="sources" aria-selected="false">Sources</button>
+  </nav>
+
+  <button class="pulse" id="pulse" aria-live="polite" title="System status">
+    <span class="pulse-dot" data-state="warming"></span>
+    <span class="pulse-text">starting</span>
+  </button>
+</header>
+
+<!-- ═══ STAGE ═══════════════════════════════════════════════════════════ -->
+<main class="stage" id="stage">
+
+  <!-- ── left: whichever section is active ── -->
+  <section class="pane pane-left" id="left">
+
+    <!-- SEARCH ------------------------------------------------------- -->
+    <div class="view" id="view-search" data-view="search">
+      <div class="opening" id="opening">
+        <p class="opening-eyebrow">Moment retrieval</p>
+        <h1 class="opening-title">Search <em>inside</em> the video.</h1>
+        <p class="opening-lede">
+          Every narrative the vision model wrote, every word that was spoken,
+          every object seen and every line of on-screen text — indexed to the
+          second and fused into one ranking.
+        </p>
+        <div class="opening-stats" id="openingStats"></div>
+        <div class="opening-tries" id="openingTries"></div>
+      </div>
+
+      <div class="results" id="results" hidden>
+        <div class="results-head">
+          <div class="results-count" id="resultsCount"></div>
+          <div class="results-filters" id="sourceFilters"></div>
+        </div>
+        <ol class="cards" id="cards"></ol>
+        <div class="more" id="more" hidden>
+          <button class="btn" id="moreBtn">Load more results</button>
+        </div>
+      </div>
+
+      <div class="empty" id="emptySearch" hidden></div>
+    </div>
+
+    <!-- LIBRARY ------------------------------------------------------ -->
+    <div class="view" id="view-library" data-view="library" hidden>
+      <div class="view-head">
+        <h2>Library</h2>
+        <div class="view-tools">
+          <input class="mini-input" id="libQ" type="search" placeholder="Filter by title, caption or creator">
+          <select class="mini-select" id="libSort" aria-label="Sort">
+            <option value="recent">Newest first</option>
+            <option value="richest">Most indexed</option>
+            <option value="longest">Longest</option>
+            <option value="shortest">Shortest</option>
+            <option value="liked">Most liked</option>
+            <option value="oldest">Oldest first</option>
+          </select>
+          <select class="mini-select" id="libHas" aria-label="Filter by content">
+            <option value="">Everything</option>
+            <option value="narrative">Has narrative</option>
+            <option value="speech">Has speech</option>
+            <option value="playable">Playable now</option>
+          </select>
+        </div>
+      </div>
+      <div class="facets" id="libFacets"></div>
+      <div class="grid" id="libGrid"></div>
+      <div class="more" id="libMore" hidden>
+        <button class="btn" id="libMoreBtn">Load more</button>
+      </div>
+    </div>
+
+    <!-- DATA --------------------------------------------------------- -->
+    <div class="view" id="view-data" data-view="data" hidden>
+      <div class="view-head">
+        <h2>Data</h2>
+        <p class="view-note" id="dataNote"></p>
+      </div>
+      <div class="schema" id="schema"></div>
+      <div class="browser" id="browser" hidden>
+        <div class="browser-head">
+          <h3 id="browserTitle"></h3>
+          <input class="mini-input" id="browserQ" type="search" placeholder="Search this table">
+          <button class="btn btn-quiet" id="browserClose">Close</button>
+        </div>
+        <div class="table-wrap"><table class="grid-table" id="browserTable"></table></div>
+        <div class="pager" id="browserPager"></div>
+      </div>
+    </div>
+
+    <!-- SOURCES ------------------------------------------------------ -->
+    <div class="view" id="view-sources" data-view="sources" hidden>
+      <div class="view-head">
+        <h2>Sources</h2>
+        <div class="view-tools">
+          <button class="btn" id="rescanBtn">Rescan channel</button>
+          <button class="btn btn-quiet" id="reindexBtn">Rebuild index</button>
+        </div>
+      </div>
+      <div class="channel" id="channelCard"></div>
+      <h3 class="section-h">Bundles imported from the channel</h3>
+      <div class="bundles" id="bundles"></div>
+      <h3 class="section-h">Columns feeding search</h3>
+      <div class="feeds" id="feeds"></div>
+      <h3 class="section-h">Activity</h3>
+      <pre class="log" id="log"></pre>
+    </div>
+  </section>
+
+  <!-- ── right: the persistent player ── -->
+  <aside class="pane pane-player" id="player" data-open="false">
+    <div class="player-idle" id="playerIdle">
+      <div class="player-idle-mark" aria-hidden="true"></div>
+      <p>Pick a result to play it here.<br>Nothing reloads — the video stays put
+         while you keep searching.</p>
+    </div>
+
+    <div class="player-live" id="playerLive" hidden>
+      <div class="screen">
+        <video id="video" playsinline preload="auto"></video>
+        <div class="screen-busy" id="screenBusy" hidden>
+          <div class="bar"><i id="busyBar"></i></div>
+          <span id="busyText">fetching from the channel</span>
+        </div>
+        <button class="screen-close" id="screenClose" aria-label="Close player">×</button>
+      </div>
+
+      <div class="ribbon-block">
+        <div class="ribbon ribbon-lg" id="playerRibbon" role="slider"
+             aria-label="Matching moments" tabindex="0"
+             aria-valuemin="0" aria-valuenow="0">
+          <i class="playhead" id="playhead"></i>
+        </div>
+        <div class="ribbon-scale"><span id="tNow">0:00</span><span id="tEnd">0:00</span></div>
+      </div>
+
+      <div class="player-meta" id="playerMeta"></div>
+
+      <div class="strip" role="tablist" aria-label="Video detail">
+        <button role="tab" class="on" data-panel="moments">Moments</button>
+        <button role="tab" data-panel="record">Database record</button>
+        <button role="tab" data-panel="similar">Similar</button>
+      </div>
+      <div class="panel" id="panel-moments"></div>
+      <div class="panel" id="panel-record" hidden></div>
+      <div class="panel" id="panel-similar" hidden></div>
+    </div>
+  </aside>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+<script src="/atlas.js"></script>
+</body>
+</html>
