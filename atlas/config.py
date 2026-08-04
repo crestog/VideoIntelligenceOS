@@ -145,7 +145,12 @@ SOURCE_WEIGHT = {
 # downloads go over MTProto and this is only the fallback threshold.
 HTTP_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 VIDEO_CACHE_GB      = float(os.environ.get("ATLAS_VIDEO_CACHE_GB", "12"))
-PREFETCH_TOP_N      = int(os.environ.get("ATLAS_PREFETCH", "6"))
+# Playback streams 1 MiB chunks straight out of the channel, so warming a result
+# means fetching two chunks — the head where playback starts and the tail where
+# a phone-written mp4 keeps its moov atom — not the whole file. At 2 MiB per
+# video instead of 30, a whole page of results can be warmed for less than one
+# old-style prefetch.
+PREFETCH_TOP_N      = int(os.environ.get("ATLAS_PREFETCH", "12"))
 
 # ── Server ────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("ATLAS_PORT", "7000"))

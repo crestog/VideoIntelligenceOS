@@ -109,7 +109,7 @@ _SOURCE_HINTS = (
 # Atlas's own tables. They are derived from the others, so indexing them would
 # feed search its own output back to it.
 _ATLAS_OWN = {"moments", "moments_fts", "bundles", "atlas_meta", "ingest_log",
-              "video_index"}
+              "video_index", "graph_nodes", "graph_edges"}
 
 _FTS_SHADOW = re.compile(r"_(data|idx|content|docsize|config)$")
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")

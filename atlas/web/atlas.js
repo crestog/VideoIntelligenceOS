@@ -160,7 +160,7 @@ function readHash() {
   const raw = location.hash.replace(/^#\/?/, '');
   const [tab, qs] = raw.split('?');
   return {
-    tab: ['search', 'library', 'data', 'sources'].includes(tab) ? tab : 'search',
+    tab: ['search', 'library', 'graph', 'data', 'sources'].includes(tab) ? tab : 'search',
     params: new URLSearchParams(qs || ''),
   };
 }
@@ -184,6 +184,9 @@ function showTab(tab, { push = true } = {}) {
     writeHash(tab, p);
   }
   if (tab === 'library' && !S.lib.rows.length) loadLibrary(true);
+  // The canvas has no size while its view is hidden, so the graph can only be
+  // measured after the switch — hence the boot call here rather than at start.
+  if (tab === 'graph') graphBoot(false);
   if (tab === 'data' && !$('schema').childElementCount) loadSchema();
   if (tab === 'sources') loadSources();
 }
@@ -265,6 +268,12 @@ function renderCount(data) {
   else if (data.mode === 'lexical') bits.push('words only');
   else if (data.mode === 'dense') bits.push('meaning only');
   $('resultsCount').innerHTML = bits.join(' <span class="sep">·</span> ');
+  // What these results have in common is often the more interesting question,
+  // and it is one click away rather than a separate search.
+  $('resultsCount').appendChild(h('button', {
+    class: 'plot-link', onclick: graphFromResults,
+    title: 'Plot these results and what they share on the graph',
+  }, 'see the graph'));
 }
 
 function renderSourceFilters(data) {
@@ -585,6 +594,10 @@ function pollMediaState(key) {
         clearInterval(statePoll);
         return;
       }
+      // Streaming means bytes are already reaching the player. The video's own
+      // events clear the overlay; showing a progress bar over a playing video
+      // would be a lie about what it is waiting for.
+      if (st.status === 'streaming') return;
       if (st.status === 'error') {
         clearInterval(statePoll);
         busy(true, st.note || 'could not fetch this video from the channel', 0);
@@ -1104,6 +1117,1379 @@ function renderFeeds(sources) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+   GRAPH
+
+   A force-directed graph on a canvas, written here rather than pulled in,
+   because the two things this one has to do are the two things a general
+   library makes awkward: nodes that mean different things need to be drawn
+   differently — a reel is a vertical frame, an entity is a disc — and a click
+   has to reach the rest of the application, opening the same persistent
+   player a search result opens.
+
+   Three parts, in order: the layout (quadtree + springs), the paint, and the
+   pointer. The layout runs on a clock that stops itself once the graph has
+   settled, so an idle tab costs nothing.
+   ════════════════════════════════════════════════════════════════════════ */
+const G = {
+  nodes: new Map(),           // id → node with position and velocity
+  edges: new Map(),           // src|dst|rel → edge
+  view: { x: 0, y: 0, k: 1 },
+  sel: null, selEdge: null, hover: null, hoverEdge: null,
+  drag: null, pan: null, moved: 0,
+  alpha: 0, raf: 0, frozen: false,
+  mode: 'data',
+  off: new Set(),             // kinds switched off in the rail
+  counts: null, loaded: false,
+  posters: new Map(),         // video key → Image | 'no'
+  hits: [], hitIndex: -1,
+  labelBoxes: [],
+  traceFrom: null,            // first end of a "how are these two related" ask
+  pathSet: null, pathEdges: null,
+};
+
+const GRAPH_TICK = {
+  charge: -900,        // node-to-node repulsion
+  theta: 0.9,          // Barnes-Hut opening angle
+  spring: 0.055,       // edge stiffness
+  gravity: 0.022,      // pull toward the middle, so nothing drifts away
+  damp: 0.72,
+  decay: 0.021,        // how fast the layout cools
+  floor: 0.005,        // below this it is settled, stop the clock
+};
+
+const KIND_COLOR = {
+  video: '#E6F0EE', dim: '#5EC8D8', tag: '#B9F18D',
+  hashtag: '#8A9BA8', table: '#7E9A98', anchor: '#FFB020',
+};
+const KIND_LABEL = {
+  video: 'video', dim: 'entity', tag: 'thing seen or said',
+  hashtag: 'hashtag', table: 'table', anchor: 'join key',
+};
+
+/* A tag inherits the colour of the evidence it came from, so an object the
+   vision model saw is the same cyan on this canvas as it is on a ribbon. */
+const RAW_SOURCE_COLOR = {
+  narrative: '#B9F18D', speech: '#FFB020', visual: '#5EC8D8',
+  ocr: '#E8705C', caption: '#8A9BA8', meta: '#6E7F8C',
+};
+
+function gcolor(node) {
+  if (!node) return '#6E7F8C';
+  if (node.kind === 'tag') {
+    const s = node.meta && node.meta.source;
+    return RAW_SOURCE_COLOR[s] || KIND_COLOR.tag;
+  }
+  return KIND_COLOR[node.kind] || '#6E7F8C';
+}
+
+function gradius(node) {
+  // Degree decides size, on a log curve: a creator with 400 videos should read
+  // as bigger than one with 4, not a hundred times bigger.
+  const w = Math.max(1, Number(node.weight) || 1);
+  if (node.kind === 'video') return 9 + Math.min(7, Math.log2(w + 1) * 1.6);
+  return 7 + Math.min(19, Math.log2(w + 1) * 3.4);
+}
+
+const gkey = (e) => `${e.src}|${e.dst}|${e.rel}`;
+
+/* ── the model ──────────────────────────────────────────────────────────── */
+function gmerge(payload, around) {
+  const fresh = [];
+  const list = payload.nodes || [];
+  // New nodes land on a ring around whatever was expanded rather than at the
+  // origin, so an expansion reads as unfolding instead of as an explosion.
+  const spread = Math.max(70, 26 + list.length * 4);
+  let i = 0;
+  for (const raw of list) {
+    let node = G.nodes.get(raw.id);
+    if (node) {
+      node.weight = raw.weight;
+      node.label = raw.label;
+      node.meta = raw.meta || node.meta;
+      continue;
+    }
+    const angle = (i / Math.max(1, list.length)) * Math.PI * 2 + (i % 3) * 0.4;
+    const base = around || { x: 0, y: 0 };
+    node = {
+      id: raw.id, kind: raw.kind, label: raw.label || raw.id,
+      sub: raw.sub || '', weight: raw.weight || 0, meta: raw.meta || {},
+      x: base.x + Math.cos(angle) * spread * (0.7 + (i % 5) * 0.09),
+      y: base.y + Math.sin(angle) * spread * (0.7 + (i % 7) * 0.07),
+      vx: 0, vy: 0, deg: 0, pin: false, expanded: false,
+    };
+    node.r = gradius(node);
+    G.nodes.set(node.id, node);
+    fresh.push(node);
+    i++;
+  }
+  for (const raw of payload.edges || []) {
+    const k = gkey(raw);
+    if (G.edges.has(k)) continue;
+    if (!G.nodes.has(raw.src) || !G.nodes.has(raw.dst)) continue;
+    G.edges.set(k, {
+      src: raw.src, dst: raw.dst, rel: raw.rel,
+      weight: Number(raw.weight) || 1, ref: raw.ref || '',
+    });
+  }
+  gdegree();
+  return fresh;
+}
+
+function gdegree() {
+  for (const n of G.nodes.values()) { n.deg = 0; n.r = gradius(n); }
+  for (const e of G.edges.values()) {
+    const a = G.nodes.get(e.src), b = G.nodes.get(e.dst);
+    if (a) a.deg++;
+    if (b) b.deg++;
+  }
+}
+
+const gvisible = (n) => n && !G.off.has(n.kind);
+
+function gliveNodes() {
+  const out = [];
+  for (const n of G.nodes.values()) if (gvisible(n)) out.push(n);
+  return out;
+}
+
+function gliveEdges() {
+  const out = [];
+  for (const e of G.edges.values()) {
+    const a = G.nodes.get(e.src), b = G.nodes.get(e.dst);
+    if (gvisible(a) && gvisible(b)) out.push({ e, a, b });
+  }
+  return out;
+}
+
+/* ── layout: Barnes-Hut ─────────────────────────────────────────────────
+   Repulsion between every pair is what spreads a graph out, and doing it
+   honestly is O(n²) — 400 nodes is 160k distance calculations per frame,
+   which drops the frame rate the moment anybody expands twice. A quadtree
+   turns distant clusters into a single averaged mass, so the same pass costs
+   O(n log n) and the layout stays smooth into the thousands. */
+function gtree(nodes) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of nodes) {
+    if (n.x < x0) x0 = n.x;
+    if (n.y < y0) y0 = n.y;
+    if (n.x > x1) x1 = n.x;
+    if (n.y > y1) y1 = n.y;
+  }
+  if (!isFinite(x0)) return null;
+  const size = Math.max(x1 - x0, y1 - y0, 1) * 1.05 + 2;
+  const root = { x: x0 - 1, y: y0 - 1, s: size, cx: 0, cy: 0, m: 0, kids: null, leaf: null };
+  for (const n of nodes) ginsert(root, n, 0);
+  gfinish(root);
+  return root;
+}
+
+const GTREE_DEPTH = 20;
+
+function gchild(cell, n) {
+  const half = cell.s / 2;
+  const i = (n.x >= cell.x + half ? 1 : 0) + (n.y >= cell.y + half ? 2 : 0);
+  if (!cell.kids) cell.kids = [null, null, null, null];
+  if (!cell.kids[i]) {
+    cell.kids[i] = {
+      x: cell.x + (i & 1 ? half : 0), y: cell.y + (i & 2 ? half : 0),
+      s: half, cx: 0, cy: 0, m: 0, kids: null, leaf: null,
+    };
+  }
+  return cell.kids[i];
+}
+
+function ginsert(cell, n, depth) {
+  for (;;) {
+    cell.cx += n.x; cell.cy += n.y; cell.m++;
+    if (!cell.kids && !cell.leaf) { cell.leaf = n; return; }
+    // Two nodes at the same coordinates would subdivide forever. Past this
+    // depth the cell just holds a list; the layout's separation pass will
+    // have pulled them apart by the next frame anyway.
+    if (depth >= GTREE_DEPTH) { (cell.extra || (cell.extra = [])).push(n); return; }
+    if (cell.leaf) {
+      const held = cell.leaf;
+      cell.leaf = null;
+      // Push the sitting tenant one level down before taking its place.
+      // Bounded by GTREE_DEPTH, so this recursion cannot run away.
+      ginsert(gchild(cell, held), held, depth + 1);
+    }
+    cell = gchild(cell, n);
+    depth++;
+  }
+}
+
+function gfinish(cell) {
+  if (!cell) return;
+  if (cell.m) { cell.cx /= cell.m; cell.cy /= cell.m; }
+  if (cell.kids) for (const k of cell.kids) gfinish(k);
+}
+
+function grepel(root, n, strength) {
+  const stack = [root];
+  let fx = 0, fy = 0;
+  while (stack.length) {
+    const cell = stack.pop();
+    if (!cell || !cell.m) continue;
+    if (cell.leaf === n && cell.m === 1) continue;      // itself
+    let dx = cell.cx - n.x, dy = cell.cy - n.y;
+    let d2 = dx * dx + dy * dy;
+    if (d2 < 1) {
+      // Exactly coincident: nudge along a direction derived from the id, so
+      // the jitter is the same every frame and the node does not shiver.
+      dx = (n.id.length % 7) - 3.5;
+      dy = (n.id.length % 5) - 2.5;
+      d2 = dx * dx + dy * dy + 1;
+    }
+    // Small enough on screen, or a single node: treat as one mass. cell.m
+    // already counts everything inside, including any coincident overflow.
+    if (cell.leaf || cell.s * cell.s / d2 < GRAPH_TICK.theta * GRAPH_TICK.theta) {
+      const d = Math.sqrt(d2);
+      const f = strength * cell.m / (d2 * d);
+      fx += dx * f; fy += dy * f;
+      continue;
+    }
+    if (cell.kids) for (const k of cell.kids) if (k) stack.push(k);
+  }
+  n.vx += fx; n.vy += fy;
+}
+
+function gtick() {
+  const nodes = gliveNodes();
+  if (!nodes.length) return;
+  const alpha = G.alpha;
+  const root = gtree(nodes);
+
+  for (const n of nodes) {
+    if (root) grepel(root, n, GRAPH_TICK.charge * alpha);
+    n.vx += -n.x * GRAPH_TICK.gravity * alpha;
+    n.vy += -n.y * GRAPH_TICK.gravity * alpha;
+  }
+
+  for (const { a, b } of gliveEdges()) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.hypot(dx, dy) || 0.01;
+    // Longer rest length for hubs so their satellites form a readable ring
+    // instead of a solid disc of overlapping labels.
+    const rest = 58 + a.r + b.r + Math.min(120, (a.deg + b.deg) * 0.9);
+    const pull = (d - rest) * GRAPH_TICK.spring * alpha;
+    const ux = (dx / d) * pull, uy = (dy / d) * pull;
+    // Each end moves in inverse proportion to its own degree — degree is the
+    // node's mass here. Without this a creator with 400 videos is dragged
+    // around by each of them in turn and the whole graph oscillates.
+    const sa = 1 / Math.max(1, a.deg), sb = 1 / Math.max(1, b.deg);
+    a.vx += ux * sa; a.vy += uy * sa;
+    b.vx -= ux * sb; b.vy -= uy * sb;
+  }
+
+  for (const n of nodes) {
+    if (n.pin || (G.drag && G.drag.node === n)) { n.vx = n.vy = 0; continue; }
+    n.vx *= GRAPH_TICK.damp; n.vy *= GRAPH_TICK.damp;
+    const cap = 34;
+    n.vx = Math.max(-cap, Math.min(cap, n.vx));
+    n.vy = Math.max(-cap, Math.min(cap, n.vy));
+    n.x += n.vx; n.y += n.vy;
+  }
+
+  // A short separation pass. Repulsion alone leaves discs touching at rest,
+  // and touching discs make the labels unreadable. It is O(n²), so it is the
+  // first thing dropped as the graph grows — by then the repulsion is doing
+  // the job well enough on its own.
+  const passes = nodes.length > 900 ? 0 : (nodes.length > 420 ? 1 : 2);
+  for (let pass = 0; pass < passes; pass++) {
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const want = a.r + b.r + 6;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > want * want || d2 < 0.0001) continue;
+        const d = Math.sqrt(d2);
+        const push = (want - d) / d * 0.5;
+        a.x -= dx * push; a.y -= dy * push;
+        b.x += dx * push; b.y += dy * push;
+      }
+    }
+  }
+
+  G.alpha += (0 - G.alpha) * GRAPH_TICK.decay;
+  if (G.alpha < GRAPH_TICK.floor) G.alpha = 0;
+}
+
+const REDUCED = window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function gheat(to) {
+  if (G.frozen) { gdraw(); return; }
+  if (REDUCED) {
+    // No animation wanted. Dragging still has to feel direct, so a drag just
+    // repaints; anything else settles the layout in one go and shows the
+    // finished arrangement rather than the journey to it.
+    if (G.drag) { gdraw(); return; }
+    G.alpha = Math.max(G.alpha, to === undefined ? 0.62 : to);
+    for (let i = 0; i < 240 && G.alpha > GRAPH_TICK.floor; i++) gtick();
+    G.alpha = 0;
+    gdraw();
+    return;
+  }
+  G.alpha = Math.max(G.alpha, to === undefined ? 0.62 : to);
+  if (!G.raf) G.raf = requestAnimationFrame(gframe);
+}
+
+function gframe() {
+  G.raf = 0;
+  if (!G.frozen && G.alpha > 0) gtick();
+  gdraw();
+  if (!G.frozen && G.alpha > 0) G.raf = requestAnimationFrame(gframe);
+}
+
+/* ── paint ──────────────────────────────────────────────────────────────── */
+let gctx = null, gcv = null, gsize = { w: 0, h: 0, dpr: 1 };
+
+function gfit(padding) {
+  const nodes = gliveNodes();
+  if (!nodes.length) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of nodes) {
+    x0 = Math.min(x0, n.x - n.r); y0 = Math.min(y0, n.y - n.r);
+    x1 = Math.max(x1, n.x + n.r); y1 = Math.max(y1, n.y + n.r);
+  }
+  const pad = padding === undefined ? 90 : padding;
+  const k = Math.min(
+    (gsize.w - pad * 2) / Math.max(1, x1 - x0),
+    (gsize.h - pad * 2) / Math.max(1, y1 - y0));
+  G.view.k = Math.max(0.12, Math.min(2.2, k));
+  G.view.x = gsize.w / 2 - ((x0 + x1) / 2) * G.view.k;
+  G.view.y = gsize.h / 2 - ((y0 + y1) / 2) * G.view.k;
+}
+
+const gtoScreen = (x, y) => ({ x: x * G.view.k + G.view.x, y: y * G.view.k + G.view.y });
+const gtoWorld = (x, y) => ({ x: (x - G.view.x) / G.view.k, y: (y - G.view.y) / G.view.k });
+
+function gneighbourSet(id) {
+  const set = new Set();
+  if (!id) return set;
+  for (const e of G.edges.values()) {
+    if (e.src === id) set.add(e.dst);
+    else if (e.dst === id) set.add(e.src);
+  }
+  return set;
+}
+
+function gdraw() {
+  if (!gctx) return;
+  const ctx = gctx, { w, h } = gsize;
+  ctx.setTransform(gsize.dpr, 0, 0, gsize.dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const focus = G.sel || G.hover;
+  const near = focus ? gneighbourSet(focus.id) : null;
+  const k = G.view.k;
+
+  // ── edges ──
+  const edges = gliveEdges();
+  ctx.lineCap = 'round';
+  for (const { e, a, b } of edges) {
+    const lit = !focus || focus.id === e.src || focus.id === e.dst;
+    const hot = G.hoverEdge && gkey(G.hoverEdge) === gkey(e);
+    const picked = (G.selEdge && gkey(G.selEdge) === gkey(e)) ||
+                   (G.pathEdges && G.pathEdges.has(gkey(e)));
+    const A = gtoScreen(a.x, a.y), B = gtoScreen(b.x, b.y);
+    ctx.beginPath();
+    ctx.moveTo(A.x, A.y);
+    ctx.lineTo(B.x, B.y);
+    if (picked || hot) {
+      ctx.strokeStyle = '#FFB020';
+      ctx.lineWidth = Math.max(1.6, 2.4 * Math.min(1.4, k));
+      ctx.globalAlpha = 1;
+    } else {
+      // Coloured by whichever end carries the meaning: a link to an object
+      // reads as that object's colour, not as a neutral grey.
+      const teller = a.kind === 'video' ? b : (b.kind === 'video' ? a : b);
+      ctx.strokeStyle = lit ? gcolor(teller) : '#24403F';
+      ctx.lineWidth = Math.max(0.6, Math.min(2.6, 0.7 + Math.log2(e.weight + 1) * 0.5) * Math.min(1.3, k));
+      ctx.globalAlpha = lit ? (focus ? 0.5 : 0.26) : 0.09;
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // ── nodes ──
+  const nodes = gliveNodes();
+  // Painted small-first so hubs and the selection land on top.
+  nodes.sort((p, q) => (p.r - q.r));
+  G.labelBoxes = [];
+  for (const n of nodes) {
+    const p = gtoScreen(n.x, n.y);
+    const r = n.r * k;
+    if (p.x < -60 || p.y < -60 || p.x > w + 60 || p.y > h + 60) continue;
+    const dim = focus && focus.id !== n.id && near && !near.has(n.id);
+    const tone = gcolor(n);
+    ctx.globalAlpha = dim ? 0.22 : 1;
+    // A traced chain outranks the focus dimming — the whole point of asking
+    // for a path is to see it against everything else.
+    const onPath = G.pathSet && G.pathSet.has(n.id);
+    if (onPath) ctx.globalAlpha = 1;
+
+    if (n.kind === 'video') gpaintVideo(ctx, n, p, r);
+    else gpaintEntity(ctx, n, p, r, tone);
+
+    if ((G.sel && G.sel.id === n.id) || onPath) {
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r + 7, 0, Math.PI * 2);
+      ctx.strokeStyle = '#FFB020';
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+    }
+    if (!n.expanded && n.deg > 0 && !dim && r > 7) {
+      // A quiet mark meaning "there is more behind this one".
+      ctx.globalAlpha = dim ? 0.2 : 0.85;
+      ctx.beginPath();
+      ctx.arc(p.x + r * 0.72, p.y - r * 0.72, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = '#FFB020';
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ── labels last, and only where they fit ──
+  const ranked = nodes.slice().sort((p, q) => {
+    const pv = (G.sel && G.sel.id === p.id ? 1e9 : 0) + (G.hover && G.hover.id === p.id ? 1e8 : 0) + p.r;
+    const qv = (G.sel && G.sel.id === q.id ? 1e9 : 0) + (G.hover && G.hover.id === q.id ? 1e8 : 0) + q.r;
+    return qv - pv;
+  });
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (const n of ranked) {
+    const p = gtoScreen(n.x, n.y);
+    const r = n.r * k;
+    if (p.x < -40 || p.y < -40 || p.x > w + 40 || p.y > h + 40) continue;
+    const must = (G.sel && G.sel.id === n.id) || (G.hover && G.hover.id === n.id);
+    if (!must && r < 9) continue;
+    const dim = focus && focus.id !== n.id && near && !near.has(n.id);
+    if (dim && !must) continue;
+
+    const size = Math.max(10, Math.min(14, 9 + r * 0.22));
+    ctx.font = `500 ${size}px 'Public Sans', sans-serif`;
+    let text = n.label || '';
+    if (text.length > 26) text = text.slice(0, 25) + '…';
+    const tw = ctx.measureText(text).width;
+    const box = { x: p.x - tw / 2 - 3, y: p.y + r + 5, w: tw + 6, h: size + 4 };
+    if (!must && gcollides(box)) continue;
+    G.labelBoxes.push(box);
+
+    ctx.fillStyle = 'rgba(11,20,22,.76)';
+    ctx.fillRect(box.x, box.y, box.w, box.h);
+    ctx.fillStyle = must ? '#FFCF6E' : '#E6F0EE';
+    ctx.fillText(text, p.x, box.y + 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function gcollides(box) {
+  for (const b of G.labelBoxes) {
+    if (box.x < b.x + b.w && box.x + box.w > b.x &&
+        box.y < b.y + b.h && box.y + box.h > b.y) return true;
+  }
+  return false;
+}
+
+function groundRect(ctx, x, y, w, hh, r) {
+  const rr = Math.min(r, w / 2, hh / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + hh, rr);
+  ctx.arcTo(x + w, y + hh, x, y + hh, rr);
+  ctx.arcTo(x, y + hh, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+/* A reel is shot vertically, so its node is a vertical frame. The shape alone
+   says "this one plays" before any label is read. */
+function gpaintVideo(ctx, n, p, r) {
+  const w = r * 1.5, hh = r * 2.3;
+  const x = p.x - w / 2, y = p.y - hh / 2;
+  groundRect(ctx, x, y, w, hh, Math.max(2, r * 0.28));
+  ctx.fillStyle = '#17292D';
+  ctx.fill();
+
+  const key = n.meta && n.meta.video_key;
+  const img = key ? gposter(key, r) : null;
+  if (img && img !== 'no' && img.complete && img.naturalWidth) {
+    ctx.save();
+    ctx.clip();
+    const scale = Math.max(w / img.naturalWidth, hh / img.naturalHeight);
+    const dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
+    ctx.drawImage(img, p.x - dw / 2, p.y - dh / 2, dw, dh);
+    ctx.restore();
+    groundRect(ctx, x, y, w, hh, Math.max(2, r * 0.28));
+  } else if (r > 6) {
+    ctx.fillStyle = '#2F5450';
+    ctx.beginPath();
+    ctx.moveTo(p.x - r * 0.24, p.y - r * 0.34);
+    ctx.lineTo(p.x + r * 0.34, p.y);
+    ctx.lineTo(p.x - r * 0.24, p.y + r * 0.34);
+    ctx.closePath();
+    ctx.fill();
+    groundRect(ctx, x, y, w, hh, Math.max(2, r * 0.28));
+  }
+  ctx.strokeStyle = '#E6F0EE';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+}
+
+function gpaintEntity(ctx, n, p, r, tone) {
+  ctx.beginPath();
+  if (n.kind === 'hashtag' || n.kind === 'anchor') {
+    // A diamond for author-supplied labels: they are claims about the video,
+    // not observations of it, and the shape keeps that distinction visible.
+    ctx.moveTo(p.x, p.y - r);
+    ctx.lineTo(p.x + r, p.y);
+    ctx.lineTo(p.x, p.y + r);
+    ctx.lineTo(p.x - r, p.y);
+    ctx.closePath();
+  } else {
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+  }
+  ctx.fillStyle = tone + '2E';
+  ctx.fill();
+  ctx.strokeStyle = tone;
+  ctx.lineWidth = n.kind === 'dim' ? 1.9 : 1.2;
+  ctx.stroke();
+  if (n.kind === 'dim' && r > 9) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r * 0.36, 0, Math.PI * 2);
+    ctx.fillStyle = tone;
+    ctx.fill();
+  }
+}
+
+function gposter(key, r) {
+  if (r < 11) return null;                   // too small to be worth a request
+  const held = G.posters.get(key);
+  if (held) return held;
+  const img = new Image();
+  img.decoding = 'async';
+  img.onload = () => gdraw();
+  img.onerror = () => G.posters.set(key, 'no');
+  G.posters.set(key, img);
+  img.src = `/api/poster/${encodeURIComponent(key)}`;
+  return img;
+}
+
+/* ── hit testing ────────────────────────────────────────────────────────── */
+function gnodeAt(sx, sy) {
+  const world = gtoWorld(sx, sy);
+  let best = null, bestD = Infinity;
+  for (const n of gliveNodes()) {
+    const dx = world.x - n.x, dy = world.y - n.y;
+    const d = Math.hypot(dx, dy);
+    const reach = n.r + 6 / G.view.k;
+    if (d < reach && d < bestD) { best = n; bestD = d; }
+  }
+  return best;
+}
+
+function gedgeAt(sx, sy) {
+  let best = null, bestD = 7;
+  for (const { e, a, b } of gliveEdges()) {
+    const A = gtoScreen(a.x, a.y), B = gtoScreen(b.x, b.y);
+    const vx = B.x - A.x, vy = B.y - A.y;
+    const len2 = vx * vx + vy * vy;
+    if (!len2) continue;
+    let t = ((sx - A.x) * vx + (sy - A.y) * vy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(sx - (A.x + vx * t), sy - (A.y + vy * t));
+    // Not a hit if it is really the node under the cursor.
+    if (d < bestD && t > 0.14 && t < 0.86) { best = e; bestD = d; }
+  }
+  return best;
+}
+
+/* ── loading ────────────────────────────────────────────────────────────── */
+async function graphBoot(force) {
+  if (G.loaded && !force) { gresize(); gheat(0.24); return; }
+  G.loaded = true;
+  $('graphEmpty').hidden = true;
+  try {
+    const data = G.mode === 'schema'
+      ? await api('/api/graph/schema')
+      : await api('/api/graph?limit=18');
+    G.nodes.clear(); G.edges.clear();
+    G.sel = G.selEdge = G.hover = null;
+    G.traceFrom = null;
+    G.pathSet = G.pathEdges = null;
+    gdetailClose();
+    if (data.counts) G.counts = data.counts;
+    gmerge(data, { x: 0, y: 0 });
+    if (!G.nodes.size) {
+      $('graphEmpty').hidden = false;
+      $('graphEmpty').textContent = '';
+      $('graphEmpty').appendChild(h('h3', { text: 'Nothing to plot yet' }));
+      $('graphEmpty').appendChild(h('p', {
+        text: data.note || 'Import a bundle from the channel and the graph '
+          + 'builds itself from whatever tables arrive.',
+      }));
+    }
+    grenderKinds();
+    grenderHud();
+    gresize();
+    // Settle before the first paint so the opening view is a graph rather
+    // than a cloud of dots that then flies apart.
+    G.alpha = 1;
+    for (let i = 0; i < 170; i++) gtick();
+    gfit();
+    gheat(0.3);
+  } catch (e) {
+    $('graphEmpty').hidden = false;
+    $('graphEmpty').textContent = '';
+    $('graphEmpty').appendChild(h('h3', { text: 'The graph is not ready' }));
+    $('graphEmpty').appendChild(h('p', { text: e.message }));
+  }
+}
+
+async function gexpand(node) {
+  if (!node) return;
+  try {
+    const data = await api(
+      `/api/graph/expand/${encodeURIComponent(node.id).replace(/%3A/g, ':')}?limit=48`);
+    if (!data.ok) { toast(data.note || 'nothing to expand'); return; }
+    const fresh = gmerge(data, node);
+    node.expanded = true;
+    grenderHud();
+    if (!fresh.length) toast('Everything it connects to is already on screen.');
+    else if (data.truncated)
+      toast(`Added ${fresh.length}. ${fmtInt(data.truncated)} more are not shown.`);
+    // Warm the videos that just appeared, so clicking one starts instantly.
+    prefetch(fresh.filter(n => n.kind === 'video')
+                  .map(n => n.meta && n.meta.video_key).filter(Boolean));
+    gheat(0.75);
+  } catch (e) { toast(e.message); }
+}
+
+/* ── the detail slab ────────────────────────────────────────────────────── */
+function gdetailClose() {
+  $('graphDetail').hidden = true;
+  $('graphDetailBody').textContent = '';
+}
+
+function gkindDot(node) {
+  return h('i', { class: 'gdot', style: `background:${gcolor(node)}` });
+}
+
+async function gselect(node) {
+  G.sel = node;
+  G.selEdge = null;
+  // A trace survives clicking one of its own members — that is how you read
+  // the chain — but any other selection means the question has moved on.
+  if (G.pathSet && (!node || !G.pathSet.has(node.id)))
+    G.pathSet = G.pathEdges = null;
+  gdraw();
+  if (!node) { gdetailClose(); return; }
+
+  const body = $('graphDetailBody');
+  $('graphDetail').hidden = false;
+  body.textContent = '';
+  body.appendChild(h('div', { class: 'gd-kind' }, gkindDot(node),
+    (KIND_LABEL[node.kind] || node.kind) + (node.sub ? ' · ' + node.sub : '')));
+  body.appendChild(h('div', { class: 'gd-title', text: node.label }));
+
+  if (node.kind === 'video') { await gvideoDetail(node, body); return; }
+
+  const line = h('div', { class: 'gd-line' });
+  line.appendChild(document.createTextNode(
+    `${fmtInt(Math.round(node.weight))} connection${node.weight === 1 ? '' : 's'}`));
+  line.appendChild(h('span', { class: 'sep', text: '·' }));
+  line.appendChild(document.createTextNode(`${node.deg} on screen`));
+  body.appendChild(line);
+
+  const acts = h('div', { class: 'gd-acts' });
+  // In schema mode there is nothing to expand — the whole schema is already
+  // on screen, and the nodes are tables rather than rows.
+  if (G.mode !== 'schema')
+    acts.appendChild(h('button', {
+      class: 'btn', onclick: () => gexpand(node),
+    }, node.expanded ? 'Expand again' : 'Expand'));
+  acts.appendChild(h('button', {
+    class: 'btn btn-quiet', onclick: () => gisolate(node),
+  }, 'Focus on this'));
+  gtraceButton(node, acts);
+  body.appendChild(acts);
+
+  if (node.kind === 'table') { gschemaDetail(node, body); return; }
+  if (node.kind === 'anchor') {
+    body.appendChild(h('p', {
+      class: 'gd-note',
+      text: 'Every table that carries a video key joins here. This is the '
+          + 'column Atlas uses to tie a row to a reel, and a table with no '
+          + 'line to it cannot be searched.',
+    }));
+    return;
+  }
+
+  gneighbourChips(node, body);
+
+  body.appendChild(h('div', { class: 'gd-h', text: 'loading' }));
+  let data;
+  try {
+    data = await api(
+      `/api/graph/node/${encodeURIComponent(node.id).replace(/%3A/g, ':')}?rows=40`);
+  } catch (e) {
+    body.lastChild.remove();
+    body.appendChild(h('p', { class: 'gd-note', text: e.message }));
+    return;
+  }
+  if (G.sel !== node) return;                 // the person moved on
+  body.lastChild.remove();
+
+  for (const rec of data.records || []) {
+    body.appendChild(h('div', { class: 'gd-h', text: `row in ${rec.table}` }));
+    if (rec.rows.length === 1) body.appendChild(kvTable(rec.rows[0]));
+    else {
+      const cols = Object.keys(rec.rows[0] || {});
+      const wrap = h('div', { class: 'gd-rows' });
+      wrap.appendChild(rowTable(cols, rec.rows.map(r => cols.map(c => r[c]))));
+      body.appendChild(wrap);
+    }
+  }
+
+  const vids = data.videos || [];
+  if (vids.length) {
+    body.appendChild(h('div', { class: 'gd-h', text: `${fmtInt(vids.length)} video${vids.length === 1 ? '' : 's'}` }));
+    body.appendChild(gvideoList(vids));
+    prefetch(vids.slice(0, 8).map(v => v.video_key));
+  }
+}
+
+/* What is next to this node, on screen, grouped by what the link is called.
+   The chips are the keyboard-and-small-screen path through the graph: the
+   canvas is a good way to see structure and a poor way to walk it precisely. */
+function gneighbourChips(node, body) {
+  const groups = new Map();
+  for (const e of G.edges.values()) {
+    let other = null;
+    if (e.src === node.id) other = G.nodes.get(e.dst);
+    else if (e.dst === node.id) other = G.nodes.get(e.src);
+    if (!other) continue;
+    if (!groups.has(e.rel)) groups.set(e.rel, []);
+    groups.get(e.rel).push(other);
+  }
+  if (!groups.size) return;
+
+  body.appendChild(h('div', { class: 'gd-h', text: 'connected to' }));
+  const order = Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
+  for (const [rel, list] of order) {
+    const wrap = h('div', { class: 'gd-rel' });
+    wrap.appendChild(h('div', { class: 'gd-rel-name' },
+      rel, ' ', h('span', { class: 'n', text: `(${fmtInt(list.length)})` })));
+    const chips = h('div', { class: 'gd-chips' });
+    list.sort((a, b) => b.weight - a.weight);
+    for (const other of list.slice(0, 40)) {
+      chips.appendChild(h('button', {
+        class: 'gchip', onclick: () => gfocus(other),
+        title: other.sub || KIND_LABEL[other.kind] || other.kind,
+      },
+        h('i', { class: 'gdot', style: `background:${gcolor(other)}` }),
+        other.label));
+    }
+    if (list.length > 40)
+      chips.appendChild(h('span', { class: 'gd-note', text: `+${fmtInt(list.length - 40)} more on the canvas` }));
+    wrap.appendChild(chips);
+    body.appendChild(wrap);
+  }
+}
+
+/* Select a node and bring the canvas to it, without changing the zoom. */
+function gfocus(node) {
+  G.view.x = gsize.w / 2 - node.x * G.view.k;
+  G.view.y = gsize.h / 2 - node.y * G.view.k;
+  gselect(node);
+}
+
+/* "How are these two related?" — pick one node, then another, and the server
+   walks the shortest chain between them. Two clicks rather than a form,
+   because the second node is usually one you find while looking around. */
+function gtraceButton(node, acts) {
+  if (G.mode === 'schema') return;
+  const armed = G.traceFrom && G.traceFrom !== node.id;
+  const from = armed ? G.nodes.get(G.traceFrom) : null;
+  acts.appendChild(h('button', {
+    class: 'btn btn-quiet',
+    title: armed
+      ? `Find the shortest chain from ${from ? from.label : 'the first node'}`
+      : 'Pick this as one end, then open another node',
+    onclick: () => {
+      if (armed) { gtrace(G.traceFrom, node.id); return; }
+      G.traceFrom = node.id;
+      toast('Now open the other node and choose "Connect to this".');
+      gselect(node);
+    },
+  }, armed ? 'Connect to this' : 'Trace from here'));
+  if (armed)
+    acts.appendChild(h('button', {
+      class: 'btn btn-quiet', onclick: () => { G.traceFrom = null; gselect(node); },
+    }, 'Cancel trace'));
+}
+
+async function gtrace(a, b) {
+  G.traceFrom = null;
+  let data;
+  try {
+    data = await api('/api/graph/path?' + new URLSearchParams({ a, b, depth: '6' }));
+  } catch (e) { toast(e.message); return; }
+  if (!data.ok) { toast(data.note || 'no connection found'); return; }
+
+  gmerge(data, { x: 0, y: 0 });
+  G.pathSet = new Set(data.path || []);
+  G.pathEdges = new Set((data.edges || [])
+    .filter(e => G.pathSet.has(e.src) && G.pathSet.has(e.dst))
+    .map(gkey));
+  // A hop that runs through a hidden kind would draw as a broken chain.
+  for (const id of G.pathSet) {
+    const n = G.nodes.get(id);
+    if (n) G.off.delete(n.kind);
+  }
+  grenderKinds();
+  grenderHud();
+
+  const body = $('graphDetailBody');
+  $('graphDetail').hidden = false;
+  body.textContent = '';
+  body.appendChild(h('div', { class: 'gd-kind' },
+    h('i', { class: 'gdot', style: 'background:#FFB020' }), 'connection found'));
+  const chain = (data.nodes || []);
+  body.appendChild(h('div', { class: 'gd-title' },
+    `${chain.length - 1} step${chain.length === 2 ? '' : 's'} apart`));
+  const walk = h('div', { class: 'gd-chips' });
+  chain.forEach((raw, i) => {
+    if (i) walk.appendChild(h('span', { class: 'gd-arrow', text: '→' }));
+    const live = G.nodes.get(raw.id) || raw;
+    walk.appendChild(h('button', {
+      class: 'gchip', onclick: () => { if (live.x !== undefined) gfocus(live); },
+    }, h('i', { class: 'gdot', style: `background:${gcolor(live)}` }), live.label));
+  });
+  body.appendChild(walk);
+  body.appendChild(h('div', { class: 'gd-acts' },
+    h('button', {
+      class: 'btn btn-quiet',
+      onclick: () => { G.pathSet = G.pathEdges = null; gdetailClose(); gdraw(); },
+    }, 'Clear the trace')));
+
+  G.sel = null; G.selEdge = null;
+  gheat(0.6);
+}
+
+function gvideoList(rows) {
+  const box = h('div', { class: 'gd-vids' });
+  for (const row of rows) {
+    const btn = h('button', {
+      class: 'gd-vid', onclick: () => {
+        openLibraryVideo(row);
+        // Bring the node onto the canvas too, so playing from the slab and
+        // clicking the graph leave you in the same place.
+        const node = G.nodes.get('v:' + row.video_key);
+        if (node) { G.sel = node; gdraw(); }
+      },
+    });
+    const img = h('img', {
+      alt: '', loading: 'lazy',
+      src: `/api/poster/${encodeURIComponent(row.video_key)}`,
+      onerror: (ev) => { ev.target.replaceWith(h('span', { class: 'gv-blank' })); },
+    });
+    btn.appendChild(img);
+    const meta = h('div');
+    meta.appendChild(h('div', { class: 'gv-t', text: row.title || row.caption || row.video_key }));
+    const bits = [];
+    if (row.creator) bits.push(row.creator);
+    if (row.duration) bits.push(timecode(row.duration));
+    if (row.moment_count) bits.push(`${fmtInt(row.moment_count)} moments`);
+    meta.appendChild(h('div', { class: 'gv-s', text: bits.join(' · ') }));
+    btn.appendChild(meta);
+    box.appendChild(btn);
+  }
+  return box;
+}
+
+async function gvideoDetail(node, body) {
+  const key = node.meta && node.meta.video_key;
+  const line = h('div', { class: 'gd-line' });
+  const bits = [];
+  if (node.meta.duration) bits.push(timecode(node.meta.duration));
+  if (node.meta.moments) bits.push(`${fmtInt(node.meta.moments)} moments`);
+  if (node.meta.likes) bits.push(`${fmtInt(node.meta.likes)} likes`);
+  if (node.meta.created_at) bits.push(fmtWhen(node.meta.created_at));
+  bits.forEach((b, i) => {
+    if (i) line.appendChild(h('span', { class: 'sep', text: '·' }));
+    line.appendChild(document.createTextNode(b));
+  });
+  body.appendChild(line);
+
+  const acts = h('div', { class: 'gd-acts' });
+  acts.appendChild(h('button', {
+    class: 'btn', onclick: () => gplay(node),
+  }, 'Play'));
+  acts.appendChild(h('button', {
+    class: 'btn btn-quiet', onclick: () => gexpand(node),
+  }, 'What is in it'));
+  acts.appendChild(h('button', {
+    class: 'btn btn-quiet', onclick: () => gisolate(node),
+  }, 'Focus on this'));
+  gtraceButton(node, acts);
+  body.appendChild(acts);
+
+  // Everything the archive knows about this reel, from the same endpoint the
+  // player's Database record panel reads — one source of truth, two views.
+  body.appendChild(h('div', { class: 'gd-h', text: 'loading the record' }));
+  try {
+    const data = await api(`/api/video/${encodeURIComponent(key)}`);
+    if (!G.sel || G.sel.id !== node.id) return;
+    body.lastChild.remove();
+    if (data.meta && Object.keys(data.meta).length) {
+      body.appendChild(h('div', { class: 'gd-h', text: 'video' }));
+      body.appendChild(kvTable(data.meta));
+    }
+    for (const rel of data.related || []) {
+      if (!rel.rows || !rel.rows.length) continue;
+      body.appendChild(h('div', { class: 'gd-h' }, rel.table,
+        h('span', { class: 'rec-count', text: `${fmtInt(rel.rows.length)} row${rel.rows.length === 1 ? '' : 's'}` })));
+      if (rel.rows.length === 1) { body.appendChild(kvTable(rel.rows[0])); continue; }
+      const wrap = h('div', { class: 'gd-rows' });
+      wrap.appendChild(rowTable(rel.columns,
+        rel.rows.map(r => rel.columns.map(c => r[c]))));
+      body.appendChild(wrap);
+    }
+  } catch (e) {
+    if (body.lastChild) body.lastChild.remove();
+    body.appendChild(h('p', { class: 'gd-note', text: e.message }));
+  }
+}
+
+function gplay(node) {
+  const m = node.meta || {};
+  openLibraryVideo({
+    video_key: m.video_key, title: node.label, caption: '',
+    creator: '', category: '', duration: m.duration,
+    likes: m.likes, created_at: m.created_at, msg_id: m.msg_id,
+    moment_count: m.moments,
+  });
+}
+
+function gschemaDetail(node, body) {
+  const m = node.meta || {};
+  body.appendChild(h('div', { class: 'gd-h', text: 'what Atlas found here' }));
+  body.appendChild(kvTable({
+    rows: fmtInt(m.rows),
+    'video key': m.key || '— none, so this table is not indexed',
+    'timeline start': m.start || '—',
+    'timeline end': m.end || '—',
+    'searchable text': (m.content || []).join(', ') || '—',
+    columns: (m.columns || []).length,
+  }));
+  body.appendChild(h('div', { class: 'gd-acts' },
+    h('button', {
+      class: 'btn', onclick: () => { showTab('data'); openTable(node.label, 0); },
+    }, 'Browse the rows')));
+}
+
+async function gedgeSelect(edge) {
+  G.selEdge = edge;
+  G.sel = null;
+  gdraw();
+  const body = $('graphDetailBody');
+  $('graphDetail').hidden = false;
+  body.textContent = '';
+  const a = G.nodes.get(edge.src), b = G.nodes.get(edge.dst);
+  body.appendChild(h('div', { class: 'gd-kind' },
+    h('i', { class: 'gdot', style: 'background:#FFB020' }), 'connection'));
+  body.appendChild(h('div', { class: 'gd-title' },
+    `${a ? a.label : edge.src} → ${b ? b.label : edge.dst}`));
+
+  const why = h('div', { class: 'gd-why' });
+  const parts = (edge.ref || '').split('|');
+  why.appendChild(document.createTextNode('Linked by '));
+  why.appendChild(h('b', { text: edge.rel }));
+  if (parts.length >= 2) {
+    why.appendChild(document.createTextNode(', read from '));
+    why.appendChild(h('code', { text: `${parts[0]}.${parts[1]}` }));
+  }
+  why.appendChild(document.createTextNode('.'));
+  body.appendChild(why);
+
+  const acts = h('div', { class: 'gd-acts' });
+  if (a) acts.appendChild(h('button', { class: 'btn btn-quiet', onclick: () => gselect(a) }, a.label.slice(0, 22)));
+  if (b) acts.appendChild(h('button', { class: 'btn btn-quiet', onclick: () => gselect(b) }, b.label.slice(0, 22)));
+  body.appendChild(acts);
+
+  body.appendChild(h('div', { class: 'gd-h', text: 'the rows behind it' }));
+  if (G.mode === 'schema') {
+    // A schema edge is a statement about columns, not about rows: there is
+    // nothing to fetch, and the Data tab is the right place to go next.
+    body.appendChild(h('p', {
+      class: 'gd-note',
+      text: 'This line is a join Atlas inferred from the column names, not a '
+          + 'stored row. Switch to the data graph to walk the actual values.',
+    }));
+    return;
+  }
+  try {
+    const data = await api('/api/graph/edge?' + new URLSearchParams({
+      src: edge.src, dst: edge.dst, rel: edge.rel,
+    }));
+    if (G.selEdge !== edge) return;
+    const recs = data.records || [];
+    if (!recs.length) {
+      body.appendChild(h('p', {
+        class: 'gd-note',
+        text: 'The link is derived rather than stored, so there is no single '
+            + 'row to show for it.',
+      }));
+      return;
+    }
+    for (const rec of recs) {
+      const cols = Object.keys(rec.rows[0] || {});
+      const wrap = h('div', { class: 'gd-rows' });
+      wrap.appendChild(rowTable(cols, rec.rows.map(r => cols.map(c => r[c]))));
+      body.appendChild(wrap);
+    }
+  } catch (e) {
+    body.appendChild(h('p', { class: 'gd-note', text: e.message }));
+  }
+}
+
+/* Keep a node and its neighbours; drop the rest. The fastest way out of a
+   graph that has grown past what you can read. */
+function gisolate(node) {
+  const keep = gneighbourSet(node.id);
+  keep.add(node.id);
+  for (const id of Array.from(G.nodes.keys())) if (!keep.has(id)) G.nodes.delete(id);
+  for (const [k, e] of Array.from(G.edges)) {
+    if (!keep.has(e.src) || !keep.has(e.dst)) G.edges.delete(k);
+  }
+  gdegree();
+  grenderHud();
+  G.alpha = 1;
+  for (let i = 0; i < 90; i++) gtick();
+  gfit();
+  gheat(0.4);
+}
+
+/* ── rail ───────────────────────────────────────────────────────────────── */
+function grenderKinds() {
+  const box = $('graphKinds');
+  box.textContent = '';
+  const tally = new Map();
+  for (const n of G.nodes.values()) tally.set(n.kind, (tally.get(n.kind) || 0) + 1);
+  const order = ['video', 'dim', 'tag', 'hashtag', 'table', 'anchor'];
+  for (const kind of order) {
+    if (!tally.has(kind)) continue;
+    const on = !G.off.has(kind);
+    box.appendChild(h('button', {
+      class: 'gkind', 'aria-pressed': String(on),
+      title: `Show or hide ${KIND_LABEL[kind] || kind} nodes`,
+      onclick: (ev) => {
+        if (G.off.has(kind)) G.off.delete(kind); else G.off.add(kind);
+        ev.currentTarget.setAttribute('aria-pressed', String(!G.off.has(kind)));
+        grenderHud();
+        gheat(0.4);
+      },
+    },
+      h('i', { class: 'gdot', style: `background:${KIND_COLOR[kind]}` }),
+      KIND_LABEL[kind] || kind,
+      h('span', { class: 'n', text: fmtInt(tally.get(kind)) })));
+  }
+}
+
+function grenderHud() {
+  const hud = $('graphHud');
+  hud.textContent = '';
+  const shown = gliveNodes().length;
+  const edges = gliveEdges().length;
+  hud.appendChild(h('div', {}, h('b', { text: fmtInt(shown) }),
+    ' nodes · ', h('b', { text: fmtInt(edges) }), ' links on screen'));
+  if (G.counts && G.counts.nodes)
+    hud.appendChild(h('div', {
+      text: `${fmtInt(G.counts.nodes)} nodes and ${fmtInt(G.counts.edges)} links derived`,
+    }));
+
+  const legend = $('graphLegend');
+  legend.textContent = '';
+  legend.appendChild(h('div', {
+    text: 'click a node to inspect · double-click to expand · click a line to see why',
+  }));
+  legend.appendChild(h('div', {
+    text: 'drag to move · scroll to zoom · shift-drag a node to pin it',
+  }));
+}
+
+let graphFindTimer = 0;
+async function grunFind(value) {
+  const q = (value || '').trim();
+  const box = $('graphHits');
+  if (!q) { box.hidden = true; box.textContent = ''; G.hits = []; return; }
+  try {
+    const data = await api('/api/graph/find?q=' + encodeURIComponent(q) + '&limit=24');
+    G.hits = data.results || [];
+    G.hitIndex = -1;
+    box.textContent = '';
+    if (!G.hits.length) {
+      box.appendChild(h('div', { class: 'ghit', text: 'nothing by that name' }));
+    } else {
+      G.hits.forEach((n, i) => {
+        box.appendChild(h('button', {
+          class: 'ghit', role: 'option', 'data-i': i,
+          onclick: () => gjumpTo(n),
+        },
+          h('i', { class: 'gdot', style: `background:${gcolor(n)}` }),
+          h('span', { class: 'glabel', text: n.label }),
+          h('span', { class: 'gsub', text: n.sub || n.kind })));
+      });
+    }
+    box.hidden = false;
+  } catch { box.hidden = true; }
+}
+
+async function gjumpTo(raw) {
+  $('graphHits').hidden = true;
+  $('graphQ').value = '';
+  let node = G.nodes.get(raw.id);
+  if (!node) {
+    // Not on screen yet: pull it in with its neighbourhood so it lands in
+    // context rather than as a lone dot in the middle of nowhere.
+    try {
+      const data = await api(
+        `/api/graph/expand/${encodeURIComponent(raw.id).replace(/%3A/g, ':')}?limit=36`);
+      if (data.ok) {
+        gmerge({ nodes: [data.centre], edges: [] }, { x: 0, y: 0 });
+        node = G.nodes.get(raw.id);
+        if (node) { node.x = 0; node.y = 0; node.expanded = true; }
+        gmerge(data, node || { x: 0, y: 0 });
+      }
+    } catch (e) { toast(e.message); return; }
+  }
+  node = G.nodes.get(raw.id);
+  if (!node) return;
+  G.off.delete(node.kind);
+  grenderKinds();
+  grenderHud();
+  // Centre on it without changing the zoom, which would lose the reader's
+  // sense of where they were.
+  G.view.x = gsize.w / 2 - node.x * G.view.k;
+  G.view.y = gsize.h / 2 - node.y * G.view.k;
+  gselect(node);
+  gheat(0.5);
+}
+
+/* ── pointer and keys ───────────────────────────────────────────────────── */
+function gresize() {
+  if (!gcv) return;
+  const rect = gcv.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  gsize.dpr = Math.min(2, window.devicePixelRatio || 1);
+  gsize.w = rect.width;
+  gsize.h = rect.height;
+  gcv.width = Math.round(rect.width * gsize.dpr);
+  gcv.height = Math.round(rect.height * gsize.dpr);
+  gdraw();
+}
+
+function gwire() {
+  gcv = $('graphCanvas');
+  if (!gcv) return;
+  gctx = gcv.getContext('2d');
+
+  const ro = new ResizeObserver(() => gresize());
+  ro.observe($('graphStage'));
+
+  gcv.addEventListener('pointerdown', (ev) => {
+    gcv.setPointerCapture(ev.pointerId);
+    G.moved = 0;
+    const rect = gcv.getBoundingClientRect();
+    const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+    const node = gnodeAt(sx, sy);
+    if (node) {
+      G.drag = { node, dx: 0, dy: 0, pin: ev.shiftKey };
+      const w = gtoWorld(sx, sy);
+      G.drag.dx = node.x - w.x;
+      G.drag.dy = node.y - w.y;
+    } else {
+      G.pan = { x: ev.clientX - G.view.x, y: ev.clientY - G.view.y };
+    }
+  });
+
+  gcv.addEventListener('pointermove', (ev) => {
+    const rect = gcv.getBoundingClientRect();
+    const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+    if (G.drag) {
+      G.moved += Math.abs(ev.movementX) + Math.abs(ev.movementY);
+      const w = gtoWorld(sx, sy);
+      G.drag.node.x = w.x + G.drag.dx;
+      G.drag.node.y = w.y + G.drag.dy;
+      G.drag.node.vx = G.drag.node.vy = 0;
+      gheat(0.34);
+      return;
+    }
+    if (G.pan) {
+      G.moved += Math.abs(ev.movementX) + Math.abs(ev.movementY);
+      G.view.x = ev.clientX - G.pan.x;
+      G.view.y = ev.clientY - G.pan.y;
+      gdraw();
+      return;
+    }
+    const node = gnodeAt(sx, sy);
+    const edge = node ? null : gedgeAt(sx, sy);
+    const changed = (node !== G.hover) ||
+      (gkey(edge || { src: '', dst: '', rel: '' }) !==
+       gkey(G.hoverEdge || { src: '', dst: '', rel: '' }));
+    G.hover = node;
+    G.hoverEdge = edge;
+    gcv.dataset.over = node || edge ? 'node' : '';
+    gcv.title = node ? `${node.label}${node.sub ? ' — ' + node.sub : ''}` : '';
+    if (changed) gdraw();
+  });
+
+  const release = (ev) => {
+    const rect = gcv.getBoundingClientRect();
+    const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+    const wasDrag = G.drag, moved = G.moved;
+    if (G.drag) {
+      if (G.drag.pin) G.drag.node.pin = true;
+      G.drag = null;
+      gheat(0.22);
+    }
+    G.pan = null;
+    G.moved = 0;
+    if (moved > 5) return;                    // a drag is not a click
+    const node = wasDrag ? wasDrag.node : gnodeAt(sx, sy);
+    if (node) { gselect(node); return; }
+    const edge = gedgeAt(sx, sy);
+    if (edge) { gedgeSelect(edge); return; }
+    G.sel = null; G.selEdge = null;
+    gdetailClose();
+    gdraw();
+  };
+  gcv.addEventListener('pointerup', release);
+  gcv.addEventListener('pointercancel', () => { G.drag = null; G.pan = null; });
+
+  gcv.addEventListener('dblclick', (ev) => {
+    const rect = gcv.getBoundingClientRect();
+    const node = gnodeAt(ev.clientX - rect.left, ev.clientY - rect.top);
+    if (node) gexpand(node);
+  });
+
+  gcv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const rect = gcv.getBoundingClientRect();
+    const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+    const before = gtoWorld(sx, sy);
+    const step = Math.exp(-ev.deltaY * 0.0016);
+    G.view.k = Math.max(0.08, Math.min(4.2, G.view.k * step));
+    // Zoom toward the cursor: the point under the pointer must not move.
+    const after = gtoWorld(sx, sy);
+    G.view.x += (after.x - before.x) * G.view.k;
+    G.view.y += (after.y - before.y) * G.view.k;
+    gdraw();
+  }, { passive: false });
+
+  gcv.addEventListener('keydown', (ev) => {
+    const step = ev.shiftKey ? 120 : 46;
+    if (ev.key === 'ArrowLeft') { G.view.x += step; gdraw(); }
+    else if (ev.key === 'ArrowRight') { G.view.x -= step; gdraw(); }
+    else if (ev.key === 'ArrowUp') { G.view.y += step; gdraw(); }
+    else if (ev.key === 'ArrowDown') { G.view.y -= step; gdraw(); }
+    else if (ev.key === '+' || ev.key === '=') { G.view.k = Math.min(4.2, G.view.k * 1.2); gdraw(); }
+    else if (ev.key === '-') { G.view.k = Math.max(0.08, G.view.k / 1.2); gdraw(); }
+    else if (ev.key === 'Enter' && G.sel) gexpand(G.sel);
+    else if (ev.key === 'Escape') {
+      G.sel = null; G.selEdge = null; G.traceFrom = null;
+      G.pathSet = G.pathEdges = null;
+      gdetailClose(); gdraw();
+    }
+    else return;
+    ev.preventDefault();
+  });
+
+  $('graphFit').addEventListener('click', () => { gfit(); gdraw(); });
+  $('graphClear').addEventListener('click', () => {
+    G.loaded = false;
+    G.traceFrom = null;
+    G.pathSet = G.pathEdges = null;
+    G.off.clear();
+    graphBoot(true);
+  });
+  $('graphFreeze').addEventListener('click', (ev) => {
+    G.frozen = !G.frozen;
+    ev.currentTarget.setAttribute('aria-pressed', String(G.frozen));
+    ev.currentTarget.textContent = G.frozen ? 'Resume' : 'Freeze';
+    if (!G.frozen) gheat(0.3);
+  });
+  $('graphDetailClose').addEventListener('click', () => {
+    G.sel = null; G.selEdge = null; gdetailClose(); gdraw();
+  });
+
+  $$('.gmode').forEach(b => b.addEventListener('click', () => {
+    if (G.mode === b.dataset.mode) return;
+    G.mode = b.dataset.mode;
+    $$('.gmode').forEach(x => x.classList.toggle('on', x === b));
+    G.loaded = false;
+    G.off.clear();
+    graphBoot(true);
+  }));
+
+  $('graphQ').addEventListener('input', (ev) => {
+    clearTimeout(graphFindTimer);
+    const value = ev.target.value;
+    graphFindTimer = setTimeout(() => grunFind(value), 180);
+  });
+  $('graphQ').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { $('graphHits').hidden = true; return; }
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      const pick = G.hits[Math.max(0, G.hitIndex)];
+      if (pick) gjumpTo(pick);
+      return;
+    }
+    if (ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp') return;
+    ev.preventDefault();
+    if (!G.hits.length) return;
+    G.hitIndex = (G.hitIndex + (ev.key === 'ArrowDown' ? 1 : -1) + G.hits.length) % G.hits.length;
+    $$('#graphHits .ghit').forEach((el, i) =>
+      el.setAttribute('aria-selected', String(i === G.hitIndex)));
+  });
+  document.addEventListener('click', (ev) => {
+    if (!$('graphRail').contains(ev.target)) $('graphHits').hidden = true;
+  });
+}
+
+/* The bridge from search: plot what the current results have in common. */
+async function graphFromResults() {
+  const keys = S.results.map(r => r.video_key).filter(Boolean).slice(0, 24);
+  if (!keys.length) return;
+  // Claim the tab before switching, so showTab does not fetch the overview
+  // graph we are about to throw away.
+  G.loaded = true;
+  G.mode = 'data';
+  $$('.gmode').forEach(x => x.classList.toggle('on', x.dataset.mode === 'data'));
+  showTab('graph');
+  try {
+    const data = await api('/api/graph/from?keys=' + encodeURIComponent(keys.join(',')));
+    G.nodes.clear(); G.edges.clear();
+    G.sel = null; G.selEdge = null;
+    gdetailClose();
+    gmerge(data, { x: 0, y: 0 });
+    G.loaded = true;
+    grenderKinds();
+    grenderHud();
+    gresize();
+    G.alpha = 1;
+    for (let i = 0; i < 160; i++) gtick();
+    gfit();
+    gheat(0.3);
+  } catch (e) { toast(e.message); }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
    STATUS
    ════════════════════════════════════════════════════════════════════════ */
 let statusTimer = 0;
@@ -1228,6 +2614,8 @@ function wire() {
     browseTimer = setTimeout(() => openTable(S.browse.table, 0), 260);
   });
   $('browserClose').addEventListener('click', () => { $('browser').hidden = true; });
+
+  gwire();
 
   $('rescanBtn').addEventListener('click', async () => {
     $('rescanBtn').disabled = true;

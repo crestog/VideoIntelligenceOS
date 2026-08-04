@@ -33,14 +33,17 @@ python atlas_boot.py
 4. **Index.** Every text column in every table is found by inspection and
    turned into timestamped passages. FTS5 is built immediately; the vector
    index builds on a background thread.
-5. **Serve.** The site is up from second one and reports its own progress. You
+5. **Derive.** The relationship graph is read out of the same schema — foreign
+   keys, list-shaped columns, hashtags — and stored as two indexed tables, so
+   opening the **Graph** tab is a lookup rather than a computation.
+6. **Serve.** The site is up from second one and reports its own progress. You
    can search a partially-imported archive while the rest is still arriving.
 
-Steps 2–4 re-run on demand from the **Sources** tab.
+Steps 2–5 re-run on demand from the **Sources** tab.
 
 ---
 
-## The four tabs
+## The five tabs
 
 **Search** — type a sentence. Results are videos, each showing a *moment
 ribbon*: the reel's full duration as a strip, with the passages that matched lit
@@ -50,6 +53,9 @@ at that second.
 **Library** — every video, sorted and filtered by what the data actually
 supports. Filters are built from the values present, so no filter is ever
 offered that returns nothing.
+
+**Graph** — the same database as a network you can walk. See
+[How the graph works](#how-the-graph-works).
 
 **Data** — the raw database. Every table, every column, with the role Atlas
 inferred for it (key / timestamp / searchable content), and a row browser for
@@ -111,6 +117,62 @@ costs one query instead of one per card.
 
 ---
 
+## How the graph works
+
+A relational database already is a graph — Atlas just stops pretending
+otherwise. `posts.creator_id` is an edge. A row in `frame_notes.objects` reading
+`barbell, rack, gym floor` is three edges. A `#food` in a caption is an edge.
+Nothing about that is specific to this schema, so nothing in `graph.py` names a
+table or a column.
+
+**Nodes** come in four kinds:
+
+| kind | id | where it comes from |
+|---|---|---|
+| video | `v:<key>` | a row in `video_index` |
+| entity | `d:<table>:<row>` | a dimension table reached by a `<stem>_id` column |
+| thing seen or said | `t:<table>.<column>:<token>` | one item from a list-shaped column |
+| hashtag | `h:<tag>` | a `#word` in any text column |
+
+The interesting one is the third. A column is treated as *a set of things*
+rather than *prose* when at least 55% of sampled non-empty values split into two
+or more items and the mean item length is four words or fewer.
+`frame_notes.objects` passes that test; `frame_notes.description` does not. This
+is the whole reason tag mining survives a schema change: add a column listing
+moods and mood nodes appear, with no code written.
+
+**Edges** carry a `ref` of `table|column[|value]` — enough to rebuild the query
+that produced them. That is what makes a line clickable rather than decorative:
+clicking one re-runs the query and shows you the rows that make it true.
+
+Both tables are precomputed into SQLite (`graph_nodes`, `graph_edges`) during
+the same staleness check that rebuilds the search index, because the moment the
+graph can go stale is the moment the index can. Every interaction is then one
+indexed lookup — expanding a node is a single `WHERE src = ?`.
+
+**Ranking is degree, and only degree.** It needs no configuration and it
+correctly answers the question the opening view is asking: which nodes hold the
+most of this archive together?
+
+`path(a, b)` runs a **two-sided BFS**, always growing the smaller frontier. A
+video hub with thousands of neighbours would otherwise force exploring most of
+the archive before reaching depth 3.
+
+The front end is a hand-written force layout on a canvas: Barnes–Hut repulsion
+through a quadtree (O(n log n), so a few thousand nodes stay at 60 fps), springs
+divided by each node's own degree so a 400-video creator is not dragged around
+by its leaves, and a separation pass that is dropped as the graph grows. Videos
+draw as vertical frames because reels are shot vertically — the shape says *this
+one plays* before the label is read — and a click opens the same persistent
+player a search result opens, already warmed by `prefetch`.
+
+Two views share the canvas. **Relationships** is the data. **Schema** is the
+database's own shape: tables joined by the keys Atlas inferred, where a table
+with no line to the `video key` anchor is exactly a table that cannot be
+searched.
+
+---
+
 ## Why playback is instant
 
 Nothing makes a 20 MB transfer instant, so the trick is to have already done it.
@@ -147,12 +209,15 @@ at runtime from the live schema:
 | Which columns hold searchable text | text type, not an id/path/hash/status field |
 | What kind of evidence a column is | table and column name mapped to narrative / speech / visual / ocr / caption / meta |
 | Which tables join to which | foreign-key-shaped columns pointing at another table's key |
+| Which columns are lists of things | ≥55% of sampled values split into ≥2 short items |
 
 A hash of the whole schema is stored with the index. When a bundle arrives whose
 schema differs — a new column, a new table, a dropped field — the hash changes
 and the index rebuilds itself, picking the new column up as searchable text with
-no code change. Tables Atlas has never seen appear in the **Data** tab and in a
-video's record automatically.
+no code change. The graph rebuilds in the same pass, so a new dimension table
+becomes a new kind of node and a new list column becomes a new fan of tags.
+Tables Atlas has never seen appear in the **Data** tab and in a video's record
+automatically.
 
 The join key across all of it is the Telegram message id. Postgres writes
 `tg1234`, `lake.db` writes `1234`, a manifest writes `"1234"` — all three
@@ -210,6 +275,7 @@ atlas/
   index.py      passages, FTS5, video_index, the vector file
   encoder.py    bge-small, CLS-pooled, degrades to nothing gracefully
   search.py     BM25 + dense + RRF + grouping
+  graph.py      nodes and edges derived from the schema, precomputed
   media.py      resolve, prefetch, 206 range serving, posters, eviction
   server.py     the API surface
   web/          index.html · atlas.css · atlas.js

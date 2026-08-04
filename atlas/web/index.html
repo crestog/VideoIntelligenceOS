@@ -35,6 +35,7 @@
   <nav class="tabs" role="tablist" aria-label="Sections">
     <button role="tab" data-tab="search" aria-selected="true">Search</button>
     <button role="tab" data-tab="library" aria-selected="false">Library</button>
+    <button role="tab" data-tab="graph" aria-selected="false">Graph</button>
     <button role="tab" data-tab="data" aria-selected="false">Data</button>
     <button role="tab" data-tab="sources" aria-selected="false">Sources</button>
   </nav>
@@ -105,6 +106,49 @@
       <div class="grid" id="libGrid"></div>
       <div class="more" id="libMore" hidden>
         <button class="btn" id="libMoreBtn">Load more</button>
+      </div>
+    </div>
+
+    <!-- GRAPH -------------------------------------------------------- -->
+    <!-- The canvas fills its pane and the controls float over it, because a
+         graph competing with a page's scroll is a graph nobody can drag. -->
+    <div class="view view-flush" id="view-graph" data-view="graph" hidden>
+      <div class="graph-stage" id="graphStage">
+        <canvas id="graphCanvas" tabindex="0"
+                aria-label="Relationship graph. Use the node list to explore with a keyboard."></canvas>
+
+        <div class="graph-rail" id="graphRail">
+          <div class="grail-find">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
+            <input id="graphQ" type="search" spellcheck="false"
+                   placeholder="Find a creator, object, tag…"
+                   aria-label="Find a node" autocomplete="off">
+            <div class="grail-hits" id="graphHits" role="listbox" hidden></div>
+          </div>
+          <div class="grail-kinds" id="graphKinds" role="group"
+               aria-label="Show these kinds of node"></div>
+          <div class="grail-modes" role="group" aria-label="What the graph shows">
+            <button class="gmode on" data-mode="data">Relationships</button>
+            <button class="gmode" data-mode="schema">Schema</button>
+          </div>
+        </div>
+
+        <div class="graph-hud" id="graphHud"></div>
+
+        <div class="graph-tools">
+          <button class="gtool" id="graphFit" title="Fit everything on screen">Fit</button>
+          <button class="gtool" id="graphFreeze" title="Pause the layout">Freeze</button>
+          <button class="gtool" id="graphClear" title="Start over from the hubs">Reset</button>
+        </div>
+
+        <div class="graph-legend" id="graphLegend"></div>
+
+        <div class="graph-detail" id="graphDetail" hidden>
+          <button class="gd-close" id="graphDetailClose" aria-label="Close">×</button>
+          <div class="gd-body" id="graphDetailBody"></div>
+        </div>
+
+        <div class="graph-empty" id="graphEmpty" hidden></div>
       </div>
     </div>
 

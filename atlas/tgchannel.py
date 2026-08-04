@@ -44,7 +44,18 @@ def log(msg: str, level: str = "INFO") -> None:
     with _LOG_LOCK:
         _LOG.append(line)
         del _LOG[:-200]
-    print(f"📡 [ATLAS] {msg}", flush=True)
+    # Logging must never be able to fail a request. A Windows console runs
+    # cp1252, so a print carrying the satellite glyph raises UnicodeEncodeError
+    # — and this is called from inside the playback generator, where an
+    # exception would abort a working video stream over a cosmetic character.
+    try:
+        print(f"📡 [ATLAS] {msg}", flush=True)
+    except Exception:                                  # noqa: BLE001
+        try:
+            print(f"[ATLAS] {msg}".encode("ascii", "replace").decode("ascii"),
+                  flush=True)
+        except Exception:                              # noqa: BLE001
+            pass
 
 
 def recent_log(limit: int = 200) -> list:
@@ -151,6 +162,31 @@ def http_download(file_id: str, dest: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════
 # MTPROTO — arbitrary message reads and large downloads
 # ══════════════════════════════════════════════════════════════════════════
+def _raw(client, name: str):
+    """The genuine coroutine function behind a pyrogram method.
+
+    Pyrogram ships `sync.py`, which at import time rewrites every async method
+    on Client into a synchronous wrapper via `functools.wraps`. Whether that
+    wrapper returns a coroutine, a finished result, or a future depends on
+    which thread you are on and whether a loop is already running — so calling
+    `client.get_messages(...)` from Atlas's worker threads returned a *result*
+    where this module expected an awaitable, and handing that to
+    `run_coroutine_threadsafe` raised "An asyncio.Future, a coroutine or an
+    awaitable is required".
+
+    `functools.wraps` leaves the original on `__wrapped__`, which is the async
+    method, unbound. Calling it with the client as the first argument gives a
+    real coroutine every time, on any thread, with no dependence on ambient
+    loop state. Falls back to the attribute itself for a pyrogram build that
+    does not apply the sync layer.
+    """
+    method = getattr(client, name)
+    inner = getattr(method, "__wrapped__", None)
+    if inner is None:
+        return method
+    return lambda *a, **kw: inner(client, *a, **kw)
+
+
 class _Mtproto:
     """A pyrogram client pinned to a private event loop on a private thread.
 
@@ -201,22 +237,33 @@ class _Mtproto:
 
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        try:
-            client = Client(
-                "atlas_reader",
-                api_id=config.API_ID, api_hash=config.API_HASH,
-                bot_token=config.BOT_TOKEN,
-                workdir=config.SESSION_DIR,
-                no_updates=True,        # Atlas never reacts to messages
-                in_memory=False)
-            self._loop.run_until_complete(client.start())
-            self._client = client
-            log("MTProto session ready")
-        except Exception as exc:
-            self._error = f"{type(exc).__name__}: {str(exc)[:200]}"
-            log(f"MTProto unavailable — {self._error}", "WARN")
-        finally:
-            self._ready.set()
+
+        async def _start():
+            try:
+                client = Client(
+                    "atlas_reader",
+                    api_id=config.API_ID, api_hash=config.API_HASH,
+                    bot_token=config.BOT_TOKEN,
+                    workdir=config.SESSION_DIR,
+                    no_updates=True,
+                    in_memory=False,
+                    # Pyrogram defaults this to 1, which puts every file
+                    # transfer behind a single semaphore. With streaming
+                    # playback that means a prefetch warming somebody else's
+                    # thumbnail stalls the video actually on screen. Four lets
+                    # the player, a warm and a background download coexist
+                    # without inviting the flood limits a wide pool trips.
+                    max_concurrent_transmissions=4)
+                await _raw(client, "start")()
+                self._client = client
+                log("MTProto session ready")
+            except Exception as exc:
+                self._error = f"{type(exc).__name__}: {str(exc)[:200]}"
+                log(f"MTProto unavailable — {self._error}", "WARN")
+            finally:
+                self._ready.set()
+
+        self._loop.run_until_complete(_start())
         if self._client is not None:
             self._loop.run_forever()
 
@@ -234,6 +281,10 @@ class _Mtproto:
     @property
     def client(self):
         return self._client
+
+    @property
+    def loop(self):
+        return self._loop
 
     @property
     def error(self):
@@ -305,7 +356,7 @@ def get_messages(ids: list, timeout: float = 120) -> list:
         nonlocal client
         client = _mt.client
         return await _with_floodwait(
-            lambda: client.get_messages(config.CHANNEL_ID, ids))
+            lambda: _raw(client, "get_messages")(config.CHANNEL_ID, ids))
 
     out = _mt.submit(_go(), timeout=timeout)
     if out is None:
@@ -320,7 +371,7 @@ def download_message(message, dest: str, progress=None,
     """Download a message's media over MTProto. Handles files of any size."""
     async def _go():
         return await _with_floodwait(
-            lambda: _mt.client.download_media(
+            lambda: _raw(_mt.client, "download_media")(
                 message, file_name=dest,
                 progress=(lambda c, t: progress(c, t)) if progress else None))
 
@@ -338,6 +389,120 @@ def download_by_id(message_id: int, dest: str, progress=None) -> bool:
     if not msgs:
         return False
     return download_message(msgs[0], dest, progress=progress)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STREAMING — bytes out of Telegram without waiting for the whole file
+# ══════════════════════════════════════════════════════════════════════════
+CHUNK = 1024 * 1024          # pyrogram's fixed stream granularity
+STREAM_STALL = 90.0          # give up on a transfer that has gone quiet
+
+
+def stream_chunks(message, first_chunk: int = 0, chunk_limit: int = 0,
+                  queue_size: int = 4):
+    """Yield 1 MiB pieces of a message's media, starting at `first_chunk`.
+
+    This is what makes a video playable before it has finished arriving.
+    `download_media` has to complete before it returns anything, so a 30 MB
+    reel means half a minute of nothing; `stream_media` hands back pieces as
+    they land, and Telegram lets us skip straight to the chunk containing the
+    byte the browser asked for — so seeking to the middle of a video does not
+    fetch the beginning.
+
+    Pyrogram is async and the caller is a synchronous response generator, so the
+    async generator runs on the MTProto loop and pushes into a bounded queue.
+    Bounded matters: without it a fast connection buffers the whole file into
+    RAM, which is exactly what this is meant to avoid. The queue applies
+    backpressure, so Atlas reads from Telegram at roughly the speed the browser
+    drains it.
+
+    Every hand-off — pieces, the end marker, an error — goes through `_offer`,
+    which waits by awaiting rather than by blocking. A blocking `put` on the
+    loop thread would freeze the entire MTProto client the moment a viewer
+    paused a video with a full queue, and nothing could cancel it because a
+    thread stuck in C code has no await point to interrupt.
+    """
+    import queue as _queue
+
+    if not _mt.start():
+        raise RuntimeError(_mt.error or "MTProto unavailable")
+
+    q = _queue.Queue(maxsize=queue_size)
+    DONE = object()
+
+    async def _offer(item):
+        while True:
+            try:
+                q.put_nowait(item)
+                return
+            except _queue.Full:
+                await asyncio.sleep(0.02)
+
+    async def _pump():
+        agen = None
+        try:
+            agen = _raw(_mt.client, "stream_media")(
+                message, offset=first_chunk, limit=chunk_limit)
+            async for piece in agen:
+                await _offer(piece)
+            await _offer(DONE)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                       # noqa: BLE001
+            await _offer(exc)
+        finally:
+            # Release Telegram's side of the transfer straight away rather than
+            # leaving it to garbage collection, which on a paused video could be
+            # a long time holding a media session open.
+            if agen is not None:
+                try:
+                    await agen.aclose()
+                except Exception:                      # noqa: BLE001
+                    pass
+
+    fut = asyncio.run_coroutine_threadsafe(_pump(), _mt.loop)
+    try:
+        while True:
+            try:
+                item = q.get(timeout=STREAM_STALL)
+            except _queue.Empty:
+                # Nothing for a long time and the pump is gone: the loop died or
+                # the coroutine was cancelled out from under us. A plain
+                # blocking get would hold this worker thread forever.
+                if fut.done():
+                    return
+                raise RuntimeError("Telegram stopped sending — no data for "
+                                   f"{STREAM_STALL:.0f}s")
+            if item is DONE:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # The browser closing the tab mid-video lands here. Cancelling stops
+        # pulling bytes we are throwing away.
+        fut.cancel()
+
+
+def message_by_id(message_id: int):
+    """One message object, or None. Used by the streaming player."""
+    msgs = get_messages([message_id])
+    return msgs[0] if msgs else None
+
+
+def media_facts(message) -> dict:
+    """Size and type of a message's media, without fetching any of it.
+
+    A 206 response has to state the file's total length in `Content-Range`
+    before a single byte is sent, so this is read off the message itself.
+    """
+    info = message_document(message)
+    return {
+        "size": int(info.get("file_size") or 0),
+        "mime": info.get("mime") or "video/mp4",
+        "name": info.get("file_name") or "",
+        "duration": info.get("duration"),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -34,7 +34,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
-from . import config, index, ingest, media, reflect, search
+from . import config, graph, index, ingest, media, reflect, search
 from .tgchannel import log, recent_log
 
 BOOT_T0 = time.time()
@@ -85,7 +85,20 @@ def _index_if_stale(conn: sqlite3.Connection, force: bool = False) -> bool:
         return False
     _boot_set(phase="indexing", detail="building the moment index")
     index.rebuild(conn, embed=True)
+    # The graph is derived from the same schema the index just read, so the
+    # moment it can go stale is the moment the index does. Rebuilding it here
+    # rather than on demand is what keeps opening the Graph tab instant.
+    _rebuild_graph(conn)
     return True
+
+
+def _rebuild_graph(conn: sqlite3.Connection) -> None:
+    """Derive the graph. Never fatal — Atlas without a graph is still Atlas."""
+    _boot_set(phase="indexing", detail="deriving the relationship graph")
+    try:
+        graph.rebuild(conn)
+    except Exception as e:                                  # noqa: BLE001
+        log(f"graph build failed — {type(e).__name__}: {e}", "WARN")
 
 
 def _boot() -> None:
@@ -93,6 +106,14 @@ def _boot() -> None:
     conn = ingest.connect()
     ingest.ensure_meta(conn)
     index.ensure_schema(conn)
+    graph.ensure_schema(conn)
+
+    # Sparse files are only usable while the process that built them remembers
+    # which chunks landed, so last run's leftovers are dropped before anything
+    # can read a hole as video data.
+    stale = media.sweep_sparse()
+    if stale:
+        log(f"cleared {stale} partial video file(s) from the last run")
 
     # Anything already imported is searchable before the network is touched.
     try:
@@ -135,6 +156,15 @@ def _boot() -> None:
     except Exception as e:
         log(f"index build failed — {type(e).__name__}: {e}")
         _boot_set(error=f"{type(e).__name__}: {e}")
+
+    # An index carried over from an earlier run is not proof of a graph: this
+    # database may predate the graph tables entirely. Deriving it costs a few
+    # seconds and only happens when there is genuinely nothing stored.
+    try:
+        if not graph.counts(conn)["nodes"]:
+            _rebuild_graph(conn)
+    except Exception as e:                                  # noqa: BLE001
+        log(f"graph check failed — {type(e).__name__}: {e}", "WARN")
 
     search.reload_vectors()
     try:
@@ -224,6 +254,7 @@ def api_status():
         "ingest": ingest.status(),
         "index": index.status(),
         "search": search.stats(conn),
+        "graph": graph.counts(conn),
         "bundles": bundles,
         "cache": media.cache_stats(),
         "telegram": {"configured": config.telegram_ready(),
@@ -519,34 +550,167 @@ def api_bundles():
                 for s in reflect.text_sources(db())]}
 
 
+# ── the graph ─────────────────────────────────────────────────────────────
+# Every route here answers in one indexed lookup against the two derived
+# tables, because the interface calls them on every click and a graph that
+# thinks before it expands is a graph nobody explores.
+@app.get("/api/graph")
+def api_graph(limit: int = 16):
+    """The opening view, plus what the whole graph contains."""
+    conn = db()
+    view = graph.overview(conn, limit=limit)
+    view["counts"] = graph.counts(conn)
+    view["status"] = graph.status()
+    return view
+
+
+@app.get("/api/graph/expand/{node_id:path}")
+def api_graph_expand(node_id: str, limit: int = 0, kind: str = ""):
+    """One node's neighbours, and every edge among the result.
+
+    `:path` on the parameter is deliberate: node ids contain colons and may
+    contain a slash inside a token, and a starlette path converter takes the
+    rest of the URL verbatim rather than stopping at the next segment.
+    """
+    return graph.neighbors(db(), node_id, limit=limit or graph.FANOUT,
+                           kind=kind)
+
+
+@app.get("/api/graph/node/{node_id:path}")
+def api_graph_node(node_id: str, rows: int = 40):
+    """Everything the database holds about one node, and the videos it reaches."""
+    found = graph.detail(db(), node_id, rows=rows)
+    if not found.get("ok"):
+        return JSONResponse(found, status_code=404)
+    return found
+
+
+@app.get("/api/graph/edge")
+def api_graph_edge(src: str, dst: str, rel: str, rows: int = 20):
+    """Why two nodes are connected — the rows that make the edge true."""
+    found = graph.edge_detail(db(), src, dst, rel, rows=rows)
+    if not found.get("ok"):
+        return JSONResponse(found, status_code=404)
+    return found
+
+
+@app.get("/api/graph/find")
+def api_graph_find(q: str = "", limit: int = 30):
+    return {"ok": True, "results": graph.find(db(), q, limit=limit)}
+
+
+@app.get("/api/graph/path")
+def api_graph_path(a: str, b: str, depth: int = 6):
+    """The shortest chain of relationships between two nodes."""
+    return graph.path(db(), a, b, max_depth=max(1, min(int(depth), 8)))
+
+
+@app.get("/api/graph/schema")
+def api_graph_schema():
+    """The database's own shape: tables joined by the keys Atlas inferred."""
+    return graph.schema_graph(db())
+
+
+@app.get("/api/graph/from")
+def api_graph_from(keys: str = "", limit: int = 24, per_video: int = 5):
+    """A graph built from a set of videos — what a result page has in common."""
+    wanted = [reflect.normalize_key(k) for k in keys.split(",") if k.strip()]
+    return graph.from_keys(db(), wanted, limit=limit, per_video=per_video)
+
+
+@app.post("/api/graph/rebuild")
+def api_graph_rebuild():
+    conn = db()
+    try:
+        return graph.rebuild(conn)
+    except Exception as e:                                  # noqa: BLE001
+        return JSONResponse({"ok": False, "note": f"{type(e).__name__}: {e}"},
+                            status_code=500)
+
+
 # ── media ─────────────────────────────────────────────────────────────────
+def _serve_file(path: str, range_header: str) -> StreamingResponse:
+    """A 206 out of a complete file on disk. The fastest path there is."""
+    media.touch(path)
+    plan = media.range_plan(path, range_header)
+    return StreamingResponse(
+        media.stream(path, plan["start"], plan["end"]),
+        status_code=plan["status"], headers=plan["headers"],
+        media_type=plan["headers"]["Content-Type"])
+
+
 @app.get("/api/play/{video_key}")
 def api_play(video_key: str, request: Request):
-    """Serve the video with byte ranges, fetching it first if it is not here.
+    """Serve the video, whether or not it has been downloaded yet.
 
-    A short blocking wait on the first request is deliberate. A person who just
-    clicked would rather the request take a moment than get an error for a file
-    that is arriving; the browser's own `<video>` retry would otherwise turn a
-    working download into a failed play.
+    The old design waited for the whole file. A 30 MB reel takes several seconds
+    to pull out of Telegram, so the first click either stalled or timed out into
+    a 503 — the browser's `<video>` element treats that as a hard failure and
+    stops, which is exactly what "the videos are not playing" looked like.
+
+    So nothing waits for a whole file any more. Three tiers, cheapest first:
+
+    1. **On disk.** Harvested locally or cached from an earlier watch. Ordinary
+       range serving, no network.
+    2. **In the sparse file.** A previous watch already pulled the chunks this
+       range needs, even though the rest of the video is still missing. Scrubbing
+       backwards and re-opening a video therefore cost nothing.
+    3. **Straight from the channel.** `stream_remote` starts at the 1 MiB chunk
+       holding the first requested byte and yields it onward as it arrives, so
+       the first frame appears after one chunk instead of after the file. Chunks
+       are written into the sparse file on the way past, which is how tier 2
+       fills in, and a video watched to the end promotes itself into the cache.
+
+    Only when MTProto is unavailable — bot-only credentials, a dead session —
+    does this fall back to the old blocking download, because the HTTP Bot API
+    cannot stream and 20 MB is all it will hand over.
     """
     conn = db()
     key = reflect.normalize_key(video_key)
-    found = media.resolve(conn, key)
-    if found["where"] not in ("local", "cache"):
-        media.ensure(conn, key, wait=25.0)
-        found = media.resolve(conn, key)
-    if found["where"] not in ("local", "cache"):
-        st = media.state(key)
-        return JSONResponse(
-            {"ok": False, "state": st,
-             "note": st.get("note") or "still downloading from Telegram"},
-            status_code=503, headers={"Retry-After": "3"})
+    rng = request.headers.get("range", "")
 
-    plan = media.range_plan(found["path"], request.headers.get("range", ""))
-    return StreamingResponse(
-        media.stream(found["path"], plan["start"], plan["end"]),
-        status_code=plan["status"], headers=plan["headers"],
-        media_type=plan["headers"]["Content-Type"])
+    found = media.resolve(conn, key)
+    if found["where"] in ("local", "cache"):
+        return _serve_file(found["path"], rng)
+    if found["where"] == "missing":
+        return JSONResponse(
+            {"ok": False, "note": "no Telegram message id for this video"},
+            status_code=404)
+
+    plan = {}
+    note = ""
+    try:
+        plan = media.remote_plan(key, found["msg_id"], rng)
+    except Exception as e:                      # MTProto down, message gone
+        note = f"{type(e).__name__}: {e}"
+
+    if plan:
+        part = media.sparse_hit(key, plan["start"], plan["end"])
+        if part:
+            media.touch(part)
+            body = media.stream(part, plan["start"], plan["end"])
+        else:
+            # Serving this range on demand covers the next few seconds of
+            # playback; the background fill covers everything after it, so the
+            # seeks that follow are answered from disk instead of costing a new
+            # Telegram media session each.
+            media.fill(key, found["msg_id"], plan["size"])
+            body = media.stream_remote(key, plan["message"], plan["start"],
+                                       plan["end"], plan["size"])
+        return StreamingResponse(
+            body, status_code=plan["status"], headers=plan["headers"],
+            media_type=plan["headers"]["Content-Type"])
+
+    media.ensure(conn, key, wait=20.0)
+    found = media.resolve(conn, key)
+    if found["where"] in ("local", "cache"):
+        return _serve_file(found["path"], rng)
+
+    st = media.state(key)
+    return JSONResponse(
+        {"ok": False, "state": st,
+         "note": note or st.get("note") or "still downloading from Telegram"},
+        status_code=503, headers={"Retry-After": "3"})
 
 
 @app.get("/api/media/{video_key}/state")
@@ -554,6 +718,14 @@ def api_media_state(video_key: str):
     key = reflect.normalize_key(video_key)
     st = media.state(key)
     st["where"] = media.resolve(db(), key)["where"]
+    # A video being streamed through is playing right now even though no file
+    # exists yet, so the interface must be able to tell that apart from a
+    # download that has not started.
+    part = media.stream_progress(key)
+    if part:
+        st["streamed_bytes"] = part["bytes"]
+        if st.get("status") in ("absent", "unknown", ""):
+            st["status"] = "streaming"
     return st
 
 

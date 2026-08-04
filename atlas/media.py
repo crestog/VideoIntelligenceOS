@@ -310,13 +310,22 @@ def ensure(conn: sqlite3.Connection, video_key: str, wait: float = 0.0) -> dict:
 
 
 def prefetch(conn: sqlite3.Connection, keys: list, limit: int = None) -> int:
-    """Warm the cache for a page of results. Returns how many were started.
+    """Warm a page of results before anybody clicks. Returns how many started.
 
-    Called from the search handler with the top results, before anybody has
-    clicked. Files already present are skipped for free, so a repeated search
-    costs nothing.
+    What "warm" means changed when playback started streaming. Pulling whole
+    files ahead of a click was the old way to make playback instant, and it
+    cost 30 MB of bandwidth per video for a guess. Now the first click only
+    needs two 1 MiB chunks — the head, where playback begins, and the tail,
+    where an mp4 written by a phone usually keeps its moov atom. Fetch those
+    into the sparse file and the video starts from disk with no round trip at
+    all, for a fifteenth of the traffic.
+
+    Without MTProto there is no chunk access, so this falls back to the whole
+    file over the Bot API, which is the only thing that transport can do.
     """
     limit = config.PREFETCH_TOP_N if limit is None else limit
+    from . import tgchannel
+    stream_ok = tgchannel.mtproto_ready()
     started = 0
     for key in list(keys)[:limit]:
         try:
@@ -328,9 +337,65 @@ def prefetch(conn: sqlite3.Connection, keys: list, limit: int = None) -> int:
         with _LOCK:
             if key in _INFLIGHT:
                 continue
+        if stream_ok:
+            # Already warmed is a success, not a reason to fall back to
+            # pulling the entire file.
+            if warm(key, found["msg_id"]):
+                started += 1
+            continue
         ensure(conn, key, wait=0)
         started += 1
     return started
+
+
+_WARMED = set()
+_WARM_SLOTS = threading.Semaphore(3)
+
+
+def warm(video_key: str, msg_id: int) -> bool:
+    """Fetch the head and tail chunks on a thread. True if it was dispatched.
+
+    Kept off the download semaphore deliberately: warming must never queue
+    behind a full download, because the whole point is that it finishes in the
+    time it takes to move the mouse.
+    """
+    key = str(video_key)
+    if not msg_id:
+        return False
+    with _LOCK:
+        if key in _WARMED:
+            return False
+        _WARMED.add(key)
+
+    def run():
+        from . import tgchannel
+        if not tgchannel.mtproto_ready():
+            with _LOCK:
+                _WARMED.discard(key)
+            return
+        with _WARM_SLOTS:
+            try:
+                message, facts = _message_for(key, msg_id)
+                if message is None:
+                    return
+                size = facts["size"]
+                last = max(0, (size - 1) // _TG_CHUNK)
+                part = _cache_path(key) + ".sparse"
+                index = _sparse_index(key)
+                for chunk_no in ({0, last} if last else {0}):
+                    with _SPARSE_LOCK:
+                        if chunk_no in index:
+                            continue
+                    for piece in tgchannel.stream_chunks(
+                            message, first_chunk=chunk_no, chunk_limit=1):
+                        _remember_chunk(part, index, chunk_no, piece, size)
+                        break
+                _maybe_promote(key, part, index, size)
+            except Exception as exc:                       # noqa: BLE001
+                log(f"warm {key} skipped — {type(exc).__name__}: {exc}", "WARN")
+
+    threading.Thread(target=run, name=f"atlas-warm-{key}", daemon=True).start()
+    return True
 
 
 def prefetch_async(db_path: str, keys: list, limit: int = None) -> None:
@@ -371,6 +436,12 @@ def _touch(path: str) -> None:
         pass
 
 
+# The play handler is the one caller outside this module that has a legitimate
+# reason to say "this file was just watched" — eviction should never take the
+# video somebody is looking at.
+touch = _touch
+
+
 def cache_stats() -> dict:
     total = 0
     files = 0
@@ -405,13 +476,13 @@ def _maybe_evict() -> None:
             if not os.path.isfile(p):
                 continue
             st = os.stat(p)
-            entries.append((st.st_atime, st.st_size, p))
+            entries.append((st.st_atime, st.st_size, p, name))
             total += st.st_size
         if total <= limit:
             return
         entries.sort()
         freed = 0
-        for _atime, size, path in entries:
+        for _atime, size, path, name in entries:
             if total - freed <= limit * 0.85:
                 break
             try:
@@ -419,6 +490,15 @@ def _maybe_evict() -> None:
                 freed += size
             except OSError:
                 continue
+            # A sparse file's chunk index is the only record of which of its
+            # bytes are real. Removing the file without forgetting the index
+            # would let a later request serve a hole — a run of zeros — as if
+            # it were video. Forget it in the same breath.
+            if name.endswith(".sparse"):
+                stem = name[:-len(".sparse")]
+                key = os.path.splitext(stem)[0]
+                with _SPARSE_LOCK:
+                    _SPARSE.pop(key, None)
         if freed:
             invalidate_resident()
             log(f"video cache trimmed — freed {freed / 1048576:.0f} MB")
@@ -445,6 +525,10 @@ def clear_cache() -> dict:
             continue
     with _LOCK:
         _STATE.clear()
+        _WARMED.clear()
+    with _SPARSE_LOCK:
+        _SPARSE.clear()
+    _MSG_CACHE.clear()
     invalidate_resident()
     return {"ok": True, "freed_mb": round(freed / 1048576, 1)}
 
@@ -554,3 +638,352 @@ def stream(path: str, start: int, end: int):
                 break
             remaining -= len(block)
             yield block
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STREAM-THROUGH — play now, cache on the way past
+# ══════════════════════════════════════════════════════════════════════════
+_MSG_CACHE = {}                  # video_key → (message, facts, at)
+_MSG_TTL = 1800.0
+_TG_CHUNK = 1024 * 1024          # pyrogram's stream granularity
+# How much one streamed-from-Telegram response will serve. Eight chunks is
+# several seconds of a reel — comfortably more than the player needs to keep
+# buffered — and it bounds how long a single media session stays open.
+REMOTE_WINDOW = 8 * _TG_CHUNK
+_SPARSE = {}                     # video_key → set of chunk numbers held
+_SPARSE_LOCK = threading.Lock()
+
+
+def _sparse_index(video_key: str) -> set:
+    with _SPARSE_LOCK:
+        return _SPARSE.setdefault(str(video_key), set())
+
+
+def sweep_sparse() -> int:
+    """Delete half-built sparse files left by a previous run.
+
+    Which chunks a sparse file holds is knowledge that lives in memory, and a
+    hole reads back as zeros rather than as an error — so an index the process
+    no longer has makes the file unsafe to trust and impossible to complete.
+    Deleting them on boot costs a re-fetch of bytes nobody is watching yet.
+    """
+    gone = 0
+    try:
+        for name in os.listdir(config.VIDEO_CACHE):
+            if not name.endswith(".sparse"):
+                continue
+            try:
+                os.remove(os.path.join(config.VIDEO_CACHE, name))
+                gone += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    with _SPARSE_LOCK:
+        _SPARSE.clear()
+    return gone
+
+
+def _remember_chunk(part: str, index: set, chunk_no: int, piece: bytes,
+                    size: int) -> None:
+    """Write one 1 MiB chunk into the sparse file at its true offset.
+
+    Seeking past the end of a file and writing produces a hole, which every
+    filesystem Atlas runs on stores as nothing until filled. So watching the
+    middle of a video costs the middle of a file, and the pieces converge on a
+    complete copy in whatever order they are watched.
+
+    Opened without truncation on purpose: two viewers on the same video would
+    otherwise race, and the one that creates the file second would erase chunks
+    the first has already recorded as held.
+    """
+    with _SPARSE_LOCK:
+        if chunk_no in index:
+            return
+    fd = None
+    try:
+        fd = os.open(part, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+        os.lseek(fd, chunk_no * _TG_CHUNK, os.SEEK_SET)
+        written = 0
+        while written < len(piece):
+            written += os.write(fd, piece[written:])
+        with _SPARSE_LOCK:
+            index.add(chunk_no)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _maybe_promote(video_key: str, part: str, index: set, size: int) -> None:
+    """Turn a fully-populated sparse file into a real cache entry."""
+    if size <= 0:
+        return
+    needed = (size + _TG_CHUNK - 1) // _TG_CHUNK
+    with _SPARSE_LOCK:
+        have = len(index)
+    if have < needed:
+        return
+    try:
+        if os.path.getsize(part) < size:
+            with open(part, "r+b") as f:
+                f.truncate(size)
+        os.replace(part, _cache_path(str(video_key)))
+        with _SPARSE_LOCK:
+            _SPARSE.pop(str(video_key), None)
+        invalidate_resident()
+        log(f"video {video_key} fully cached from streaming")
+        _maybe_evict()
+    except OSError:
+        pass
+
+
+def sparse_hit(video_key: str, start: int, end: int) -> str:
+    """The sparse file, if it already holds every chunk this range needs.
+
+    Re-watching the first ten seconds of a video should not re-fetch them, and
+    scrubbing backwards is the most common thing a person does in a player.
+
+    The file's length is checked as well as the index, because a chunk recorded
+    as held is only useful if the bytes are still there — an eviction between
+    the two checks would otherwise serve a hole, which decodes as silence and a
+    grey frame rather than as an error anybody could see.
+    """
+    part = _cache_path(str(video_key)) + ".sparse"
+    index = _sparse_index(str(video_key))
+    with _SPARSE_LOCK:
+        held = set(index)
+    if not held:
+        return ""
+    for c in range(start // _TG_CHUNK, end // _TG_CHUNK + 1):
+        if c not in held:
+            return ""
+    try:
+        if os.path.getsize(part) <= end:
+            return ""
+    except OSError:
+        return ""
+    return part
+
+
+def _message_for(video_key: str, msg_id: int):
+    """A message object and its media facts, memoised.
+
+    Every range request the browser makes would otherwise cost a round trip to
+    resolve the same message — and a seek storm makes a dozen of them. The
+    channel is immutable, so caching this for half an hour is free.
+    """
+    key = str(video_key)
+    hit = _MSG_CACHE.get(key)
+    if hit and _now() - hit[2] < _MSG_TTL:
+        return hit[0], hit[1]
+
+    from . import tgchannel
+    message = tgchannel.message_by_id(int(msg_id))
+    if message is None:
+        return None, {}
+    facts = tgchannel.media_facts(message)
+    if not facts.get("size"):
+        return None, {}
+    _MSG_CACHE[key] = (message, facts, _now())
+    if len(_MSG_CACHE) > 512:
+        for k in sorted(_MSG_CACHE, key=lambda k: _MSG_CACHE[k][2])[:128]:
+            _MSG_CACHE.pop(k, None)
+    return message, facts
+
+
+def remote_plan(video_key: str, msg_id: int, range_header: str) -> dict:
+    """A range plan for a video that is still in the channel.
+
+    Same contract as `range_plan`, but the size comes off the Telegram message
+    instead of a file on disk, so the browser can be told the real length and
+    start playing without anything having been downloaded yet.
+
+    One difference: a remote range is capped to `REMOTE_WINDOW`. Browsers open a
+    video with `bytes=0-`, meaning "everything from here", and answering that
+    literally holds one Telegram media session open for the entire file — each
+    of which costs an auth handshake to build, and there are only a handful of
+    permits. Returning a smaller range than asked for is explicitly allowed by
+    the range spec and is what CDNs do; the player simply asks for the next
+    window, by which time the background fill has usually put it on disk.
+    """
+    message, facts = _message_for(video_key, msg_id)
+    if message is None:
+        return {}
+    size = facts["size"]
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": facts.get("mime") or "video/mp4",
+        "Cache-Control": "public, max-age=604800, immutable",
+    }
+    m = _RANGE.match(range_header or "")
+    if not m:
+        # No range header at all: a 200 must carry the whole body, so this one
+        # cannot be windowed. Only non-browser clients land here.
+        headers["Content-Length"] = str(size)
+        return {"status": 200, "start": 0, "end": size - 1, "size": size,
+                "headers": headers, "message": message}
+
+    raw_start, raw_end = m.group(1), m.group(2)
+    if raw_start == "":
+        length = int(raw_end or 0)
+        start = max(0, size - length)
+        end = size - 1
+    else:
+        start = int(raw_start)
+        end = int(raw_end) if raw_end else size - 1
+    start = max(0, min(start, size - 1))
+    end = max(start, min(end, size - 1))
+    end = min(end, start + REMOTE_WINDOW - 1)
+
+    headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    headers["Content-Length"] = str(end - start + 1)
+    return {"status": 206, "start": start, "end": end, "size": size,
+            "headers": headers, "message": message}
+
+
+def stream_remote(video_key: str, message, start: int, end: int,
+                  size: int):
+    """Serve a byte range straight out of Telegram, caching whole chunks.
+
+    Telegram only addresses media in 1 MiB chunks, so a request for byte
+    1_500_000 starts at chunk 1 and the first 476 KiB of that chunk are
+    trimmed. That is the whole trick behind seeking into a video nobody has
+    downloaded: skip to the chunk that holds the byte, discard the prefix, and
+    the browser has its frame in one round trip instead of thirty.
+
+    Chunks that go past are written into a sparse side-file, so a video watched
+    once is progressively assembled on disk. When every chunk has landed the
+    file is promoted to the ordinary cache and later views never touch the
+    network — the second watch is a local read.
+    """
+    from . import tgchannel
+
+    key = str(video_key)
+    first_chunk = start // _TG_CHUNK
+    skip = start - first_chunk * _TG_CHUNK
+    want = end - start + 1
+
+    part = _cache_path(key) + ".sparse"
+    index = _sparse_index(key)
+
+    sent = 0
+    chunk_no = first_chunk
+    # The UI polls for progress, and "absent" would make it show a download bar
+    # over a video that is already playing. Streaming is its own state.
+    _set(key, status="streaming", got=start, total=size, note="")
+    try:
+        for piece in tgchannel.stream_chunks(message, first_chunk=first_chunk):
+            _remember_chunk(part, index, chunk_no, piece, size)
+            chunk_no += 1
+
+            if skip:
+                piece = piece[skip:]
+                skip = 0
+            if not piece:
+                continue
+            if sent + len(piece) >= want:
+                yield piece[:want - sent]
+                sent = want
+                break
+            yield piece
+            sent += len(piece)
+            _set(key, got=min(size, start + sent))
+    finally:
+        if sent >= want:
+            _maybe_promote(key, part, index, size)
+        with _LOCK:
+            slot = _STATE.get(key)
+            if slot and slot.get("status") == "streaming":
+                slot["status"] = "ready" if sent >= want else "partial"
+
+
+def stream_progress(video_key: str) -> dict:
+    """How much of this video is already on disk in the sparse file.
+
+    Reported so the interface can show a real "cached" fraction for a video
+    being watched before it has finished arriving, rather than either nothing
+    or a misleading download bar.
+    """
+    key = str(video_key)
+    with _SPARSE_LOCK:
+        held = len(_SPARSE.get(key) or ())
+    if not held:
+        return {}
+    return {"chunks": held, "bytes": held * _TG_CHUNK}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BACKGROUND FILL — one session per video instead of one per seek
+# ══════════════════════════════════════════════════════════════════════════
+_FILLING = set()
+_FILL_SLOTS = threading.Semaphore(2)
+
+
+def fill(video_key: str, msg_id: int, size: int) -> bool:
+    """Quietly finish a video that is being watched. True if it was dispatched.
+
+    Streaming a range on demand makes the first frame appear immediately, but
+    every range costs a Telegram media session — pyrogram builds one per
+    `get_file` call, complete with an auth handshake — and a person scrubbing a
+    timeline generates a dozen ranges in as many seconds. Paying that per seek
+    is what makes an otherwise-working player feel broken.
+
+    So the first remote range also starts this: one sequential pass that writes
+    every chunk into the same sparse file the player reads from. Within a few
+    seconds the whole video is local, seeks stop touching the network entirely,
+    and the file promotes itself into the ordinary cache. The watcher sees the
+    video get faster while they watch it.
+
+    Chunks the player already fetched are skipped on the write side, so the two
+    never fight over the file — they cooperate on it.
+    """
+    key = str(video_key)
+    if not msg_id or size <= 0:
+        return False
+    if os.path.exists(_cache_path(key)):
+        return False
+    with _LOCK:
+        if key in _FILLING:
+            return False
+        _FILLING.add(key)
+
+    def run():
+        from . import tgchannel
+        try:
+            with _FILL_SLOTS:
+                if os.path.exists(_cache_path(key)):
+                    return
+                message, facts = _message_for(key, msg_id)
+                if message is None:
+                    return
+                total = facts.get("size") or size
+                part = _cache_path(key) + ".sparse"
+                index = _sparse_index(key)
+                needed = (total + _TG_CHUNK - 1) // _TG_CHUNK
+                with _SPARSE_LOCK:
+                    start_at = min(
+                        (c for c in range(needed) if c not in index),
+                        default=needed)
+                if start_at >= needed:
+                    _maybe_promote(key, part, index, total)
+                    return
+                chunk_no = start_at
+                for piece in tgchannel.stream_chunks(
+                        message, first_chunk=start_at, queue_size=2):
+                    _remember_chunk(part, index, chunk_no, piece, total)
+                    chunk_no += 1
+                _maybe_promote(key, part, index, total)
+        except Exception as exc:                           # noqa: BLE001
+            log(f"fill {key} stopped — {type(exc).__name__}: "
+                f"{str(exc)[:120]}", "WARN")
+        finally:
+            with _LOCK:
+                _FILLING.discard(key)
+
+    threading.Thread(target=run, name=f"atlas-fill-{key}", daemon=True).start()
+    return True
