@@ -718,6 +718,15 @@ try:
 except Exception as _capture_exc:      # pragma: no cover - import guard
     vios_log(f"capture tab unavailable: {_capture_exc}", "SYS", "WARN")
 
+# The v2 processing plane. Guarded separately from capture: the two share a
+# design and nothing else, and a torch that will not import on this box must
+# not cost the operator the capture tab as well.
+try:
+    from vios.process.routes import process_router
+    app.include_router(process_router)
+except Exception as _process_exc:      # pragma: no cover - import guard
+    vios_log(f"process tab unavailable: {_process_exc}", "SYS", "WARN")
+
 @app.get("/api/status")
 def get_status():
     """Polled every 1.5s per open tab, so it must be nearly free.

@@ -1,0 +1,1409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Process · VIOS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ─────────────────────────────────────────────────────────────────────
+   The same design system as the capture tab, deliberately. These are two
+   halves of one machine, and a colour means the same thing in both: the
+   channel spectrum is the only accent palette either page gets to use.
+
+   The one element that belongs to this page alone is the rotation strip —
+   the chain of cohorts across the top of Run. It is the shape of the whole
+   engine: load a set of models, sweep every video, drop them, load the next.
+   ───────────────────────────────────────────────────────────────────── */
+:root{
+  --ink:#0E1013; --slate:#191D23; --line:#2A3038; --paper:#E8EAED;
+  --dim:#8B939E; --focus:#7DD3FC;
+  --speech:#7DD3FC; --ocr:#FDE68A; --visual:#86EFAC; --narrative:#C4B5FD;
+  --style:#F9A8D4; --caption:#FCA5A5; --concept:#5EEAD4;
+  --good:#86EFAC; --warn:#FDE68A; --bad:#FCA5A5;
+  --r:10px; --pad:20px;
+  --display:'Bricolage Grotesque',ui-sans-serif,system-ui,sans-serif;
+  --body:'IBM Plex Sans',ui-sans-serif,system-ui,-apple-system,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{background:var(--ink);color:var(--paper);font-family:var(--body);
+  font-size:14px;line-height:1.55;letter-spacing:-.005em;-webkit-font-smoothing:antialiased}
+::selection{background:rgba(125,211,252,.28)}
+a{color:var(--focus);text-decoration:none} a:hover{text-decoration:underline}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--ink)}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
+::-webkit-scrollbar-thumb:hover{background:#3a424d}
+
+/* ── shell ───────────────────────────────────────────────────────── */
+.shell{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
+.rail{border-right:1px solid var(--line);background:var(--ink);position:sticky;top:0;
+  height:100vh;display:flex;flex-direction:column;padding:22px 0}
+.brand{padding:0 22px 20px;border-bottom:1px solid var(--line);margin-bottom:14px}
+.brand h1{font-family:var(--display);font-weight:800;font-size:19px;letter-spacing:-.03em;line-height:1.1}
+.brand .sub{font-family:var(--mono);font-size:10px;color:var(--dim);
+  text-transform:uppercase;letter-spacing:.14em;margin-top:5px}
+.nav{display:flex;flex-direction:column;gap:1px;padding:0 10px;flex:1}
+.nav button{all:unset;cursor:pointer;padding:9px 12px;border-radius:8px;color:var(--dim);
+  font-size:13.5px;font-weight:500;display:flex;align-items:center;gap:10px;
+  transition:background .12s,color .12s}
+.nav button:hover,.nav button.on{background:var(--slate);color:var(--paper)}
+.nav button .dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.5}
+.nav button.on .dot{opacity:1;background:var(--focus)}
+.nav button .badge{margin-left:auto;font-family:var(--mono);font-size:9.5px;color:var(--dim)}
+.rail-foot{padding:14px 22px 0;border-top:1px solid var(--line);margin-top:10px}
+.rail-foot a{display:block;font-size:12px;color:var(--dim);padding:4px 0}
+.rail-foot a:hover{color:var(--paper);text-decoration:none}
+.main{min-width:0;display:flex;flex-direction:column}
+
+/* ── status bar ──────────────────────────────────────────────────── */
+.statusbar{position:sticky;top:0;z-index:30;background:rgba(14,16,19,.93);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.sb-row{display:flex;align-items:center;gap:16px;padding:13px 26px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px 4px 8px;
+  border:1px solid var(--line);border-radius:999px;font-family:var(--mono);font-size:10.5px;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--dim);white-space:nowrap}
+.pill i{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:none}
+.pill.running{color:var(--good);border-color:rgba(134,239,172,.32)}
+.pill.running i{background:var(--good);animation:pulse 1.9s ease-in-out infinite}
+.pill.paused{color:var(--warn);border-color:rgba(253,230,138,.32)}
+.pill.paused i{background:var(--warn)}
+.pill.stopping{color:var(--warn);border-color:rgba(253,230,138,.32)}
+.pill.stopping i{background:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+.pill.error{color:var(--bad);border-color:rgba(252,165,165,.35)}
+.pill.error i{background:var(--bad)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.sb-msg{flex:1;min-width:0;color:var(--dim);font-size:13px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.sb-stats{display:flex;gap:18px;font-family:var(--mono);font-size:11.5px;white-space:nowrap}
+.sb-stats b{color:var(--paper);font-weight:500}
+.sb-stats span{color:var(--dim)}
+.spectrum{height:4px;display:flex;background:var(--slate)}
+.spectrum i{height:100%;transition:width .6s cubic-bezier(.4,0,.2,1)}
+
+.page{padding:30px 26px 90px;max-width:1240px;width:100%}
+.page[hidden]{display:none}
+h2.title{font-family:var(--display);font-weight:700;font-size:23px;letter-spacing:-.028em}
+p.lede{color:var(--dim);font-size:14px;max-width:66ch;margin-top:7px}
+.sec{margin-top:34px}
+.sec > h3{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.15em;color:var(--dim);margin-bottom:12px;display:flex;align-items:center;gap:10px}
+.sec > h3::after{content:'';flex:1;height:1px;background:var(--line)}
+.sec > h3 .act{font-family:var(--body);font-size:11.5px;letter-spacing:0;
+  text-transform:none;cursor:pointer;color:var(--focus)}
+
+/* ── cards ───────────────────────────────────────────────────────── */
+.card{background:var(--slate);border:1px solid var(--line);border-radius:var(--r);
+  padding:var(--pad);position:relative;overflow:hidden}
+.card + .card{margin-top:14px}
+.card > .band{position:absolute;inset:0 0 auto;height:2px;opacity:.85}
+.card h4{font-family:var(--display);font-weight:600;font-size:15.5px;letter-spacing:-.02em}
+.card .hint{color:var(--dim);font-size:12.5px;margin-top:4px;max-width:64ch}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+
+/* ── THE ROTATION STRIP — this page's signature ──────────────────── */
+.rot{display:flex;gap:0;align-items:stretch;overflow-x:auto;padding:2px 0 6px}
+.rot .co{flex:1 0 200px;min-width:200px;background:var(--slate);border:1px solid var(--line);
+  padding:13px 15px;position:relative;transition:border-color .2s,background .2s}
+.rot .co:first-child{border-radius:var(--r) 0 0 var(--r)}
+.rot .co:last-child{border-radius:0 var(--r) var(--r) 0}
+.rot .co + .co{border-left:none}
+.rot .co .bar{position:absolute;inset:auto 0 0 0;height:2px;background:var(--line)}
+.rot .co .bar i{display:block;height:100%;background:var(--dim);width:0;
+  transition:width .6s cubic-bezier(.4,0,.2,1)}
+.rot .co .n{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--dim);display:flex;gap:8px;align-items:center}
+.rot .co .n b{color:var(--paper);font-weight:500}
+.rot .co .vr{margin-left:auto;color:var(--dim)}
+.rot .co .ps{margin-top:9px;display:flex;flex-wrap:wrap;gap:4px}
+.rot .co .ps s{text-decoration:none;font-family:var(--mono);font-size:9.5px;
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--dim);
+  background:var(--ink)}
+.rot .co .ps s.more{border-style:dashed}
+.rot .co .pc{margin-top:10px;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.rot .co.done{background:rgba(134,239,172,.045)}
+.rot .co.done .bar i{background:var(--good)}
+.rot .co.done .n b{color:var(--good)}
+.rot .co.on{border-color:var(--focus);background:rgba(125,211,252,.06);z-index:2}
+.rot .co.on .bar i{background:var(--focus)}
+.rot .co.on .n b{color:var(--focus)}
+.rot .co.on .ps s{border-color:rgba(125,211,252,.3);color:var(--paper)}
+.rot .loop{flex:none;display:flex;align-items:center;justify-content:center;width:34px;
+  color:var(--dim);font-family:var(--mono);font-size:15px}
+
+/* live now */
+.now{border:1px solid var(--line);border-radius:var(--r);background:var(--slate);
+  padding:16px 18px;display:grid;grid-template-columns:1fr auto;gap:14px;align-items:center}
+.now .k{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--dim)}
+.now .v{font-family:var(--display);font-size:19px;font-weight:600;letter-spacing:-.02em;
+  margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.now .sub{color:var(--dim);font-size:12.5px;margin-top:3px;font-family:var(--mono);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.now .clock{font-family:var(--mono);font-size:26px;color:var(--focus);letter-spacing:-.02em}
+.now.idle .clock{color:var(--dim)}
+.loaded{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}
+.loaded s{text-decoration:none;font-family:var(--mono);font-size:10px;padding:2px 7px;
+  border-radius:5px;border:1px solid rgba(94,234,212,.28);color:var(--concept);
+  background:rgba(94,234,212,.06)}
+
+/* ── form ────────────────────────────────────────────────────────── */
+.field{margin-top:14px}
+.field label{display:block;font-size:12px;font-weight:500;color:var(--paper);margin-bottom:5px}
+.field .note{color:var(--dim);font-weight:400;font-size:11.5px}
+input[type=text],input[type=password],input[type=number],textarea,select{
+  width:100%;background:var(--ink);border:1px solid var(--line);border-radius:8px;
+  color:var(--paper);padding:9px 11px;font-family:var(--mono);font-size:12.5px;
+  outline:none;transition:border-color .14s,box-shadow .14s}
+input::placeholder,textarea::placeholder{color:#5d6570}
+input:focus,textarea:focus,select:focus{border-color:var(--focus);
+  box-shadow:0 0 0 3px rgba(125,211,252,.13)}
+select{font-family:var(--body);cursor:pointer}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.row > .field{flex:1;min-width:150px;margin-top:0}
+.check{display:flex;align-items:center;gap:9px;margin-top:11px;cursor:pointer;font-size:13px}
+.check input{width:15px;height:15px;accent-color:var(--focus);cursor:pointer}
+
+/* ── buttons ─────────────────────────────────────────────────────── */
+.btn{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:7px;
+  padding:8px 15px;border-radius:8px;font-size:13px;font-weight:500;
+  border:1px solid var(--line);color:var(--paper);background:var(--ink);
+  transition:background .13s,border-color .13s,transform .06s;white-space:nowrap}
+.btn:hover{background:#20252c;border-color:#3a424d}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{opacity:.4;cursor:not-allowed;transform:none}
+.btn.primary{background:var(--focus);color:#08111a;border-color:var(--focus);font-weight:600}
+.btn.primary:hover{background:#a5e2fd;border-color:#a5e2fd}
+.btn.danger{color:var(--bad);border-color:rgba(252,165,165,.28)}
+.btn.danger:hover{background:rgba(252,165,165,.08)}
+.btn.sm{padding:5px 10px;font-size:11.5px}
+.btns{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}
+
+/* ── data ────────────────────────────────────────────────────────── */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.stat{background:var(--slate);padding:14px 16px}
+.stat .n{font-family:var(--mono);font-size:22px;font-weight:500;letter-spacing:-.02em;line-height:1.15}
+.stat .k{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--dim);margin-top:5px}
+.stat.good .n{color:var(--good)} .stat.warn .n{color:var(--warn)}
+.stat.bad .n{color:var(--bad)} .stat.focus .n{color:var(--focus)}
+.stat.concept .n{color:var(--concept)}
+
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--dim);font-weight:400;padding:8px 10px;
+  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--slate);z-index:1}
+td{padding:8px 10px;border-bottom:1px solid rgba(42,48,56,.55);vertical-align:top}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:rgba(255,255,255,.022)}
+td.mono,th.mono{font-family:var(--mono);font-size:11.5px}
+td.r,th.r{text-align:right}
+.tbl-wrap{border:1px solid var(--line);border-radius:var(--r);overflow:auto;
+  max-height:560px;background:var(--slate)}
+.tag{display:inline-block;padding:1.5px 7px;border-radius:5px;font-family:var(--mono);
+  font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;border:1px solid}
+.tag.done{color:var(--good);border-color:rgba(134,239,172,.3);background:rgba(134,239,172,.07)}
+.tag.queued{color:var(--dim);border-color:var(--line)}
+.tag.running{color:var(--focus);border-color:rgba(125,211,252,.32);background:rgba(125,211,252,.07)}
+.tag.failed{color:var(--warn);border-color:rgba(253,230,138,.3);background:rgba(253,230,138,.06)}
+.tag.skipped{color:var(--dim);border-color:var(--line);opacity:.75}
+
+/* the coverage grid: one row per pass, bar coloured by evidence channel */
+.cov{display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.cov .r{background:var(--slate);display:grid;
+  grid-template-columns:150px 1fr 62px 92px 78px;gap:12px;align-items:center;padding:8px 14px}
+.cov .r:hover{background:#1d2229}
+.cov .r.head{background:var(--ink);font-family:var(--mono);font-size:9.5px;
+  text-transform:uppercase;letter-spacing:.13em;color:var(--dim)}
+.cov .nm{font-size:12.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cov .nm em{font-style:normal;font-family:var(--mono);font-size:10px;color:var(--dim);display:block}
+.cov .track{height:7px;border-radius:4px;background:var(--ink);overflow:hidden;display:flex}
+.cov .track i{height:100%;transition:width .5s cubic-bezier(.4,0,.2,1)}
+.cov .track i.d{background:var(--ch,var(--focus))}
+.cov .track i.s{background:var(--line)}
+.cov .track i.f{background:var(--warn)}
+.cov .track i.r{background:var(--focus);animation:pulse 1.6s ease-in-out infinite}
+.cov .pc,.cov .cl,.cov .et{font-family:var(--mono);font-size:11px;color:var(--dim);text-align:right}
+.cov .pc b{color:var(--paper);font-weight:500}
+
+/* pass catalogue */
+.stage{margin-top:22px}
+.stage > h4{font-family:var(--display);font-size:15px;font-weight:700;letter-spacing:-.02em;
+  display:flex;align-items:center;gap:10px}
+.stage > h4 em{font-style:normal;font-family:var(--mono);font-size:10px;color:var(--dim);
+  text-transform:uppercase;letter-spacing:.12em}
+.stage > .sh{color:var(--dim);font-size:12.5px;margin:4px 0 12px;max-width:70ch}
+.plist{display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.p{background:var(--slate);display:grid;grid-template-columns:22px 1fr auto;gap:13px;
+  padding:12px 15px;align-items:start;cursor:pointer;transition:background .12s}
+.p:hover{background:#1d2229}
+.p input{width:15px;height:15px;accent-color:var(--focus);margin-top:2px;cursor:pointer}
+.p .t{font-size:13.5px;font-weight:500;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.p .t .ch{width:7px;height:7px;border-radius:2px;background:var(--ch,var(--line));flex:none}
+.p .t code{font-family:var(--mono);font-size:10.5px;color:var(--dim);background:var(--ink);
+  border:1px solid var(--line);border-radius:4px;padding:0 5px}
+.p .s{color:var(--dim);font-size:12.5px;margin-top:3px;max-width:74ch}
+.p .d{color:#a9b1bb;font-size:12.5px;margin-top:8px;max-width:74ch;display:none;
+  border-left:2px solid var(--line);padding-left:11px}
+.p.open .d{display:block}
+.p .m{font-family:var(--mono);font-size:10.5px;color:var(--dim);text-align:right;
+  white-space:nowrap;line-height:1.7}
+.p .m b{color:var(--paper);font-weight:500}
+.p .m .q{color:var(--concept)}
+.p.off{opacity:.5}
+.p .kinds{margin-top:7px;display:flex;flex-wrap:wrap;gap:4px}
+.p .kinds s{text-decoration:none;font-family:var(--mono);font-size:9.5px;color:var(--dim);
+  border:1px solid var(--line);border-radius:4px;padding:0 5px}
+
+/* activity log */
+.log{font-family:var(--mono);font-size:11.5px;max-height:340px;overflow:auto;
+  border:1px solid var(--line);border-radius:var(--r);background:var(--slate)}
+.log .ln{display:grid;grid-template-columns:62px 1fr;gap:12px;padding:5px 13px;
+  border-bottom:1px solid rgba(42,48,56,.4)}
+.log .ln:last-child{border-bottom:none}
+.log .t{color:#5d6570}
+.log .m{color:#c3c9d1;word-break:break-word}
+.log .ln.warn .m{color:var(--warn)} .log .ln.error .m{color:var(--bad)}
+
+.result{margin-top:13px;padding:10px 13px;border-radius:8px;font-size:12.5px;
+  border:1px solid var(--line);background:var(--ink);display:none;white-space:pre-wrap}
+.result.show{display:block}
+.result.ok{border-color:rgba(134,239,172,.3);color:var(--good)}
+.result.no{border-color:rgba(252,165,165,.32);color:var(--bad)}
+.result.busy{border-color:rgba(125,211,252,.3);color:var(--focus)}
+#toast{position:fixed;right:22px;bottom:22px;z-index:80;display:flex;flex-direction:column;
+  gap:8px;pointer-events:none}
+#toast div{background:var(--slate);border:1px solid var(--line);border-left:3px solid var(--focus);
+  border-radius:8px;padding:10px 15px;font-size:12.5px;max-width:400px;
+  animation:slide .25s ease both;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+#toast div.no{border-left-color:var(--bad)} #toast div.ok{border-left-color:var(--good)}
+@keyframes slide{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+
+.checks{display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-top:13px}
+.chk{background:var(--slate);padding:10px 14px;display:flex;align-items:flex-start;gap:11px}
+.chk .m{width:16px;text-align:center;font-family:var(--mono);font-size:13px;flex:none}
+.chk.ok .m{color:var(--good)} .chk.no .m{color:var(--warn)}
+.chk .nm{font-weight:500;min-width:150px;font-size:12.5px;flex:none}
+.chk .dt{color:var(--dim);font-size:12px;font-family:var(--mono);word-break:break-word}
+
+/* help */
+.help-body{max-width:78ch}
+.help-body h4{font-family:var(--display);font-size:16px;font-weight:700;
+  letter-spacing:-.02em;margin:26px 0 7px}
+.help-body h4:first-child{margin-top:0}
+.help-body p{color:#c3c9d1;margin:9px 0}
+.help-body ol,.help-body ul{margin:9px 0 9px 20px;color:#c3c9d1}
+.help-body li{margin:5px 0}
+.help-body code{font-family:var(--mono);font-size:11.5px;background:var(--ink);
+  border:1px solid var(--line);border-radius:5px;padding:1.5px 5px;color:var(--concept)}
+.help-body strong{color:var(--paper);font-weight:600}
+.callout{border-left:2px solid var(--focus);background:rgba(125,211,252,.05);
+  padding:11px 15px;border-radius:0 8px 8px 0;margin:14px 0;font-size:13px;color:#c3c9d1}
+.callout.warn{border-left-color:var(--warn);background:rgba(253,230,138,.05)}
+.callout.bad{border-left-color:var(--bad);background:rgba(252,165,165,.05)}
+.callout b{color:var(--paper)}
+details.step{border:1px solid var(--line);border-radius:var(--r);background:var(--slate);
+  margin-top:10px;overflow:hidden}
+details.step > summary{padding:12px 16px;cursor:pointer;font-weight:500;font-size:13.5px;
+  list-style:none;display:flex;align-items:center;gap:11px}
+details.step > summary::-webkit-details-marker{display:none}
+details.step > summary::before{content:'+';font-family:var(--mono);color:var(--focus);
+  font-size:14px;width:12px}
+details.step[open] > summary::before{content:'−'}
+details.step[open] > summary{border-bottom:1px solid var(--line)}
+details.step .in{padding:15px 16px 18px}
+.stepnum{font-family:var(--mono);font-size:10px;color:var(--dim);background:var(--ink);
+  border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+.skel{color:var(--dim);font-size:12.5px;padding:24px;text-align:center;font-family:var(--mono)}
+
+/* claim reader */
+.claims{display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden;max-height:520px;overflow-y:auto}
+.cl{background:var(--slate);padding:9px 14px;display:grid;
+  grid-template-columns:96px 108px 1fr auto;gap:12px;align-items:baseline;font-size:12.5px}
+.cl .c{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--ch,var(--dim))}
+.cl .k{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+.cl .v{color:#d6dbe1;word-break:break-word}
+.cl .o{font-family:var(--mono);font-size:9.5px;color:#5d6570;white-space:nowrap}
+
+@media(max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .rail{position:static;height:auto;flex-direction:row;align-items:center;padding:12px 16px;
+    border-right:none;border-bottom:1px solid var(--line);overflow-x:auto}
+  .brand{border:none;padding:0 18px 0 0;margin:0}
+  .nav{flex-direction:row;padding:0;flex:none}
+  .rail-foot{display:none}
+  .page{padding:22px 16px 80px}
+  .sb-row{padding:11px 16px;flex-wrap:wrap}
+  .cov .r{grid-template-columns:118px 1fr 54px;gap:9px}
+  .cov .cl,.cov .et{display:none}
+  .now{grid-template-columns:1fr}
+  .cl{grid-template-columns:1fr;gap:2px}
+}
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="rail">
+    <div class="brand">
+      <h1>Process</h1>
+      <div class="sub">Evidence engine</div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-p="run" class="on"><span class="dot"></span>Run</button>
+      <button data-p="passes"><span class="dot"></span>Passes<span class="badge" id="bPasses"></span></button>
+      <button data-p="coverage"><span class="dot"></span>Coverage</button>
+      <button data-p="db"><span class="dot"></span>Database</button>
+      <button data-p="setup"><span class="dot"></span>Setup</button>
+      <button data-p="help"><span class="dot"></span>Help</button>
+    </nav>
+    <div class="rail-foot">
+      <a href="/capture">← Capture tab</a>
+      <a href="/">← Home</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="statusbar">
+      <div class="sb-row">
+        <span class="pill" id="pill"><i></i><span id="pillText">idle</span></span>
+        <span class="sb-msg" id="sbMsg">Loading…</span>
+        <span class="sb-stats">
+          <span>done <b id="sDone">—</b></span>
+          <span>claims <b id="sClaims">—</b></span>
+          <span>left <b id="sLeft">—</b></span>
+          <span>eta <b id="sEta">—</b></span>
+        </span>
+      </div>
+      <div class="spectrum" id="spec"></div>
+    </div>
+
+    <!-- ══ RUN ══════════════════════════════════════════════════════ -->
+    <section class="page" id="p-run">
+      <h2 class="title">The rotation</h2>
+      <p class="lede">Models are loaded in groups that fit the cards you have. Each group
+        sweeps every video before it is dropped and the next group is loaded — so a reel
+        is fetched and decoded once per group, not once per pass.</p>
+
+      <div class="sec">
+        <h3>Cohorts <span class="act" data-goto="passes">choose passes →</span></h3>
+        <div class="rot" id="rot"><div class="skel">No plan yet — open Setup and run the readiness check.</div></div>
+        <div class="card" style="margin-top:14px">
+          <div class="band" id="resBand" style="background:var(--focus)"></div>
+          <div class="n" style="font-family:var(--mono);font-size:10px;letter-spacing:.13em;
+            text-transform:uppercase;color:var(--dim)">Hardware</div>
+          <div id="resLine" style="font-family:var(--mono);font-size:12.5px;margin-top:6px;color:#c3c9d1">—</div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Now</h3>
+        <div class="now idle" id="now">
+          <div>
+            <div class="k">Idle</div>
+            <div class="v" id="nowV">Nothing running</div>
+            <div class="sub" id="nowS">Press Start on Setup once the readiness check is clean.</div>
+            <div class="loaded" id="nowLoaded"></div>
+          </div>
+          <div class="clock" id="nowClock">—</div>
+        </div>
+        <div class="btns">
+          <button class="btn primary" id="bStart">Start</button>
+          <button class="btn" id="bPause">Pause</button>
+          <button class="btn" id="bResume" hidden>Resume</button>
+          <button class="btn danger" id="bStop">Stop</button>
+          <button class="btn" id="bPublish">Publish shard now</button>
+        </div>
+        <div class="result" id="runResult"></div>
+      </div>
+
+      <div class="sec">
+        <h3>This session</h3>
+        <div class="stats">
+          <div class="stat focus"><div class="n" id="kVideos">0</div><div class="k">videos</div></div>
+          <div class="stat"><div class="n" id="kPasses">0</div><div class="k">passes</div></div>
+          <div class="stat good"><div class="n" id="kClaims">0</div><div class="k">claims</div></div>
+          <div class="stat concept"><div class="n" id="kVectors">0</div><div class="k">vectors</div></div>
+          <div class="stat warn"><div class="n" id="kSkipped">0</div><div class="k">skipped</div></div>
+          <div class="stat bad"><div class="n" id="kFailed">0</div><div class="k">failed</div></div>
+          <div class="stat"><div class="n" id="kShards">0</div><div class="k">shards</div></div>
+          <div class="stat"><div class="n" id="kUptime">—</div><div class="k">uptime</div></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Store</h3>
+        <div class="stats">
+          <div class="stat"><div class="n" id="dVideos">0</div><div class="k">videos</div></div>
+          <div class="stat"><div class="n" id="dShots">0</div><div class="k">shots</div></div>
+          <div class="stat good"><div class="n" id="dClaims">0</div><div class="k">claims</div></div>
+          <div class="stat concept"><div class="n" id="dVectors">0</div><div class="k">vectors</div></div>
+          <div class="stat"><div class="n" id="dObservers">0</div><div class="k">observers</div></div>
+          <div class="stat"><div class="n" id="dPending">0</div><div class="k">unpublished</div></div>
+          <div class="stat"><div class="n" id="dDisk">—</div><div class="k">scratch free</div></div>
+          <div class="stat"><div class="n" id="dFetch">—</div><div class="k">fetched</div></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Activity</h3>
+        <div class="log" id="log"><div class="skel">Nothing yet.</div></div>
+      </div>
+    </section>
+
+    <!-- ══ PASSES ═══════════════════════════════════════════════════ -->
+    <section class="page" id="p-passes" hidden>
+      <h2 class="title">Every pass this engine can run</h2>
+      <p class="lede">Nothing here trusts a single model. Speech is transcribed twice by
+        different architectures, text is read by two OCR engines, and every reading is
+        stored as a claim with the observer that made it — so two systems disagreeing is
+        recorded as a disagreement rather than silently resolved.</p>
+
+      <div class="btns" style="margin-top:18px">
+        <button class="btn sm" data-pick="all">Select all</button>
+        <button class="btn sm" data-pick="default">Recommended</button>
+        <button class="btn sm" data-pick="core">Core only</button>
+        <button class="btn sm" data-pick="none">Clear</button>
+        <button class="btn sm primary" id="bSavePasses">Save selection</button>
+      </div>
+      <div class="result" id="passResult"></div>
+      <div id="stages"><div class="skel">Loading the catalogue…</div></div>
+    </section>
+
+    <!-- ══ COVERAGE ═════════════════════════════════════════════════ -->
+    <section class="page" id="p-coverage" hidden>
+      <h2 class="title">What has been run, on what</h2>
+      <p class="lede">One row per pass. The bar is every video in this worker's slice:
+        filled is finished, grey is skipped for a stated reason, amber failed. Stopping
+        the engine loses nothing — this table is the memory.</p>
+
+      <div class="sec">
+        <h3>Passes <span class="act" id="bRefreshCov">refresh</span></h3>
+        <div class="cov" id="covGrid"><div class="skel">Nothing planned yet.</div></div>
+      </div>
+
+      <div class="sec">
+        <h3>In flight</h3>
+        <div class="tbl-wrap" style="max-height:240px">
+          <table><thead><tr><th>Video</th><th>Pass</th><th>Worker</th><th>Progress</th><th class="r">Lease</th></tr></thead>
+          <tbody id="tRunning"><tr><td colspan="5" class="skel">Nothing in flight.</td></tr></tbody></table>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Failures</h3>
+        <p class="lede" style="margin-bottom:12px">Grouped by pass and message. Fix the cause —
+          usually a missing package or a model download that timed out — then requeue.</p>
+        <div class="tbl-wrap" style="max-height:340px">
+          <table><thead><tr><th>Pass</th><th class="r">Videos</th><th>Error</th><th></th></tr></thead>
+          <tbody id="tFailures"><tr><td colspan="4" class="skel">No failures.</td></tr></tbody></table>
+        </div>
+        <div class="btns">
+          <button class="btn" id="bRequeueAll">Requeue every failure</button>
+        </div>
+        <div class="result" id="covResult"></div>
+      </div>
+
+      <div class="sec">
+        <h3>Re-run a pass from scratch</h3>
+        <div class="card">
+          <h4>Changed a prompt or a model?</h4>
+          <div class="hint">This queues the pass again for every video. Claims already written
+            are kept under their original observer — the database records what it used to think,
+            which is the only way a later disagreement can be traced.</div>
+          <div class="row" style="margin-top:14px">
+            <div class="field"><label>Pass id</label>
+              <input type="text" id="rsComp" placeholder="narrate"></div>
+            <div class="field"><label>Type it again to confirm <span class="note">costs GPU hours</span></label>
+              <input type="text" id="rsConfirm" placeholder="narrate"></div>
+            <button class="btn danger" id="bReset">Re-run</button>
+          </div>
+          <div class="result" id="resetResult"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ DATABASE ═════════════════════════════════════════════════ -->
+    <section class="page" id="p-db" hidden>
+      <h2 class="title">The evidence</h2>
+      <p class="lede">Every claim carries the observer that made it and, where it belongs to
+        a moment, the shot it came from. Search is over the claim text — this is the same
+        index the reader tabs will query.</p>
+
+      <div class="sec">
+        <h3>Search</h3>
+        <div class="row">
+          <div class="field"><input type="text" id="q" placeholder="a phrase said, read on screen, or seen"></div>
+          <button class="btn primary" id="bSearch">Search</button>
+        </div>
+        <div class="claims" id="results" style="margin-top:14px"><div class="skel">Type something above.</div></div>
+      </div>
+
+      <div class="sec">
+        <h3>Videos <span class="act" id="bRefreshVids">refresh</span></h3>
+        <div class="tbl-wrap" style="max-height:420px">
+          <table><thead><tr><th>Key</th><th>Uploader</th><th class="r">Secs</th><th class="r">Shots</th>
+            <th class="r">Size</th><th></th></tr></thead>
+          <tbody id="tVideos"><tr><td colspan="6" class="skel">Nothing yet.</td></tr></tbody></table>
+        </div>
+      </div>
+
+      <div class="sec" id="secDetail" hidden>
+        <h3>One video <span class="act" id="bCloseDetail">close</span></h3>
+        <div class="card"><div id="vHead"></div></div>
+        <div class="claims" id="vClaims" style="margin-top:14px"></div>
+      </div>
+
+      <div class="sec">
+        <h3>Observers</h3>
+        <p class="lede" style="margin-bottom:12px">One row per model-and-settings combination that
+          has ever written to this database. Change a prompt and a new row appears; the old
+          claims keep pointing at the old row.</p>
+        <div class="tbl-wrap" style="max-height:320px">
+          <table><thead><tr><th>Observer</th><th>Pass</th><th>Model</th><th>Device</th></tr></thead>
+          <tbody id="tObservers"><tr><td colspan="4" class="skel">None yet.</td></tr></tbody></table>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Shards</h3>
+        <p class="lede" style="margin-bottom:12px">Each shard is everything learned since the last
+          one, gzipped and pushed to the channel. This is how a session that dies at hour twelve
+          costs nothing, and how ten accounts merge into one database.</p>
+        <div class="tbl-wrap" style="max-height:300px">
+          <table><thead><tr><th>Shard</th><th>Note</th><th class="r">Claims</th><th class="r">Vectors</th>
+            <th class="r">Size</th><th class="r">Message</th></tr></thead>
+          <tbody id="tShards"><tr><td colspan="6" class="skel">None yet.</td></tr></tbody></table>
+        </div>
+        <div class="btns">
+          <button class="btn" id="bRestore">Replay shards from the channel</button>
+          <button class="btn" id="bSync">Pull new captures from the ledger</button>
+        </div>
+        <div class="result" id="dbResult"></div>
+      </div>
+    </section>
+
+    <!-- ══ SETUP ════════════════════════════════════════════════════ -->
+    <section class="page" id="p-setup" hidden>
+      <h2 class="title">Setup</h2>
+      <p class="lede">Credentials live in this process's memory and nowhere else — not in a
+        file, not in a notebook cell, not in git. That means re-typing them after a restart,
+        which is the trade this project chose on purpose.</p>
+
+      <div class="sec">
+        <h3>Credentials</h3>
+        <div class="card">
+          <div class="band" style="background:linear-gradient(90deg,var(--speech),var(--concept))"></div>
+          <h4>Telegram</h4>
+          <div class="hint">The same channel the capture tab uploads to. The engine reads the
+            original mp4s from it and writes evidence shards back.</div>
+          <div class="row" style="margin-top:14px">
+            <div class="field"><label>Bot token <span class="note" id="tokState"></span></label>
+              <input type="password" id="fToken" placeholder="123456:AA…" autocomplete="off"></div>
+            <div class="field"><label>Channel id</label>
+              <input type="text" id="fChannel" placeholder="-100…"></div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <div class="field"><label>API id <span class="note">my.telegram.org</span></label>
+              <input type="text" id="fApiId" placeholder="1234567"></div>
+            <div class="field"><label>API hash</label>
+              <input type="password" id="fApiHash" placeholder="32 hex characters" autocomplete="off"></div>
+          </div>
+          <div class="callout warn" style="margin-top:14px"><b>The API id and hash are not optional here.</b>
+            The Bot API cannot fetch a message by id, so without them the engine cannot reach
+            the capture records — and cannot download any original over 20 MB.</div>
+        </div>
+
+        <div class="card">
+          <div class="band" style="background:var(--narrative)"></div>
+          <h4>Hugging Face</h4>
+          <div class="hint">Only the speaker-diarisation pass needs this, because pyannote's
+            weights are gated. Everything else downloads without a token.</div>
+          <div class="field"><label>Access token <span class="note" id="hfState"></span></label>
+            <input type="password" id="fHf" placeholder="hf_…" autocomplete="off"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>This worker</h3>
+        <div class="card">
+          <h4>Which slice of the library</h4>
+          <div class="hint">Run the same engine on several Kaggle accounts by giving each one a
+            different index. Videos are split by a hash of their key, so the slices never
+            overlap and no account needs to know about the others.</div>
+          <div class="row" style="margin-top:14px">
+            <div class="field"><label>Workers in total</label>
+              <input type="number" id="fParts" min="1" max="64" placeholder="1"></div>
+            <div class="field"><label>This one is number <span class="note">0-based</span></label>
+              <input type="number" id="fIndex" min="0" max="63" placeholder="0"></div>
+            <div class="field"><label>Stop after N videos <span class="note">0 = no limit</span></label>
+              <input type="number" id="fLimit" min="0" placeholder="0"></div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <div class="field"><label>Publish a shard every N videos</label>
+              <input type="number" id="fPublish" min="5" placeholder="50"></div>
+            <div class="field"><label>Working-file cache, MB</label>
+              <input type="number" id="fCache" min="1000" placeholder="12000"></div>
+            <div class="field"><label>Extra VRAM headroom, MB</label>
+              <input type="number" id="fVram" min="0" placeholder="384"></div>
+          </div>
+          <label class="check"><input type="checkbox" id="fFollow">
+            Keep watching for new captures when the sweep is done</label>
+          <label class="check"><input type="checkbox" id="fSync">
+            Read the capture ledger on start</label>
+          <label class="check"><input type="checkbox" id="fRestore">
+            Replay evidence shards from the channel on start</label>
+          <div class="field" style="margin-top:14px"><label>Capture ledger
+            <span class="note">leave alone unless it lives somewhere unusual</span></label>
+            <input type="text" id="fLedger" placeholder="…/capture_ledger.db"></div>
+          <div class="btns">
+            <button class="btn primary" id="bSave">Save settings</button>
+            <button class="btn" id="bCheck">Run readiness check</button>
+          </div>
+          <div class="result" id="setupResult"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Readiness</h3>
+        <div class="checks" id="checks"><div class="skel">Not checked yet.</div></div>
+        <div class="btns">
+          <button class="btn primary" id="bStart2">Start the engine</button>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Estimate</h3>
+        <div class="stats">
+          <div class="stat"><div class="n" id="ePasses">—</div><div class="k">passes</div></div>
+          <div class="stat"><div class="n" id="eCohorts">—</div><div class="k">cohorts</div></div>
+          <div class="stat"><div class="n" id="eMine">—</div><div class="k">my videos</div></div>
+          <div class="stat focus"><div class="n" id="ePer">—</div><div class="k">sec / video</div></div>
+          <div class="stat warn"><div class="n" id="eWall">—</div><div class="k">wall hours</div></div>
+          <div class="stat"><div class="n" id="eDl">—</div><div class="k">weights MB</div></div>
+        </div>
+        <p class="lede" style="margin-top:10px">A first guess from the catalogue. The moment real
+          runs exist, the Coverage tab's numbers replace it — those are measured on this machine,
+          which is the only estimate worth acting on.</p>
+      </div>
+    </section>
+
+    <!-- ══ HELP ═════════════════════════════════════════════════════ -->
+    <section class="page" id="p-help" hidden>
+      <h2 class="title">How to run this</h2>
+      <p class="lede">Twelve minutes of setup, then it runs unattended until you stop it.
+        Everything it learns is pushed to Telegram as it goes, so nothing is lost when a
+        session ends.</p>
+
+      <div class="sec help-body">
+        <h4>What this tab actually does</h4>
+        <p>The capture tab put every reel into a Telegram channel. This tab reads them back out
+          and <strong>watches each one with about thirty different systems</strong> — two speech
+          models, two OCR engines, object and face detection, depth, scene cutting, colour and
+          motion measurement, embeddings, and several vision-language models that describe what
+          is happening and why it holds attention.</p>
+        <p>Everything each system says is written down as a <strong>claim</strong>: what was said,
+          which pass said it, which model, which version of the settings, and which shot of the
+          video it belongs to. Nothing overwrites anything. When two transcribers disagree about
+          a word, the database has both, and the disagreement is a fact you can query.</p>
+        <div class="callout"><b>Why it rotates.</b> Two T4s hold about 28 GB of weights. Thirty
+          passes do not fit at once, so they are grouped: load a group, run it over every video,
+          drop it, load the next. A reel is downloaded and decoded once per group instead of
+          once per pass — the difference between a week and an afternoon.</div>
+
+        <h4>Before you start</h4>
+        <details class="step" open><summary><span class="stepnum">1</span>Get the Telegram credentials</summary>
+          <div class="in">
+            <p>The same four values the capture tab uses. If capture is already running, they are
+              the same ones — this tab keeps its own copy because the two engines can run in
+              different processes.</p>
+            <ol>
+              <li><strong>Bot token</strong> — message <code>@BotFather</code>, <code>/mytoken</code>,
+                pick your bot. It looks like <code>123456789:AA…</code>.</li>
+              <li><strong>Channel id</strong> — forward any message from the channel to
+                <code>@userinfobot</code>, or open the channel on web.telegram.org and read the
+                number from the URL. It starts with <code>-100</code>.</li>
+              <li><strong>API id and hash</strong> — sign in at <a href="https://my.telegram.org"
+                target="_blank" rel="noopener">my.telegram.org</a> → API development tools. Any app
+                name works. These are your account's, not the bot's.</li>
+            </ol>
+            <div class="callout bad"><b>If these ever leak, rotate them.</b> A bot token is revoked
+              with <code>/revoke</code> in BotFather; the API hash is regenerated at my.telegram.org.
+              Nothing in this project writes either to disk.</div>
+          </div>
+        </details>
+
+        <details class="step"><summary><span class="stepnum">2</span>Get a Hugging Face token (optional)</summary>
+          <div class="in">
+            <p>Only <code>diarize</code> — the pass that works out how many people are speaking and
+              when — needs one, because pyannote's weights are gated behind an accepted licence.</p>
+            <ol>
+              <li>Make an account at <a href="https://huggingface.co" target="_blank" rel="noopener">huggingface.co</a>.</li>
+              <li>Open <code>pyannote/speaker-diarization-3.1</code> and
+                <code>pyannote/segmentation-3.0</code> and accept the terms on both.</li>
+              <li>Settings → Access Tokens → New token, read access. Paste it into Setup.</li>
+            </ol>
+            <p>Skip this and everything else still runs; the diarisation pass records itself as
+              skipped, with the reason.</p>
+          </div>
+        </details>
+
+        <details class="step"><summary><span class="stepnum">3</span>Choose your passes</summary>
+          <div class="in">
+            <p>Open <a href="#" data-goto="passes">Passes</a>. Every system is listed with what it
+              costs and what it writes. <strong>Recommended</strong> is a good starting point — it
+              leaves out only the heaviest deep-reading passes.</p>
+            <p>Two rules the engine enforces for you: a pass that needs another pass's output will
+              not run without it, and a pass that cannot fit in your VRAM is dropped from the plan
+              with the reason shown.</p>
+          </div>
+        </details>
+
+        <details class="step"><summary><span class="stepnum">4</span>Split the work across accounts</summary>
+          <div class="in">
+            <p>One Kaggle session gives 12 hours. Ten accounts give ten slices of the library
+              running at once.</p>
+            <p>On each account, set <strong>workers in total</strong> to how many accounts you are
+              using, and <strong>this one is number</strong> to a different value on each —
+              0, 1, 2 and so on. Videos are assigned by a hash of their key, so the slices never
+              overlap and the accounts never need to talk to each other.</p>
+            <div class="callout"><b>They merge automatically.</b> Every account pushes its findings
+              to the same channel as shards. Any session that ticks <em>replay evidence shards on
+              start</em> pulls in everything every other account has published.</div>
+          </div>
+        </details>
+
+        <details class="step"><summary><span class="stepnum">5</span>Run the readiness check, then start</summary>
+          <div class="in">
+            <p>The check looks for ffmpeg, the Python packages each selected pass imports, free
+              VRAM and disk, whether the bot can actually post to the channel, and whether there
+              are any videos to process at all.</p>
+            <p>Amber lines are advisory — a missing OCR package costs you one pass out of thirty.
+              Only the blocking ones stop the engine, and they are listed separately.</p>
+            <p>Then press <strong>Start</strong>. Watch the Run tab; leave the browser if you like,
+              the engine does not need it.</p>
+          </div>
+        </details>
+
+        <h4>Stopping and starting again</h4>
+        <p><strong>Stop whenever you want.</strong> The pass in flight finishes and is recorded,
+          the last shard is published, and the engine goes idle. Start it again tomorrow, next
+          week, or on a different account and it picks up exactly where it stopped — no reel is
+          ever fetched twice and no pass is ever run twice on the same video.</p>
+        <p>If a Kaggle session is killed without warning, the leases held by that worker expire
+          after forty minutes and the rows go back into the pool. You lose at most the passes that
+          were mid-flight.</p>
+
+        <h4>When something fails</h4>
+        <ul>
+          <li><strong>A pass fails on every video</strong> — almost always a missing package. The
+            Coverage tab groups failures by message; install what it names, then Requeue.</li>
+          <li><strong>Out of VRAM</strong> — the engine drops every resident model and carries on.
+            If it repeats, raise the extra VRAM headroom in Setup, which makes the cohorts smaller.</li>
+          <li><strong>Everything skips with "artifact is missing"</strong> — ffmpeg is not on PATH.
+            Nothing can be decoded without it.</li>
+          <li><strong>"No API id"</strong> — the engine can only reach originals under 20 MB and
+            cannot read capture records at all. Add the API id and hash.</li>
+        </ul>
+
+        <h4>Running it on Kaggle</h4>
+        <p>In a notebook cell:</p>
+        <p><code>!pip install -r requirements.txt</code><br>
+          <code>!python ui_server.py</code></p>
+        <p>Open the forwarded port, go to <code>/process</code>, paste the credentials, run the
+          check, start. Turn the internet toggle on and pick the T4 ×2 accelerator before you run
+          anything — neither can be changed once a session has started.</p>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+/* ── helpers ──────────────────────────────────────────────────────── */
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num = n => (n === null || n === undefined || n === '') ? '—' : Number(n).toLocaleString();
+const CH = ['speech','ocr','visual','narrative','style','caption','concept'];
+const chVar = c => CH.includes(c) ? `var(--${c})` : 'var(--line)';
+
+function toast(msg, kind){
+  const d = document.createElement('div');
+  d.className = kind || ''; d.textContent = msg;
+  $('#toast').appendChild(d);
+  setTimeout(() => { d.style.opacity='0'; d.style.transition='opacity .3s';
+    setTimeout(() => d.remove(), 320); }, 4400);
+}
+function say(sel, msg, kind){
+  const n = $(sel); if(!n) return;
+  n.textContent = msg; n.className = 'result show ' + (kind || '');
+}
+async function post(url, body){
+  try{
+    const r = await fetch(url, {method:'POST', body});
+    return await r.json();
+  }catch(e){ return {ok:false, error:String(e)}; }
+}
+async function get(url){
+  try{
+    const r = await fetch(url);
+    return await r.json();
+  }catch(e){ return {ok:false, error:String(e)}; }
+}
+function form(obj){
+  const f = new FormData();
+  for(const [k,v] of Object.entries(obj)) if(v !== undefined && v !== null && v !== '') f.append(k,v);
+  return f;
+}
+function human(sec){
+  sec = Math.max(0, Math.round(sec || 0));
+  if(sec < 60) return sec + 's';
+  if(sec < 3600) return Math.round(sec/60) + 'm';
+  if(sec < 86400) return (sec/3600).toFixed(1) + 'h';
+  return (sec/86400).toFixed(1) + 'd';
+}
+function mb(b){ return b ? (b/1048576).toFixed(1) + ' MB' : '—'; }
+function clock(t){
+  if(!t && t !== 0) return '—';
+  const s = Math.round(t);
+  return s < 60 ? s + 's' : Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
+}
+
+/* ── navigation ───────────────────────────────────────────────────── */
+const PAGES = ['run','passes','coverage','db','setup','help'];
+function goto(p){
+  if(!PAGES.includes(p)) return;
+  $$('#nav button').forEach(b => b.classList.toggle('on', b.dataset.p === p));
+  PAGES.forEach(x => $('#p-' + x).hidden = (x !== p));
+  window.scrollTo(0,0);
+  if(p === 'passes' && !catalogLoaded) loadCatalog();
+  if(p === 'coverage') loadCoverage();
+  if(p === 'db') loadDb();
+  if(p === 'setup') loadPlan();
+}
+$('#nav').addEventListener('click', e => {
+  const b = e.target.closest('button'); if(b) goto(b.dataset.p);
+});
+document.addEventListener('click', e => {
+  const a = e.target.closest('[data-goto]');
+  if(a){ e.preventDefault(); goto(a.dataset.goto); }
+});
+
+/* ══ RUN ═══════════════════════════════════════════════════════════ */
+let selected = new Set(), catalog = [], catalogLoaded = false;
+// The last status payload, kept so pages other than Run can answer questions
+// about the store without firing their own request.
+let last = null;
+
+function render(s){
+  last = s;
+  const st = s.state || 'idle';
+  const pill = $('#pill');
+  pill.className = 'pill ' + (['running','paused','stopping','error'].includes(st) ? st : '');
+  $('#pillText').textContent = st;
+  $('#sbMsg').textContent = s.error || s.message || '';
+
+  const c = s.counts || {}, store = s.store || {};
+  const done = (c.done || 0) + (c.skipped || 0);
+  const total = Object.values(c).reduce((a,b) => a + (b||0), 0);
+  $('#sDone').textContent = num(done);
+  $('#sClaims').textContent = num(store.claims || 0);
+  $('#sLeft').textContent = num(Math.max(total - done, 0));
+
+  // ETA from what this machine measured, not from the catalogue's guesses
+  let eta = 0;
+  (s.matrix || []).forEach(m => { if(m.eta_seconds) eta += m.eta_seconds; });
+  const gpus = Math.max((s.resources || {}).gpu_count || 1, 1);
+  $('#sEta').textContent = eta ? human(eta / gpus) : '—';
+
+  // spectrum: the channel mix of everything written so far
+  renderSpectrum(s);
+  renderRotation(s);
+  renderNow(s);
+
+  const ses = s.session || {};
+  $('#kVideos').textContent = num(ses.videos);
+  $('#kPasses').textContent = num(ses.passes);
+  $('#kClaims').textContent = num(ses.claims);
+  $('#kVectors').textContent = num(ses.vectors);
+  $('#kSkipped').textContent = num(ses.skipped);
+  $('#kFailed').textContent = num(ses.failed);
+  $('#kShards').textContent = num(ses.shards);
+  $('#kUptime').textContent = s.uptime ? human(s.uptime) : '—';
+
+  $('#dVideos').textContent = num(store.videos);
+  $('#dShots').textContent = num(store.shots);
+  $('#dClaims').textContent = num(store.claims);
+  $('#dVectors').textContent = num(store.vectors);
+  $('#dObservers').textContent = num(store.observers);
+  $('#dPending').textContent = num((s.shards || {}).pending);
+  $('#dDisk').textContent = s.disk_free_mb ? (s.disk_free_mb/1024).toFixed(0) + ' GB' : '—';
+  const src = s.source || {};
+  $('#dFetch').textContent = src.downloaded ? src.downloaded + ' / ' + src.mb + ' MB' : '—';
+
+  $('#resLine').textContent = s.resources_line || 'Not measured yet.';
+  const run = st === 'running', paused = st === 'paused';
+  $('#bStart').disabled = run || paused || st === 'stopping';
+  $('#bPause').hidden = paused; $('#bPause').disabled = !run;
+  $('#bResume').hidden = !paused;
+  $('#bStop').disabled = !(run || paused);
+}
+
+function renderSpectrum(s){
+  const el = $('#spec');
+  const m = s.matrix || [];
+  if(!m.length){ el.innerHTML = ''; return; }
+  const byCh = {};
+  m.forEach(r => {
+    const comp = catalog.find(c => c.id === r.component);
+    const ch = (comp && comp.channel) || '';
+    if(!ch) return;
+    byCh[ch] = (byCh[ch] || 0) + (r.claims || 0);
+  });
+  const total = Object.values(byCh).reduce((a,b)=>a+b, 0);
+  if(!total){ el.innerHTML = ''; return; }
+  el.innerHTML = CH.filter(c => byCh[c]).map(c =>
+    `<i style="width:${(byCh[c]/total*100).toFixed(2)}%;background:${chVar(c)}"></i>`).join('');
+}
+
+function renderRotation(s){
+  const el = $('#rot');
+  const cs = s.cohorts || [];
+  if(!cs.length){
+    el.innerHTML = '<div class="skel">No plan yet — open Setup and run the readiness check.</div>';
+    return;
+  }
+  const parts = cs.map((c, i) => {
+    const pct = c.total ? Math.round(100 * c.done / c.total) : 0;
+    const names = (c.titles || c.components || []).slice(0, 5);
+    const extra = (c.components || []).length - names.length;
+    return `<div class="co ${c.state === 'running' ? 'on' : c.state === 'done' ? 'done' : ''}">
+      <div class="n"><b>Cohort ${i + 1}</b><span class="vr">${num(c.vram_mb)} MB</span></div>
+      <div class="ps">${names.map(n => `<s>${esc(n)}</s>`).join('')}
+        ${extra > 0 ? `<s class="more">+${extra}</s>` : ''}</div>
+      <div class="pc">${num(c.done)} / ${num(c.total)} · ${pct}%${
+        c.loads ? ` · ${c.loads.length || c.loads} loads` : ''}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+    </div>`;
+  });
+  el.innerHTML = parts.join('<div class="loop">→</div>') +
+    '<div class="loop" title="then back to the top for anything new">↺</div>';
+}
+
+function renderNow(s){
+  const n = $('#now'), cur = s.current || {};
+  if(cur.video_key){
+    n.classList.remove('idle');
+    n.querySelector('.k').textContent = 'Cohort ' + ((cur.cohort ?? 0) + 1) +
+      ' · pass ' + (cur.component || '—');
+    $('#nowV').textContent = cur.title || cur.component || cur.video_key;
+    $('#nowS').textContent = cur.video_key + (cur.note ? ' · ' + cur.note : '') +
+      ' · ' + (cur.passes || 0) + ' passes this visit';
+    $('#nowClock').textContent = clock(cur.elapsed);
+  }else{
+    n.classList.add('idle');
+    n.querySelector('.k').textContent = s.state === 'running' ? 'Working' : 'Idle';
+    $('#nowV').textContent = s.state === 'running' ? 'Preparing…' : 'Nothing running';
+    $('#nowS').textContent = s.message || '';
+    $('#nowClock').textContent = '—';
+  }
+  const loaded = s.loaded || [];
+  $('#nowLoaded').innerHTML = loaded.length
+    ? loaded.map(k => `<s>${esc(k)}</s>`).join('')
+    : '';
+}
+
+async function tick(){
+  const s = await get('/api/process/status');
+  if(s.ok === false) return;
+  render(s);
+  const t = s.task || {};
+  if(t.running) say('#setupResult', t.message || 'Working…', 'busy');
+}
+async function tickLog(){
+  const r = await get('/api/process/activity?limit=90');
+  if(!r.ok) return;
+  const el = $('#log');
+  if(!r.events.length){ el.innerHTML = '<div class="skel">Nothing yet.</div>'; return; }
+  el.innerHTML = r.events.map(e => {
+    const t = new Date(e.at * 1000).toLocaleTimeString([], {hour12:false});
+    return `<div class="ln ${esc(e.level)}"><span class="t">${t}</span>
+      <span class="m">${esc(e.text)}</span></div>`;
+  }).join('');
+}
+
+$('#bStart').onclick = $('#bStart2').onclick = async () => {
+  say('#runResult', 'Starting…', 'busy');
+  const r = await post('/api/process/start');
+  if(r.ok){ say('#runResult', 'Running.', 'ok'); toast('Engine started', 'ok'); goto('run'); }
+  else{
+    say('#runResult', r.error || 'Could not start.', 'no');
+    say('#setupResult', r.error || 'Could not start.', 'no');
+    if(r.preflight) drawChecks(r.preflight);
+    toast('Could not start — see the readiness check', 'no');
+  }
+  tick();
+};
+$('#bPause').onclick = async () => { await post('/api/process/pause'); tick(); };
+$('#bResume').onclick = async () => { await post('/api/process/resume'); tick(); };
+$('#bStop').onclick = async () => {
+  say('#runResult', 'Stopping — the pass in flight will finish and be recorded.', 'busy');
+  await post('/api/process/stop'); tick();
+};
+$('#bPublish').onclick = async () => {
+  say('#runResult', 'Exporting and uploading…', 'busy');
+  const r = await post('/api/process/publish');
+  if(r.ok && r.shard) say('#runResult', 'Published ' + r.shard, 'ok');
+  else say('#runResult', r.error || 'Nothing new to publish.', r.ok ? '' : 'no');
+};
+
+/* ══ PASSES ════════════════════════════════════════════════════════ */
+const STAGE_BLURB = {
+  0: 'No model and no GPU. Everything else depends on these: the shot table is the ' +
+     'atomic unit of time in this database, and every later pass reports against it.',
+  1: 'Arithmetic over pixels and metadata. Cheap, exact, and not subject to a model ' +
+     'having a bad day — colour, motion, loudness, cut rhythm, the caption and its comments.',
+  2: 'Perception. What was said, what is written on screen, what is in frame. Two ' +
+     'independent systems on the readings that matter most, so a disagreement is visible.',
+  3: 'Language. Vision-language models reading the assembled evidence and saying what ' +
+     'is happening and why it holds attention. The only passes allowed to interpret.'
+};
+
+async function loadCatalog(){
+  const r = await get('/api/process/catalog');
+  if(!r.ok){ $('#stages').innerHTML = `<div class="skel">${esc(r.error)}</div>`; return; }
+  catalog = r.components; catalogLoaded = true;
+  selected = new Set(r.selected);
+  drawCatalog();
+  fillSettings(r.settings);
+}
+
+function drawCatalog(){
+  const byStage = {};
+  catalog.forEach(c => (byStage[c.stage] = byStage[c.stage] || []).push(c));
+  $('#stages').innerHTML = Object.keys(byStage).sort().map(st => {
+    const rows = byStage[st].map(c => {
+      const on = selected.has(c.id);
+      const dev = c.device === 'gpu'
+        ? `<b>${num(c.vram_mb)}</b> MB${c.cards > 1 ? ' ×' + c.cards : ''}`
+        : 'cpu';
+      return `<label class="p ${on ? '' : 'off'}" data-id="${esc(c.id)}"
+          style="--ch:${chVar(c.channel)}">
+        <input type="checkbox" ${on ? 'checked' : ''} data-cb="${esc(c.id)}">
+        <div>
+          <div class="t"><span class="ch"></span>${esc(c.title)}<code>${esc(c.id)}</code>
+            ${c.tier !== 'core' ? `<code>${esc(c.tier)}</code>` : ''}</div>
+          <div class="s">${esc(c.summary)}</div>
+          ${c.detail ? `<div class="d">${esc(c.detail)}</div>` : ''}
+          ${c.kinds && c.kinds.length ? `<div class="kinds">${
+            c.kinds.map(k => `<s>${esc(k)}</s>`).join('')}</div>` : ''}
+        </div>
+        <div class="m">${dev}<br>${c.seconds}s / video
+          ${c.quant ? `<br><span class="q">${esc(c.quant)}</span>` : ''}
+          ${c.model ? `<br>${esc(String(c.model).split('/').pop().slice(0,22))}` : ''}</div>
+      </label>`;
+    }).join('');
+    const names = {0:'structure',1:'signal',2:'perception',3:'language'};
+    return `<div class="stage">
+      <h4>Stage ${st} <em>${esc(names[st] || '')}</em></h4>
+      <div class="sh">${esc(STAGE_BLURB[st] || '')}</div>
+      <div class="plist">${rows}</div></div>`;
+  }).join('');
+  $('#bPasses').textContent = selected.size + '/' + catalog.length;
+}
+
+$('#stages').addEventListener('change', e => {
+  const cb = e.target.closest('[data-cb]'); if(!cb) return;
+  cb.checked ? selected.add(cb.dataset.cb) : selected.delete(cb.dataset.cb);
+  cb.closest('.p').classList.toggle('off', !cb.checked);
+  $('#bPasses').textContent = selected.size + '/' + catalog.length;
+});
+// clicking the row body (not the checkbox) opens the long description
+$('#stages').addEventListener('click', e => {
+  if(e.target.matches('input')) return;
+  const p = e.target.closest('.p');
+  if(p && p.querySelector('.d')){ e.preventDefault(); p.classList.toggle('open'); }
+});
+$$('[data-pick]').forEach(b => b.onclick = () => {
+  const mode = b.dataset.pick;
+  selected = new Set(
+    mode === 'all' ? catalog.map(c => c.id)
+    : mode === 'none' ? []
+    : mode === 'core' ? catalog.filter(c => c.tier === 'core').map(c => c.id)
+    : catalog.filter(c => c.default_on).map(c => c.id));
+  drawCatalog();
+});
+$('#bSavePasses').onclick = async () => {
+  if(!selected.size) return say('#passResult', 'Pick at least one pass.', 'no');
+  say('#passResult', 'Saving…', 'busy');
+  const r = await post('/api/process/config', form({components:[...selected].join(',')}));
+  if(r.ok){
+    say('#passResult', `${selected.size} passes selected. The plan is rebuilt on the next start.`, 'ok');
+    loadPlan();
+  }else say('#passResult', r.error, 'no');
+};
+
+/* ══ COVERAGE ══════════════════════════════════════════════════════ */
+async function loadCoverage(){
+  const r = await get('/api/process/coverage');
+  if(!r.ok){ $('#covGrid').innerHTML = `<div class="skel">${esc(r.error)}</div>`; return; }
+  const m = r.matrix || [];
+  if(!m.length){
+    $('#covGrid').innerHTML = '<div class="skel">Nothing planned yet — start the engine once.</div>';
+  }else{
+    $('#covGrid').innerHTML =
+      `<div class="r head"><span>Pass</span><span>Coverage</span><span>Done</span>
+        <span>Claims</span><span>Left</span></div>` +
+      m.map(e => {
+        const comp = catalog.find(c => c.id === e.component) || {};
+        const t = Math.max(e.total, 1);
+        const w = k => (100 * (e[k] || 0) / t).toFixed(2) + '%';
+        return `<div class="r" style="--ch:${chVar(comp.channel)}">
+          <div class="nm">${esc(comp.title || e.component)}<em>${esc(e.component)}</em></div>
+          <div class="track">
+            <i class="d" style="width:${w('done')}"></i>
+            <i class="r" style="width:${w('running')}"></i>
+            <i class="f" style="width:${w('failed')}"></i>
+            <i class="s" style="width:${w('skipped')}"></i>
+          </div>
+          <div class="pc"><b>${e.percent}%</b></div>
+          <div class="cl">${num(e.claims)}${e.vectors ? ' +' + num(e.vectors) + 'v' : ''}</div>
+          <div class="et">${e.eta_seconds ? human(e.eta_seconds) : (e.remaining ? num(e.remaining) : '—')}</div>
+        </div>`;
+      }).join('');
+  }
+  const run = r.running || [];
+  $('#tRunning').innerHTML = run.length ? run.map(x => `<tr>
+    <td class="mono">${esc(x.video_key)}</td><td class="mono">${esc(x.component)}</td>
+    <td class="mono">${esc(String(x.worker || '').slice(0,14))}</td>
+    <td>${esc(x.checkpoint || '')}</td>
+    <td class="mono r">${x.lease_until ? human(x.lease_until - Date.now()/1000) : '—'}</td>
+  </tr>`).join('') : '<tr><td colspan="5" class="skel">Nothing in flight.</td></tr>';
+
+  const f = await get('/api/process/failures?limit=60');
+  const fs = (f.ok && f.failures) || [];
+  $('#tFailures').innerHTML = fs.length ? fs.map(x => `<tr>
+    <td class="mono">${esc(x.component)}</td><td class="mono r">${num(x.n)}</td>
+    <td class="mono" style="color:var(--warn)">${esc(String(x.last_error || '').slice(0,190))}</td>
+    <td><button class="btn sm" data-requeue="${esc(x.component)}">Requeue</button></td>
+  </tr>`).join('') : '<tr><td colspan="4" class="skel">No failures.</td></tr>';
+}
+$('#bRefreshCov').onclick = loadCoverage;
+$('#tFailures').addEventListener('click', async e => {
+  const b = e.target.closest('[data-requeue]'); if(!b) return;
+  b.disabled = true;
+  const r = await post('/api/process/requeue', form({component:b.dataset.requeue, state:'failed'}));
+  say('#covResult', r.ok ? `Requeued ${r.requeued} rows for ${b.dataset.requeue}.` : r.error,
+      r.ok ? 'ok' : 'no');
+  loadCoverage();
+});
+$('#bRequeueAll').onclick = async () => {
+  const r = await post('/api/process/requeue', form({state:'failed'}));
+  say('#covResult', r.ok ? `Requeued ${r.requeued} rows.` : r.error, r.ok ? 'ok' : 'no');
+  loadCoverage();
+};
+$('#bReset').onclick = async () => {
+  const r = await post('/api/process/reset',
+    form({component: $('#rsComp').value.trim(), confirm: $('#rsConfirm').value.trim()}));
+  say('#resetResult', r.ok ? `Queued again for ${r.reset} videos. Existing claims kept.` : r.error,
+      r.ok ? 'ok' : 'no');
+  if(r.ok){ $('#rsComp').value = $('#rsConfirm').value = ''; loadCoverage(); }
+};
+
+/* ══ DATABASE ══════════════════════════════════════════════════════ */
+async function loadDb(){
+  const v = await get('/api/process/videos?limit=120');
+  $('#tVideos').innerHTML = (v.ok && v.videos.length) ? v.videos.map(x => `<tr>
+    <td class="mono">${esc(x.video_key)}</td><td>${esc(x.uploader || '—')}</td>
+    <td class="mono r">${x.duration ? x.duration.toFixed(1) : '—'}</td>
+    <td class="mono r">${num(x.shots)}</td><td class="mono r">${mb(x.bytes)}</td>
+    <td><button class="btn sm" data-video="${esc(x.video_key)}">Open</button></td>
+  </tr>`).join('') : '<tr><td colspan="6" class="skel">Nothing yet.</td></tr>';
+
+  const o = await get('/api/process/observers');
+  $('#tObservers').innerHTML = (o.ok && o.observers.length) ? o.observers.map(x => `<tr>
+    <td class="mono">${esc(x.observer_id)}</td><td class="mono">${esc(x.component)}</td>
+    <td class="mono">${esc(x.model || '—')}</td><td class="mono">${esc(x.device || '')}</td>
+  </tr>`).join('') : '<tr><td colspan="4" class="skel">None yet.</td></tr>';
+
+  const sh = await get('/api/process/shards');
+  $('#tShards').innerHTML = (sh.ok && sh.shards.length) ? sh.shards.slice().reverse().map(x => `<tr>
+    <td class="mono">${esc(x.shard_id)}</td><td class="mono">${esc(x.component || '')}</td>
+    <td class="mono r">${num(x.claims)}</td><td class="mono r">${num(x.vectors)}</td>
+    <td class="mono r">${mb(x.bytes)}</td>
+    <td class="mono r">${x.msg_id ? esc(x.msg_id) : '<span style="color:var(--warn)">local</span>'}</td>
+  </tr>`).join('') : '<tr><td colspan="6" class="skel">None yet.</td></tr>';
+}
+$('#bRefreshVids').onclick = loadDb;
+
+$('#tVideos').addEventListener('click', async e => {
+  const b = e.target.closest('[data-video]'); if(!b) return;
+  const r = await get('/api/process/video/' + encodeURIComponent(b.dataset.video));
+  if(!r.ok) return toast(r.error || 'Not found', 'no');
+  const v = r.video || {}, cov = r.coverage || [];
+  $('#vHead').innerHTML = `
+    <h4>${esc(v.video_key)}</h4>
+    <div class="hint">${esc(v.uploader || 'unknown')} ·
+      ${v.duration ? v.duration.toFixed(1) + 's' : '—'} ·
+      ${v.width || '?'}×${v.height || '?'} · ${num(v.shots)} shots · ${mb(v.bytes)}
+      ${v.url ? ` · <a href="${esc(v.url)}" target="_blank" rel="noopener">source</a>` : ''}</div>
+    <div class="loaded" style="margin-top:12px">${cov.map(c =>
+      `<s style="border-color:var(--line);color:var(--dim)">${esc(c.component)} · ${esc(c.state)}</s>`
+      ).join('')}</div>`;
+  $('#vClaims').innerHTML = (r.claims || []).length
+    ? r.claims.map(renderClaim).join('')
+    : '<div class="skel">No claims yet.</div>';
+  $('#secDetail').hidden = false;
+  $('#secDetail').scrollIntoView({behavior:'smooth', block:'start'});
+});
+$('#bCloseDetail').onclick = () => { $('#secDetail').hidden = true; };
+
+function renderClaim(c){
+  const val = c.value === null || c.value === undefined || c.value === ''
+    ? (c.num !== null && c.num !== undefined ? String(c.num) : '') : String(c.value);
+  return `<div class="cl" style="--ch:${chVar(c.channel)}">
+    <span class="c">${esc(c.channel)}</span>
+    <span class="k">${esc(c.kind)}${c.shot_idx !== null && c.shot_idx !== undefined
+      ? ' · shot ' + c.shot_idx : ''}</span>
+    <span class="v">${esc(val.slice(0, 400))}</span>
+    <span class="o">${esc(String(c.observer_id || '').split('@')[0])}</span>
+  </div>`;
+}
+
+$('#bSearch').onclick = doSearch;
+$('#q').addEventListener('keydown', e => { if(e.key === 'Enter') doSearch(); });
+async function doSearch(){
+  const q = $('#q').value.trim();
+  if(!q) return;
+  $('#results').innerHTML = '<div class="skel">Searching…</div>';
+  const r = await get('/api/process/search?limit=80&q=' + encodeURIComponent(q));
+  if(!r.ok) return $('#results').innerHTML = `<div class="skel">${esc(r.error)}</div>`;
+  $('#results').innerHTML = r.results.length
+    ? r.results.map(c => renderClaim(c) ).join('')
+    : `<div class="skel">${last && last.store && last.store.fts === false
+        ? 'This SQLite build has no FTS5, so claim search is off. The published bundle still searches in the browser.'
+        : 'Nothing matched. The index only holds what has already been processed.'}</div>`;
+}
+
+$('#bRestore').onclick = async () => {
+  say('#dbResult', 'Scanning the channel…', 'busy');
+  const r = await post('/api/process/restore');
+  if(!r.ok) return say('#dbResult', r.error, 'no');
+  pollTask('#dbResult', () => { loadDb(); tick(); });
+};
+$('#bSync').onclick = async () => {
+  say('#dbResult', 'Reading the capture ledger…', 'busy');
+  const r = await post('/api/process/sync');
+  if(!r.ok) return say('#dbResult', r.error, 'no');
+  pollTask('#dbResult', () => { loadDb(); tick(); });
+};
+
+async function pollTask(target, done){
+  const t = setInterval(async () => {
+    const s = await get('/api/process/task');
+    say(target, s.message || 'Working…', s.error ? 'no' : s.running ? 'busy' : 'ok');
+    if(!s.running){ clearInterval(t); if(done) done(); }
+  }, 1200);
+}
+
+/* ══ SETUP ═════════════════════════════════════════════════════════ */
+function fillSettings(s){
+  if(!s) return;
+  $('#tokState').textContent = s.bot_token_set ? '· saved, leave blank to keep' : '· not set';
+  $('#hfState').textContent = s.hf_token_set ? '· saved, leave blank to keep' : '· not set';
+  if(s.channel_id) $('#fChannel').placeholder = String(s.channel_id);
+  if(s.api_id_set) $('#fApiId').placeholder = 'saved — leave blank to keep';
+  if(s.api_hash_set) $('#fApiHash').placeholder = 'saved — leave blank to keep';
+  $('#fParts').value = s.partitions; $('#fIndex').value = s.index;
+  $('#fLimit').value = s.video_limit; $('#fPublish').value = s.publish_every;
+  $('#fCache').value = s.cache_budget_mb; $('#fVram').value = s.vram_headroom_mb;
+  $('#fFollow').checked = !!s.follow; $('#fSync').checked = !!s.sync_on_start;
+  $('#fRestore').checked = !!s.restore_on_start;
+  $('#fLedger').placeholder = s.ledger_path || '';
+}
+
+$('#bSave').onclick = async () => {
+  say('#setupResult', 'Saving…', 'busy');
+  const r = await post('/api/process/config', form({
+    bot_token: $('#fToken').value.trim(), channel_id: $('#fChannel').value.trim(),
+    api_id: $('#fApiId').value.trim(), api_hash: $('#fApiHash').value.trim(),
+    hf_token: $('#fHf').value.trim(),
+    partitions: $('#fParts').value, index: $('#fIndex').value,
+    video_limit: $('#fLimit').value || '0', publish_every: $('#fPublish').value,
+    cache_budget_mb: $('#fCache').value, vram_headroom_mb: $('#fVram').value || '0',
+    follow: $('#fFollow').checked ? '1' : '0',
+    sync_on_start: $('#fSync').checked ? '1' : '0',
+    restore_on_start: $('#fRestore').checked ? '1' : '0',
+    ledger_path: $('#fLedger').value.trim(),
+  }));
+  if(r.ok){
+    // Clear the secret fields the moment they are accepted. They are in the
+    // engine now; leaving them in the DOM only puts them in the next screenshot.
+    ['#fToken','#fApiHash','#fHf'].forEach(s => $(s).value = '');
+    fillSettings(r.settings);
+    say('#setupResult', 'Saved. Credentials are held in memory only.', 'ok');
+    toast('Settings saved', 'ok');
+    loadPlan();
+  }else say('#setupResult', r.error, 'no');
+};
+
+$('#bCheck').onclick = async () => {
+  say('#setupResult', 'Checking…', 'busy');
+  const r = await post('/api/process/preflight');
+  if(!r.ok) return say('#setupResult', r.error, 'no');
+  pollTask('#setupResult', async () => {
+    const s = await get('/api/process/task');
+    if(s.result) drawChecks(s.result);
+    loadPlan();
+  });
+};
+
+function drawChecks(res){
+  const cs = res.checks || [];
+  $('#checks').innerHTML = cs.length ? cs.map(c => `<div class="chk ${c.ok ? 'ok' : 'no'}">
+    <span class="m">${c.ok ? '✓' : '!'}</span><span class="nm">${esc(c.name)}</span>
+    <span class="dt">${esc(c.detail)}</span></div>`).join('')
+    : '<div class="skel">Nothing to report.</div>';
+  const blocking = res.blocking || [];
+  say('#setupResult',
+    blocking.length ? 'Blocked: ' + blocking.join(' · ') : 'Ready to start.',
+    blocking.length ? 'no' : 'ok');
+}
+
+async function loadPlan(){
+  const r = await get('/api/process/plan');
+  if(!r.ok) return;
+  const e = r.estimate || {};
+  $('#ePasses').textContent = num(e.components);
+  $('#eCohorts').textContent = num((r.cohorts || []).length);
+  $('#eMine').textContent = num(r.my_videos);
+  $('#ePer').textContent = e.seconds_per_video ? e.seconds_per_video.toFixed(0) : '—';
+  $('#eWall').textContent = e.wall_hours ? e.wall_hours.toFixed(1) : '—';
+  $('#eDl').textContent = num(e.download_mb);
+}
+
+/* ── boot ─────────────────────────────────────────────────────────── */
+loadCatalog().then(() => { tick(); loadPlan(); });
+tickLog();
+setInterval(tick, 1200);
+setInterval(tickLog, 3000);
+</script>
+</body>
+</html>

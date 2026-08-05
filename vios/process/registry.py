@@ -1,0 +1,873 @@
+"""
+vios.process.registry — every model and script declared as data.
+
+This file is the answer to "what is actually running?". Nothing here executes.
+Each component is a row: what it needs, what it costs, what it produces, what it
+depends on. The rotation loop reads these rows to decide what to load; the
+interface reads the same rows to draw the list of systems. There is exactly one
+description of the pipeline and both the machine and the person read it.
+
+Why data and not code:
+
+  A pipeline written as a function is a pipeline you cannot look at. You cannot
+  ask it "what would fit in 14 GB?", you cannot show it in a table, and you
+  cannot add a model to it without editing control flow. A pipeline written as a
+  list of rows answers all three by inspection.
+
+Four rules govern what goes in this list.
+
+**Mathematics before models.** Cut rate, loudness, colour, motion, tempo and
+shot scale are computed, not asked. A model that is asked "how fast is this
+cut?" produces a plausible sentence; `numpy.diff` over the shot table produces
+the number. Nine of the components below never load a neural network at all, and
+they carry the parts of the database that must be exactly right.
+
+**Time is never claimed.** Every component that speaks about *when* speaks in
+shot indices. The shot table maps an index to seconds by arithmetic we control.
+No prompt anywhere in this system asks a model for a timestamp, because models
+produce timestamps that look correct and are not.
+
+**Two observers where it matters.** Speech, on-screen text and meaning each get
+a second, architecturally different reader. Agreement is a confidence signal;
+disagreement is a flag worth surfacing. This is the schema-level form of "i dont
+trust one single llm, or model, or script".
+
+**Sized for the machine that exists.** Every VRAM figure assumes Kaggle's 2 × T4:
+Turing, SM 75, 16 GB per card, no NVLink. That means FP16 or INT4 (AWQ/GPTQ),
+never BF16, never FP8, never FlashAttention-2 — see `resources.capabilities`.
+Anything needing more than one card says so and is off by default.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+
+from . import CHANNELS
+
+# What a component can write. Used by the tab to show, per pass, whether it
+# contributed evidence, geometry, files, or vectors.
+OUTPUTS = ("video", "shots", "claims", "vectors", "artifacts")
+
+# Coarse ordering. Components sort by stage first, so a cohort never contains a
+# perception pass scheduled ahead of the shot detection it reads.
+STAGE_STRUCTURE, STAGE_SIGNAL, STAGE_PERCEPTION, STAGE_LANGUAGE = 0, 1, 2, 3
+STAGE_NAMES = {
+    STAGE_STRUCTURE: "structure",
+    STAGE_SIGNAL: "signal",
+    STAGE_PERCEPTION: "perception",
+    STAGE_LANGUAGE: "language",
+}
+
+
+@dataclass(frozen=True)
+class Component:
+    """One pass over one video.
+
+    `weights` is the field that makes cohorts cheap: three components can share
+    one 6 GB VLM, and the packer must count those 6 GB once, not three times.
+    Components with the same `weights` string load one model between them.
+    """
+
+    id: str
+    title: str
+    stage: int
+    family: str                      # ffmpeg | signal | audio | vision | vlm | text
+    summary: str                     # one line, shown in the tab's list
+    detail: str = ""                 # the paragraph shown when a row is opened
+
+    channel: str = ""                # "" for structural passes that emit no claims
+    model: str = ""                  # the HF repo, or the library doing the work
+    weights: str = ""                # VRAM-sharing key; defaults to `model`
+    quant: str = ""                  # awq | int8_float16 | fp16 | ""
+    revision: str = "1"              # bump to re-run a pass under a new observer
+
+    device: str = "cpu"              # cpu | gpu
+    cards: int = 1                   # 2 means it must be sharded across both T4s
+    vram_mb: int = 0
+    ram_mb: int = 512
+    disk_mb: int = 0                 # weights to download, for the disk check
+    seconds: float = 1.0             # per video, on one T4, ~30 s reel
+
+    needs: tuple = ()                # component ids that must finish first
+    produces: tuple = ("claims",)
+    kinds: tuple = ()                # claim kinds, so the tab can say what it wrote
+    requires: tuple = ()             # importable module names, for preflight
+    params: dict = field(default_factory=dict)
+
+    tier: str = "core"               # core | deep | optional
+    default_on: bool = True
+    notes: str = ""
+
+    @property
+    def load_key(self) -> str:
+        return self.weights or self.model or self.id
+
+    @property
+    def stage_name(self) -> str:
+        return STAGE_NAMES.get(self.stage, str(self.stage))
+
+    def as_dict(self) -> dict:
+        d = asdict(self)
+        d["stage_name"] = self.stage_name
+        d["load_key"] = self.load_key
+        return d
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage 0 — structure. No model, no GPU, and everything else depends on it.
+# ══════════════════════════════════════════════════════════════════════════
+
+_STRUCTURE = [
+    Component(
+        id="probe", title="Probe", stage=STAGE_STRUCTURE, family="ffmpeg",
+        summary="Container truth: duration, resolution, fps, codecs, bitrate.",
+        detail=(
+            "ffprobe on the original mp4. Fills the video row rather than "
+            "writing claims — a container's declared duration is not an "
+            "observation anyone can disagree with. Runs first because every "
+            "later pass needs to know how long the video is before it can "
+            "decide how to sample it."),
+        produces=("video",), seconds=0.8, ram_mb=128,
+        requires=("subprocess",),
+    ),
+    Component(
+        id="artifacts", title="Artifacts", stage=STAGE_STRUCTURE, family="ffmpeg",
+        summary="Poster, sprite sheet, 4-second loop, 480p proxy, waveform, wav.",
+        detail=(
+            "One ffmpeg invocation per artifact, all derived and all "
+            "disposable. The 480p faststart proxy is what the site actually "
+            "streams; the sprite sheet is what makes scrubbing instant; the "
+            "16 kHz mono wav is what every audio pass reads, so the original "
+            "is decoded once instead of six times."),
+        produces=("artifacts",), seconds=14.0, ram_mb=1024,
+        requires=("subprocess",),
+        params={"proxy_height": 480, "sprite_cols": 10, "loop_seconds": 4},
+    ),
+    Component(
+        id="shots", title="Shot detection", stage=STAGE_STRUCTURE, family="vision",
+        summary="TransNetV2 over a PySceneDetect prefilter — the atomic unit.",
+        detail=(
+            "Shots are the spine of the whole database. Every claim about "
+            "'when' is a shot index, and this pass is the only thing allowed "
+            "to decide where a shot begins. PySceneDetect's content detector "
+            "runs first and cheaply on the proxy; TransNetV2 then resolves the "
+            "soft cuts and dissolves that a threshold detector misses, which "
+            "on edited reels is most of them."),
+        model="Soulter/TransNetV2", weights="transnetv2", device="gpu",
+        vram_mb=700, disk_mb=90, seconds=5.0, ram_mb=1536,
+        needs=("artifacts",), produces=("shots",),
+        requires=("torch", "scenedetect"),
+        params={"threshold": 0.5, "min_shot_frames": 8},
+    ),
+    Component(
+        id="keyframes", title="Keyframes", stage=STAGE_STRUCTURE, family="ffmpeg",
+        summary="One sharp representative frame per shot, plus its atlas tile.",
+        detail=(
+            "Picks the least-blurred frame in each shot by variance of the "
+            "Laplacian rather than taking the midpoint, because the midpoint of "
+            "a shot with camera movement is frequently the blurriest frame in "
+            "it. Every vision pass downstream reads these frames, so a bad "
+            "choice here degrades six components at once."),
+        needs=("shots",), produces=("artifacts",), seconds=3.0, ram_mb=1024,
+        requires=("cv2",), params={"candidates_per_shot": 5},
+    ),
+]
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage 1 — signal. Arithmetic over pixels and samples. No model can be wrong
+# about these numbers because no model is involved.
+# ══════════════════════════════════════════════════════════════════════════
+
+_SIGNAL = [
+    Component(
+        id="caption", title="Caption and comments", stage=STAGE_SIGNAL,
+        family="signal", channel="caption",
+        summary="The creator's text, hashtags, mentions, and the captured comments.",
+        detail=(
+            "Reads the info JSON the capture plane stored beside the mp4. "
+            "Hashtags and mentions are extracted structurally, not by a model, "
+            "and comments are kept verbatim with their like counts — the "
+            "audience's own words are the only direct evidence of what landed."),
+        seconds=0.2, needs=(), produces=("claims",),
+        kinds=("caption", "hashtag", "mention", "comment", "creator_reply",
+               "likes", "views", "comments", "uploader"),
+    ),
+    Component(
+        id="cuts", title="Cut rhythm", stage=STAGE_SIGNAL, family="signal",
+        channel="style",
+        summary="Average shot length, cut rate, and how regular the rhythm is.",
+        detail=(
+            "Pure arithmetic over the shot table: ASL, cuts per minute, the "
+            "coefficient of variation of shot lengths, and where the cut rate "
+            "accelerates. Editing tempo is one of the strongest correlates of "
+            "retention and it is a number, not an opinion."),
+        seconds=0.2, needs=("shots",),
+        kinds=("asl", "cut_rate", "rhythm", "acceleration"),
+    ),
+    Component(
+        id="colour", title="Colour", stage=STAGE_SIGNAL, family="signal",
+        channel="style",
+        summary="Per-shot palette in CIELAB, brightness, contrast, saturation.",
+        detail=(
+            "k-means in CIELAB rather than RGB, because perceptual distance is "
+            "the thing being measured and RGB distance is not it. Produces a "
+            "five-swatch palette per shot plus the statistics that let 'high "
+            "contrast, cool, desaturated' become a searchable query."),
+        seconds=2.5, needs=("keyframes",), requires=("cv2", "numpy"),
+        kinds=("palette", "brightness", "contrast", "saturation", "temperature"),
+        params={"swatches": 5},
+    ),
+    Component(
+        id="motion", title="Motion and camera", stage=STAGE_SIGNAL, family="signal",
+        channel="style",
+        summary="Frame-difference energy and an affine fit for camera movement.",
+        detail=(
+            "Estimates a global affine transform between consecutive frames and "
+            "reads the camera move out of its parameters — translation is a "
+            "pan, uniform scale is a zoom, high residual is handheld. Classifying "
+            "camera movement by fitting a transform is exact where asking a "
+            "vision model the same question is a guess dressed as an answer."),
+        seconds=7.0, needs=("shots",), requires=("cv2", "numpy"),
+        kinds=("camera_move", "motion_energy", "stability"),
+    ),
+    Component(
+        id="loudness", title="Loudness", stage=STAGE_SIGNAL, family="signal",
+        channel="audio",
+        summary="EBU R128 LUFS, true peak, dynamic range, silence ratio.",
+        detail=(
+            "The broadcast standard, computed the standard way. Loudness "
+            "profile over time is what separates a reel that opens on a beat "
+            "drop from one that opens on a whisper, and the silence ratio is a "
+            "reliable structural marker for pauses used as emphasis."),
+        seconds=1.5, needs=("artifacts",), requires=("numpy", "soundfile"),
+        kinds=("lufs", "true_peak", "dynamic_range", "silence_ratio"),
+    ),
+    Component(
+        id="music", title="Tempo and key", stage=STAGE_SIGNAL, family="signal",
+        channel="audio",
+        summary="Beat tracking, BPM, key estimate, harmonic/percussive split.",
+        detail=(
+            "librosa's beat tracker for tempo and beat grid, Krumhansl–Schmuckler "
+            "for key, HPSS for the harmonic/percussive ratio. Knowing where the "
+            "beats are makes 'the cut lands on the downbeat' a checkable "
+            "statement rather than a stylistic impression."),
+        seconds=4.0, needs=("artifacts",), requires=("librosa", "numpy"),
+        kinds=("tempo", "key", "beat_grid", "harmonic_ratio"),
+    ),
+]
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage 2 — perception. What is in the audio and on the screen.
+# ══════════════════════════════════════════════════════════════════════════
+
+_PERCEPTION = [
+    # ── speech ──────────────────────────────────────────────────────────
+    Component(
+        id="transcribe", title="Transcribe", stage=STAGE_PERCEPTION, family="audio",
+        channel="speech",
+        summary="Whisper large-v3 via CTranslate2, word timestamps, 99 languages.",
+        detail=(
+            "The primary reader of speech. INT8/FP16 on CTranslate2 rather than "
+            "the reference implementation because it is roughly four times "
+            "faster on a T4 for the same weights. Language is detected per "
+            "video, not assumed: the archive is English, Hindi and a long tail "
+            "of others, and a pass that assumes English silently produces "
+            "confident nonsense on the tail. When detection confidence is low "
+            "the video is flagged rather than transcribed badly."),
+        model="Systran/faster-whisper-large-v3", weights="whisper-large-v3",
+        quant="int8_float16", device="gpu", vram_mb=3100, disk_mb=3100,
+        seconds=9.0, ram_mb=2048,
+        needs=("artifacts",), produces=("claims",),
+        requires=("faster_whisper",),
+        kinds=("transcript", "segment", "words", "language",
+               "language_uncertain", "speech_rate"),
+        params={"beam_size": 5, "vad_filter": True, "word_timestamps": True,
+                "condition_on_previous_text": False},
+        notes="condition_on_previous_text off: it causes repetition loops on "
+              "music-heavy reels, which is most of them.",
+    ),
+    Component(
+        id="transcribe-alt", title="Transcribe (second reader)",
+        stage=STAGE_PERCEPTION, family="audio", channel="speech",
+        summary="large-v3-turbo as an independent observer of the same audio.",
+        detail=(
+            "A different decoder over the same waveform. Where the two agree, "
+            "confidence is high and search can trust the words; where they "
+            "diverge, the segment is marked contested and the interface shows "
+            "both. This costs five seconds a reel and is the cheapest quality "
+            "signal in the entire pipeline."),
+        model="mobiuslabsgmbh/faster-whisper-large-v3-turbo", weights="whisper-turbo",
+        quant="int8_float16", device="gpu", vram_mb=1600, disk_mb=1600,
+        seconds=5.0, needs=("artifacts",), requires=("faster_whisper",),
+        kinds=("transcript", "segment", "language", "agreement", "contested"),
+        params={"beam_size": 1, "vad_filter": True},
+    ),
+    Component(
+        id="diarize", title="Speakers", stage=STAGE_PERCEPTION, family="audio",
+        channel="speech",
+        summary="pyannote 3.1: how many voices, and who speaks when.",
+        detail=(
+            "Speaker turns, not speaker names. Distinguishing a monologue from "
+            "an interview from a voiceover-over-b-roll is structural "
+            "information that changes how every other reading of the reel "
+            "should be interpreted. No identity is inferred or stored."),
+        model="pyannote/speaker-diarization-3.1", weights="pyannote-3.1",
+        device="gpu", vram_mb=1400, disk_mb=100, seconds=7.0,
+        needs=("artifacts",), requires=("pyannote.audio",),
+        kinds=("speaker_turn", "speaker_count", "speaker_share", "overlap"),
+        notes="Needs a Hugging Face token and gated-model acceptance.",
+    ),
+    Component(
+        id="audio-tag", title="Sound events", stage=STAGE_PERCEPTION, family="audio",
+        channel="audio",
+        summary="PANNs over AudioSet classes plus CLAP embeddings of the track.",
+        detail=(
+            "Music, laughter, applause, whooshes, room tone, silence. A "
+            "transcript records the words and misses everything else, and on "
+            "short-form video the everything else is half the craft. CLAP also "
+            "yields an audio embedding, which makes 'sounds like this' a real "
+            "query."),
+        model="laion/clap-htsat-fused", weights="clap-panns", device="gpu",
+        vram_mb=1300, disk_mb=1800, seconds=3.0,
+        needs=("artifacts",), produces=("claims", "vectors"),
+        requires=("torch", "transformers"),
+        kinds=("sound_event", "music_presence"),
+    ),
+
+    # ── on-screen text ──────────────────────────────────────────────────
+    Component(
+        id="ocr", title="On-screen text", stage=STAGE_PERCEPTION, family="vision",
+        channel="ocr",
+        summary="PP-OCRv5, Latin and Devanagari, with temporal deduplication.",
+        detail=(
+            "Reels caption themselves; the words burned into the frame are "
+            "often the whole message and never appear in the transcript. "
+            "Detection runs per keyframe, then identical strings across "
+            "adjacent shots are collapsed into a single claim spanning a shot "
+            "range, so a caption held for eight seconds is one piece of "
+            "evidence rather than forty."),
+        model="PaddlePaddle/PP-OCRv5", weights="ppocr-v5", device="gpu",
+        vram_mb=1500, disk_mb=400, seconds=8.0,
+        needs=("keyframes",), requires=("paddleocr",),
+        kinds=("text", "text_region", "text_density", "text_style"),
+        params={"languages": ["en", "devanagari"], "min_confidence": 0.6},
+    ),
+    Component(
+        id="ocr-alt", title="On-screen text (second reader)",
+        stage=STAGE_PERCEPTION, family="vision", channel="ocr",
+        summary="Florence-2 reading the same frames with a different architecture.",
+        detail=(
+            "A detector-plus-recogniser and an end-to-end vision-language model "
+            "fail in different ways: the first drops stylised type, the second "
+            "hallucinates plausible words. Running both and keeping both means "
+            "the failures do not overlap, and agreement between them is a much "
+            "stronger signal than either one's own confidence score."),
+        model="microsoft/Florence-2-large", weights="florence-2-large",
+        quant="fp16", device="gpu", vram_mb=1700, disk_mb=1600, seconds=6.0,
+        needs=("keyframes",), requires=("transformers", "torch"),
+        kinds=("text",),
+    ),
+
+    # ── what is in frame ────────────────────────────────────────────────
+    Component(
+        id="detect", title="Objects", stage=STAGE_PERCEPTION, family="vision",
+        channel="visual",
+        summary="YOLO11 over keyframes: boxes, classes, counts, screen share.",
+        detail=(
+            "A closed vocabulary, deliberately. Eighty classes detected "
+            "reliably with boxes and counts are worth more than a thousand "
+            "classes guessed, because counts and positions are the inputs to "
+            "later arithmetic — screen share over time, entrance and exit, "
+            "how much of the frame the subject occupies."),
+        model="Ultralytics/YOLO11", weights="yolo11x", quant="fp16",
+        device="gpu", vram_mb=1200, disk_mb=120, seconds=4.0,
+        needs=("keyframes",), requires=("ultralytics",),
+        kinds=("object", "object_count", "screen_share"),
+        params={"conf": 0.35, "imgsz": 960},
+    ),
+    Component(
+        id="faces", title="Faces and framing", stage=STAGE_PERCEPTION,
+        family="vision", channel="visual",
+        summary="SCRFD detection and tracking: how many people, how close.",
+        detail=(
+            "Face count, box size relative to frame, and track continuity "
+            "across shots. Face size is the most reliable proxy for shot scale "
+            "on people-centred video, and 'talking head cut to b-roll cut back' "
+            "is a structure that can be detected geometrically. Embeddings are "
+            "used only to link tracks within one video and are not stored as "
+            "identity."),
+        model="deepinsight/insightface-scrfd", weights="insightface",
+        device="gpu", vram_mb=900, disk_mb=350, seconds=4.0,
+        needs=("keyframes",), requires=("insightface",),
+        kinds=("face_count", "face_scale", "face_track"),
+    ),
+    Component(
+        id="depth", title="Shot scale", stage=STAGE_PERCEPTION, family="vision",
+        channel="style",
+        summary="Depth Anything V2 small — close-up, medium, or wide.",
+        detail=(
+            "Relative depth over the keyframe, reduced to the depth spread of "
+            "the central region. A close-up has a flat, near histogram; a wide "
+            "shot has a long tail. This gives shot scale for footage with no "
+            "faces in it, where the face-size proxy has nothing to measure."),
+        model="depth-anything/Depth-Anything-V2-Small", weights="depth-anything-v2-s",
+        quant="fp16", device="gpu", vram_mb=500, disk_mb=100, seconds=3.0,
+        needs=("keyframes",), requires=("transformers", "torch"),
+        kinds=("shot_scale", "depth_spread"),
+        tier="optional",
+    ),
+    Component(
+        id="visual-embed", title="Visual embedding", stage=STAGE_PERCEPTION,
+        family="vision", channel="visual",
+        summary="SigLIP-2 per keyframe — the vectors behind visual search.",
+        detail=(
+            "One vector per shot and one pooled vector per video. This is what "
+            "makes 'find the shot that looks like this' work, what powers "
+            "near-duplicate detection across five thousand reels, and what the "
+            "aesthetic head and the zero-shot tagger both read. Computed once, "
+            "used by four things."),
+        model="google/siglip2-so400m-patch14-384", weights="siglip2-so400m",
+        quant="fp16", device="gpu", vram_mb=1800, disk_mb=1700, seconds=3.0,
+        needs=("keyframes",), produces=("vectors",),
+        requires=("transformers", "torch"),
+        kinds=(),
+    ),
+    Component(
+        id="tag", title="Zero-shot tags", stage=STAGE_PERCEPTION, family="vision",
+        channel="visual",
+        summary="Cosine similarity against a curated label set. No prompting.",
+        detail=(
+            "The label vocabulary — settings, activities, formats, objects "
+            "specific to this archive — is embedded once, and tagging is then a "
+            "matrix multiply against vectors that already exist. Free, "
+            "deterministic, and extensible: adding forty new labels next month "
+            "re-tags five thousand reels in seconds without touching a GPU."),
+        needs=("visual-embed",), seconds=0.3,
+        requires=("numpy",), kinds=("tag",),
+        params={"top_k": 12, "min_similarity": 0.22},
+    ),
+    Component(
+        id="aesthetic", title="Frame quality", stage=STAGE_PERCEPTION,
+        family="vision", channel="style",
+        summary="Sharpness, exposure, clipping, noise, colourfulness, quality probe.",
+        detail=(
+            "Five classical no-reference measures — variance of the Laplacian, "
+            "mean luminance, clipped-pixel share, a high-pass MAD noise "
+            "estimate and Hasler–Süsstrunk colourfulness — plus a relative "
+            "quality probe taken as the margin between 'well shot' and 'badly "
+            "shot' text embeddings against the SigLIP vector that already "
+            "exists. Deliberately not the LAION aesthetic MLP: that head is "
+            "trained on CLIP ViT-L/14 features and would be meaningless over "
+            "SigLIP ones. Useful less as a verdict than as a filter — when a "
+            "pattern only appears in badly-exposed frames, the pattern is "
+            "about the exposure."),
+        weights="aesthetic-probe", device="gpu", vram_mb=200, disk_mb=0,
+        seconds=1.5,
+        needs=("visual-embed",), requires=("cv2", "numpy"),
+        kinds=("aesthetic", "sharpness", "exposure", "clipping", "noise",
+               "colourfulness"),
+        tier="optional",
+    ),
+]
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage 3 — language. The only place a model is asked what something means,
+# and it is asked in shot indices.
+# ══════════════════════════════════════════════════════════════════════════
+
+_VLM = "qwen3-vl-8b-awq"
+
+_LANGUAGE = [
+    Component(
+        id="describe", title="Describe shots", stage=STAGE_LANGUAGE, family="vlm",
+        channel="visual",
+        summary="Qwen3-VL 8B AWQ: what is physically present, shot by shot.",
+        detail=(
+            "Literal description only — objects, people, setting, action, text "
+            "position. No interpretation, no intent, no timestamps. The model "
+            "receives the keyframes of a bounded range of shots and answers "
+            "about shot 3, not about 00:07, because it is not able to know what "
+            "00:07 is and will invent it if asked."),
+        model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
+        device="gpu", vram_mb=6200, disk_mb=6000, seconds=18.0, ram_mb=3072,
+        needs=("keyframes", "shots"), requires=("transformers", "torch"),
+        kinds=("shot_description", "subject", "setting", "action"),
+        params={"max_shots_per_call": 6, "max_new_tokens": 320,
+                "temperature": 0.2},
+    ),
+    Component(
+        id="narrate", title="Narrative", stage=STAGE_LANGUAGE, family="vlm",
+        channel="narrative",
+        summary="The hook, the turn, the payoff — as shot ranges, with reasons.",
+        detail=(
+            "Same weights as `describe`, a different question, and the "
+            "expensive one. It is given the transcript, the on-screen text, the "
+            "shot descriptions and the loudness curve, and asked what the video "
+            "is doing and why it holds attention — answering in shot ranges. "
+            "This is the pass whose output most directly serves script writing "
+            "and pattern recognition, and it is deliberately last, because it "
+            "reads everything the earlier passes produced."),
+        model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
+        device="gpu", vram_mb=6200, disk_mb=0, seconds=20.0, ram_mb=3072,
+        needs=("describe", "transcribe", "ocr", "loudness", "cuts"),
+        requires=("transformers", "torch"),
+        kinds=("hook", "beat", "turn", "payoff", "premise", "why_it_works",
+               "weakness"),
+        params={"max_new_tokens": 700, "temperature": 0.3},
+    ),
+    Component(
+        id="style-read", title="Craft", stage=STAGE_LANGUAGE, family="vlm",
+        channel="style",
+        summary="Framing, lighting, grade and edit, read against the measurements.",
+        detail=(
+            "The model is handed the numbers the signal passes computed — cut "
+            "rate, palette, camera moves, shot scale — and asked to name the "
+            "technique they add up to. Grounding the reading in measurements is "
+            "what stops it becoming film-school vocabulary applied at random; "
+            "every stylistic claim it makes has arithmetic sitting under it."),
+        model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
+        device="gpu", vram_mb=6200, disk_mb=0, seconds=12.0, ram_mb=3072,
+        needs=("describe", "colour", "motion", "cuts"),
+        requires=("transformers", "torch"),
+        kinds=("technique", "lighting", "grade", "framing", "edit_style",
+               "reference"),
+    ),
+    Component(
+        id="keyphrase", title="Keyphrases", stage=STAGE_LANGUAGE, family="text",
+        channel="concept",
+        summary="YAKE and KeyBERT over the assembled text. Deterministic.",
+        detail=(
+            "A statistical extractor and an embedding-based one, both "
+            "reproducible, both incapable of inventing a phrase that is not in "
+            "the text. They are the control group against which the language "
+            "model's concept extraction is judged: a concept the model reports "
+            "and neither extractor can find is a concept worth doubting."),
+        needs=("transcribe", "ocr", "caption"), seconds=0.6,
+        requires=("yake",), kinds=("keyphrase",),
+    ),
+    Component(
+        id="concepts", title="Concepts and entities", stage=STAGE_LANGUAGE,
+        family="text", channel="concept",
+        summary="Qwen3 4B AWQ over the assembled text: entities, topics, techniques.",
+        detail=(
+            "Normalised concept names with the span of text that evidences "
+            "each, which is what makes the knowledge graph traversable and its "
+            "edges auditable. Only concepts that both this pass and the "
+            "keyphrase extractor support become graph nodes; the rest are kept "
+            "as claims but do not get to shape the structure."),
+        model="Qwen/Qwen3-4B-Instruct-AWQ", weights="qwen3-4b-awq", quant="awq",
+        device="gpu", vram_mb=3400, disk_mb=3000, seconds=8.0,
+        needs=("transcribe", "ocr", "caption", "keyphrase"),
+        requires=("transformers", "torch"),
+        kinds=("entity", "topic", "technique", "claim_span", "unsupported"),
+    ),
+    Component(
+        id="text-embed", title="Text embedding", stage=STAGE_LANGUAGE,
+        family="text", channel="concept",
+        summary="BGE-M3 over transcript, caption, OCR and narration.",
+        detail=(
+            "Multilingual by construction, which matters when the same archive "
+            "holds English, Hindi and Hinglish and the query may be in any of "
+            "them. Embeds each passage separately rather than the video as a "
+            "whole, so a semantic hit lands on a moment instead of on a "
+            "twenty-thousand-character blur."),
+        model="BAAI/bge-m3", weights="bge-m3", quant="fp16", device="gpu",
+        vram_mb=2400, disk_mb=2300, seconds=2.0,
+        needs=("transcribe", "caption"), produces=("vectors",),
+        requires=("transformers", "torch"), kinds=(),
+    ),
+    Component(
+        id="hook", title="Hook analysis", stage=STAGE_LANGUAGE, family="signal",
+        channel="narrative",
+        summary="The first three seconds, measured: words, cuts, loudness, text.",
+        detail=(
+            "Assembly, not inference. What is said, what is written, how many "
+            "cuts, how loud, and what is in frame during the window where "
+            "retention is decided — all of it read out of claims that already "
+            "exist. Cheap to compute and re-computable the instant the "
+            "definition of 'the hook' changes."),
+        needs=("transcribe", "ocr", "cuts", "loudness", "describe"),
+        seconds=0.3, kinds=("hook_words", "hook_cuts", "hook_loudness",
+                            "hook_text", "hook_visual"),
+        params={"window_seconds": 3.0},
+    ),
+
+    # ── the deep pass, off by default ───────────────────────────────────
+    Component(
+        id="narrate-deep", title="Narrative (38B)", stage=STAGE_LANGUAGE,
+        family="vlm", channel="narrative",
+        summary="InternVL3 38B AWQ across both cards, for the reels worth it.",
+        detail=(
+            "Sharded over two T4s with device_map, which without NVLink means "
+            "PCIe traffic on every layer boundary and roughly a ninety-second "
+            "pass. Not worth it for five thousand reels; clearly worth it for "
+            "the few hundred that outperformed, where the difference between a "
+            "good reading and an excellent one compounds into everything "
+            "written afterwards. Off by default, pointed at a subset."),
+        model="OpenGVLab/InternVL3-38B-AWQ", weights="internvl3-38b-awq",
+        quant="awq", device="gpu", cards=2, vram_mb=21500, disk_mb=21000,
+        seconds=95.0, ram_mb=6144,
+        needs=("describe", "transcribe", "ocr", "narrate"),
+        requires=("transformers", "torch"),
+        kinds=("hook", "beat", "turn", "payoff", "why_it_works", "critique"),
+        tier="deep", default_on=False,
+        notes="Two cards. Nothing else can be resident while this runs.",
+    ),
+]
+
+CATALOGUE = tuple(_STRUCTURE + _SIGNAL + _PERCEPTION + _LANGUAGE)
+BY_ID = {c.id: c for c in CATALOGUE}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Reading the catalogue
+# ══════════════════════════════════════════════════════════════════════════
+
+def get(component_id: str) -> Component:
+    try:
+        return BY_ID[component_id]
+    except KeyError:
+        raise KeyError(f"no such component: {component_id!r}") from None
+
+
+def all_ids() -> list:
+    return [c.id for c in CATALOGUE]
+
+
+def defaults() -> list:
+    return [c.id for c in CATALOGUE if c.default_on]
+
+
+def validate() -> list:
+    """Structural checks over the catalogue itself.
+
+    Called at import time by the engine and surfaced in the tab. A typo in a
+    `needs` tuple or a channel that does not exist would otherwise become a
+    runtime failure three cohorts into a twelve-hour session, which is the worst
+    possible time to discover it.
+    """
+    problems = []
+    seen = set()
+    for c in CATALOGUE:
+        if c.id in seen:
+            problems.append(f"{c.id}: duplicate id")
+        seen.add(c.id)
+        if c.channel and c.channel not in CHANNELS:
+            problems.append(f"{c.id}: unknown channel {c.channel!r}")
+        for n in c.needs:
+            if n not in BY_ID:
+                problems.append(f"{c.id}: needs unknown component {n!r}")
+            elif BY_ID[n].stage > c.stage:
+                problems.append(
+                    f"{c.id} (stage {c.stage}) needs {n} (stage {BY_ID[n].stage})")
+        for p in c.produces:
+            if p not in OUTPUTS:
+                problems.append(f"{c.id}: unknown output {p!r}")
+        if "claims" in c.produces and not c.channel:
+            problems.append(f"{c.id}: writes claims but declares no channel")
+        if c.device == "gpu" and not c.vram_mb:
+            problems.append(f"{c.id}: gpu component with no vram_mb")
+    # cycles
+    try:
+        topo_sort(all_ids())
+    except ValueError as exc:
+        problems.append(str(exc))
+    return problems
+
+
+def topo_sort(ids) -> list:
+    """Dependency order, stable and deterministic.
+
+    Ties break on (stage, id) rather than insertion order so two workers on two
+    accounts derive the identical plan from the identical catalogue — which is
+    what lets them share a coverage table without ever talking.
+    """
+    want = list(dict.fromkeys(ids))
+    unknown = [i for i in want if i not in BY_ID]
+    if unknown:
+        raise KeyError(f"unknown components: {unknown}")
+    wanted = set(want)
+    ready, out = [], []
+    remaining = {i: {n for n in BY_ID[i].needs if n in wanted} for i in want}
+    ready = sorted((i for i, d in remaining.items() if not d),
+                   key=lambda i: (BY_ID[i].stage, i))
+    while ready:
+        cur = ready.pop(0)
+        out.append(cur)
+        newly = []
+        for i, deps in remaining.items():
+            if cur in deps:
+                deps.discard(cur)
+                if not deps and i not in out and i not in ready:
+                    newly.append(i)
+        ready = sorted(ready + newly, key=lambda i: (BY_ID[i].stage, i))
+        remaining.pop(cur, None)
+    if remaining:
+        raise ValueError(f"dependency cycle among {sorted(remaining)}")
+    return out
+
+
+def missing_dependencies(ids) -> dict:
+    """Components required by the selection that are not in it.
+
+    Selecting `narrate` without `describe` is a legitimate thing to want — the
+    describe pass may already be done from a previous session — so this reports
+    rather than refuses. The engine checks coverage for the real answer.
+    """
+    wanted = set(ids)
+    out = {}
+    for i in ids:
+        gap = [n for n in BY_ID[i].needs if n not in wanted]
+        if gap:
+            out[i] = gap
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Cohorts — the rotation loop's plan
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Cohort:
+    """One load of the GPU: a set of components that are resident together.
+
+    The loop runs each component in the cohort over every pending video, uploads
+    the shard, unloads everything, and packs the next cohort. Grouping matters
+    because loading a 6 GB model takes forty seconds and doing it once per video
+    instead of once per cohort would cost more time than the inference.
+    """
+    index: int = 0
+    components: list = field(default_factory=list)
+    vram_mb: int = 0
+    cards: int = 1
+    loads: list = field(default_factory=list)   # distinct weights to fetch
+
+    def as_dict(self, videos: int = 0) -> dict:
+        seconds = sum(BY_ID[c].seconds for c in self.components)
+        return {
+            "index": self.index,
+            "components": list(self.components),
+            "titles": [BY_ID[c].title for c in self.components],
+            "vram_mb": self.vram_mb,
+            "cards": self.cards,
+            "loads": list(self.loads),
+            "seconds_per_video": round(seconds, 1),
+            "eta_seconds": round(seconds * videos, 1) if videos else None,
+        }
+
+
+def plan_cohorts(ids, vram_budget_mb: int, gpu_count: int = 1,
+                 disk_budget_mb: int = 0) -> list:
+    """Pack components into cohorts that fit the measured VRAM.
+
+    First-fit over the dependency order, not best-fit, and the difference is
+    deliberate. Best-fit would pack denser and reorder passes to do it, which
+    breaks the property that matters more than density: a cohort's outputs are
+    complete and uploaded before the next cohort starts, so a session killed at
+    the twelve-hour wall loses at most one cohort of work.
+
+    Components sharing `weights` cost VRAM once — three VLM passes on the same
+    8B model are one 6 GB load, and packing them apart would triple both the
+    download and the load time for no benefit at all.
+
+    A component needing two cards gets a cohort to itself. Sharding a 38B model
+    across both T4s leaves nothing to share with.
+    """
+    order = topo_sort(ids)
+    cohorts, cur = [], Cohort(index=0)
+    cur_loads: dict = {}
+
+    def close():
+        nonlocal cur, cur_loads
+        if cur.components:
+            cur.loads = list(cur_loads)
+            cohorts.append(cur)
+        cur = Cohort(index=len(cohorts))
+        cur_loads = {}
+
+    for cid in order:
+        c = BY_ID[cid]
+
+        if c.cards > gpu_count and c.device == "gpu":
+            # Cannot run here at all. Skipped rather than dropped silently —
+            # the caller reports it.
+            continue
+
+        if c.cards > 1:
+            close()
+            cur.components.append(cid)
+            cur_loads[c.load_key] = c.vram_mb
+            cur.vram_mb = c.vram_mb
+            cur.cards = c.cards
+            close()
+            continue
+
+        cost = 0 if c.load_key in cur_loads else c.vram_mb
+        if c.device == "gpu" and cur.vram_mb + cost > vram_budget_mb:
+            close()
+            cost = c.vram_mb
+
+        cur.components.append(cid)
+        if c.device == "gpu":
+            cur_loads[c.load_key] = c.vram_mb
+            cur.vram_mb += cost
+
+    close()
+    return [c for c in cohorts if c.components]
+
+
+def unrunnable(ids, res: dict) -> dict:
+    """Components the measured machine cannot host, with the reason.
+
+    Shown in the tab beside the plan rather than raised, because "this session
+    got one GPU instead of two" is a normal Kaggle Tuesday and the answer is to
+    run the other twenty-six passes, not to stop.
+    """
+    out = {}
+    per_card = res.get("usable_vram_mb", 0)
+    total = res.get("usable_vram_total_mb", 0)
+    gpus = res.get("gpu_count", 0)
+    for cid in ids:
+        c = BY_ID.get(cid)
+        if c is None or c.device != "gpu":
+            continue
+        if not gpus:
+            out[cid] = "no GPU in this session"
+        elif c.cards > gpus:
+            out[cid] = f"needs {c.cards} cards, session has {gpus}"
+        elif c.cards > 1 and c.vram_mb > total:
+            out[cid] = f"needs {c.vram_mb} MB across cards, {total} MB usable"
+        elif c.cards == 1 and c.vram_mb > per_card:
+            out[cid] = f"needs {c.vram_mb} MB on one card, {per_card} MB usable"
+    return out
+
+
+def rows(selected=None) -> list:
+    """The catalogue as the tab renders it: one dict per component."""
+    sel = set(selected) if selected is not None else set(defaults())
+    out = []
+    for c in CATALOGUE:
+        d = c.as_dict()
+        d["selected"] = c.id in sel
+        out.append(d)
+    return out
+
+
+def estimate(ids, videos: int, gpu_count: int = 1) -> dict:
+    """Wall-clock estimate for a full sweep, before anything has been measured.
+
+    Replaced by the coverage table's measured averages the moment real runs
+    exist — this is only for the "what am I about to start" screen.
+    """
+    order = topo_sort(ids)
+    per_video = sum(BY_ID[i].seconds for i in order)
+    parallel = max(gpu_count, 1)
+    return {
+        "components": len(order),
+        "videos": videos,
+        "seconds_per_video": round(per_video, 1),
+        "gpu_hours": round(per_video * videos / 3600.0, 1),
+        "wall_hours": round(per_video * videos / 3600.0 / parallel, 1),
+        "download_mb": sum({BY_ID[i].load_key: BY_ID[i].disk_mb
+                            for i in order}.values()),
+    }
