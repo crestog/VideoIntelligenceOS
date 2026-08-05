@@ -28,3 +28,11 @@ scipy
 einops
 tiktoken
 opencv-python
+
+# ── v2 capture plane (Instagram → Telegram) ──
+# python-multipart is not optional: FastAPI raises at import time on any route
+# with Form()/File() parameters without it, which would silently disable the
+# whole capture tab behind ui_server's import guard.
+python-multipart
+yt-dlp
+gallery-dl

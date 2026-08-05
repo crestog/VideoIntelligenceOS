@@ -709,6 +709,15 @@ app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="main_videos")
 app.include_router(v17_router)
 app.include_router(admin_router)
 
+# The v2 capture plane. Imported defensively because it is the newest and most
+# separable part of the system: a missing dependency in the capture tab must
+# not take the feed, the explore tab and v17 down with it.
+try:
+    from vios.capture.routes import capture_router
+    app.include_router(capture_router)
+except Exception as _capture_exc:      # pragma: no cover - import guard
+    vios_log(f"capture tab unavailable: {_capture_exc}", "SYS", "WARN")
+
 @app.get("/api/status")
 def get_status():
     """Polled every 1.5s per open tab, so it must be nearly free.

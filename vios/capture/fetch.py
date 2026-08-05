@@ -121,7 +121,12 @@ def tool_versions() -> dict:
             res = subprocess.run(args, capture_output=True, text=True,
                                  timeout=60)
             if res.returncode == 0 and res.stdout:
-                out[name] = res.stdout.strip().splitlines()[0][:70]
+                line = res.stdout.strip().splitlines()[0]
+                # ffmpeg answers with a whole banner ("ffmpeg version 8.1.2-full
+                # _build-www.gyan.dev Copyright (c) 2000-2026 …"); the readiness
+                # panel wants the version, not the build's marketing.
+                m = re.search(r"\bversion\s+(\S+)", line)
+                out[name] = (m.group(1) if m else line)[:40]
         except (OSError, subprocess.SubprocessError):
             pass
     out["ok"] = bool(out["yt_dlp"])

@@ -1,0 +1,1163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capture · VIOS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ─────────────────────────────────────────────────────────────────────
+   VIOS design system. Near-black base; the channel spectrum is the only
+   accent palette, so a colour on this page always means the same thing it
+   means on every other page.
+   ───────────────────────────────────────────────────────────────────── */
+:root{
+  --ink:#0E1013; --slate:#191D23; --line:#2A3038; --paper:#E8EAED;
+  --dim:#8B939E; --focus:#7DD3FC;
+  --speech:#7DD3FC; --ocr:#FDE68A; --visual:#86EFAC; --narrative:#C4B5FD;
+  --style:#F9A8D4; --caption:#FCA5A5; --concept:#5EEAD4;
+  --good:#86EFAC; --warn:#FDE68A; --bad:#FCA5A5;
+  --r:10px; --pad:20px;
+  --display:'Bricolage Grotesque',ui-sans-serif,system-ui,sans-serif;
+  --body:'IBM Plex Sans',ui-sans-serif,system-ui,-apple-system,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--ink); color:var(--paper); font-family:var(--body);
+  font-size:14px; line-height:1.55; letter-spacing:-.005em;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:rgba(125,211,252,.28)}
+a{color:var(--focus);text-decoration:none}
+a:hover{text-decoration:underline}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--ink)}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
+::-webkit-scrollbar-thumb:hover{background:#3a424d}
+
+/* ── shell ───────────────────────────────────────────────────────── */
+.shell{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
+.rail{
+  border-right:1px solid var(--line); background:var(--ink);
+  position:sticky; top:0; height:100vh; display:flex; flex-direction:column;
+  padding:22px 0;
+}
+.brand{padding:0 22px 20px;border-bottom:1px solid var(--line);margin-bottom:14px}
+.brand h1{
+  font-family:var(--display); font-weight:800; font-size:19px;
+  letter-spacing:-.03em; line-height:1.1;
+}
+.brand .sub{
+  font-family:var(--mono); font-size:10px; color:var(--dim);
+  text-transform:uppercase; letter-spacing:.14em; margin-top:5px;
+}
+.nav{display:flex;flex-direction:column;gap:1px;padding:0 10px;flex:1}
+.nav button{
+  all:unset; cursor:pointer; padding:9px 12px; border-radius:8px;
+  color:var(--dim); font-size:13.5px; font-weight:500; display:flex;
+  align-items:center; gap:10px; transition:background .12s,color .12s;
+}
+.nav button:hover{background:var(--slate);color:var(--paper)}
+.nav button.on{background:var(--slate);color:var(--paper)}
+.nav button .dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.5}
+.nav button.on .dot{opacity:1;background:var(--focus)}
+.rail-foot{padding:14px 22px 0;border-top:1px solid var(--line);margin-top:10px}
+.rail-foot a{
+  display:block; font-size:12px; color:var(--dim); padding:4px 0;
+}
+.rail-foot a:hover{color:var(--paper);text-decoration:none}
+
+.main{min-width:0;display:flex;flex-direction:column}
+
+/* ── the status bar: always visible, because during a week-long run this
+      is the only thing the operator actually looks at ─────────────── */
+.statusbar{
+  position:sticky; top:0; z-index:30; background:rgba(14,16,19,.93);
+  backdrop-filter:blur(14px); border-bottom:1px solid var(--line);
+}
+.sb-row{display:flex;align-items:center;gap:16px;padding:13px 26px}
+.pill{
+  display:inline-flex;align-items:center;gap:7px;padding:4px 11px 4px 8px;
+  border:1px solid var(--line);border-radius:999px;font-family:var(--mono);
+  font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);
+  white-space:nowrap;
+}
+.pill i{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:none}
+.pill.running{color:var(--good);border-color:rgba(134,239,172,.32)}
+.pill.running i{background:var(--good);animation:pulse 1.9s ease-in-out infinite}
+.pill.paused{color:var(--warn);border-color:rgba(253,230,138,.32)}
+.pill.paused i{background:var(--warn)}
+.pill.error{color:var(--bad);border-color:rgba(252,165,165,.35)}
+.pill.error i{background:var(--bad)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.sb-msg{flex:1;min-width:0;color:var(--dim);font-size:13px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-stats{display:flex;gap:18px;font-family:var(--mono);font-size:11.5px;white-space:nowrap}
+.sb-stats b{color:var(--paper);font-weight:500}
+.sb-stats span{color:var(--dim)}
+
+/* the evidence spectrum: x = progress, colour = channel. The signature
+   element of the whole interface, used here as the capture progress bar. */
+.spectrum{height:4px;display:flex;background:var(--slate)}
+.spectrum i{height:100%;transition:width .5s cubic-bezier(.4,0,.2,1)}
+
+.page{padding:30px 26px 90px;max-width:1180px;width:100%}
+.page[hidden]{display:none}
+
+h2.title{font-family:var(--display);font-weight:700;font-size:23px;letter-spacing:-.028em}
+p.lede{color:var(--dim);font-size:14px;max-width:65ch;margin-top:7px}
+.sec{margin-top:34px}
+.sec > h3{
+  font-family:var(--mono); font-size:10.5px; text-transform:uppercase;
+  letter-spacing:.15em; color:var(--dim); margin-bottom:12px;
+  display:flex; align-items:center; gap:10px;
+}
+.sec > h3::after{content:'';flex:1;height:1px;background:var(--line)}
+
+/* ── cards ───────────────────────────────────────────────────────── */
+.card{
+  background:var(--slate); border:1px solid var(--line); border-radius:var(--r);
+  padding:var(--pad); position:relative; overflow:hidden;
+}
+.card + .card{margin-top:14px}
+.card > .band{position:absolute;inset:0 0 auto;height:2px;opacity:.85}
+.card h4{font-family:var(--display);font-weight:600;font-size:15.5px;letter-spacing:-.02em}
+.card .hint{color:var(--dim);font-size:12.5px;margin-top:4px;max-width:62ch}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+
+/* ── form ────────────────────────────────────────────────────────── */
+.field{margin-top:14px}
+.field label{
+  display:block;font-size:12px;font-weight:500;color:var(--paper);margin-bottom:5px;
+}
+.field .note{color:var(--dim);font-weight:400;font-size:11.5px}
+input[type=text],input[type=password],input[type=number],textarea,select{
+  width:100%; background:var(--ink); border:1px solid var(--line);
+  border-radius:8px; color:var(--paper); padding:9px 11px;
+  font-family:var(--mono); font-size:12.5px; outline:none;
+  transition:border-color .14s, box-shadow .14s;
+}
+input::placeholder,textarea::placeholder{color:#5d6570}
+input:focus,textarea:focus,select:focus{
+  border-color:var(--focus); box-shadow:0 0 0 3px rgba(125,211,252,.13);
+}
+textarea{resize:vertical;min-height:92px;line-height:1.5}
+select{font-family:var(--body);cursor:pointer}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.row > .field{flex:1;min-width:150px;margin-top:0}
+.check{display:flex;align-items:center;gap:9px;margin-top:11px;cursor:pointer;font-size:13px}
+.check input{width:15px;height:15px;accent-color:var(--focus);cursor:pointer}
+
+/* ── buttons ─────────────────────────────────────────────────────── */
+.btn{
+  all:unset; cursor:pointer; display:inline-flex; align-items:center; gap:7px;
+  padding:8px 15px; border-radius:8px; font-size:13px; font-weight:500;
+  border:1px solid var(--line); color:var(--paper); background:var(--ink);
+  transition:background .13s,border-color .13s,transform .06s; white-space:nowrap;
+}
+.btn:hover{background:#20252c;border-color:#3a424d}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{opacity:.4;cursor:not-allowed;transform:none}
+.btn.primary{background:var(--focus);color:#08111a;border-color:var(--focus);font-weight:600}
+.btn.primary:hover{background:#a5e2fd;border-color:#a5e2fd}
+.btn.danger{color:var(--bad);border-color:rgba(252,165,165,.28)}
+.btn.danger:hover{background:rgba(252,165,165,.08)}
+.btn.ghost{background:transparent}
+.btns{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}
+
+/* ── data ────────────────────────────────────────────────────────── */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.stat{background:var(--slate);padding:14px 16px}
+.stat .n{font-family:var(--mono);font-size:22px;font-weight:500;letter-spacing:-.02em;
+  line-height:1.15}
+.stat .k{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--dim);margin-top:5px}
+.stat.good .n{color:var(--good)} .stat.warn .n{color:var(--warn)}
+.stat.bad .n{color:var(--bad)} .stat.focus .n{color:var(--focus)}
+
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{
+  text-align:left;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--dim);font-weight:400;padding:8px 10px;
+  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--slate);
+}
+td{padding:8px 10px;border-bottom:1px solid rgba(42,48,56,.55);vertical-align:top}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:rgba(255,255,255,.022)}
+td.mono,th.mono{font-family:var(--mono);font-size:11.5px}
+.tag{
+  display:inline-block;padding:1.5px 7px;border-radius:5px;font-family:var(--mono);
+  font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;border:1px solid;
+}
+.tag.uploaded{color:var(--good);border-color:rgba(134,239,172,.3);background:rgba(134,239,172,.07)}
+.tag.queued{color:var(--dim);border-color:var(--line)}
+.tag.fetching{color:var(--focus);border-color:rgba(125,211,252,.32);background:rgba(125,211,252,.07)}
+.tag.failed{color:var(--warn);border-color:rgba(253,230,138,.3);background:rgba(253,230,138,.06)}
+.tag.unavailable{color:var(--bad);border-color:rgba(252,165,165,.3);background:rgba(252,165,165,.06)}
+.tag.skipped{color:var(--dim);border-color:var(--line)}
+.tbl-wrap{border:1px solid var(--line);border-radius:var(--r);overflow:auto;max-height:520px;
+  background:var(--slate)}
+
+/* activity log */
+.log{font-family:var(--mono);font-size:11.5px;max-height:330px;overflow:auto;
+  border:1px solid var(--line);border-radius:var(--r);background:var(--slate)}
+.log .ln{display:grid;grid-template-columns:64px 92px 1fr;gap:10px;padding:5px 12px;
+  border-bottom:1px solid rgba(42,48,56,.4)}
+.log .ln:last-child{border-bottom:none}
+.log .t{color:#5d6570}
+.log .k{color:var(--dim)}
+.log .k.captured{color:var(--good)} .log .k.hostile{color:var(--bad)}
+.log .k.unavailable,.log .k.upload-failed{color:var(--warn)}
+.log .k.seed,.log .k.import{color:var(--concept)}
+.log .m{color:var(--paper);word-break:break-word}
+
+/* toast + inline result */
+.result{margin-top:13px;padding:10px 13px;border-radius:8px;font-size:12.5px;
+  border:1px solid var(--line);background:var(--ink);display:none;white-space:pre-wrap}
+.result.show{display:block}
+.result.ok{border-color:rgba(134,239,172,.3);color:var(--good)}
+.result.no{border-color:rgba(252,165,165,.32);color:var(--bad)}
+.result.busy{border-color:rgba(125,211,252,.3);color:var(--focus)}
+#toast{position:fixed;right:22px;bottom:22px;z-index:80;display:flex;
+  flex-direction:column;gap:8px;pointer-events:none}
+#toast div{background:var(--slate);border:1px solid var(--line);border-left:3px solid var(--focus);
+  border-radius:8px;padding:10px 15px;font-size:12.5px;max-width:380px;
+  animation:slide .25s ease both;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+#toast div.no{border-left-color:var(--bad)} #toast div.ok{border-left-color:var(--good)}
+@keyframes slide{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+
+/* checks */
+.checks{display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-top:13px}
+.chk{background:var(--slate);padding:10px 14px;display:flex;align-items:center;gap:11px}
+.chk .m{width:16px;text-align:center;font-family:var(--mono);font-size:13px;flex:none}
+.chk.ok .m{color:var(--good)} .chk.no .m{color:var(--bad)}
+.chk .nm{font-weight:500;min-width:128px;font-size:12.5px}
+.chk .dt{color:var(--dim);font-size:12px;font-family:var(--mono);word-break:break-word}
+
+/* help */
+.help-body{max-width:76ch}
+.help-body h4{font-family:var(--display);font-size:16px;font-weight:700;
+  letter-spacing:-.02em;margin:26px 0 7px}
+.help-body h4:first-child{margin-top:0}
+.help-body p{color:#c3c9d1;margin:9px 0}
+.help-body ol,.help-body ul{margin:9px 0 9px 20px;color:#c3c9d1}
+.help-body li{margin:5px 0}
+.help-body code{font-family:var(--mono);font-size:11.5px;background:var(--ink);
+  border:1px solid var(--line);border-radius:5px;padding:1.5px 5px;color:var(--concept)}
+.help-body strong{color:var(--paper);font-weight:600}
+.callout{border-left:2px solid var(--focus);background:rgba(125,211,252,.05);
+  padding:11px 15px;border-radius:0 8px 8px 0;margin:14px 0;font-size:13px;color:#c3c9d1}
+.callout.warn{border-left-color:var(--warn);background:rgba(253,230,138,.05)}
+.callout.bad{border-left-color:var(--bad);background:rgba(252,165,165,.05)}
+.callout b{color:var(--paper)}
+details.step{border:1px solid var(--line);border-radius:var(--r);background:var(--slate);
+  margin-top:10px;overflow:hidden}
+details.step > summary{padding:12px 16px;cursor:pointer;font-weight:500;font-size:13.5px;
+  list-style:none;display:flex;align-items:center;gap:11px}
+details.step > summary::-webkit-details-marker{display:none}
+details.step > summary::before{content:'+';font-family:var(--mono);color:var(--focus);
+  font-size:14px;width:12px}
+details.step[open] > summary::before{content:'−'}
+details.step[open] > summary{border-bottom:1px solid var(--line)}
+details.step .in{padding:15px 16px 18px}
+.stepnum{font-family:var(--mono);font-size:10px;color:var(--dim);background:var(--ink);
+  border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+
+.skel{color:var(--dim);font-size:12.5px;padding:22px;text-align:center;font-family:var(--mono)}
+@media(max-width:860px){
+  .shell{grid-template-columns:1fr}
+  .rail{position:static;height:auto;flex-direction:row;align-items:center;
+    padding:12px 16px;border-right:none;border-bottom:1px solid var(--line);overflow-x:auto}
+  .brand{border:none;padding:0 18px 0 0;margin:0}
+  .nav{flex-direction:row;padding:0;flex:none}
+  .rail-foot{display:none}
+  .page{padding:22px 16px 80px}
+  .sb-row{padding:11px 16px;flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ── rail ─────────────────────────────────────────────────────── -->
+  <aside class="rail">
+    <div class="brand">
+      <h1>Capture</h1>
+      <div class="sub">Instagram → Telegram</div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-p="run"    class="on"><span class="dot"></span>Run</button>
+      <button data-p="setup"><span class="dot"></span>Setup</button>
+      <button data-p="queue"><span class="dot"></span>Queue</button>
+      <button data-p="help"><span class="dot"></span>Help</button>
+    </nav>
+    <div class="rail-foot">
+      <a href="/admin">← Admin</a>
+      <a href="/">Feed</a>
+      <a href="/v17">V17</a>
+    </div>
+  </aside>
+
+  <!-- ── main ─────────────────────────────────────────────────────── -->
+  <div class="main">
+
+    <div class="statusbar">
+      <div class="sb-row">
+        <span class="pill" id="pill"><i></i><span id="pillText">idle</span></span>
+        <div class="sb-msg" id="sbMsg">Loading…</div>
+        <div class="sb-stats">
+          <span>done <b id="sDone">—</b></span>
+          <span>left <b id="sLeft">—</b></span>
+          <span>eta <b id="sEta">—</b></span>
+          <span>next <b id="sNext">—</b></span>
+        </div>
+      </div>
+      <div class="spectrum" id="spectrum">
+        <i style="width:0;background:var(--visual)"></i>
+        <i style="width:0;background:var(--speech)"></i>
+        <i style="width:0;background:var(--ocr)"></i>
+        <i style="width:0;background:var(--caption)"></i>
+      </div>
+    </div>
+
+    <!-- ══ RUN ═══════════════════════════════════════════════════════ -->
+    <section class="page" id="p-run">
+      <h2 class="title">Run</h2>
+      <p class="lede">One reel every couple of minutes, for as long as it takes.
+        Stop it whenever you like — nothing is lost, and nothing already in the
+        channel is ever downloaded twice.</p>
+
+      <div class="sec">
+        <h3>Ledger</h3>
+        <div class="stats" id="stats"><div class="stat"><div class="n">—</div><div class="k">loading</div></div></div>
+      </div>
+
+      <div class="sec">
+        <h3>Control</h3>
+        <div class="card">
+          <div class="band" style="background:linear-gradient(90deg,var(--visual),var(--speech))"></div>
+          <h4>Before the first run</h4>
+          <p class="hint">Checks everything that could stop a week-long job:
+            the downloader, the bot's permission to post, your cookies, free disk
+            and whether there is anything queued.</p>
+          <div class="btns">
+            <button class="btn" id="bCheck">Run pre-flight check</button>
+            <button class="btn ghost" id="bScan">Scan channel for existing reels</button>
+          </div>
+          <div class="checks" id="checks" hidden></div>
+          <div class="result" id="rCheck"></div>
+        </div>
+
+        <div class="card">
+          <div class="band" style="background:linear-gradient(90deg,var(--speech),var(--concept))"></div>
+          <h4>Capture</h4>
+          <p class="hint">Start picks up exactly where the last session stopped.
+            Pause finishes the reel in flight and then waits. Stop abandons the
+            current download only — its row is repaired on the next start.</p>
+          <div class="btns">
+            <button class="btn primary" id="bStart">Start capturing</button>
+            <button class="btn" id="bPause">Pause</button>
+            <button class="btn" id="bResume">Resume</button>
+            <button class="btn danger" id="bStop">Stop</button>
+          </div>
+          <label class="check"><input type="checkbox" id="seedFirst" checked>
+            Read the channel first, so nothing already there is downloaded again</label>
+          <div class="result" id="rRun"></div>
+        </div>
+
+        <div class="card">
+          <div class="band" style="background:var(--narrative)"></div>
+          <h4>Right now</h4>
+          <div class="stats" id="now" style="margin-top:12px">
+            <div class="stat"><div class="n">—</div><div class="k">idle</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Activity</h3>
+        <div class="log" id="log"><div class="skel">no activity yet</div></div>
+      </div>
+    </section>
+
+    <!-- ══ SETUP ═════════════════════════════════════════════════════ -->
+    <section class="page" id="p-setup" hidden>
+      <h2 class="title">Setup</h2>
+      <p class="lede">Everything the capture engine needs, in one form. Values
+        live in memory for as long as this process runs — nothing here is
+        written to a file or committed to the repository, so on a fresh Kaggle
+        session you paste them again. The <a href="#" data-goto="help">Help</a>
+        tab explains where to get each one.</p>
+
+      <div class="sec">
+        <h3>Telegram — where the reels are stored</h3>
+        <div class="card">
+          <div class="band" style="background:var(--speech)"></div>
+          <div class="grid2">
+            <div class="field">
+              <label>Bot token <span class="note">— from @BotFather</span></label>
+              <input type="password" id="botToken" placeholder="1234567890:AAH…" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>Channel ID <span class="note">— starts with -100</span></label>
+              <input type="text" id="channelId" placeholder="-1001234567890" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>API ID <span class="note">— optional, from my.telegram.org</span></label>
+              <input type="text" id="apiId" placeholder="1234567" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>API hash <span class="note">— optional, pairs with API ID</span></label>
+              <input type="password" id="apiHash" placeholder="32 hex characters" autocomplete="off">
+            </div>
+          </div>
+          <p class="hint" style="margin-top:12px">The API ID and hash are only
+            needed for two things: reading the channel's history to find reels
+            you already uploaded, and uploading a file larger than 50&nbsp;MB.
+            Capture works without them.</p>
+          <div class="btns">
+            <button class="btn primary" id="bSaveTg">Save</button>
+            <button class="btn" id="bProbe">Test connection</button>
+          </div>
+          <div class="result" id="rTg"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Instagram — proving you are logged in</h3>
+        <div class="card">
+          <div class="band" style="background:var(--caption)"></div>
+          <h4>Cookies</h4>
+          <p class="hint">Saved and private reels are only visible to a logged-in
+            account, so the downloader needs your session cookie. Use a
+            <strong>second, throwaway Instagram account</strong> — if anything
+            ever goes wrong it is that account that pays for it, not your main
+            one. Export in Netscape format and paste the whole file below.</p>
+          <div class="field">
+            <label>cookies.txt <span class="note">— stored in memory and in a
+              0600 scratch file, deleted when the engine stops</span></label>
+            <textarea id="cookies" placeholder="# Netscape HTTP Cookie File&#10;.instagram.com&#9;TRUE&#9;/&#9;TRUE&#9;1790000000&#9;sessionid&#9;…" spellcheck="false"></textarea>
+          </div>
+          <div class="btns"><button class="btn primary" id="bSaveCk">Save cookies</button></div>
+          <div class="result" id="rCk"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Pace — how invisible you want to be</h3>
+        <div class="card">
+          <div class="band" style="background:var(--visual)"></div>
+          <div class="row">
+            <div class="field">
+              <label>Seconds between reels <span class="note">— average, not fixed</span></label>
+              <select id="target">
+                <option value="60">60s — about 1,400/day (faster, more visible)</option>
+                <option value="120" selected>120s — about 700/day (recommended)</option>
+                <option value="180">180s — about 480/day (very quiet)</option>
+                <option value="300">300s — about 290/day (glacial)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Give up after <span class="note">— attempts per reel</span></label>
+              <input type="number" id="maxAttempts" value="5" min="1" max="20">
+            </div>
+          </div>
+          <label class="check"><input type="checkbox" id="breaks" checked>
+            Take a 12–40 minute break every 18–40 reels</label>
+          <label class="check"><input type="checkbox" id="quiet" checked>
+            Slow down between 02:00 and 06:00, like a person asleep</label>
+          <label class="check"><input type="checkbox" id="galleryDl" checked>
+            Fall back to gallery-dl when yt-dlp cannot get a reel</label>
+          <div class="field">
+            <label>Skip these collections <span class="note">— comma separated, optional</span></label>
+            <input type="text" id="skipCols" placeholder="memes, random">
+          </div>
+          <div class="btns"><button class="btn primary" id="bSavePace">Save pace</button></div>
+          <div class="result" id="rPace"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Import — what to capture</h3>
+        <div class="card">
+          <div class="band" style="background:var(--concept)"></div>
+          <h4>Your saved reels</h4>
+          <p class="hint">Drop in the Instagram data export (<code>.zip</code>) or
+            a markdown file of links. Importing the same file twice is safe —
+            anything already known is counted as a duplicate and left alone.</p>
+          <div class="field">
+            <label>Export ZIP or markdown file</label>
+            <input type="file" id="file" accept=".zip,.md,.txt,.json"
+                   style="font-family:var(--body);padding:8px">
+          </div>
+          <div class="field">
+            <label>…or paste links <span class="note">— <code>## Category</code>
+              headings are read as collections</span></label>
+            <textarea id="paste" placeholder="## Business&#10;https://www.instagram.com/reel/…&#10;https://www.instagram.com/reel/…" spellcheck="false"></textarea>
+          </div>
+          <div class="btns"><button class="btn primary" id="bImport">Import</button></div>
+          <div class="result" id="rImport"></div>
+        </div>
+
+        <div class="card">
+          <div class="band" style="background:var(--ocr)"></div>
+          <h4>Already uploaded</h4>
+          <p class="hint">Reels that are in the channel but not in the ledger.
+            Scanning the channel finds them automatically; pasting links is the
+            fallback when the API ID and hash are not available.</p>
+          <div class="btns">
+            <button class="btn" id="bScan2">Scan channel</button>
+            <button class="btn ghost" id="bRescan">Rescan from the beginning</button>
+          </div>
+          <div class="field">
+            <label>Mark these links as already captured</label>
+            <textarea id="seedText" placeholder="https://www.instagram.com/reel/…" spellcheck="false"></textarea>
+          </div>
+          <div class="btns"><button class="btn" id="bSeedUrls">Mark as captured</button></div>
+          <div class="result" id="rSeed"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Ledger — the thing that must never be lost</h3>
+        <div class="card">
+          <div class="band" style="background:var(--narrative)"></div>
+          <p class="hint">The ledger is what remembers, months from now, that a
+            reel was already captured. It is uploaded to the channel and pinned
+            every 25 reels, so a Kaggle session dying costs you nothing.</p>
+          <div class="btns">
+            <button class="btn" id="bSnap">Back up to Telegram now</button>
+            <button class="btn" id="bRestore">Restore from Telegram</button>
+            <button class="btn ghost" onclick="location.href='/api/capture/export'">Download as JSON</button>
+            <button class="btn ghost" id="bRetry">Retry all failures</button>
+          </div>
+          <div class="result" id="rLedger"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ QUEUE ═════════════════════════════════════════════════════ -->
+    <section class="page" id="p-queue" hidden>
+      <h2 class="title">Queue</h2>
+      <p class="lede">Every reel the system knows about, and what happened to it.</p>
+
+      <div class="sec">
+        <h3>Collections</h3>
+        <div class="stats" id="cols"><div class="stat"><div class="n">—</div><div class="k">loading</div></div></div>
+      </div>
+
+      <div class="sec">
+        <h3>Items</h3>
+        <div class="row" style="margin-bottom:12px">
+          <div class="field" style="max-width:220px">
+            <label>Show</label>
+            <select id="qState">
+              <option value="">Everything</option>
+              <option value="queued">Waiting</option>
+              <option value="uploaded">Captured</option>
+              <option value="failed">Failed — will retry</option>
+              <option value="unavailable">Gone from Instagram</option>
+              <option value="fetching">In flight</option>
+            </select>
+          </div>
+          <button class="btn" id="bPrev">← Previous</button>
+          <button class="btn" id="bNext">Next →</button>
+          <span class="pill" id="qPage"><i></i><span>—</span></span>
+        </div>
+        <div class="tbl-wrap">
+          <table><thead><tr>
+            <th>State</th><th>Reel</th><th>Creator</th>
+            <th class="mono">Views</th><th class="mono">Size</th><th>Detail</th>
+          </tr></thead><tbody id="qBody">
+            <tr><td colspan="6"><div class="skel">loading…</div></td></tr>
+          </tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ HELP ══════════════════════════════════════════════════════ -->
+    <section class="page" id="p-help" hidden>
+      <h2 class="title">How this works</h2>
+      <p class="lede">Read once, set up in about ten minutes, then leave it
+        running for a week.</p>
+
+      <div class="sec">
+        <h3>The idea</h3>
+        <div class="card help-body">
+          <p>Instagram is not an archive. Reels get deleted, accounts go private,
+            and a collection you spent two years building can disappear in an
+            afternoon. This tool copies every reel you saved — the original video
+            file, the caption, the view and like counts, and as many comments as
+            Instagram will hand over — into a Telegram channel that has no size
+            limit and no expiry.</p>
+          <p>It does this <strong>slowly and on purpose</strong>. About one reel
+            every two minutes, with irregular gaps, occasional long breaks and a
+            quiet period overnight. That is roughly <code>0.5</code> requests per
+            minute against a threshold that starts biting around <code>30</code>.
+            Downloading five thousand reels takes about a week. Downloading them
+            in an afternoon gets the account checkpointed and gets you nothing.</p>
+          <div class="callout"><b>It never downloads the same reel twice.</b>
+            Every capture is written to a ledger before the next one starts, and
+            the ledger is backed up into the channel itself. Stop after two hours,
+            come back in three months on a different machine, restore the ledger,
+            and it picks up exactly where it left off.</div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Step by step</h3>
+
+        <details class="step" open>
+          <summary><span class="stepnum">01</span> Make a Telegram channel and a bot</summary>
+          <div class="in help-body">
+            <ol>
+              <li>In Telegram, create a <strong>new private channel</strong>. This
+                is where every reel will live, so give it a name you will recognise
+                in five years.</li>
+              <li>Open a chat with <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>,
+                send <code>/newbot</code>, and follow the two prompts. It replies
+                with a token that looks like
+                <code>1234567890:AAH…</code> — that is your <strong>bot token</strong>.</li>
+              <li>Go to your channel → <em>Administrators</em> → <em>Add admin</em>,
+                search for your bot by its username, and add it. Give it
+                <strong>Post messages</strong> and <strong>Delete messages</strong>.
+                Without Post it cannot upload anything; without Delete the channel
+                scan leaves a stray dot behind each time.</li>
+              <li>To find the <strong>channel ID</strong>: forward any message from
+                the channel to <a href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a>,
+                or open the channel in Telegram Web and read it out of the URL. It
+                is a negative number starting <code>-100</code>.</li>
+            </ol>
+            <div class="callout warn"><b>Treat the bot token like a password.</b>
+              Anyone who has it can post to and read your channel. If it has ever
+              been pasted somewhere public, send <code>/revoke</code> to BotFather
+              and use the new one.</div>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="stepnum">02</span> Get an API ID and hash — optional</summary>
+          <div class="in help-body">
+            <p>Skip this if you only want to capture. You need it for exactly two
+              things: <strong>reading the channel's history</strong> (so reels you
+              uploaded before today are not downloaded again) and
+              <strong>uploading files over 50&nbsp;MB</strong>, which almost no
+              reel is.</p>
+            <ol>
+              <li>Go to <a href="https://my.telegram.org" target="_blank" rel="noopener">my.telegram.org</a>
+                and log in with your phone number.</li>
+              <li>Open <em>API development tools</em>, fill in any app name and
+                short name.</li>
+              <li>Copy the <strong>App api_id</strong> (a number) and the
+                <strong>App api_hash</strong> (32 hex characters).</li>
+            </ol>
+            <div class="callout bad"><b>These identify you personally, not a bot.</b>
+              They cannot be revoked as easily as a bot token. Never put them in a
+              file, a notebook cell or a screenshot — paste them into the form on
+              the Setup tab and nowhere else.</div>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="stepnum">03</span> Make a throwaway Instagram account</summary>
+          <div class="in help-body">
+            <p>The downloader signs in as you to see your saved reels. Use a
+              <strong>second account</strong> for this, never your real one.</p>
+            <ol>
+              <li>Create a new Instagram account. Give it a profile picture and
+                follow twenty or thirty accounts — a completely empty account that
+                immediately starts fetching reels looks exactly like what it is.</li>
+              <li>Let it sit for a day or two before using it here.</li>
+              <li>If your saved reels are on your main account, you have two
+                choices: export the links from the main account (step&nbsp;4) and
+                let the throwaway do the downloading, which works for any public
+                reel; or accept the risk and use the main account's cookies for
+                private ones.</li>
+            </ol>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="stepnum">04</span> Export your saved reels from Instagram</summary>
+          <div class="in help-body">
+            <ol>
+              <li>In the Instagram app: <em>Settings → Accounts Centre → Your
+                information and permissions → Download your information</em>.</li>
+              <li>Choose <strong>Some of your information</strong> and tick
+                <strong>Saved</strong> (and <strong>Likes</strong> if you want
+                those too). Pick <strong>JSON</strong>, not HTML.</li>
+              <li>Choose the smallest date range that covers what you want, and
+                request the download. It arrives by email in anything from a few
+                minutes to a day.</li>
+              <li>Upload the <code>.zip</code> straight into the Import box on the
+                Setup tab. There is no need to unpack it.</li>
+            </ol>
+            <div class="callout">The importer reads the whole export looking for
+              Instagram links, rather than expecting one exact file layout — so it
+              keeps working when Meta renames things, which they do. Collection
+              names are picked up automatically.</div>
+            <p>If you already keep a list of links somewhere, a markdown file works
+              just as well:</p>
+            <p><code>## Business</code><br>
+               <code>https://www.instagram.com/reel/ABC123/</code><br>
+               <code>https://www.instagram.com/reel/DEF456/</code><br>
+               <code>## Fitness</code><br>
+               <code>https://www.instagram.com/reel/GHI789/</code></p>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="stepnum">05</span> Export your cookies</summary>
+          <div class="in help-body">
+            <ol>
+              <li>Log into Instagram in a browser, using the throwaway account.</li>
+              <li>Install a cookie exporter extension — <em>Get cookies.txt
+                LOCALLY</em> for Chrome, or <em>cookies.txt</em> for Firefox. Pick
+                one that works offline; an extension that uploads your cookies to
+                a server is handing over the account.</li>
+              <li>With instagram.com open, click the extension and export in
+                <strong>Netscape</strong> format.</li>
+              <li>Open the downloaded file in a text editor, copy everything, and
+                paste it into the Cookies box on the Setup tab.</li>
+            </ol>
+            <div class="callout warn"><b>Cookies expire.</b> Instagram sessions last
+              weeks, not months. If the run starts failing with login errors,
+              export them again — the ledger keeps everything it already captured,
+              so refreshing costs nothing but a minute.</div>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="stepnum">06</span> Check, then start</summary>
+          <div class="in help-body">
+            <ol>
+              <li>Go to the <strong>Run</strong> tab and press
+                <em>Run pre-flight check</em>. It verifies the downloader is
+                installed, the bot can actually post to the channel, the cookies
+                are loaded, there is disk space, and there is something queued.</li>
+              <li>Press <em>Scan channel for existing reels</em> once, if you have
+                uploaded reels before. It reads the channel and marks everything it
+                finds as already captured.</li>
+              <li>Press <strong>Start capturing</strong> and leave it. The status
+                bar shows what it is doing and when the next reel is due.</li>
+            </ol>
+            <div class="callout"><b>On Kaggle</b>, a session runs for at most 12
+              hours. That is fine — start it, come back, start it again. Every
+              reel is committed before the next one begins, and the ledger is
+              pinned in your channel every 25 reels. A new session only needs
+              <em>Restore from Telegram</em> before it starts.</div>
+          </div>
+        </details>
+      </div>
+
+      <div class="sec">
+        <h3>When things go wrong</h3>
+        <div class="card help-body">
+          <h4>“Instagram pushed back”</h4>
+          <p>A rate limit or a login wall. The engine slows itself down
+            automatically and retries that reel in two hours. If it happens five
+            times in a row it stops on purpose rather than digging the hole
+            deeper — refresh the cookies, wait a few hours, and start again.</p>
+
+          <h4>“Gone from Instagram”</h4>
+          <p>The post was deleted or the account went private. Nothing to fix;
+            these are recorded so you know what was lost and are never retried.</p>
+
+          <h4>The bot cannot post</h4>
+          <p>Almost always the bot was added to the channel but not given
+            <em>Post messages</em>. Channel → Administrators → your bot → turn it
+            on. The pre-flight check tells you which of the two it is.</p>
+
+          <h4>The session died mid-reel</h4>
+          <p>Expected. That reel's row is left mid-flight and repaired on the next
+            start, which puts it back in the queue with its attempt counted.
+            Nothing else is affected.</p>
+
+          <h4>It says everything is captured but the channel looks empty</h4>
+          <p>The ledger and the channel have drifted — usually from restoring an
+            old ledger over a newer one. Press <em>Rescan from the beginning</em>
+            on the Setup tab; it rebuilds the ledger from what is actually in the
+            channel, which is the real source of truth.</p>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>What gets stored</h3>
+        <div class="card help-body">
+          <p>For each reel, two messages go into the channel:</p>
+          <ul>
+            <li>The <strong>original video</strong>, sent as a video so Telegram
+              also stores a thumbnail and plays it inline, captioned with the
+              collection, creator, view and like counts, the description, and the
+              permalink.</li>
+            <li>A <strong>metadata record</strong> attached as a reply — a JSON
+              file holding everything above plus the comments, the full untouched
+              response from Instagram, file hashes, and which tool captured it and
+              when.</li>
+          </ul>
+          <p>The raw response is kept deliberately. Anything useful in it that
+            nobody has thought to use yet is still there in two years, without
+            re-downloading a single reel — by which time some of them will no
+            longer exist.</p>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+'use strict';
+/* ── tiny helpers ─────────────────────────────────────────────────── */
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num = n => (n === null || n === undefined || n === '') ? '—'
+  : Number(n).toLocaleString();
+
+function toast(msg, kind){
+  const d = document.createElement('div');
+  d.className = kind || ''; d.textContent = msg;
+  $('#toast').appendChild(d);
+  setTimeout(() => { d.style.opacity = '0'; d.style.transition = 'opacity .3s';
+    setTimeout(() => d.remove(), 320); }, 4200);
+}
+function say(el, msg, kind){
+  const n = $(el); if(!n) return;
+  n.textContent = msg; n.className = 'result show ' + (kind || '');
+}
+async function post(url, body){
+  const r = await fetch(url, {method:'POST', body});
+  let j; try { j = await r.json(); } catch { j = {ok:false, error:'bad response'}; }
+  return j;
+}
+function form(obj){
+  const f = new FormData();
+  for(const [k, v] of Object.entries(obj)) if(v !== undefined && v !== null) f.append(k, v);
+  return f;
+}
+function human(sec){
+  sec = Math.max(0, Math.round(sec));
+  if(sec < 60) return sec + 's';
+  if(sec < 3600) return Math.round(sec/60) + 'm';
+  if(sec < 86400) return (sec/3600).toFixed(1) + 'h';
+  return (sec/86400).toFixed(1) + 'd';
+}
+function mb(b){ return b ? (b/1048576).toFixed(1) + ' MB' : '—'; }
+
+/* ── navigation ───────────────────────────────────────────────────── */
+function goto(page){
+  $$('#nav button').forEach(b => b.classList.toggle('on', b.dataset.p === page));
+  ['run','setup','queue','help'].forEach(p => $('#p-' + p).hidden = (p !== page));
+  window.scrollTo(0, 0);
+  if(page === 'queue') loadQueue();
+}
+$('#nav').addEventListener('click', e => {
+  const b = e.target.closest('button'); if(b) goto(b.dataset.p);
+});
+document.addEventListener('click', e => {
+  const a = e.target.closest('[data-goto]');
+  if(a){ e.preventDefault(); goto(a.dataset.goto); }
+});
+
+/* ── status polling ───────────────────────────────────────────────── */
+let lastState = '';
+async function tick(){
+  try{
+    const s = await (await fetch('/api/capture/status')).json();
+    if(s.ok === false) return;
+    render(s);
+  }catch(e){ /* a dropped poll is not worth a message */ }
+}
+
+function render(s){
+  const st = s.state || 'idle';
+  const pill = $('#pill');
+  pill.className = 'pill ' + (st === 'running' ? 'running'
+    : st === 'paused' ? 'paused' : st === 'error' ? 'error' : '');
+  $('#pillText').textContent = st;
+  $('#sbMsg').textContent = s.error || s.message || '';
+
+  const c = s.counts || {};
+  const done = c.uploaded || 0, total = c.total || 0;
+  $('#sDone').textContent = num(done);
+  $('#sLeft').textContent = num(c.remaining || 0);
+  $('#sEta').textContent = (c.remaining ? human(s.eta_hours * 3600) : '—');
+  $('#sNext').textContent = s.waiting_seconds ? human(s.waiting_seconds)
+    : (s.current && s.current.key ? 'now' : '—');
+
+  /* the spectrum bar doubles as the progress bar: captured, in flight,
+     retrying, and gone — each a channel colour, so the mix is readable
+     at a glance without a legend. */
+  const seg = $('#spectrum').children, T = Math.max(total, 1);
+  const w = n => (100 * n / T).toFixed(3) + '%';
+  seg[0].style.width = w(done);
+  seg[1].style.width = w(c.fetching || 0);
+  seg[2].style.width = w(c.failed || 0);
+  seg[3].style.width = w(c.unavailable || 0);
+
+  $('#stats').innerHTML = [
+    ['focus', total, 'in ledger'],
+    ['good', done, 'captured'],
+    ['', c.queued || 0, 'waiting'],
+    ['warn', c.failed || 0, 'will retry'],
+    ['bad', c.unavailable || 0, 'gone'],
+    ['', s.per_hour ?? 0, 'per hour'],
+  ].map(([k, n, l]) =>
+    `<div class="stat ${k}"><div class="n">${num(n)}</div><div class="k">${l}</div></div>`
+  ).join('');
+
+  const cur = s.current || {}, ses = s.session || {}, pc = s.pacer || {};
+  const pct = cur.total ? Math.round(100 * (cur.sent || 0) / cur.total) : 0;
+  $('#now').innerHTML = [
+    ['focus', cur.key ? esc(cur.key) : '—', cur.phase || 'idle'],
+    ['', cur.phase === 'uploading' ? pct + '%' : (cur.bytes ? mb(cur.bytes) : '—'),
+      cur.phase === 'uploading' ? 'uploaded' : 'downloaded'],
+    ['good', num(ses.captured), 'this session'],
+    ['warn', num(ses.failed), 'failed this session'],
+    ['', human(ses.elapsed || 0), 'session length'],
+    [pc.backoff > 1 ? 'warn' : '', (pc.requests_per_minute ?? '—') + '/min',
+      pc.backoff > 1 ? 'backed off ' + pc.backoff + '×' : 'request rate'],
+  ].map(([k, n, l]) =>
+    `<div class="stat ${k}"><div class="n">${n}</div><div class="k">${l}</div></div>`
+  ).join('');
+
+  if(st !== lastState){
+    lastState = st;
+    $('#bStart').disabled = (st === 'running');
+    $('#bPause').disabled = (st !== 'running');
+    $('#bResume').disabled = (st !== 'paused');
+    $('#bStop').disabled = (st === 'idle' || st === 'error');
+  }
+
+  const t = s.task || {};
+  if(t.running) say('#rCheck', t.message || 'working…', 'busy');
+}
+
+async function loadLog(){
+  try{
+    const j = await (await fetch('/api/capture/activity?limit=45')).json();
+    if(!j.ok) return;
+    const rows = j.events || [];
+    $('#log').innerHTML = rows.length ? rows.map(e => {
+      const t = new Date((e.at || 0) * 1000).toTimeString().slice(0, 8);
+      return `<div class="ln"><span class="t">${t}</span>`
+        + `<span class="k ${esc(e.kind)}">${esc(e.kind)}</span>`
+        + `<span class="m">${esc(e.key ? e.key + ' · ' : '')}${esc(e.text || '')}</span></div>`;
+    }).join('') : '<div class="skel">no activity yet</div>';
+  }catch(e){}
+}
+
+/* ── setup actions ────────────────────────────────────────────────── */
+$('#bSaveTg').onclick = async () => {
+  const j = await post('/api/capture/config', form({
+    bot_token: $('#botToken').value.trim(),
+    channel_id: $('#channelId').value.trim(),
+    api_id: $('#apiId').value.trim(),
+    api_hash: $('#apiHash').value.trim(),
+  }));
+  if(j.ok){
+    say('#rTg', 'Saved. These stay in memory only — you will paste them again '
+      + 'on a fresh session.', 'ok');
+    // Clear the secrets from the DOM once accepted; there is no reason for
+    // them to sit in a form field for the rest of the week.
+    $('#botToken').value = ''; $('#apiHash').value = '';
+    toast('Telegram settings saved', 'ok');
+  } else say('#rTg', j.error, 'no');
+};
+
+$('#bProbe').onclick = async () => {
+  say('#rTg', 'Testing…', 'busy');
+  const j = await post('/api/capture/preflight');
+  if(!j.ok){ say('#rTg', j.error, 'no'); return; }
+  const tg = (j.checks || []).find(c => c.name === 'Telegram');
+  say('#rTg', tg ? (tg.ok ? '✓ ' : '✗ ') + tg.detail : 'no result', tg && tg.ok ? 'ok' : 'no');
+};
+
+$('#bSaveCk').onclick = async () => {
+  const v = $('#cookies').value;
+  if(!v.trim()){ say('#rCk', 'Paste the cookies file contents first.', 'no'); return; }
+  const j = await post('/api/capture/config', form({cookies_text: v}));
+  if(j.ok){
+    say('#rCk', 'Cookies loaded.', 'ok');
+    $('#cookies').value = '';
+    toast('Cookies loaded', 'ok');
+  } else say('#rCk', j.error, 'no');
+};
+
+$('#bSavePace').onclick = async () => {
+  const j = await post('/api/capture/config', form({
+    target_seconds: $('#target').value,
+    max_attempts: $('#maxAttempts').value,
+    breaks: $('#breaks').checked ? '1' : '0',
+    quiet_hours: $('#quiet').checked ? '1' : '0',
+    gallery_dl: $('#galleryDl').checked ? '1' : '0',
+    skip_collections: $('#skipCols').value,
+  }));
+  if(j.ok){
+    const s = j.settings;
+    say('#rPace', `One reel every ${s.target_seconds}s on average — about `
+      + `${Math.round(86400 / s.target_seconds)} a day.`, 'ok');
+  } else say('#rPace', j.error, 'no');
+};
+
+$('#bImport').onclick = async () => {
+  const f = $('#file').files[0], txt = $('#paste').value;
+  if(!f && !txt.trim()){ say('#rImport', 'Choose a file or paste some links.', 'no'); return; }
+  say('#rImport', 'Reading…', 'busy');
+  const fd = new FormData();
+  if(f) fd.append('file', f);
+  if(txt.trim()) fd.append('text', txt);
+  const j = await post('/api/capture/import', fd);
+  if(j.ok){
+    const cols = Object.entries(j.collections || {})
+      .sort((a, b) => b[1] - a[1]).slice(0, 8)
+      .map(([k, v]) => `${k} (${v})`).join(', ');
+    say('#rImport', `Found ${num(j.found)} links in ${j.format || 'the file'}.\n`
+      + `${num(j.added)} added, ${num(j.duplicate)} already known`
+      + (j.unrecognised ? `, ${num(j.unrecognised)} not recognised` : '') + '.'
+      + (cols ? `\nCollections: ${cols}` : ''), 'ok');
+    $('#paste').value = ''; tick();
+  } else say('#rImport', j.error, 'no');
+};
+
+async function runScan(target){
+  say(target, 'Starting the scan…', 'busy');
+  const j = await post('/api/capture/seed/channel');
+  if(!j.ok){ say(target, j.error, 'no'); return; }
+  const poll = setInterval(async () => {
+    const t = await (await fetch('/api/capture/task')).json();
+    if(t.running){ say(target, t.message, 'busy'); return; }
+    clearInterval(poll);
+    if(t.error){ say(target, t.error, 'no'); return; }
+    const r = t.result || {};
+    say(target, r.skipped
+      ? 'Channel unchanged since the last scan.'
+      : `${num(r.in_channel)} reels in the channel · ${num(r.adopted)} new to `
+        + `the ledger · ${num(r.corrected)} corrected.`, 'ok');
+    tick();
+  }, 1200);
+}
+$('#bScan').onclick = () => runScan('#rCheck');
+$('#bScan2').onclick = () => runScan('#rSeed');
+
+$('#bRescan').onclick = async () => {
+  const j = await post('/api/capture/seed/rescan');
+  say('#rSeed', j.ok ? j.message : j.error, j.ok ? 'ok' : 'no');
+};
+
+$('#bSeedUrls').onclick = async () => {
+  const j = await post('/api/capture/seed/urls', form({text: $('#seedText').value}));
+  if(j.ok){ say('#rSeed', `${num(j.adopted)} marked as already captured.`, 'ok');
+    $('#seedText').value = ''; tick(); }
+  else say('#rSeed', j.error, 'no');
+};
+
+$('#bSnap').onclick = async () => {
+  say('#rLedger', 'Uploading…', 'busy');
+  const j = await post('/api/capture/snapshot');
+  say('#rLedger', j.ok ? j.message : j.error, j.ok ? 'ok' : 'no');
+};
+$('#bRestore').onclick = async () => {
+  if(!confirm('Replace the ledger on this machine with the one pinned in the '
+    + 'channel?\n\nThe current file is kept alongside it as .replaced.')) return;
+  say('#rLedger', 'Downloading…', 'busy');
+  const j = await post('/api/capture/restore');
+  say('#rLedger', j.ok ? `${j.message} ${num((j.counts||{}).uploaded)} captured, `
+    + `${num((j.counts||{}).remaining)} to go.` : j.error, j.ok ? 'ok' : 'no');
+  tick();
+};
+$('#bRetry').onclick = async () => {
+  const j = await post('/api/capture/requeue', form({state: 'failed'}));
+  say('#rLedger', j.ok ? `${num(j.requeued)} put back in the queue.` : j.error,
+      j.ok ? 'ok' : 'no');
+  tick();
+};
+
+/* ── run actions ──────────────────────────────────────────────────── */
+$('#bCheck').onclick = async () => {
+  say('#rCheck', 'Checking…', 'busy');
+  const j = await post('/api/capture/preflight');
+  if(!j.ok){ say('#rCheck', j.error, 'no'); return; }
+  const box = $('#checks'); box.hidden = false;
+  box.innerHTML = (j.checks || []).map(c =>
+    `<div class="chk ${c.ok ? 'ok' : 'no'}"><span class="m">${c.ok ? '✓' : '✗'}</span>`
+    + `<span class="nm">${esc(c.name)}</span><span class="dt">${esc(c.detail)}</span></div>`
+  ).join('');
+  say('#rCheck', j.ready
+    ? `Ready. ${num((j.counts||{}).remaining)} reels to capture — about `
+      + `${j.eta_hours} hours at the current pace.`
+    : `Cannot start yet: ${(j.blocking || []).join(', ')}.`,
+    j.ready ? 'ok' : 'no');
+};
+
+$('#bStart').onclick = async () => {
+  const j = await post('/api/capture/start',
+    form({seed_first: $('#seedFirst').checked ? '1' : '0'}));
+  say('#rRun', j.message || j.error || '', j.ok ? 'ok' : 'no');
+  if(j.ok) toast('Capture started', 'ok'); else toast(j.error || j.message, 'no');
+  tick();
+};
+$('#bPause').onclick  = async () => { await post('/api/capture/pause');  tick(); };
+$('#bResume').onclick = async () => { await post('/api/capture/resume'); tick(); };
+$('#bStop').onclick   = async () => {
+  say('#rRun', 'Stopping — waiting for the current reel to be released…', 'busy');
+  const j = await post('/api/capture/stop');
+  say('#rRun', 'Stopped. Nothing is lost — press Start whenever you like.', 'ok');
+  tick();
+};
+
+/* ── queue tab ────────────────────────────────────────────────────── */
+let qOffset = 0;
+async function loadQueue(){
+  const state = $('#qState').value;
+  const j = await (await fetch(
+    `/api/capture/queue?state=${encodeURIComponent(state)}&limit=50&offset=${qOffset}`)).json();
+  if(!j.ok){ $('#qBody').innerHTML = `<tr><td colspan="6"><div class="skel">${esc(j.error)}</div></td></tr>`; return; }
+  const items = j.items || [];
+  $('#qPage').querySelector('span').textContent =
+    items.length ? `${qOffset + 1}–${qOffset + items.length}` : 'none';
+  $('#bPrev').disabled = qOffset === 0;
+  $('#bNext').disabled = items.length < 50;
+  $('#qBody').innerHTML = items.length ? items.map(i => `
+    <tr>
+      <td><span class="tag ${esc(i.state)}">${esc(i.state)}</span></td>
+      <td class="mono"><a href="${esc(i.url)}" target="_blank" rel="noopener">${esc(i.key)}</a></td>
+      <td>${esc(i.uploader || '—')}</td>
+      <td class="mono">${num(i.views)}</td>
+      <td class="mono">${i.file_size ? mb(i.file_size) : '—'}</td>
+      <td style="color:var(--dim)">${esc((i.last_error || '').slice(0, 90))
+        || (i.msg_id ? 'message ' + i.msg_id : '')}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="6"><div class="skel">nothing here</div></td></tr>';
+
+  const cj = await (await fetch('/api/capture/collections')).json();
+  if(cj.ok){
+    const cols = cj.collections || [];
+    $('#cols').innerHTML = cols.length ? cols.slice(0, 12).map(c =>
+      `<div class="stat"><div class="n">${num(c.done)}<span style="color:var(--dim);font-size:14px">/${num(c.n)}</span></div>`
+      + `<div class="k">${esc(c.name).slice(0, 22)}</div></div>`).join('')
+      : '<div class="stat"><div class="n">—</div><div class="k">no collections yet</div></div>';
+  }
+}
+$('#qState').onchange = () => { qOffset = 0; loadQueue(); };
+$('#bPrev').onclick = () => { qOffset = Math.max(0, qOffset - 50); loadQueue(); };
+$('#bNext').onclick = () => { qOffset += 50; loadQueue(); };
+
+/* ── boot ─────────────────────────────────────────────────────────── */
+tick(); loadLog();
+setInterval(tick, 2000);
+setInterval(loadLog, 6000);
+</script>
+</body>
+</html>

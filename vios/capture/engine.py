@@ -574,6 +574,56 @@ class CaptureEngine:
             led.log("snapshot-failed", str(exc)[:300])
 
     # ── what the admin tab reads ─────────────────────────────────────────
+    @property
+    def telegram(self) -> Telegram | None:
+        """The configured client, or None. Read-only on purpose — callers ask
+        whether it exists, they do not get to swap it mid-run."""
+        return self._tg
+
+    def snapshot_now(self) -> dict:
+        if not self._tg:
+            raise RuntimeError("Set the bot token and channel id first.")
+        self._snapshot(self.ledger, force=True)
+        return {"message": "Ledger uploaded and pinned in the channel."}
+
+    def restore_ledger(self) -> dict:
+        """Pull the pinned ledger out of the channel and put it in place.
+
+        The first thing a fresh Kaggle session does. The existing file is moved
+        aside rather than deleted: restoring the wrong snapshot over a good
+        local ledger would otherwise be an unrecoverable click, and the cost of
+        keeping it is a few megabytes.
+        """
+        from .upload import restore_snapshot
+        if not self._tg:
+            raise RuntimeError("Set the bot token and channel id first.")
+        if self.state in (RUNNING, PAUSED):
+            raise RuntimeError("Stop the run before restoring a ledger over it.")
+        tmp = self.ledger_path + ".incoming"
+        if not restore_snapshot(self._tg, tmp):
+            raise RuntimeError("No pinned ledger found in the channel.")
+        with self._lock:
+            if self._ledger:
+                self._ledger.close()
+                self._ledger = None
+            if os.path.exists(self.ledger_path):
+                os.replace(self.ledger_path, self.ledger_path + ".replaced")
+            # A stale -wal/-shm beside a replaced database is how SQLite ends up
+            # applying one ledger's journal to another one's pages.
+            for side in ("-wal", "-shm"):
+                stale = self.ledger_path + side
+                if os.path.exists(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+            os.replace(tmp, self.ledger_path)
+        counts = self.ledger.counts()
+        self.ledger.log("restore", f"ledger restored from the channel: "
+                                   f"{counts.get('uploaded', 0)} captured")
+        return {"counts": counts,
+                "message": "Ledger restored from the channel."}
+
     def status(self) -> dict:
         led = self.ledger
         counts = led.counts()
