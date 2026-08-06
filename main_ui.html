@@ -128,6 +128,11 @@
         <button class="tab-btn" data-tab="v17_workspace" onclick="switchTab('v17_workspace', this)">🎬 V17 Workspace</button>
         <button class="tab-btn" data-tab="omniscient" onclick="switchTab('omniscient', this)">🔮 Omniscient</button>
         <button class="tab-btn" data-tab="admin" onclick="switchTab('admin', this)">🛡️ Admin</button>
+        <!-- The v2 planes are their own pages, not in-page tabs: each is a long-
+             running engine with its own polling, and mounting them here would
+             keep both alive in the background of every other tab. -->
+        <button class="tab-btn" onclick="location.href='/capture'">⬇️ Capture</button>
+        <button class="tab-btn" onclick="location.href='/process'">⚙️ Process</button>
     </div>
 
     <div id="reels" class="tab-content active">

@@ -36,3 +36,23 @@ opencv-python
 python-multipart
 yt-dlp
 gallery-dl
+
+# ── v2 processing plane (the 30 passes) ──
+# torch, numpy and opencv come with the Kaggle image; pinning them here is how
+# you break CUDA on a machine you cannot ssh into. Everything below is what the
+# image does NOT already carry.
+#
+# A missing package here is not fatal. Preflight imports each pass's modules and
+# reports what is absent; the engine drops those passes from the plan and runs
+# the rest. So a failed install costs you passes, not the session.
+scenedetect                 # shot boundaries — the atomic unit everything else indexes against
+librosa                     # tempo, key, loudness
+soundfile                   # wav io for the audio passes
+yake                        # keyphrases, statistical rather than prompted
+pyannote.audio              # diarisation; also needs an accepted licence + HF token
+insightface                 # faces and framing
+onnxruntime-gpu             # insightface's runtime
+# paddleocr also needs paddlepaddle-gpu, which is a ~700 MB wheel that must match
+# the image's CUDA. If it fails, `ocr` is skipped and `ocr-alt` (Florence-2, pure
+# transformers) still reads the on-screen text. Install it by hand if you want both.
+paddleocr
