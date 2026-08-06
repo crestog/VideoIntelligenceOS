@@ -835,3 +835,161 @@ def hook(job: Job) -> Emission:
     em.notes = {"window": window, "shots": len(opening),
                 "words": len(words), "on_screen": len(written)}
     return em
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# perframe
+# ══════════════════════════════════════════════════════════════════════════
+
+def perframe(job: Job) -> Emission:
+    """Measure every extracted frame, not one per shot.
+
+    The other pixel passes in this module read `job.frames()`, which is the
+    keyframe set: one image per shot, chosen for sharpness. That is the correct
+    input for a shot-level claim and it is a sample. This pass reads the
+    `allframes` manifest instead and measures all of it, so the archive can say
+    what was happening at any moment rather than at forty moments.
+
+    **The output does not go in the claims table, and that is deliberate.** A
+    900-frame reel measured on six metrics is 5,400 claims; across five
+    thousand videos it is twenty-seven million rows carrying numbers nobody
+    queries individually. What people query is the summary — "reels that get
+    dark in the last third", "shots with a freeze frame" — and what people plot
+    is the whole curve at once. So the per-frame numbers are written as
+    columnar arrays in `perframe.json`, one array per metric indexed by frame,
+    which is both two orders of magnitude smaller than a row per frame and the
+    shape a plot actually wants. Only the summary lands as claims.
+
+    `phash` earns its place by answering a question nothing else here can: a
+    run of identical hashes is a freeze frame, and a freeze frame is the
+    difference between a video that ended and a video that broke. It also makes
+    near-duplicate reels findable across the archive without a model.
+    """
+    import cv2  # noqa: PLC0415
+    np = _np()
+
+    mpath = job.path("allframes/manifest.json")
+    if not os.path.exists(mpath):
+        raise SkipPass("no allframes manifest — run the allframes pass first")
+    with open(mpath, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+
+    entries = manifest.get("frames") or []
+    if not entries:
+        raise SkipPass("allframes manifest is empty")
+
+    root = job.path("allframes")
+    cols = {k: [] for k in ("t", "brightness", "contrast", "saturation",
+                            "temperature", "sharpness", "motion")}
+    hashes, black, unreadable = [], 0, 0
+    prev_small = None
+
+    for n, e in enumerate(entries):
+        if n % 200 == 0:
+            job.heartbeat(f"frame {n}/{len(entries)}")
+        img = cv2.imread(os.path.join(root, e["file"]))
+        if img is None:
+            unreadable += 1
+            continue
+
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        v = hsv[:, :, 2].astype(np.float32) / 255.0
+        s = hsv[:, :, 1].astype(np.float32) / 255.0
+        b, g, r = (img[:, :, i].astype(np.float32).mean() for i in range(3))
+        grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        bright = float(v.mean())
+        if bright < 0.02:
+            black += 1
+
+        # Motion as mean absolute difference against the previous frame, on a
+        # 64x64 reduction. At full size this is the single most expensive line
+        # in the pass and the extra pixels change the number in the third
+        # decimal — the curve is what matters, not its precision.
+        small = cv2.resize(grey, (64, 64), interpolation=cv2.INTER_AREA)
+        if prev_small is None:
+            motion_v = 0.0
+        else:
+            motion_v = float(np.abs(small.astype(np.float32)
+                                    - prev_small.astype(np.float32)).mean() / 255.0)
+        prev_small = small
+
+        cols["t"].append(e["t"])
+        cols["brightness"].append(round(bright, 4))
+        cols["contrast"].append(round(float(v.std()), 4))
+        cols["saturation"].append(round(float(s.mean()), 4))
+        cols["temperature"].append(round(float((r - b) / 255.0), 4))
+        cols["sharpness"].append(round(float(cv2.Laplacian(grey, cv2.CV_64F).var()), 3))
+        cols["motion"].append(round(motion_v, 5))
+        hashes.append(_phash(grey, cv2, np))
+
+    measured = len(cols["t"])
+    if not measured:
+        raise SkipPass("no readable frames in the allframes set")
+
+    # Freeze runs: consecutive frames whose hash is identical. One repeat is a
+    # static shot, which is ordinary; a run past a second is a stall.
+    freezes, run_start, longest = [], 0, 0
+    for i in range(1, len(hashes)):
+        if hashes[i] != hashes[i - 1]:
+            span = i - run_start
+            if span > 1:
+                secs = cols["t"][i - 1] - cols["t"][run_start]
+                if secs >= 1.0:
+                    freezes.append({"from": cols["t"][run_start],
+                                    "to": cols["t"][i - 1],
+                                    "seconds": round(secs, 3),
+                                    "frames": span})
+                longest = max(longest, span)
+            run_start = i
+
+    with open(job.path("allframes/perframe.json"), "w", encoding="utf-8") as fh:
+        json.dump({"count": measured, "columns": cols, "phash": hashes,
+                   "freezes": freezes}, fh, separators=(",", ":"))
+
+    em = Emission()
+    em.artifact("perframe", job.path("allframes/perframe.json"),
+                {"frames": measured, "metrics": len(cols) - 1})
+
+    for name in ("brightness", "contrast", "saturation", "temperature",
+                 "sharpness", "motion"):
+        vals = cols[name]
+        em.claim("style", f"{name}_mean", num=round(sum(vals) / len(vals), 4))
+        em.claim("style", f"{name}_min", num=round(min(vals), 4))
+        em.claim("style", f"{name}_max", num=round(max(vals), 4))
+
+    em.claim("style", "black_frames", num=black)
+    em.claim("style", "freeze_spans", num=len(freezes))
+    if freezes:
+        em.claim("style", "longest_freeze",
+                 num=round(max(f["seconds"] for f in freezes), 3))
+    em.claim("style", "unique_frames",
+             num=round(len(set(hashes)) / len(hashes), 4))
+
+    em.notes = {
+        "measured": measured,
+        "of": len(entries),
+        "unreadable": unreadable,
+        "complete": measured == len(entries),
+        "black_frames": black,
+        "freeze_spans": len(freezes),
+        "distinct_ratio": round(len(set(hashes)) / len(hashes), 4),
+    }
+    return em
+
+
+def _phash(grey, cv2, np) -> str:
+    """A 64-bit perceptual hash, as 16 hex characters.
+
+    DCT of a 32x32 reduction, low-frequency 8x8 block, thresholded at its own
+    median with the DC term excluded — the DC term is overall brightness, and
+    leaving it in makes every hash track exposure instead of content.
+    """
+    small = cv2.resize(grey, (32, 32), interpolation=cv2.INTER_AREA)
+    d = cv2.dct(small.astype(np.float32))[:8, :8].flatten()
+    med = np.median(d[1:])
+    bits = 0
+    for i, val in enumerate(d):
+        if val > med:
+            bits |= (1 << i)
+    return f"{bits:016x}"

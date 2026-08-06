@@ -226,6 +226,31 @@ _SIGNAL = [
         kinds=("asl", "cut_rate", "rhythm", "acceleration"),
     ),
     Component(
+        id="perframe", title="Per-frame measurement", stage=STAGE_SIGNAL,
+        family="signal", channel="style",
+        summary="Brightness, contrast, saturation, sharpness, motion and a "
+                "perceptual hash for every frame in the video.",
+        detail=(
+            "The other pixel passes read the keyframe set, one image per shot. "
+            "This one reads the complete frame set the allframes pass wrote "
+            "and measures all of it, so the archive can answer what was "
+            "happening at any moment rather than at forty moments. The "
+            "per-frame numbers are written as columnar arrays in "
+            "perframe.json rather than as claims: a 900-frame reel on six "
+            "metrics is 5,400 rows, and across the archive that is "
+            "twenty-seven million rows nobody queries one at a time. Only the "
+            "summary becomes claims. The perceptual hash earns its place by "
+            "finding freeze frames - a run of identical hashes is the "
+            "difference between a video that ended and one that broke - and "
+            "by making near-duplicate reels findable without a model."),
+        seconds=6.0, ram_mb=1024, needs=("allframes",),
+        requires=("cv2", "numpy"),
+        kinds=("brightness_mean", "brightness_min", "brightness_max",
+               "contrast_mean", "saturation_mean", "temperature_mean",
+               "sharpness_mean", "motion_mean", "black_frames",
+               "freeze_spans", "longest_freeze", "unique_frames"),
+    ),
+    Component(
         id="colour", title="Colour", stage=STAGE_SIGNAL, family="signal",
         channel="style",
         summary="Per-shot palette in CIELAB, brightness, contrast, saturation.",

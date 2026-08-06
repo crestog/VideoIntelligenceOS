@@ -35,6 +35,7 @@ RUNNERS: dict = {
     "motion":         ("signal", "motion"),
     "loudness":       ("signal", "loudness"),
     "music":          ("signal", "music"),
+    "perframe":       ("signal", "perframe"),
 
     # stage 2 — perception
     "transcribe":     ("audio", "transcribe"),
