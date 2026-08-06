@@ -26,6 +26,7 @@ RUNNERS: dict = {
     "artifacts":      ("structure", "artifacts"),
     "shots":          ("structure", "shots"),
     "keyframes":      ("structure", "keyframes"),
+    "allframes":      ("structure", "allframes"),
 
     # stage 1 — signal: arithmetic, no model
     "caption":        ("signal", "caption"),

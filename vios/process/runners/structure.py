@@ -1,7 +1,7 @@
 """
-vios.process.runners.structure — probe, artifacts, shots, keyframes.
+vios.process.runners.structure — probe, artifacts, shots, keyframes, allframes.
 
-The four passes that turn a file into something the rest of the pipeline can
+The five passes that turn a file into something the rest of the pipeline can
 address. None of them produces an opinion; all of them produce geometry. If
 these are wrong every claim downstream inherits the error, which is why the
 shot detector gets two algorithms and the keyframe picker gets a sharpness
@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 
+from .. import frames as frames_module
 from .. import media
 from .base import Emission, Job, SkipPass
 
@@ -308,4 +309,73 @@ def keyframes(job: Job) -> Emission:
 
     em.artifact("frames", outdir, {"count": len(index)})
     em.notes = {"frames": len(index), "shots": len(rows)}
+    return em
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# allframes
+# ══════════════════════════════════════════════════════════════════════════
+
+def allframes(job: Job) -> Emission:
+    """Every frame of the video, dated from the stream, with the proof beside it.
+
+    Distinct from `keyframes`, which picks one frame per shot for the passes
+    that read a handful of images. This writes the complete set, and the two
+    coexist deliberately: a shot-level summary wants a representative frame, and
+    a claim to have seen the whole video wants all of them.
+
+    The pass does not fail when coverage is incomplete, and that is on purpose.
+    A reel with a genuine hole in it — dropped frames from a bad upload, an
+    encoder that gave up — is still a reel worth analysing, and raising here
+    would send it round the retry ladder for a defect no retry can repair. The
+    verdict is recorded, surfaced in the notes, and left for a person to read.
+    What *does* fail is producing no frames at all, which means the stream was
+    never readable and the video row is wrong.
+
+    Reads `job.source`, not `job.media`. Every other vision pass prefers the
+    480p proxy and is right to, but the proxy is a re-encode written at a
+    constant rate: its frames have already been resampled, so extracting from
+    it would produce a frame set whose count and timestamps describe the proxy
+    rather than the video. The one pass that certifies completeness has to read
+    the file the claim is about.
+    """
+    outdir = os.path.join(job.workdir, "allframes")
+    p = job.params
+    job.heartbeat("extracting every frame")
+
+    manifest, verdict = frames_module.extract_and_verify(
+        job.source, outdir,
+        analysis_width=int(p.get("analysis_width", 384)),
+        full=bool(p.get("full_tier", False)),
+        full_width=int(p.get("full_width", 0)))
+
+    rate = manifest["rates"]
+    if job.log:
+        for line in frames_module.report(verdict,
+                                         os.path.basename(job.source)).splitlines():
+            job.log(line)
+
+    em = Emission()
+    em.artifact("allframes", outdir, {
+        "count": manifest["count"],
+        "complete": verdict["complete"],
+        "analysis_width": manifest["analysis_width"],
+        "bytes": verdict.get("bytes", {}),
+    })
+    em.notes = {
+        "frames": manifest["count"],
+        "fps": rate["fps"],
+        "vfps": rate["vfps"],
+        "variable_rate": rate["variable"],
+        "duration": rate["duration"],
+        "complete": verdict["complete"],
+        "coverage": verdict["checks"]["coverage"]["detail"],
+        "count_check": verdict["checks"]["count"]["detail"],
+        "timing_check": verdict["checks"]["timing"]["detail"],
+    }
+    if not verdict["complete"]:
+        failed = [k for k, c in verdict["checks"].items() if not c["ok"]]
+        em.notes["incomplete"] = ", ".join(failed)
+        job.note(f"frame coverage incomplete ({', '.join(failed)}) "
+                 f"— see allframes/coverage.json")
     return em

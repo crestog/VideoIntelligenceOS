@@ -171,6 +171,27 @@ _STRUCTURE = [
         needs=("shots",), produces=("artifacts",), seconds=3.0, ram_mb=1024,
         requires=("cv2",), params={"candidates_per_shot": 5},
     ),
+    Component(
+        id="allframes", title="All frames", stage=STAGE_STRUCTURE, family="ffmpeg",
+        summary="Every frame of the video, with a per-frame timestamp and a "
+                "coverage proof.",
+        detail=(
+            "Not a sample. One ffmpeg pass with -fps_mode passthrough writes "
+            "exactly the frames the file contains — the default mode "
+            "manufactures duplicates to force a constant rate, and on a "
+            "110-frame test file it emitted 150, forty of them invented. Each "
+            "frame is dated by the presentation timestamp read out of the "
+            "stream rather than by index/fps, which drifts seconds off on the "
+            "variable-rate video that most reels are. A coverage.json is "
+            "written beside the frames recording four independent checks: "
+            "every file present, the count against the stream's own "
+            "declaration, every timestamp read rather than interpolated, and "
+            "every wall-clock second holding at least one frame. That last "
+            "check is the one a frame count cannot substitute for."),
+        needs=("probe",), produces=("artifacts",), seconds=30.0, ram_mb=1024,
+        requires=("subprocess",),
+        params={"analysis_width": 384, "full_tier": False, "full_width": 0},
+    ),
 ]
 
 # ══════════════════════════════════════════════════════════════════════════
