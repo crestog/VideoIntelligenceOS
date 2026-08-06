@@ -156,11 +156,15 @@ class ProcessEngine:
         self.disk_floor_mb = DISK_FLOOR_MB
         self.video_limit = 0            # 0 = the whole partition
 
-        # ── runtime-only credentials ─────────────────────────────────────
+        # ── credentials ──────────────────────────────────────────────────
+        # Never written by this class. Read once at construction from Kaggle
+        # Secrets / the environment / the laptop file, so a session that has
+        # them stored is configured before the Setup page is ever opened.
         self._tg: Telegram | None = None
         self._api_id = 0
         self._api_hash = ""
         self._hf_token = ""
+        self.cred_sources: dict = {}
 
         # ── live state ───────────────────────────────────────────────────
         self.resources: dict = {}
@@ -186,6 +190,35 @@ class ProcessEngine:
 
         self._activity: deque = deque(maxlen=500)
         self._status_cache: tuple = (0.0, {})
+        self._adopt_stored_credentials()
+
+    def _adopt_stored_credentials(self) -> None:
+        """Configure from the stored credentials, if there are any.
+
+        Silent on failure: a broken secret store must not stop the tab from
+        loading, since the tab is where it would be fixed.
+        """
+        try:
+            from vios.creds import resolve  # noqa: PLC0415
+            got = resolve()
+        except Exception:
+            return
+        v = got.get("values") or {}
+        if not v:
+            return
+        self.cred_sources = got.get("sources") or {}
+        try:
+            self.configure(
+                bot_token=v.get("bot_token", ""),
+                channel_id=v.get("channel_id") or None,
+                api_id=int(v.get("api_id") or 0),
+                api_hash=v.get("api_hash", ""),
+                hf_token=v.get("hf_token", ""))
+            if self.cred_sources:
+                where = sorted(set(self.cred_sources.values()))
+                self._log(f"credentials loaded from {', '.join(where)}")
+        except Exception:
+            self.cred_sources = {}
 
     # ══════════════════════════════════════════════════════════════════════
     # Resources this engine owns
@@ -290,12 +323,19 @@ class ProcessEngine:
         """Everything the form needs to redraw itself. No secrets leave here —
         a token's presence is a boolean, which is all the interface has ever
         needed to know."""
+        try:
+            from vios.creds import describe  # noqa: PLC0415
+            stored = describe()
+        except Exception:
+            stored = {}
         return {
             "bot_token_set": bool(self._tg and self._tg.token),
             "api_id_set": bool(self._api_id),
             "api_hash_set": bool(self._api_hash),
             "hf_token_set": bool(self._hf_token),
             "channel_id": (self._tg.channel if self._tg else None),
+            "credential_sources": dict(self.cred_sources),
+            "stored_credentials": stored,
             "components": list(self.selected),
             "partitions": self.partitions,
             "index": self.index,
@@ -652,6 +692,11 @@ class ProcessEngine:
                 self._log(f"Reclaimed {reclaimed} stale leases from a session "
                           f"that did not shut down")
 
+            revived = cov.revive_failed()
+            if revived["revived"]:
+                self._log(f"Auto-revived {revived['revived']} failed rows "
+                          f"(exhausted: {revived['exhausted']})")
+
             budget = max(res.get("usable_vram_mb", 0) - self.vram_headroom_mb,
                          512)
             cohorts = registry.plan_cohorts(
@@ -673,11 +718,32 @@ class ProcessEngine:
             if self._stopping():
                 break
             if worked == 0:
+                deferred = cov.deferred()
+                if deferred["rows"] and self.follow:
+                    due = deferred["due_at"]
+                    wait = max(int(due - time.time()), 60) if due else IDLE_POLL_SECONDS
+                    with self._lock:
+                        self.message = (f"{deferred['rows']} rows in backoff — "
+                                        f"next batch due in {wait}s.")
+                    self._log(f"{deferred['rows']} rows deferred, "
+                              f"checking back in {wait}s")
+                    self._sleep(wait)
+                    if self.sync_on_start:
+                        intake.sync(store, self.ledger_path)
+                    continue
+
                 if not self.follow:
                     with self._lock:
-                        self.message = ("Sweep complete — every selected pass "
-                                        "has run on every video in this slice.")
-                    self._log("Sweep complete")
+                        self.message = (
+                            "Sweep complete — every selected pass has run on "
+                            "every video in this slice."
+                            if not deferred["rows"] else
+                            f"Sweep complete for now — {deferred['rows']} rows "
+                            f"are in a retry backoff and will be picked up by "
+                            f"the next run.")
+                    self._log("Sweep complete"
+                              + (f"; {deferred['rows']} rows deferred to a "
+                                 f"later run" if deferred["rows"] else ""))
                     return
                 with self._lock:
                     self.message = ("Caught up. Watching for new captures — "
@@ -1094,12 +1160,14 @@ class ProcessEngine:
             counts = self.coverage.counts()
             failures = self.coverage.failures(12)
             running = self.coverage.running()
+            retry = self.coverage.retry_state()
             shards = self.store.shards()
             pending = max(self.store.max_claim_id() -
                           int(self.store.get_meta("shard_lo_id", "0") or 0), 0)
         except Exception as exc:
             stats, matrix, counts, failures, running, shards = (
                 {}, [], {}, [], [], [])
+            retry = {}
             self._log(f"status: {type(exc).__name__}: {exc}", "warn")
 
         by_id = {m["component"]: m for m in matrix}
@@ -1129,6 +1197,7 @@ class ProcessEngine:
             "counts": counts,
             "failures": failures,
             "running": running,
+            "retry": retry,
             "store": stats,
             "shards": {"count": len(shards),
                        "last": shards[-1] if shards else None,

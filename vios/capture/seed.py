@@ -160,10 +160,15 @@ def scan_channel(tg, api_id: int, api_hash: str, head: int = 0,
     try:
         import asyncio
         from pyrogram import Client
+        from vios.tgcompat import patch as _tgpatch
     except ImportError:
         raise RuntimeError(
             "pyrogram is not installed, so the channel cannot be scanned. "
             "Seed from a URL list instead, or install pyrogram.")
+    # Before any call names the channel: pyrogram's chat id floor predates
+    # Telegram's current id range, and a channel made this year is *below* it.
+    # Without this the scan dies on `Peer id invalid` at the first batch.
+    _tgpatch()
     if not (api_id and api_hash):
         raise RuntimeError(
             "Reading channel history needs an API id and API hash. Add them "

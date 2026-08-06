@@ -362,9 +362,11 @@ class Telegram:
         try:
             import asyncio
             from pyrogram import Client
+            from vios.tgcompat import patch as _tgpatch
         except ImportError:
             raise UploadError("pyrogram is not installed; cannot upload a file "
                               "over 50 MB.")
+        _tgpatch()   # see vios/tgcompat.py — modern channel ids, old library
 
         async def _go():
             app = Client("vios_capture_big", api_id=self.api_id,

@@ -51,6 +51,24 @@ LEASE_SECONDS = 40 * 60
 # hours that other videos would use better.
 MAX_ATTEMPTS = 3
 
+# How long a row waits after its Nth failed attempt before it may be claimed
+# again. Three attempts back to back are not three chances: a pass that fails in
+# two seconds — a missing package, a peer id the library rejects before it ever
+# reaches the network — burns all three inside ten seconds and retires, and the
+# operator is left pressing Requeue for a condition that would have cleared on
+# its own. Spacing the attempts is what makes them independent.
+RETRY_BACKOFF = (10 * 60, 45 * 60)      # after attempt 1, after attempt 2
+
+# A row that has burned its attempts is not given up on; it is set aside and
+# tried again later, up to this many times. This is the automatic form of the
+# Requeue button: same effect, on a schedule, bounded so a genuinely broken
+# video cannot consume the queue forever. Six revivals at four hours covers a
+# full day of Kaggle sessions, which is long enough for "the model download was
+# rate-limited" or "Telegram was refusing connections" to have stopped being
+# true, and short enough that the work resumes without anyone watching.
+REVIVE_AFTER = 4 * 3600
+MAX_REVIVALS = 6
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS coverage (
     video_key   TEXT NOT NULL,
@@ -60,6 +78,8 @@ CREATE TABLE IF NOT EXISTS coverage (
     worker      TEXT,
     token       TEXT,           -- identifies one claim() call, exactly
     lease_until REAL DEFAULT 0,
+    next_try_at REAL DEFAULT 0, -- backoff: not claimable before this moment
+    revivals    INTEGER DEFAULT 0,  -- automatic requeues already spent
     started_at  REAL,
     done_at     REAL,
     seconds     REAL,          -- how long it actually took, for the ETA
@@ -70,10 +90,27 @@ CREATE TABLE IF NOT EXISTS coverage (
     checkpoint  TEXT,          -- JSON: how far a long job got
     PRIMARY KEY (video_key, component)
 );
+"""
+
+# Created after the migration, never with the table: an index over `next_try_at`
+# cannot be built on a database whose `coverage` predates that column, and
+# `CREATE TABLE IF NOT EXISTS` is a silent no-op there rather than an error. The
+# ordering — table, then columns, then indexes — is what makes an old database
+# open instead of raising "no such column" on the first line of the schema.
+INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_cov_claim ON coverage(component, state, lease_until);
 CREATE INDEX IF NOT EXISTS ix_cov_state ON coverage(state, component);
 CREATE INDEX IF NOT EXISTS ix_cov_token ON coverage(token);
+CREATE INDEX IF NOT EXISTS ix_cov_retry ON coverage(state, next_try_at);
 """
+
+# Columns added after the first release. A database written by an earlier build
+# is opened, not discarded — it holds the coverage of every video processed so
+# far, and re-earning that would cost the GPU hours it originally took.
+MIGRATIONS = (
+    ("next_try_at", "REAL DEFAULT 0"),
+    ("revivals", "INTEGER DEFAULT 0"),
+)
 
 
 def worker_id() -> str:
@@ -103,7 +140,25 @@ class Coverage:
         self.index = index
         self.worker = worker or worker_id()
         self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.conn.executescript(INDEXES)
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release.
+
+        A database written by an earlier build of the processing engine is
+        opened, not discarded — it holds the coverage of every video processed
+        so far, and re-earning that would cost the GPU hours it originally took.
+        Adding a column to an existing table is safe and instant; SQLite makes
+        the new column `NULL` in every existing row (or the specified DEFAULT),
+        and writes the new shape to every row inserted from here on.
+        """
+        cur = self.conn.execute("PRAGMA table_info(coverage)")
+        have = {r["name"] for r in cur.fetchall()}
+        for name, spec in MIGRATIONS:
+            if name not in have:
+                self.conn.execute(f"ALTER TABLE coverage ADD COLUMN {name} {spec}")
 
     # ── filling the table ───────────────────────────────────────────────
     def plan(self, components: list, video_keys: list | None = None) -> int:
@@ -151,6 +206,11 @@ class Coverage:
         ~16 ms resolution, so two claims in the same tick get an identical
         `started_at`. Measured: the second claim re-reported all four rows from
         the first, which would have processed every one of them twice.
+
+        Respects `next_try_at`: a failed row with a future `next_try_at` is not
+        claimable until that time arrives — the automatic backoff that answers
+        "every failed pass sat behind a manual Requeue button when they want
+        automatic retry". A `queued` row is always claimable immediately.
         """
         now = time.time()
         token = uuid.uuid4().hex
@@ -159,13 +219,13 @@ class Coverage:
             "started_at=?, attempts=attempts+1 "
             "WHERE rowid IN (SELECT rowid FROM coverage "
             "  WHERE component=? AND ("
-            "     state=? OR (state=? AND lease_until < ?) "
-            "     OR (state=? AND attempts < ?)) "
+            "     (state=? AND next_try_at <= ?) OR (state=? AND lease_until < ?) "
+            "     OR (state=? AND attempts < ? AND next_try_at <= ?)) "
             + self._mine() +
             "  ORDER BY attempts, video_key LIMIT ?)")
         self.conn.execute(sql, (
             RUNNING, self.worker, token, now + LEASE_SECONDS, now,
-            component, QUEUED, RUNNING, now, FAILED, MAX_ATTEMPTS, n))
+            component, QUEUED, now, RUNNING, now, FAILED, MAX_ATTEMPTS, now, n))
         self.conn.commit()
         return [r["video_key"] for r in self.conn.execute(
             "SELECT video_key FROM coverage WHERE token=? ORDER BY video_key",
@@ -183,6 +243,9 @@ class Coverage:
 
         This claims nothing. It is the cheap read that tells the loop which
         video to pick up next; `claim_for` is what takes ownership.
+
+        Respects `next_try_at`: a failed row with a future `next_try_at` is not
+        a candidate until that time arrives.
         """
         if not components:
             return []
@@ -191,12 +254,12 @@ class Coverage:
         sql = (
             "SELECT video_key, MIN(attempts) AS a FROM coverage "
             f"WHERE component IN ({marks}) AND ("
-            "   state=? OR (state=? AND lease_until < ?) "
-            "   OR (state=? AND attempts < ?))"
+            "   (state=? AND next_try_at <= ?) OR (state=? AND lease_until < ?) "
+            "   OR (state=? AND attempts < ? AND next_try_at <= ?))"
             + self._mine() +
             " GROUP BY video_key ORDER BY a, video_key LIMIT ?")
-        args = list(components) + [QUEUED, RUNNING, now, FAILED,
-                                   MAX_ATTEMPTS, int(limit)]
+        args = list(components) + [QUEUED, now, RUNNING, now, FAILED,
+                                   MAX_ATTEMPTS, now, int(limit)]
         return [r["video_key"] for r in self.conn.execute(sql, args)]
 
     def claim_for(self, video_key: str, components: list) -> list:
@@ -210,6 +273,9 @@ class Coverage:
         Returns the components actually taken — never assume it is everything
         asked for, since another worker's lapsed lease may have been renewed
         between `candidates` and here.
+
+        Respects `next_try_at`: a failed row with a future `next_try_at` is not
+        claimable until that time arrives.
         """
         if not components:
             return []
@@ -221,12 +287,12 @@ class Coverage:
             "started_at=?, attempts=attempts+1 "
             "WHERE rowid IN (SELECT rowid FROM coverage "
             f"  WHERE video_key=? AND component IN ({marks}) AND ("
-            "     state=? OR (state=? AND lease_until < ?) "
-            "     OR (state=? AND attempts < ?))"
+            "     (state=? AND next_try_at <= ?) OR (state=? AND lease_until < ?) "
+            "     OR (state=? AND attempts < ? AND next_try_at <= ?))"
             + self._mine() + ")")
         args = ([RUNNING, self.worker, token, now + LEASE_SECONDS, now,
                  video_key] + list(components) +
-                [QUEUED, RUNNING, now, FAILED, MAX_ATTEMPTS])
+                [QUEUED, now, RUNNING, now, FAILED, MAX_ATTEMPTS, now])
         self.conn.execute(sql, args)
         self.conn.commit()
         return [r["component"] for r in self.conn.execute(
@@ -267,21 +333,33 @@ class Coverage:
     def fail(self, video_key: str, component: str, error: str) -> str:
         """Record a failure. Returns the resulting state.
 
-        A row that has burned its attempts stays `failed` and stops being
-        claimed — but it is never deleted, because "this component cannot handle
-        this video" is itself a finding, and the failures panel groups them so a
-        pattern is visible. Ten OOMs on the ten longest reels is a configuration
-        problem, not ten unrelated accidents.
+        A row that has burned its attempts is not given up on; it is set aside
+        and tried again later. The backoff and revival together answer "every
+        failed pass sat behind a manual Requeue button when they want automatic
+        retry". A transient issue — missing dependency, rate-limited model
+        download, Telegram refusing connections — clears on its own without the
+        operator watching.
         """
         row = self.conn.execute(
             "SELECT attempts FROM coverage WHERE video_key=? AND component=?",
             (video_key, component)).fetchone()
         attempts = row["attempts"] if row else MAX_ATTEMPTS
         state = FAILED if attempts >= MAX_ATTEMPTS else QUEUED
+
+        # Backoff between attempts: try → wait 10 min → try → wait 45 min → try
+        if state == QUEUED and attempts > 0:
+            delay = RETRY_BACKOFF[min(attempts - 1, len(RETRY_BACKOFF) - 1)]
+            next_try = time.time() + delay
+        # Terminal failure: wait REVIVE_AFTER before a revival requeues it
+        elif state == FAILED:
+            next_try = time.time() + REVIVE_AFTER
+        else:
+            next_try = 0
+
         self.conn.execute(
             "UPDATE coverage SET state=?, last_error=?, lease_until=0, "
-            "worker=NULL, token=NULL WHERE video_key=? AND component=?",
-            (state, str(error)[:800], video_key, component))
+            "next_try_at=?, worker=NULL, token=NULL WHERE video_key=? AND component=?",
+            (state, str(error)[:800], next_try, video_key, component))
         self.conn.commit()
         return state
 
@@ -300,10 +378,25 @@ class Coverage:
         now = time.time()
         return self.conn.execute(
             "SELECT COUNT(*) FROM coverage WHERE component=? AND ("
-            "state=? OR (state=? AND lease_until < ?) OR "
-            "(state=? AND attempts < ?))" + self._mine(),
-            (component, QUEUED, RUNNING, now, FAILED, MAX_ATTEMPTS)
+            "(state=? AND next_try_at <= ?) OR (state=? AND lease_until < ?) OR "
+            "(state=? AND attempts < ? AND next_try_at <= ?))" + self._mine(),
+            (component, QUEUED, now, RUNNING, now, FAILED, MAX_ATTEMPTS, now)
         ).fetchone()[0]
+
+    def deferred(self) -> dict:
+        """Work that exists but is waiting on a clock, and when it is due.
+
+        Without this the sweep would look at "nothing claimable right now" and
+        announce that it had finished, when what is true is that everything left
+        is in a backoff window. Returns {"rows": n, "due_at": epoch|0}.
+        """
+        now = time.time()
+        row = self.conn.execute(
+            "SELECT COUNT(*) n, MIN(next_try_at) due FROM coverage "
+            "WHERE next_try_at > ? AND ("
+            "  state=? OR (state=? AND revivals < ?))" + self._mine(),
+            (now, QUEUED, FAILED, MAX_REVIVALS)).fetchone()
+        return {"rows": row["n"] or 0, "due_at": row["due"] or 0.0}
 
     def counts(self, component: str = "") -> dict:
         sql = "SELECT state, COUNT(*) n FROM coverage"
@@ -358,11 +451,58 @@ class Coverage:
             "SELECT * FROM coverage WHERE state=? ORDER BY started_at", (RUNNING,))]
 
     def failures(self, limit: int = 100) -> list:
-        return [dict(r) for r in self.conn.execute(
-            "SELECT component, last_error, COUNT(*) n, "
-            "GROUP_CONCAT(video_key) keys FROM coverage WHERE state=? "
-            "GROUP BY component, SUBSTR(last_error,1,80) "
-            "ORDER BY n DESC LIMIT ?", (FAILED, limit))]
+        """Failures grouped by component and message, with their retry standing.
+
+        `retrying` vs `needs_attention` is the distinction that matters to
+        whoever is reading the panel: the first will clear itself and wants no
+        action, the second has spent every automatic retry and is the only kind
+        worth interrupting someone for.
+        """
+        now = time.time()
+        rows = []
+        for r in self.conn.execute(
+                "SELECT component, last_error, COUNT(*) n, "
+                "GROUP_CONCAT(video_key) keys, MIN(next_try_at) due, "
+                "MAX(revivals) revivals, "
+                "SUM(CASE WHEN revivals >= ? THEN 1 ELSE 0 END) stuck "
+                "FROM coverage WHERE state=? "
+                "GROUP BY component, SUBSTR(last_error,1,80) "
+                "ORDER BY n DESC LIMIT ?", (MAX_REVIVALS, FAILED, limit)):
+            e = dict(r)
+            e["needs_attention"] = e.pop("stuck", 0) or 0
+            e["retrying"] = e["n"] - e["needs_attention"]
+            due = e.pop("due", 0) or 0
+            e["retry_in"] = round(max(due - now, 0)) if due and e["retrying"] else 0
+            rows.append(e)
+        return rows
+
+    def retry_state(self) -> dict:
+        """What the automatic retry is holding, and when it acts next.
+
+        The tab needs this to stop lying in the other direction. Before the
+        backoff existed, a failed row was visibly stuck and the operator knew to
+        press Requeue; now it will clear itself, and a panel that showed only a
+        red count would send them looking for a button they no longer need. So:
+        how many rows are waiting on a clock, when the earliest one is due, and
+        how many have spent every revival and genuinely do need a person.
+        """
+        now = time.time()
+        d = self.deferred()
+        stuck = self.conn.execute(
+            "SELECT COUNT(*) FROM coverage WHERE state=? AND revivals >= ?"
+            + self._mine(), (FAILED, MAX_REVIVALS)).fetchone()[0]
+        revived = self.conn.execute(
+            "SELECT COUNT(*) FROM coverage WHERE revivals > 0" + self._mine()
+        ).fetchone()[0]
+        return {
+            "waiting": d["rows"],
+            "due_at": d["due_at"],
+            "due_in": round(max(d["due_at"] - now, 0)) if d["due_at"] else 0,
+            "needs_attention": stuck,
+            "ever_revived": revived,
+            "max_revivals": MAX_REVIVALS,
+            "max_attempts": MAX_ATTEMPTS,
+        }
 
     def for_video(self, video_key: str) -> list:
         return [dict(r) for r in self.conn.execute(
@@ -377,8 +517,9 @@ class Coverage:
         attempts is the point — leaving them at 3 means the retry is claimed
         once and immediately retired again.
         """
-        sql = ("UPDATE coverage SET state=?, attempts=0, last_error=NULL, "
-               "worker=NULL, token=NULL, lease_until=0 WHERE state=?")
+        sql = ("UPDATE coverage SET state=?, attempts=0, next_try_at=0, "
+               "last_error=NULL, worker=NULL, token=NULL, lease_until=0 "
+               "WHERE state=?")
         args: list = [QUEUED, state]
         if component:
             sql += " AND component=?"
@@ -396,9 +537,10 @@ class Coverage:
         question again.
         """
         cur = self.conn.execute(
-            "UPDATE coverage SET state=?, attempts=0, worker=NULL, token=NULL, "
-            "lease_until=0, done_at=NULL, seconds=NULL, last_error=NULL, "
-            "checkpoint=NULL WHERE component=?", (QUEUED, component))
+            "UPDATE coverage SET state=?, attempts=0, revivals=0, worker=NULL, "
+            "token=NULL, lease_until=0, next_try_at=0, done_at=NULL, seconds=NULL, "
+            "last_error=NULL, checkpoint=NULL WHERE component=?",
+            (QUEUED, component))
         self.conn.commit()
         return max(cur.rowcount, 0)
 
@@ -422,3 +564,33 @@ class Coverage:
             (QUEUED, RUNNING, time.time()))
         self.conn.commit()
         return max(cur.rowcount, 0)
+
+    def revive_failed(self) -> dict:
+        """Requeue rows that ran out of attempts, once their wait has elapsed.
+
+        This is the Requeue button, on a timer. The operator pressing it is
+        saying "the thing that broke this is probably fixed now"; four hours of
+        elapsed time says the same thing with less certainty and no attention,
+        which for a transient fault — a rate-limited model download, a refused
+        Telegram connection, a package that was missing until the next session
+        installed it — is enough.
+
+        Bounded by `MAX_REVIVALS` so a genuinely broken video cannot keep
+        re-entering the queue forever. `last_error` is kept, not overwritten:
+        after six revivals the operator needs to see what it actually said.
+
+        Returns {"revived": n, "exhausted": n}, where `exhausted` is the number
+        of rows that have spent every revival and now really do need a person.
+        """
+        now = time.time()
+        cur = self.conn.execute(
+            "UPDATE coverage SET state=?, attempts=0, next_try_at=0, "
+            "revivals=revivals+1, worker=NULL, token=NULL, lease_until=0 "
+            "WHERE state=? AND next_try_at <= ? AND revivals < ?" + self._mine(),
+            (QUEUED, FAILED, now, MAX_REVIVALS))
+        revived = max(cur.rowcount, 0)
+        self.conn.commit()
+        exhausted = self.conn.execute(
+            "SELECT COUNT(*) FROM coverage WHERE state=? AND revivals >= ?"
+            + self._mine(), (FAILED, MAX_REVIVALS)).fetchone()[0]
+        return {"revived": revived, "exhausted": exhausted}

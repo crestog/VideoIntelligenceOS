@@ -1024,9 +1024,16 @@ $('#bImport').onclick = async () => {
     const cols = Object.entries(j.collections || {})
       .sort((a, b) => b[1] - a[1]).slice(0, 8)
       .map(([k, v]) => `${k} (${v})`).join(', ');
-    say('#rImport', `Found ${num(j.found)} links in ${j.format || 'the file'}.\n`
-      + `${num(j.added)} added, ${num(j.duplicate)} already known`
-      + (j.unrecognised ? `, ${num(j.unrecognised)} not recognised` : '') + '.'
+    // Read as: how many distinct reels the file describes, then what changed.
+    // "already known" counts reels this ledger had before the import, never a
+    // reel's second collection tag — that distinction is the whole point.
+    const bits = [`${num(j.added)} new to the queue`];
+    if(j.duplicate) bits.push(`${num(j.duplicate)} already in the ledger`
+      + (j.captured ? ` (${num(j.captured)} captured)` : ''));
+    if(j.memberships) bits.push(`${num(j.memberships)} collection tags`);
+    if(j.unrecognised) bits.push(`${num(j.unrecognised)} lines not permalinks`);
+    say('#rImport', `${num(j.unique ?? j.found)} distinct reels in `
+      + `${j.format || 'the file'}.\n` + bits.join(', ') + '.'
       + (cols ? `\nCollections: ${cols}` : ''), 'ok');
     $('#paste').value = ''; tick();
   } else say('#rImport', j.error, 'no');

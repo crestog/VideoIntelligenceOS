@@ -56,6 +56,18 @@ SKIPPED = "skipped"           # excluded by category filter
 
 TERMINAL = (UPLOADED, UNAVAILABLE, SKIPPED)
 
+# Retries, and how long a row that has used them up waits before it is tried
+# again anyway. Parking a row for thirty days is indistinguishable from giving
+# up: the reason a fetch fails is usually a condition — expired cookies, a rate
+# limit, a host refusing connections — that stops being true in hours, and a
+# queue that will not look again until next month has, in practice, handed the
+# problem to whoever remembers to press Requeue. Four hours, six times, is a
+# full day of retrying without attention; after that the row is genuinely stuck
+# and the failures panel says so rather than implying a button will fix it.
+CAPTURE_REVIVE_AFTER = 4 * 3600
+CAPTURE_MAX_REVIVALS = 6
+CAPTURE_PARKED = 86400 * 30    # only once every revival is spent
+
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -69,6 +81,7 @@ CREATE TABLE IF NOT EXISTS item (
     position      INTEGER,              -- order within the input, for FIFO
 
     attempts      INTEGER NOT NULL DEFAULT 0,
+    revivals      INTEGER NOT NULL DEFAULT 0,  -- automatic requeues spent
     last_try_at   REAL,
     next_try_at   REAL NOT NULL DEFAULT 0,
     last_error    TEXT,
@@ -165,6 +178,7 @@ class Ledger:
         self.conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         # FULL, not NORMAL: the cost is a few milliseconds per reel on a loop
         # that sleeps two minutes between reels, and the benefit is that a
         # power cut cannot lose the record of an upload that already happened.
@@ -172,6 +186,20 @@ class Ledger:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a ledger was first written.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a new
+        column in `_SCHEMA` never reaches a ledger that predates it. Opening
+        rather than rebuilding matters here more than anywhere else in the
+        system: this table is the record of which reels are already in Telegram,
+        and losing it means re-uploading thousands of files.
+        """
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(item)")}
+        for name, spec in (("revivals", "INTEGER NOT NULL DEFAULT 0"),):
+            if name not in have:
+                self.conn.execute(f"ALTER TABLE item ADD COLUMN {name} {spec}")
 
     # ── plumbing ─────────────────────────────────────────────────────────
     def close(self):
@@ -251,32 +279,131 @@ class Ledger:
 
         One transaction for the whole file — importing 5,000 links one commit
         at a time takes minutes on a spinning ledger and milliseconds here.
+
+        The input is *pairs*, and one reel saved into three collections arrives
+        as three pairs. So the first thing this does is fold the pairs down to
+        one entry per reel carrying a set of collections. Counting the pairs
+        instead is what produced the "6,879 already known" on a brand new
+        ledger: those were not reels anybody had captured, they were the second
+        and third collection membership of reels added moments earlier in the
+        same loop. A count that says "already known" has to mean *the archive
+        already has this*, or it is worse than no count at all.
         """
-        added = dup = bad = 0
-        pos = self._next_position()
-        seen_now = set()
+        folded: dict = {}
+        order: list = []
+        bad = 0
         for url, collection in items:
             can = canonical(url)
             if not can:
                 bad += 1
                 continue
             key = can[0]
-            existed = key in seen_now or self._exists(key)
-            self.add(url, collection, source, position=pos if not existed else None)
-            if existed:
-                dup += 1
-            else:
-                added += 1
+            if key not in folded:
+                folded[key] = (can[1], set())
+                order.append(key)
+            if collection:
+                folded[key][1].add(collection.strip())
+
+        pos = self._next_position()
+        added = known = done = links = 0
+        for key in order:
+            url, cols = folded[key]
+            row = self.conn.execute(
+                "SELECT state FROM item WHERE key=?", (key,)).fetchone()
+            if row is None:
+                self.add(url, None, source, position=pos)
                 pos += 1
-                seen_now.add(key)
+                added += 1
+            else:
+                known += 1
+                if row["state"] in TERMINAL:
+                    done += 1
+            # Memberships are added for new and existing reels alike: finding
+            # out that reel X is also in "recipes" is new information even when
+            # reel X was captured in March.
+            for col in sorted(cols):
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO membership(key,collection) "
+                    "VALUES(?,?)", (key, col))
+                links += cur.rowcount or 0
         self.conn.commit()
-        self.log("import", f"{source}: +{added} new, {dup} already known, "
-                           f"{bad} unrecognised")
-        return {"added": added, "duplicate": dup, "unrecognised": bad}
+        self.log("import",
+                 f"{source}: {len(order)} reels in the file — {added} new to "
+                 f"the queue, {known} already in the ledger ({done} of those "
+                 f"already captured), {links} new collection tags, "
+                 f"{bad} lines that were not permalinks")
+        return {"added": added, "duplicate": known, "captured": done,
+                "unique": len(order), "memberships": links,
+                "unrecognised": bad}
 
     def _exists(self, key: str) -> bool:
         return self.conn.execute(
             "SELECT 1 FROM item WHERE key=?", (key,)).fetchone() is not None
+
+    # ── which channel do these message ids mean? ──────────────────────────
+    def bind_channel(self, channel) -> dict:
+        """Record which channel this ledger's message ids point into.
+
+        A `msg_id` is meaningless on its own: message 38 exists in every
+        channel and is a different message in each. So the first time a channel
+        is configured, the ledger remembers it; from then on, a *different*
+        channel is a fact worth shouting about, because every `uploaded` row
+        now names a message that channel does not have.
+
+        That is the failure the processing plane reported as
+        "could not download the original from Telegram (message 38)". Nothing
+        was wrong with message 38. It was in the previous channel.
+
+        Returns one of three verdicts:
+          {"state": "bound"}    first time, nothing to check against
+          {"state": "same"}     matches — the normal case, every run
+          {"state": "changed"}  with counts, and `stale` rows to be reset
+        """
+        new = str(channel or "").strip()
+        if not new:
+            return {"state": "unset"}
+        old = str(self.get_meta("channel_id", "") or "").strip()
+        if not old:
+            self.set_meta("channel_id", new)
+            self.conn.commit()
+            return {"state": "bound", "channel": new}
+        if old == new:
+            return {"state": "same", "channel": new}
+
+        stale = int(self.conn.execute(
+            "SELECT COUNT(*) AS n FROM item WHERE state=? AND msg_id IS NOT NULL",
+            (UPLOADED,)).fetchone()["n"])
+        return {"state": "changed", "was": old, "now": new, "stale": stale}
+
+    def rebind_channel(self, channel, requeue: bool = True) -> dict:
+        """Point the ledger at a new channel, and deal with the old ids.
+
+        `requeue=True` moves every uploaded row back to the queue with its
+        message ids cleared: the bytes are not in the new channel, so as far as
+        the archive is concerned they were never captured, and the honest thing
+        is to fetch them again. `requeue=False` keeps the rows and only rebinds
+        — correct when the channel was *migrated* (a group upgraded to a
+        supergroup keeps its history under a new id) and the messages really
+        are still there.
+        """
+        new = str(channel or "").strip()
+        was = str(self.get_meta("channel_id", "") or "")
+        moved = 0
+        if requeue:
+            cur = self.conn.execute(
+                "UPDATE item SET state=?, msg_id=NULL, record_msg_id=NULL, "
+                "file_id=NULL, done_at=NULL, next_try_at=0, attempts=0, "
+                "last_error='channel changed; the old message ids were not "
+                "valid here' WHERE state=? AND msg_id IS NOT NULL",
+                (QUEUED, UPLOADED))
+            moved = cur.rowcount or 0
+        self.set_meta("channel_id", new)
+        self.conn.commit()
+        self.log("rebind", f"channel {was or '(none)'} → {new}; "
+                           f"{moved} captured reels returned to the queue"
+                 if requeue else
+                 f"channel {was or '(none)'} → {new}; message ids kept")
+        return {"was": was, "now": new, "requeued": moved}
 
     def _next_position(self) -> int:
         row = self.conn.execute("SELECT MAX(position) AS m FROM item").fetchone()
@@ -347,15 +474,34 @@ class Ledger:
                     max_attempts: int = 5):
         """Record a failure and schedule the retry.
 
-        Past `max_attempts` the item is parked as `failed` with `next_try_at`
-        far in the future rather than deleted — a dead link today may be a
-        cookie problem, and the row is still evidence the reel was saved.
+        Past `max_attempts` the row is not parked for a month; it spends one of
+        its revivals, its attempt count is cleared, and it comes back in four
+        hours. A fetch fails for a condition that usually stops being true in
+        hours — expired cookies, a rate limit, a host refusing connections — and
+        a queue that will not look again until next month has in practice handed
+        the problem to whoever remembers to press Requeue.
+
+        Only when every revival is spent is the row parked far out. It is never
+        deleted: a dead link today may be a cookie problem tomorrow, and the row
+        is still evidence the reel was saved.
         """
         row = self.conn.execute(
-            "SELECT attempts FROM item WHERE key=?", (key,)).fetchone()
+            "SELECT attempts, revivals FROM item WHERE key=?", (key,)).fetchone()
         attempts = int(row["attempts"]) if row else 1
+        revivals = int(row["revivals"] or 0) if row else 0
+
         if attempts >= max_attempts:
-            retry_in = 86400 * 30
+            if revivals < CAPTURE_MAX_REVIVALS:
+                # Spend a revival: back in four hours with a clean attempt count.
+                self.conn.execute(
+                    "UPDATE item SET state=?, last_error=?, next_try_at=?, "
+                    "attempts=0, revivals=revivals+1 WHERE key=?",
+                    (FAILED, str(error)[:900],
+                     time.time() + CAPTURE_REVIVE_AFTER, key))
+                self.conn.commit()
+                return
+            retry_in = CAPTURE_PARKED
+
         self.conn.execute(
             "UPDATE item SET state=?, last_error=?, next_try_at=? WHERE key=?",
             (FAILED, str(error)[:900], time.time() + retry_in, key))
@@ -370,8 +516,16 @@ class Ledger:
         self.log("unavailable", reason[:200], key)
 
     def requeue(self, states=(FAILED,), reset_attempts: bool = True) -> int:
+        """Put rows back in the queue now. The manual override.
+
+        Still worth having with automatic revival in place: it is how you say "I
+        just fixed the cookies, do not wait four hours", and it is the only way
+        back for a row that has spent every revival. Revivals are cleared too —
+        an operator saying "try again" means a full fresh ladder, not one more
+        attempt against an exhausted budget.
+        """
         marks = ",".join("?" * len(states))
-        sql = f"UPDATE item SET state=?, next_try_at=0"
+        sql = "UPDATE item SET state=?, next_try_at=0, revivals=0"
         if reset_attempts:
             sql += ", attempts=0"
         sql += f" WHERE state IN ({marks})"

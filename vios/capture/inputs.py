@@ -46,6 +46,11 @@ _INTERESTING = re.compile(
 
 MD_HEADER = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 
+# Export members whose name describes a container rather than a category.
+_GENERIC = re.compile(
+    r"^(saved_?posts?|saved_?saved_?media|saved|liked_?posts?|bookmarks?|"
+    r"your_?saved|posts?)$", re.IGNORECASE)
+
 
 def _clean_collection(name: str) -> str:
     """Normalise a collection label so the same one from two inputs agrees."""
@@ -115,26 +120,60 @@ def _links_in(node) -> list:
     return found
 
 
+_COLLECTION_KEYS = ("name", "collection", "collection name", "collection_name",
+                    "saved collection", "folder")
+
+
+def _explicit_label(node) -> str:
+    """A collection name the export states outright, in `string_map_data`.
+
+    This is read *even when the node also carries a link*, and that is the
+    whole reason it is a separate function. `saved_collections.json` puts both
+    in one entry:
+
+        {"title": "",
+         "string_map_data": {"Name": {"value": "workout"},
+                             "Post":  {"href": "https://instagram.com/reel/…"}}}
+
+    The older rule — a node that has a link cannot name a collection — was
+    written to stop `saved_posts.json` attributing every reel to its creator's
+    username, and it does stop that. But it also threw away the one place the
+    real collection names live, so every import came back labelled after the
+    file it was read from. `Name` inside `string_map_data` is unambiguous:
+    saved_posts puts the username in `title`, never here.
+    """
+    if not isinstance(node, dict):
+        return ""
+    smd = node.get("string_map_data")
+    if not isinstance(smd, dict):
+        return ""
+    for k, v in smd.items():
+        if k.strip().lower() in _COLLECTION_KEYS and isinstance(v, dict):
+            val = v.get("value")
+            if isinstance(val, str) and not val.startswith("http"):
+                got = _clean_collection(val)
+                if got:
+                    return got
+    return ""
+
+
 def _label_of(node) -> str:
     """The collection name this node announces, or "".
 
-    A node that carries a permalink is a *saved item*, and in `saved_posts.json`
+    Two tiers. An explicit `string_map_data` name always wins. Failing that, a
+    node that carries a permalink is a *saved item*, and in `saved_posts.json`
     its `title` is the creator's username, not a collection — attributing 4,000
     reels to 900 one-reel "collections" named after their creators is worse
-    than attributing them to the file they came from. So a node only names a
-    collection if it does not also contain a link.
+    than attributing them to the file they came from. So the loose `title`/
+    `name` fallback only applies to nodes with no link of their own.
     """
-    if not isinstance(node, dict) or _links_in(node):
+    if not isinstance(node, dict):
         return ""
-    smd = node.get("string_map_data")
-    if isinstance(smd, dict):
-        for k, v in smd.items():
-            if (k.lower() in ("name", "title", "collection", "collection name")
-                    and isinstance(v, dict)
-                    and isinstance(v.get("value"), str)):
-                got = _clean_collection(v["value"])
-                if got:
-                    return got
+    explicit = _explicit_label(node)
+    if explicit:
+        return explicit
+    if _links_in(node):
+        return ""
     for k in _NAME_KEYS:
         v = node.get(k)
         if isinstance(v, str) and v.strip() and not v.startswith("http"):
@@ -223,8 +262,13 @@ def _read_zip(source, all_files: bool = False) -> list:
                 raw = z.read(name)
             except (zipfile.BadZipFile, OSError, RuntimeError):
                 continue
-            base = _clean_collection(
-                os.path.splitext(os.path.basename(name))[0].replace("_", " "))
+            # The file name is the fallback label, used only for reels no
+            # collection claims. `saved_posts.json` is the container of
+            # *everything* saved, so "saved posts" is not a category — it is
+            # the absence of one, and saying so keeps the tally readable.
+            stem = os.path.splitext(os.path.basename(name))[0]
+            base = ("uncategorised" if _GENERIC.match(stem)
+                    else _clean_collection(stem.replace("_", " ")))
             text = raw.decode("utf-8", "replace")
             if low.endswith(".json"):
                 try:
@@ -267,6 +311,19 @@ def parse_any(path: str, data: bytes | None = None) -> dict:
     elif low.endswith(".zip"):
         items = parse_export_zip(path)
         fmt = "instagram-export-zip"
+    elif low.endswith(".json"):
+        text = (data.decode("utf-8", "replace") if data is not None
+                else open(path, "r", encoding="utf-8", errors="replace").read())
+        try:
+            node = json.loads(text)
+            out = []
+            _walk_json(node, "uncategorised", out)
+            items = out
+            fmt = "instagram-json"
+        except Exception:
+            # Malformed JSON; fall back to text scraping.
+            items = parse_markdown(text)
+            fmt = "markdown" if items else "text"
     else:
         text = (data.decode("utf-8", "replace") if data is not None
                 else open(path, "r", encoding="utf-8", errors="replace").read())

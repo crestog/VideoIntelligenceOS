@@ -106,11 +106,16 @@ class CaptureEngine:
         self._pause = threading.Event()
         self._lock = threading.RLock()
 
-        # Runtime-only credentials. Set by configure(), never persisted.
+        # Credentials. Held in memory for the life of the process and never
+        # written by this class — but *read* from Kaggle Secrets, the
+        # environment and the laptop file at construction, so a session that
+        # has them stored is already configured before the page loads. See
+        # vios/creds.py.
         self._tg: Telegram | None = None
         self._api_id = 0
         self._api_hash = ""
         self._cookies_path = ""
+        self.cred_sources: dict = {}
 
         self.pacer = Pacer()
         self.skip_collections: tuple = ()
@@ -119,6 +124,32 @@ class CaptureEngine:
         self.snapshot_every = SNAPSHOT_EVERY
 
         self._ledger: Ledger | None = None
+        self._adopt_stored_credentials()
+
+    def _adopt_stored_credentials(self) -> None:
+        """Configure from the stored credentials, if there are any.
+
+        Failure here is silent on purpose: a broken secret store must not stop
+        the tab from loading, because the tab is where you would go to fix it.
+        """
+        try:
+            from vios.creds import resolve  # noqa: PLC0415
+            got = resolve()
+        except Exception:
+            return
+        v = got.get("values") or {}
+        if not v:
+            return
+        self.cred_sources = got.get("sources") or {}
+        try:
+            self.configure(
+                bot_token=v.get("bot_token", ""),
+                channel_id=v.get("channel_id") or None,
+                api_id=int(v.get("api_id") or 0),
+                api_hash=v.get("api_hash", ""),
+                cookies_text=v.get("ig_cookies", ""))
+        except Exception:
+            self.cred_sources = {}
 
     # ── ledger ───────────────────────────────────────────────────────────
     @property
@@ -167,7 +198,23 @@ class CaptureEngine:
                 self.max_attempts = max(1, int(max_attempts))
             if allow_gallery_dl is not None:
                 self.allow_gallery_dl = bool(allow_gallery_dl)
-        return self.settings()
+
+        out = self.settings()
+        # Outside the lock: this touches the ledger, and the ledger is what the
+        # worker thread holds. A channel change is surfaced, never acted on
+        # silently — requeueing 6,000 reels is the operator's decision.
+        if self._tg and self._tg.channel:
+            try:
+                out["channel_check"] = self.ledger.bind_channel(self._tg.channel)
+            except Exception as exc:
+                out["channel_check"] = {"state": "unknown", "error": str(exc)}
+        return out
+
+    def accept_channel_change(self, requeue: bool = True) -> dict:
+        """Confirm a channel switch. See `Ledger.rebind_channel`."""
+        if not (self._tg and self._tg.channel):
+            raise RuntimeError("Set the channel id first.")
+        return self.ledger.rebind_channel(self._tg.channel, requeue=requeue)
 
     def _write_cookies(self, text: str):
         """Persist the cookie jar for the length of the process only.
@@ -188,12 +235,19 @@ class CaptureEngine:
 
     def settings(self) -> dict:
         """Never returns a secret. The UI shows presence, not value."""
+        try:
+            from vios.creds import describe  # noqa: PLC0415
+            stored = describe()
+        except Exception:
+            stored = {}
         return {
             "base": self.base,
             "ledger": self.ledger_path,
             "bot_token_set": bool(self._tg and self._tg.token),
             "channel": (self._tg.channel if self._tg else None),
             "api_credentials_set": bool(self._api_id and self._api_hash),
+            "credential_sources": dict(self.cred_sources),
+            "stored_credentials": stored,
             "cookies_set": bool(self._cookies_path
                                 and os.path.isfile(self._cookies_path)),
             "target_seconds": round(self.pacer.target, 1),

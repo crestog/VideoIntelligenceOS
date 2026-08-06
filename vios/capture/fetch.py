@@ -68,9 +68,27 @@ _HOSTILE = re.compile(
 
 _UNAVAILABLE = re.compile(
     r"(unable to (fetch|extract)|has been removed|has been deleted|"
+    r"(may have been|been) (deleted|removed)|"
     r"content is (not available|unavailable)|page not found|"
-    r"post is private|account is private|no video formats found|"
+    # "Post not available", "Video unavailable" — the same fact as the phrasings
+    # above, and without this they fall through to `transient` and spend a full
+    # retry ladder on a post that is definitively gone.
+    r"\b(post|video|media|reel|photo) (is )?(not available|unavailable)\b|"
+    r"post is private|account is private|"
     r"unsupported url|\b404\b|does not exist|nothing to download)",
+    re.IGNORECASE)
+
+# "No video formats found" is yt-dlp saying *this post has no video*, which for
+# a saved Instagram post usually means it is a photo or a carousel of photos.
+# That is a post worth keeping — the caption, the comments and the images are
+# all signal — and `fetch` has always known how to return an image-only result.
+# What it could not do was get there: this pattern used to sit in _UNAVAILABLE,
+# so the error was terminal, gallery-dl was never tried, and every photo post
+# in the export was written off as "unavailable". It is its own class now, and
+# the only one that says "try the other downloader, it fetches images".
+_PHOTO_ONLY = re.compile(
+    r"(no video formats found|no video could be found|"
+    r"requested format is not available|there are no video)",
     re.IGNORECASE)
 
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm")
@@ -83,7 +101,16 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 class FetchError(RuntimeError):
-    """A fetch failed. `kind` is one of unavailable | hostile | transient."""
+    """A fetch failed.
+
+    `kind` is one of **unavailable | hostile | transient | photo**, and the last
+    one is internal to this module. `photo` means yt-dlp found the post but it
+    holds no video, which is a routing instruction rather than a failure:
+    `fetch` catches it and hands the URL to gallery-dl, so it resolves into
+    either a success or an `unavailable`. It never reaches the engine, whose
+    handler branches on `terminal` and `hostile` and would otherwise treat a
+    photo post as a transient fault worth retrying.
+    """
 
     def __init__(self, message: str, kind: str = "transient"):
         super().__init__(message)
@@ -97,11 +124,21 @@ class FetchError(RuntimeError):
     def terminal(self) -> bool:
         return self.kind == "unavailable"
 
+    @property
+    def photo_only(self) -> bool:
+        """yt-dlp found the post but it holds no video. gallery-dl can."""
+        return self.kind == "photo"
+
 
 def classify(text: str) -> str:
     blob = text or ""
     if _HOSTILE.search(blob):
         return "hostile"
+    # Ordered before _UNAVAILABLE: a photo post's log often carries a generic
+    # "unable to extract" alongside the specific "no video formats found", and
+    # the specific one is the one that tells you what to do next.
+    if _PHOTO_ONLY.search(blob):
+        return "photo"
     if _UNAVAILABLE.search(blob):
         return "unavailable"
     return "transient"
@@ -407,14 +444,27 @@ def fetch(url: str, key: str, work: str, cookies: str | None = None,
     try:
         log = run_ytdlp(url, work, cookies, timeout)
     except FetchError as first:
-        if first.terminal or first.hostile or not allow_gallery_dl:
+        # A photo post is the one failure where the second downloader is not a
+        # long shot but the correct tool: yt-dlp only does video, gallery-dl
+        # does images. So it overrides `allow_gallery_dl`, which exists to keep
+        # a *retry* off a hostile host — and this is not a retry, it is the
+        # first attempt by the only program that can do the job.
+        if first.hostile or (first.terminal and not first.photo_only):
+            raise
+        if not allow_gallery_dl and not first.photo_only:
             raise
         try:
             log = run_gallery_dl(url, work, cookies, timeout)
             tool = "gallery-dl"
         except FetchError as second:
-            # Report the first failure: yt-dlp's diagnostics are far better,
-            # and gallery-dl's "no results" says nothing about why.
+            if first.photo_only:
+                # Now it is genuinely gone: the post has no video, and the
+                # image fetcher could not find images either.
+                raise FetchError(
+                    f"post has no video and no images could be fetched "
+                    f"({second})", "unavailable")
+            # Otherwise report the first failure: yt-dlp's diagnostics are far
+            # better, and gallery-dl's "no results" says nothing about why.
             raise FetchError(f"{first} (gallery-dl also failed: {second})",
                              first.kind)
 

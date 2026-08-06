@@ -154,6 +154,7 @@ class Channel:
         self.log = log or (lambda m: None)
         self.ready = False
         self.reason = ""
+        self.last_error = ""
         self._loop = None
         self._thread = None
         self._app = None
@@ -172,9 +173,19 @@ class Channel:
             try:
                 import asyncio  # noqa: PLC0415
                 from pyrogram import Client  # noqa: PLC0415
+                from vios.tgcompat import patch as _tgpatch  # noqa: PLC0415
             except ImportError:
                 self.reason = "pyrogram is not installed"
                 return False
+
+            # Must happen before the first call that names the channel.
+            # Pyrogram rejects channel ids past 2**31 outright, and a channel
+            # created recently has one — which surfaces here as every download
+            # failing while the session itself reports healthy. See
+            # vios/tgcompat.py for the whole story.
+            note = _tgpatch()
+            if note:
+                self.log(note)
 
             self._loop = asyncio.new_event_loop()
             self._thread = threading.Thread(
@@ -266,7 +277,11 @@ class Channel:
         try:
             msgs = self._submit(_go(), timeout=timeout)
         except Exception as exc:
-            self.log(f"message fetch failed: {type(exc).__name__}: {exc}")
+            # Kept, not just logged: `Source.ensure` raises the error the user
+            # actually sees, and "could not download the original" with no
+            # cause attached is what made this class of failure unreadable.
+            self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            self.log(f"message fetch failed: {self.last_error}")
             return {}
         return {int(m.id): m for m in msgs
                 if m is not None and not getattr(m, "empty", False)}
@@ -293,7 +308,8 @@ class Channel:
         try:
             got = self._submit(_go(), timeout=timeout)
         except Exception as exc:
-            self.log(f"download failed: {type(exc).__name__}: {str(exc)[:120]}")
+            self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            self.log(f"download failed: {self.last_error}")
             got = None
         if not got or not os.path.exists(got):
             for stray in (tmp, dest + ".part"):
@@ -374,10 +390,7 @@ class Source:
                              f"{str(exc)[:120]}")
 
         if not have_source:
-            raise SourceError(
-                self._why(msg_id, file_id) if not (msg_id or file_id)
-                else f"could not download the original from Telegram "
-                     f"(message {msg_id or '?'})")
+            raise SourceError(self._why(msg_id, file_id, size))
 
         got = os.path.getsize(dest)
         if got < 4096:
@@ -390,10 +403,40 @@ class Source:
         self.bytes += got
         return dest
 
-    @staticmethod
-    def _why(msg_id, file_id) -> str:
-        return ("this video has no Telegram message id and no file id — the "
-                "capture ledger row is incomplete, so there is nothing to fetch")
+    def _why(self, msg_id, file_id, size: int = 0) -> str:
+        """The reason this video's bytes could not be had, in the user's terms.
+
+        Written as a full diagnosis rather than a status line because this
+        string is the only thing the operator sees, and the previous version
+        ("could not download the original from Telegram (message 38)") named
+        the symptom while hiding all four things that could have caused it.
+        """
+        if not (msg_id or file_id):
+            return ("this video has no Telegram message id and no file id — "
+                    "the capture ledger row is incomplete, so there is nothing "
+                    "to fetch. Re-run the capture tab's channel scan to repair "
+                    "it.")
+
+        err = getattr(self.channel, "last_error", "") if self.channel else ""
+        if err:
+            return (f"Telegram refused the fetch for message {msg_id or '?'}: "
+                    f"{err}")
+
+        if self.channel is None or not self.channel.ready:
+            why = (getattr(self.channel, "reason", "") if self.channel
+                   else "no MTProto session was opened")
+            over = (size and size > BOT_DOWNLOAD_LIMIT)
+            return (f"message {msg_id or '?'} needs MTProto and it is not "
+                    f"available ({why or 'reason unknown'})."
+                    + (f" The file is {size / 1048576:.0f} MB, over the Bot "
+                       f"API's 20 MB download limit, so there is no fallback."
+                       if over else
+                       " Add the API id and API hash on the Setup page."))
+
+        return (f"message {msg_id or '?'} is gone from the channel — the "
+                f"session can read the channel, but that message id returned "
+                f"nothing. It was deleted, or the channel id now points "
+                f"somewhere else than it did at capture time.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
