@@ -712,11 +712,22 @@ app.include_router(admin_router)
 # The v2 capture plane. Imported defensively because it is the newest and most
 # separable part of the system: a missing dependency in the capture tab must
 # not take the feed, the explore tab and v17 down with it.
+#
+# The handler uses `custom_print`, and that is the whole point of this comment.
+# It used to call `vios_log`, which this module never imports — so the guard
+# raised NameError *while handling* the import failure. An except clause that
+# cannot run is worse than no guard at all: one missing wheel
+# (python-multipart, yt-dlp) turned "the capture tab is unavailable" into
+# ui_server exiting at import, which boot.py's watchdog then restarted forever.
+# That is the loop that reads as "the backend does not start".
 try:
     from vios.capture.routes import capture_router
     app.include_router(capture_router)
+    _CAPTURE_READY = True
 except Exception as _capture_exc:      # pragma: no cover - import guard
-    vios_log(f"capture tab unavailable: {_capture_exc}", "SYS", "WARN")
+    _CAPTURE_READY = False
+    _CAPTURE_WHY = f"{type(_capture_exc).__name__}: {_capture_exc}"
+    custom_print(f"⚠️ capture tab unavailable — {_CAPTURE_WHY}")
 
 # The v2 processing plane. Guarded separately from capture: the two share a
 # design and nothing else, and a torch that will not import on this box must
@@ -724,8 +735,87 @@ except Exception as _capture_exc:      # pragma: no cover - import guard
 try:
     from vios.process.routes import process_router
     app.include_router(process_router)
+    _PROCESS_READY = True
 except Exception as _process_exc:      # pragma: no cover - import guard
-    vios_log(f"process tab unavailable: {_process_exc}", "SYS", "WARN")
+    _PROCESS_READY = False
+    _PROCESS_WHY = f"{type(_process_exc).__name__}: {_process_exc}"
+    custom_print(f"⚠️ process tab unavailable — {_PROCESS_WHY}")
+
+
+# A tab that failed to import must still answer, or the page it backs shows a
+# spinner forever with nothing in the log to explain it. These stand-ins reply
+# with the import error itself, so the browser says what the console said.
+def _plane_unavailable(name: str, why: str):
+    from fastapi.responses import PlainTextResponse
+
+    @app.get(f"/{name}", response_class=PlainTextResponse)
+    def _page():                                   # pragma: no cover
+        return (f"The {name} tab could not load on this machine.\n\n{why}\n\n"
+                f"Everything else on this server is running. Reinstall the "
+                f"dependencies (bash setup.sh) and restart to get it back.")
+
+    @app.get(f"/api/{name}/status")
+    def _status():                                 # pragma: no cover
+        return {"ok": False, "available": False, "error": why}
+
+
+if not _CAPTURE_READY:
+    _plane_unavailable("capture", _CAPTURE_WHY)
+if not _PROCESS_READY:
+    _plane_unavailable("process", _PROCESS_WHY)
+
+
+# ── Atlas, mounted rather than launched ───────────────────────────────────
+# Atlas was built as its own FastAPI app on its own port with its own tunnel
+# (atlas_boot.py), which is why the reader was a separate website you had to
+# find a second URL for. It is a sub-application, so it can simply be mounted:
+# every Atlas route keeps its own path, one level down, on the URL that is
+# already open.
+#
+# `atlas_boot.py` still works and is unchanged — Atlas on a laptop with the
+# channel and no GPU is a real way to run it. Both entry points now share one
+# app object, so there is no second copy of the reader to keep in step.
+#
+# Boot is *not* started here. Atlas's boot thread scans the Telegram channel,
+# imports bundles and loads a sentence-transformer; doing that at import time
+# would add minutes to every ui_server start, including the starts where nobody
+# opens Atlas at all. It is started on the first request to /atlas instead, and
+# the interface is designed to be served during its own boot — it renders
+# immediately and reports progress in the status pill.
+_ATLAS_READY = False
+_ATLAS_WHY = ""
+try:
+    from atlas import server as _atlas_server
+
+    app.mount("/atlas", _atlas_server.app, name="atlas")
+    _ATLAS_READY = True
+except Exception as _atlas_exc:         # pragma: no cover - import guard
+    _ATLAS_WHY = f"{type(_atlas_exc).__name__}: {_atlas_exc}"
+    custom_print(f"⚠️ atlas tab unavailable — {_ATLAS_WHY}")
+
+if _ATLAS_READY:
+    _atlas_booted = threading.Event()
+
+    @app.middleware("http")
+    async def _atlas_lazy_boot(request: Request, call_next):
+        """Start Atlas's scan/index the first time somebody opens it."""
+        if (request.url.path.startswith("/atlas")
+                and not _atlas_booted.is_set()):
+            _atlas_booted.set()
+            try:
+                _atlas_server.start_boot()
+                custom_print("🗺️ Atlas: boot started (scanning the channel for "
+                             "database bundles)")
+            except Exception as exc:
+                custom_print(f"⚠️ Atlas boot failed to start: "
+                             f"{type(exc).__name__}: {exc}")
+        return await call_next(request)
+else:
+    @app.get("/atlas", response_class=HTMLResponse)
+    def _atlas_missing():                          # pragma: no cover
+        return HTMLResponse(
+            f"<h1>Atlas</h1><p>Atlas could not load on this machine.</p>"
+            f"<pre>{_ATLAS_WHY}</pre>", status_code=503)
 
 @app.get("/api/status")
 def get_status():

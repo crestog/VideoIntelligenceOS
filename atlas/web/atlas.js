@@ -120,8 +120,36 @@ function toast(msg) {
 }
 
 /* ── transport ─────────────────────────────────────────────────────────── */
+
+/* Where this Atlas is mounted.
+ *
+ * Atlas runs two ways and the interface must not care which: standalone on its
+ * own port (`atlas_boot.py`, everything at `/`), or mounted inside the main
+ * VIOS server at `/atlas` so the whole system is one tunnel and one URL.
+ *
+ * Derived from this script's own resolved URL rather than from
+ * `location.pathname`, because the pathname is not reliable here — the tab
+ * router writes to `location.hash`, deep links carry a hash, and a trailing
+ * slash may or may not be present. The script tag's `src` is resolved to an
+ * absolute URL by the browser and is exactly one of `/atlas.js` or
+ * `/atlas/atlas.js`, which makes this a fact rather than an inference.
+ *
+ * Yields '' standalone and '/atlas' mounted, so `BASE + '/api/…'` is right in
+ * both and no caller has to know.
+ */
+const BASE = (() => {
+  const tag = document.currentScript
+    || [...document.querySelectorAll('script')].find(s => /atlas\.js(\?|$)/.test(s.src));
+  try { return new URL(tag.src).pathname.replace(/\/atlas\.js.*$/, ''); }
+  catch { return ''; }
+})();
+
+/* Absolute-from-root paths, rewritten to sit under BASE. Every call site keeps
+ * writing '/api/…' and this is the single place that knows about mounting. */
+const U = (path) => (path.startsWith('/') ? BASE + path : path);
+
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  const res = await fetch(U(path), opts);
   const body = await res.text();
   let data;
   try { data = body ? JSON.parse(body) : {}; }
@@ -357,7 +385,7 @@ function ribbon(video, { large = false, onSeek = null } = {}) {
 function posterImg(video, at, cls) {
   const key = video.video_key;
   const t = (at === null || at === undefined) ? '' : `?t=${Math.max(0, at).toFixed(1)}`;
-  const img = h('img', { alt: '', loading: 'lazy', 'data-src': `/api/poster/${key}${t}` });
+  const img = h('img', { alt: '', loading: 'lazy', 'data-src': U(`/api/poster/${key}${t}`) });
   const wrap = h('div', { class: cls },
     h('span', { class: 'noshot', text: key }), img);
   img.addEventListener('error', () => { img.remove(); });
@@ -525,7 +553,7 @@ function prefetch(keys) {
   const fresh = keys.filter(k => k && !S.prefetched.has(k));
   if (!fresh.length) return;
   fresh.forEach(k => S.prefetched.add(k));
-  fetch('/api/prefetch?keys=' + encodeURIComponent(fresh.join(',')),
+  fetch(U('/api/prefetch?keys=' + encodeURIComponent(fresh.join(','))),
         { method: 'POST' }).catch(() => {});
 }
 
@@ -561,7 +589,7 @@ function openVideo(video, at) {
     // timestamp first, so a click on a moment 40 s in does not download the
     // 40 s before it.
     const frag = at ? `#t=${Math.max(0, at).toFixed(2)}` : '';
-    vid.src = `/api/play/${encodeURIComponent(key)}${frag}`;
+    vid.src = U(`/api/play/${encodeURIComponent(key)}${frag}`);
     vid.load();
     vid.play().catch(() => {});
     pollMediaState(key);
@@ -1675,7 +1703,7 @@ function gposter(key, r) {
   img.onload = () => gdraw();
   img.onerror = () => G.posters.set(key, 'no');
   G.posters.set(key, img);
-  img.src = `/api/poster/${encodeURIComponent(key)}`;
+  img.src = U(`/api/poster/${encodeURIComponent(key)}`);
   return img;
 }
 
@@ -1995,7 +2023,7 @@ function gvideoList(rows) {
     });
     const img = h('img', {
       alt: '', loading: 'lazy',
-      src: `/api/poster/${encodeURIComponent(row.video_key)}`,
+      src: U(`/api/poster/${encodeURIComponent(row.video_key)}`),
       onerror: (ev) => { ev.target.replaceWith(h('span', { class: 'gv-blank' })); },
     });
     btn.appendChild(img);

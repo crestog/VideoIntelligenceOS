@@ -8,7 +8,11 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/atlas.css">
+<!-- Relative, not root-absolute: Atlas serves either at / (atlas_boot.py) or at
+     /atlas/ (mounted in the main VIOS server), and a relative href resolves
+     correctly under both. atlas.js reads its own resolved src to find the same
+     prefix for API calls. -->
+<link rel="stylesheet" href="atlas.css">
 </head>
 <body>
 
@@ -231,6 +235,6 @@
 </main>
 
 <div class="toast" id="toast" hidden></div>
-<script src="/atlas.js"></script>
+<script src="atlas.js"></script>
 </body>
 </html>
