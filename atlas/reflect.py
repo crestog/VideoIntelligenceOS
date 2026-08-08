@@ -56,8 +56,9 @@ _KEY_NAMES = ("videouuid", "videokey", "mediakey", "msgid", "videoid",
               "video", "uuid", "mediaid")
 _START_NAMES = ("startt", "startsec", "starttime", "tstart", "start",
                 "tssec", "timestamp", "ts", "time", "sec", "seconds",
-                "offset", "position")
-_END_NAMES = ("endt", "endsec", "endtime", "tend", "end", "stop", "until")
+                "offset", "position", "t0")
+_END_NAMES = ("endt", "endsec", "endtime", "tend", "end", "stop", "until",
+              "t1")
 
 # Wall-clock columns. A row's insert time is not a position in a video, and
 # treating it as one puts every moment at t=1.75 billion seconds.
@@ -77,7 +78,14 @@ _NOT_CONTENT_TOKEN = {
 }
 # Whole names that are not content regardless of how they tokenise.
 _NOT_CONTENT_EXACT = {"durationstr", "firstframe", "folderid", "thumb",
-                      "localvideopath", "abspath", "videopath", "filepath"}
+                      "localvideopath", "abspath", "videopath", "filepath",
+                      # The evidence schema. `uid` is a content hash, `channel`
+                      # and `space` are enums, `detector` and `observerid` name
+                      # the model that spoke — all of them identifiers rather
+                      # than things a person searches for. Left in, a query for
+                      # "speech" matches every transcript claim ever written.
+                      "uid", "channel", "space", "detector", "observerid",
+                      "videokey", "component"}
 
 # What kind of evidence a column carries. Keyed by (table, column) with both
 # sides normalised, because the same column name means different things in
@@ -282,6 +290,42 @@ def source_label(table: str, column: str) -> str:
     return "meta"
 
 
+# Columns whose value names the kind of evidence in that row.
+_ROW_SOURCE_COLUMNS = ("channel", "source")
+# Only these values are trusted to partition a table. An arbitrary enum would
+# split the index into labels nothing knows how to weight or colour, so a
+# column has to speak the vocabulary the rest of Atlas already uses.
+_KNOWN_SOURCES = frozenset({"narrative", "speech", "visual", "ocr", "caption",
+                            "meta", "audio", "concept", "style"})
+
+
+def _row_source_labels(conn, table: str, cols: list):
+    """(column, [values]) when a table labels its own rows, else None.
+
+    Read from the data rather than declared per table, so an evidence store
+    that adds a channel next month partitions on it without a code change.
+    A column qualifies only if every value it holds is a source Atlas knows —
+    one unrecognised value and the whole table falls back to a single spec,
+    because a half-labelled index is harder to reason about than an unlabelled
+    one.
+    """
+    by_norm = {_norm(c["name"]): c["name"] for c in cols}
+    for want in _ROW_SOURCE_COLUMNS:
+        name = by_norm.get(want)
+        if not name:
+            continue
+        try:
+            vals = [r[0] for r in conn.execute(
+                f"SELECT DISTINCT {_q(name)} FROM {_q(table)} "
+                f"WHERE {_q(name)} IS NOT NULL LIMIT 40")]
+        except sqlite3.Error:
+            continue
+        vals = [str(v) for v in vals if str(v).strip()]
+        if vals and all(v in _KNOWN_SOURCES for v in vals):
+            return name, sorted(set(vals))
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # DIMENSION JOINS
 # ══════════════════════════════════════════════════════════════════════════
@@ -356,14 +400,32 @@ def text_sources(conn: sqlite3.Connection) -> list:
         e_expr = f"t.{_q(end)}" if end else "NULL"
 
         for text_col in content_columns(cols):
+            base = (f"SELECT t.{_q(key)}, {s_expr}, {e_expr}, "
+                    f"t.{_q(text_col)} FROM {_q(table)} t "
+                    f"WHERE t.{_q(text_col)} IS NOT NULL "
+                    f"AND TRIM(t.{_q(text_col)}) <> ''")
+
+            # A table that names its own evidence kind per row gets one spec
+            # per kind. The evidence store keeps every transcript, OCR hit and
+            # caption in a single `claim` table separated by `channel`; one
+            # spec for the whole table would label all of them alike, and a
+            # transcript would then be weighted like a filename.
+            labels = _row_source_labels(conn, table, cols)
+            if labels:
+                col, values = labels
+                for val in values:
+                    specs.append({
+                        "table": table, "key": key, "start": start, "end": end,
+                        "text": text_col, "source": val, "via": None,
+                        "sql": base + f" AND t.{_q(col)} = '{val}'",
+                    })
+                continue
+
             specs.append({
                 "table": table, "key": key, "start": start, "end": end,
                 "text": text_col, "source": source_label(table, text_col),
                 "via": None,
-                "sql": (f"SELECT t.{_q(key)}, {s_expr}, {e_expr}, "
-                        f"t.{_q(text_col)} FROM {_q(table)} t "
-                        f"WHERE t.{_q(text_col)} IS NOT NULL "
-                        f"AND TRIM(t.{_q(text_col)}) <> ''"),
+                "sql": base,
             })
 
         # Dimension text, pulled onto the parent's key so a creator's name is
@@ -432,21 +494,40 @@ def describe(conn: sqlite3.Connection, samples: int = 0) -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 # KEYS
 # ══════════════════════════════════════════════════════════════════════════
-_DIGITS = re.compile(r"\d+")
+_ALL_DIGITS = re.compile(r"^\d+$")
+# Namespace markers that carry no identity of their own.
+_KEY_NAMESPACE = re.compile(r"^vios[:=]", re.I)
+# Producers that spell a numeric Telegram message id with a prefix. Kept to an
+# explicit short list on purpose — a generic "letters then digits" rule would
+# also match Instagram shortcodes like `Cx1234` and throw away the letters that
+# make them unique.
+_PREFIXED_NUMBER = re.compile(r"^(?:tg|msg|id)[_:-]?(\d+)$", re.I)
 
 
 def normalize_key(value) -> str:
-    """Reduce any spelling of a video's identity to its digits.
+    """Reduce any spelling of a video's identity to one canonical form.
 
     Postgres says `tg1234`, lake.db says `1234` in `posts.video_id` and again
-    in `videos.msg_id`, and a manifest says `"1234"`. They are the same reel.
-    Normalising to the digits is what lets a narrative from one table and a
-    transcript from another land on the same video without a mapping table that
-    would need maintaining every time a producer changes its id format.
+    in `videos.msg_id`, and a manifest says `"1234"`. They are the same reel,
+    and collapsing them is what lets a narrative from one table and a
+    transcript from another land on the same video without a mapping table.
+
+    What this must NOT do is reduce an identifier to whatever digits it happens
+    to contain. The capture plane keys rows by Instagram shortcode, and under a
+    digit-extraction rule `REEL1` and `DBd2xyz` become `1` and `2` — so two
+    unrelated reels merge into one video and their moments interleave. A
+    shortcode is returned whole, and case-sensitively: Instagram's alphabet is
+    base64-ish, so `Abc` and `aBc` are different posts.
     """
     if value is None:
         return ""
     if isinstance(value, (int, float)):
         return str(int(value))
-    m = _DIGITS.search(str(value))
-    return m.group(0) if m else str(value).strip()
+    s = str(value).strip()
+    if not s:
+        return ""
+    s = _KEY_NAMESPACE.sub("", s, count=1).strip()
+    if _ALL_DIGITS.match(s):
+        return s
+    m = _PREFIXED_NUMBER.match(s)
+    return m.group(1) if m else s

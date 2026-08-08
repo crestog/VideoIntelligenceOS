@@ -30,6 +30,15 @@ python atlas_boot.py
    replayed into SQLite. Every bundle is a full snapshot, so later ones
    overwrite the rows they share and contribute the rows they added. Import is
    a merge, not a restore.
+
+   The same walk picks up **evidence shards** — `vios-evidence-*.jsonl.gz`, the
+   format the GPU plane posts. A shard is not a bundle: no manifest, no parts,
+   no SQLite, nothing pinned, and it is *additive* rather than a snapshot. Atlas
+   replays them without being told the process plane's schema, inferring each
+   table's shape, its column types and its key from the rows themselves — so a
+   pass added upstream becomes searchable here with no code change. Opaque
+   payloads (embeddings, thumbnails) are dropped on the way in: they are the
+   largest thing in the file and the only part Atlas has no use for.
 4. **Index.** Every text column in every table is found by inspection and
    turned into timestamped passages. FTS5 is built immediately; the vector
    index builds on a background thread.
@@ -61,8 +70,8 @@ offered that returns nothing.
 inferred for it (key / timestamp / searchable content), and a row browser for
 each one. This is where you check what a bundle actually contained.
 
-**Sources** — which bundles were imported, which columns feed search, whether
-the channel is reachable, how large the video cache is, and a live log.
+**Sources** — which bundles and shards were imported, which columns feed search,
+whether the channel is reachable, how large the video cache is, and a live log.
 
 ---
 
@@ -270,7 +279,7 @@ atlas/
   config.py     paths, credentials, retrieval constants
   tgchannel.py  the channel: Bot API + MTProto, one interface
   pgdump.py     replays a plain pg_dump into SQLite — no PostgreSQL needed
-  ingest.py     scanning the channel, importing bundles as merges
+  ingest.py     scanning the channel, importing bundles and evidence shards
   reflect.py    every assumption about schema shape, in one file
   index.py      passages, FTS5, video_index, the vector file
   encoder.py    bge-small, CLS-pooled, degrades to nothing gracefully
@@ -286,4 +295,7 @@ Bundles carry the database, not the media. Frames were never shipped, so the
 image vectors from the harvester's Qdrant are not here and could not be used if
 they were. Atlas builds its own **text** index from the narratives, transcripts
 and frame notes that *are* in the bundle — which is why search works on the
-words in the archive from the moment the first bundle lands.
+words in the archive from the moment the first bundle lands. Evidence shards are
+read on the same terms: their claims become passages, their embeddings are
+discarded, because those vectors are a different model in a different space and
+nothing here could query them.

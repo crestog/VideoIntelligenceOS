@@ -28,6 +28,7 @@ hang forever was an await with no timeout, and none of this code can repeat it.
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 
@@ -575,16 +576,71 @@ def looks_like_manifest(info: dict) -> bool:
     return "✅ VIOS bundle" in cap
 
 
+SHARD_PREFIX = "vios-evidence-"
+SHARD_SUFFIX = ".jsonl.gz"
+
+
+def looks_like_shard(info: dict) -> bool:
+    """Is this message an evidence shard from the GPU plane?
+
+    Two independent lanes post to this channel and they share no format. The
+    harvester posts *bundles*: a manifest naming the parts of a SQLite
+    snapshot. The process engine posts *shards*: one gzipped JSONL file per
+    batch of claims, complete on its own, with no manifest anywhere and nothing
+    pinned. A reader that only knew manifests walked straight past every claim
+    the GPU ever produced — which is exactly what Atlas did.
+
+    Same two signals as a manifest, for the same reason: the file name is what
+    the engine writes today, the caption marker is what survives a rename.
+    """
+    name = (info.get("file_name") or "").lower()
+    if name.startswith(SHARD_PREFIX) and name.endswith(SHARD_SUFFIX):
+        return True
+    cap = (info.get("caption") or "").strip().lower()
+    return cap.startswith("vios evidence")
+
+
+def shard_seq(info: dict) -> str:
+    """The shard's own id — `<site>-<seq>` — from its name, caption, or failing
+    both, its message id.
+
+    The site prefix is the load-bearing half. Ten Kaggle accounts each number
+    their shards from one, so `0007` alone names ten different files; keyed on
+    that, importing worker 3's seventh shard would mark worker 7's as held.
+    """
+    name = (info.get("file_name") or "").strip()
+    if name.lower().startswith(SHARD_PREFIX) and \
+            name.lower().endswith(SHARD_SUFFIX):
+        got = name[len(SHARD_PREFIX):-len(SHARD_SUFFIX)].strip()
+        if got:
+            return got
+    cap = (info.get("caption") or "").strip()
+    m = re.match(r"vios\s+evidence\s*[·:•-]\s*(\S+)", cap, re.I)
+    if m:
+        return m.group(1)
+    return f"msg{info.get('message_id')}"
+
+
+def fetch_document(info: dict, dest: str) -> bool:
+    """Pull a message's file to `dest`, cheap transport first.
+
+    HTTP needs no session and no login, so it is tried whenever the message
+    carried a `file_id`; it returns False rather than raising when the file is
+    over the Bot API's 20 MB ceiling, and MTProto picks that up.
+    """
+    ok = False
+    if info.get("file_id"):
+        ok = http_download(info["file_id"], dest)
+    if not ok and info.get("message_id"):
+        ok = download_by_id(info["message_id"], dest)
+    return bool(ok and os.path.exists(dest))
+
+
 def read_manifest_document(info: dict, work_dir: str) -> dict:
     """Download a manifest message and parse it. Manifests are a few KB, so the
     HTTP path always fits and MTProto is only the fallback."""
     dest = os.path.join(work_dir, f"manifest-{info['message_id']}.json")
-    ok = False
-    if info.get("file_id"):
-        ok = http_download(info["file_id"], dest)
-    if not ok:
-        ok = download_by_id(info["message_id"], dest)
-    if not ok or not os.path.exists(dest):
+    if not fetch_document(info, dest):
         return None
     try:
         with open(dest, "r", encoding="utf-8") as f:

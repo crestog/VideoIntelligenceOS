@@ -32,10 +32,23 @@ Import is a merge, not a restore. Every bundle is a full snapshot of the machine
 at one moment; importing all of them into one database means later snapshots
 overwrite rows they share and contribute rows they added, and re-importing one
 changes nothing. That is what makes "scan the entire channel" safe to run twice.
+
+**Two lanes post to this channel, and only one of them posts bundles.** The
+harvester writes bundles: snapshots of the capture ledger, manifests, parts.
+The GPU plane writes *shards* — `vios-evidence-*.jsonl.gz`, one gzipped JSONL
+per batch of claims, each complete on its own, none of them pinned and none of
+them mentioned in any manifest. Nothing about that format resembles a bundle, so
+a reader that knew only manifests walked past every transcript, every caption
+and every OCR line the models ever produced. `import_shard` is the other half,
+and the walk offers each message to both readers.
+
+Shards are additive where bundles are snapshots, so their merge rule is the
+mirror image: never overwrite, only fill. See `_dedup_columns` and `_enrich`.
 """
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -436,6 +449,322 @@ def import_bundle(manifest: dict, manifest_id: int,
     return {"ok": True, "seq": seq, "rows": merged}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# IMPORT ONE EVIDENCE SHARD
+# ══════════════════════════════════════════════════════════════════════════
+# A shard is the other lane's format, and it is nothing like a bundle: no
+# manifest, no parts, no SQLite. One gzipped JSONL file, first line a header,
+# every line after it a row tagged with the table it came from. It is complete
+# on its own and it is *additive* — bundles are snapshots that overwrite, shards
+# are batches that accumulate.
+#
+# Atlas replays them without knowing what the GPU plane's schema is, because it
+# cannot: that schema is defined in another program, on another branch of the
+# tree, and changes when a pass is added. So the table shapes are inferred from
+# the rows themselves. What Atlas *does* have to get right is the declared
+# column types — reflect.py reads them to decide what is a timestamp and what is
+# searchable text, and a table built with every column untyped reflects as one
+# where nothing is a number and everything is prose.
+_SHARD_MAGIC = "vios-evidence-shard"
+
+# Long unbroken hex or base64: an embedding, a thumbnail, a signature. Atlas
+# cannot read it, cannot search it and has no code that consumes it — the
+# vectors it searches with are its own, from its own encoder, in its own space.
+# Kept, it is the largest thing in the database and the only useless one.
+_OPAQUE = re.compile(r"^[A-Za-z0-9+/=]{256,}$")
+
+
+def _sql_type(values: list) -> str:
+    """The narrowest SQLite type that holds every value seen for a column, or
+    "" when the column was empty in this shard.
+
+    Not cosmetic. `_is_numeric` and `_is_texty` in reflect.py read the declared
+    type and nothing else, so a `t0` column created untyped is not a timestamp,
+    a claim's text is not searchable, and the whole shard lands in the database
+    correct and completely invisible.
+
+    The empty case is why this returns "" rather than defaulting to TEXT. A
+    video is written the moment it is downloaded, before anything has measured
+    it, so the first shard carries `duration: null` for every row. Typed TEXT on
+    that evidence, the column then stores the 30.0 a later shard measured as the
+    *string* `"30.0"` — which is not a duration, does not compare, and turns the
+    moment ribbon into a blank strip. The caller leaves such a column out
+    entirely, so the first shard that knows something creates it correctly.
+    """
+    seen = set()
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            seen.add(int)
+        elif isinstance(v, (int, float)):
+            seen.add(type(v))
+        else:
+            seen.add(str)
+    if not seen:
+        return ""
+    if seen == {int}:
+        return "INTEGER"
+    if seen <= {int, float}:
+        return "REAL"
+    return "TEXT"
+
+
+def _is_opaque(values: list) -> bool:
+    """Is this column a payload rather than a fact? Judged on the values, since
+    the name is whatever the other program chose to call it."""
+    long_blobs = 0
+    real = 0
+    for v in values:
+        if v is None or v == "":
+            continue
+        real += 1
+        if isinstance(v, str) and _OPAQUE.match(v):
+            long_blobs += 1
+    return real > 0 and long_blobs == real
+
+
+def _dedup_columns(order: list, rows: list) -> list:
+    """The smallest column set whose values identify a row, or [].
+
+    This is how a re-imported shard stays a no-op at the row level rather than
+    only at the file level. There is no primary key to copy — JSONL carries
+    values, not constraints — so it is measured instead: try each identifier-
+    shaped column alone, then identifier-led pairs. Every table in the evidence
+    schema lands on its real key this way (`uid` for claims, `video_key` for
+    videos, `video_key + idx` for shots) without Atlas naming any of them.
+
+    **A key must contain an identifier.** Uniqueness alone is not evidence of a
+    key, because it is measured on one batch: a shard holding one video's two
+    shots has a unique `idx` — 0 and 1 — and an index built on that silently
+    swallows every other video's opening shot for the rest of the archive. A
+    column that is unique only because the sample was narrow is a coincidence;
+    requiring the identifier is what tells the two apart.
+
+    Empty when nothing qualifies, which is not a failure — the shard-level skip
+    still holds, and a table with genuine duplicate rows should keep them.
+    """
+    scalar = [c for c in order
+              if all(v is None or isinstance(v, (int, float, bool))
+                     or (isinstance(v, str) and len(v) <= 96)
+                     for v in (r.get(c) for r in rows))]
+    ident = [c for c in scalar
+             if reflect._norm(c).endswith(("id", "key", "uid", "hash"))]
+    if not ident:
+        return []
+    rest = [c for c in scalar if c not in ident]
+
+    def unique(cols):
+        keys = set()
+        for r in rows:
+            k = tuple(_scalar(r.get(c)) for c in cols)
+            if any(v is None for v in k) or k in keys:
+                return False
+            keys.add(k)
+        return True
+
+    for c in ident:
+        if unique([c]):
+            return [c]
+    for a in ident:
+        for b in ident + rest:
+            if b != a and unique([a, b]):
+                return [a, b]
+    return []
+
+
+def read_shard(path: str) -> tuple:
+    """Parse a shard file into (header, {table: [rows]}).
+
+    A shard truncated by a session that died mid-upload is not an error — every
+    line before the tear is still good evidence. Parsing stops at the first
+    unreadable line and keeps what came before, the same way the process plane's
+    own reader does.
+    """
+    import gzip                                       # noqa: PLC0415
+    tables, torn = {}, 0
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        header = json.loads(fh.readline() or "{}")
+        if header.get("_") != _SHARD_MAGIC:
+            raise ValueError("not an evidence shard")
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                torn = 1
+                break
+            t = rec.pop("t", "")
+            if t and isinstance(rec, dict):
+                tables.setdefault(str(t), []).append(rec)
+    header["_torn"] = torn
+    return header, tables
+
+
+def _ensure_shard_table(conn: sqlite3.Connection, table: str,
+                        types: dict, keys: list) -> list:
+    """Create or widen the destination table. Returns the columns it will take.
+
+    Widening rather than recreating matters because shards arrive in any order
+    and a later pass adds columns: shard 4 may carry a `confidence` the schema
+    did not have when shard 1 built the table.
+    """
+    if not _table_exists(conn, table):
+        cols_sql = ", ".join(f'"{c}" {t}' for c, t in types.items())
+        conn.execute(f'CREATE TABLE "{table}" ({cols_sql})')
+        if keys:
+            idx = ("ux_" + table + "_" + "_".join(keys))[:60]
+            key_sql = ", ".join('"%s"' % k for k in keys)
+            conn.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx}" '
+                         f'ON "{table}" ({key_sql})')
+        return list(types)
+
+    have = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+    for c, t in types.items():
+        if c not in have:
+            try:
+                conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" {t}')
+                have.add(c)
+            except sqlite3.Error:
+                pass
+    return [c for c in types if c in have]
+
+
+def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
+    """Download one evidence shard and replay it into atlas.db."""
+    seq = "shard:" + tgchannel.shard_seq(info)
+    msg_id = info.get("message_id")
+    dest = os.path.join(work_dir, f"shard-{msg_id}.jsonl.gz")
+    _set(current=seq, detail=f"{seq} — downloading")
+
+    if not tgchannel.fetch_document(info, dest):
+        size = int(info.get("file_size") or 0)
+        return {"ok": False, "seq": seq,
+                "note": (f"could not download ({size / 1048576:.1f} MB — over "
+                         f"the Bot API's 20 MB cap and MTProto is not "
+                         f"available)" if size > config.HTTP_DOWNLOAD_LIMIT
+                         else "could not download")}
+    try:
+        header, tables = read_shard(dest)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "seq": seq, "note": f"unreadable: {exc}"}
+
+    rows_in = sum(len(v) for v in tables.values())
+    _set(detail=f"{seq} — replaying {rows_in} row(s)")
+    merged, dropped = {}, []
+
+    for table, rows in tables.items():
+        if not rows or reflect._norm(table) in reflect._ATLAS_OWN or \
+                reflect._FTS_SHADOW.search(table.lower()):
+            # Atlas's own tables are not a landing zone. A shard that happened
+            # to carry a table called `moments` would otherwise overwrite the
+            # index with the raw rows the index is built from.
+            dropped.append(f"{table} (reserved name)")
+            continue
+
+        order, values = [], {}
+        for r in rows:
+            for c in r:
+                if c not in values:
+                    order.append(c)
+                    values[c] = []
+        for c in order:
+            values[c] = [r.get(c) for r in rows]
+
+        types = {}
+        for c in order:
+            if _is_opaque(values[c]):
+                dropped.append(f"{table}.{c} (opaque)")
+                continue
+            t = _sql_type(values[c])
+            if not t:
+                # Empty in this shard, so there is nothing to learn about it and
+                # nothing to store. Left out, not guessed at — see `_sql_type`.
+                continue
+            types[c] = t
+        if not types:
+            continue
+
+        keys = _dedup_columns(list(types), rows)
+        cols = _ensure_shard_table(conn, table, types, keys)
+        if not cols:
+            continue
+
+        before = conn.total_changes
+        col_sql = ", ".join('"%s"' % c for c in cols)
+        conn.executemany(
+            f'INSERT OR IGNORE INTO "{table}" ({col_sql}) '
+            f'VALUES ({", ".join("?" * len(cols))})',
+            [[_scalar(r.get(c)) for c in cols] for r in rows])
+        added = conn.total_changes - before
+        merged[table] = merged.get(table, 0) + added
+
+        # Rows the unique index rejected are not necessarily redundant: a video
+        # first written with no duration, then re-written once it was measured,
+        # is the same row carrying more. Fill the blanks it can, overwrite
+        # nothing. Only runs when there were duplicates, so a shard of all-new
+        # claims — the common case, and the big one — pays nothing for it.
+        if keys and added < len(rows):
+            _enrich(conn, table, cols, keys, rows)
+
+    conn.commit()
+    # `counts` is what the shard *holds*, not what this run happened to add.
+    # A bundle's row records its manifest's counts for the same reason: the
+    # Sources tab is answering "what arrived in this file", and a shard imported
+    # twice would otherwise rewrite its own history to say it contributed
+    # nothing. What this run added is the delta, and it goes in the note.
+    delta = ", ".join(f"{k} +{v}" for k, v in sorted(merged.items()) if v)
+    held = {t: len(rows) for t, rows in tables.items()}
+    conn.execute(
+        "INSERT OR REPLACE INTO bundles(seq, manifest_id, schema, created_at, "
+        "code_commit, parts, bytes, counts, imported_at, status, note) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (seq, msg_id, header.get("schema"), str(header.get("at") or ""),
+         header.get("component") or "", 1,
+         int(info.get("file_size") or os.path.getsize(dest)),
+         json.dumps(held), time.time(), "ok",
+         ("truncated — kept what was readable. "
+          if header.get("_torn") else "")
+         + (delta or "nothing new")
+         + (" · dropped " + ", ".join(dropped[:6]) if dropped else ""))[:400])
+    conn.commit()
+
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+
+    log(f"{seq} imported — {delta or 'no new rows'}"
+        + (f" · dropped {len(dropped)} opaque column(s)" if dropped else ""))
+    return {"ok": True, "seq": seq, "rows": merged, "shard": True}
+
+
+def _scalar(v):
+    """JSON holds nested objects; SQLite does not. Anything structured is
+    stored as the JSON it already was, which reflect.py then treats as text."""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, bool):
+        return int(v)
+    return v
+
+
+def _enrich(conn: sqlite3.Connection, table: str, cols: list, keys: list,
+            rows: list) -> None:
+    """Fill NULL columns of rows that already existed. Never overwrites."""
+    fill = [c for c in cols if c not in keys]
+    if not fill:
+        return
+    sets = ", ".join(f'"{c}" = COALESCE("{c}", ?)' for c in fill)
+    where = " AND ".join(f'"{k}" = ?' for k in keys)
+    conn.executemany(
+        f'UPDATE "{table}" SET {sets} WHERE {where}',
+        [[_scalar(r.get(c)) for c in fill] + [_scalar(r.get(k)) for k in keys]
+         for r in rows])
+
+
 def _record_failure(conn: sqlite3.Connection, seq: str, manifest_id: int,
                     note: str) -> None:
     try:
@@ -579,10 +908,37 @@ def scan_and_import(full: bool = True, max_messages: int = 0,
                 info = tgchannel.message_document(msg)
                 if not info or info.get("message_id") in found_ids:
                     continue
+                m_id = info.get("message_id")
+
+                # Two lanes post to this one channel and their messages are
+                # interleaved by time, so every message is offered to both
+                # readers rather than the walk being run twice. A message can
+                # only be one of them: a manifest is a `.json` naming parts, a
+                # shard is a `.jsonl.gz` that is already the whole thing.
+                if tgchannel.looks_like_shard(info):
+                    found_ids.append(m_id)
+                    seq = "shard:" + tgchannel.shard_seq(info)
+                    _set(found=_STATE["found"] + 1)
+                    if seq in seen:
+                        _set(skipped=_STATE["skipped"] + 1)
+                        continue
+                    _set(phase="importing")
+                    res = import_shard(info, conn, work)
+                    if res.get("ok"):
+                        _set(imported=_STATE["imported"] + 1)
+                        seen.add(res["seq"])
+                        if on_bundle:
+                            on_bundle(conn, res)
+                    else:
+                        _set(failed=_STATE["failed"] + 1)
+                        _record_failure(conn, seq, m_id, res.get("note", ""))
+                        log(f"{seq} failed — {res.get('note')}")
+                    _set(phase="scanning")
+                    continue
+
                 man = _manifest_from_message(msg, work)
                 if not man:
                     continue
-                m_id = info.get("message_id")
                 found_ids.append(m_id)
                 seq = str(man.get("seq") or m_id)
                 _set(found=_STATE["found"] + 1)
@@ -607,10 +963,10 @@ def scan_and_import(full: bool = True, max_messages: int = 0,
         meta_set(conn, "last_scan", time.time())
         meta_set(conn, "last_scan_head", head)
         _set(phase="done", running=False, finished_at=time.time(),
-             current="", detail=f"{_STATE['found']} bundle(s) in channel · "
-                                f"{_STATE['imported']} imported · "
+             current="", detail=f"{_STATE['found']} bundle(s) and shard(s) "
+                                f"in channel · {_STATE['imported']} imported · "
                                 f"{_STATE['skipped']} already held")
-        log(f"scan complete — {_STATE['found']} manifest(s), "
+        log(f"scan complete — {_STATE['found']} bundle(s)/shard(s), "
             f"{_STATE['imported']} imported, {_STATE['failed']} failed")
     except Exception as e:
         _set(phase="error", running=False, finished_at=time.time(),

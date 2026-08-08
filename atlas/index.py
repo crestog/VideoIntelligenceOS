@@ -292,6 +292,13 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
     """Create the moment tables. Returns True if FTS5 is usable."""
     for ddl in _MOMENT_DDL:
         conn.execute(ddl)
+    # `rebuild` records its fingerprint in atlas_meta on the last four
+    # statements it runs. That table belongs to the ingest path, so a database
+    # that reached the indexer without going through a bundle import — a folder
+    # adopted locally, a shard replayed straight in — had every passage built
+    # and then lost the lot to "no such table: atlas_meta" at the finish line.
+    from .ingest import ensure_meta          # noqa: PLC0415  (cycle at import)
+    ensure_meta(conn)
     fts = True
     for ddl in _FTS_DDL:
         try:
