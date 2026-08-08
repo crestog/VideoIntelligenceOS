@@ -19,6 +19,38 @@ import time
 BOOT_MARKER = "/tmp/vios_session_active"
 
 
+# ══════════════════════════════════════════════════════════
+# PHASE 0: CREDENTIALS
+# ══════════════════════════════════════════════════════════
+# Done before anything else imports `config`, which reads the environment once
+# at import time and keeps what it found.
+#
+# Kaggle Secrets are an API, not environment variables, and vios/creds.py is the
+# only file here that knows how to call it. Everything else — the harvester, the
+# upload bot, Atlas, every worker below — reads os.environ and has no fallback
+# value, because a literal default once published a live bot token from this
+# public repo. So a session with all four secrets stored correctly still booted
+# with "Telegram disabled", and the advice printed further down was to export
+# them by hand in the launch cell: the one place a credential should never be
+# typed. Asking once here fixes every process at the same time, since Popen
+# hands this environment to each of them.
+print("🔑 [SYSTEM] Phase 0: Reading credentials...", flush=True)
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from vios import creds as _creds
+
+    _bridged = _creds.export_to_env()
+    if _bridged:
+        print(f"   ✅ Kaggle Secrets → environment: "
+              f"{', '.join(sorted(_bridged.values()))}", flush=True)
+    elif _creds.on_kaggle():
+        print("   ℹ️ No Kaggle Secrets to add (already set, or none stored).",
+              flush=True)
+except Exception as _e:
+    print(f"   ⚠️ Kaggle Secrets unavailable: {type(_e).__name__}: {_e}",
+          flush=True)
+
+
 def stream_logs(pipe, prefix, is_engine=False):
     """Stream subprocess output to console with prefix tagging."""
     for line in iter(pipe.readline, ''):
@@ -202,8 +234,10 @@ try:
         print("", flush=True)
         print(f"⚠️ [SECRETS] Telegram disabled — not set: {', '.join(_absent)}", flush=True)
         print("      The web UI, CV pipeline, dashboard and queues all still run.", flush=True)
-        print("      To enable channel harvesting and the upload bot, add these as", flush=True)
-        print("      Kaggle Secrets and export them in the launch cell.", flush=True)
+        print("      To enable channel harvesting and the upload bot, add these", flush=True)
+        print("      as Kaggle Secrets under their VIOS_ names (Add-ons →", flush=True)
+        print("      Secrets) and restart. Phase 0 above picks them up on its", flush=True)
+        print("      own — nothing needs exporting in the launch cell.", flush=True)
     else:
         print("🔑 [SECRETS] Telegram credentials present.", flush=True)
     if not NIM_API_KEY:

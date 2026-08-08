@@ -135,6 +135,41 @@ def _from_file() -> dict:
             if k in FIELDS and v and str(v).strip()}
 
 
+def export_to_env() -> dict:
+    """Make Kaggle Secrets visible to code that reads only the environment.
+
+    Returns `{field: env var}` for the variables this call actually set — the
+    names, never the values, so a launcher can print the result into a notebook
+    log that may be shared.
+
+    Kaggle Secrets are not environment variables. They are an API you have to
+    call, and this module is the only thing in the repository that calls it.
+    Every other program here reads `os.environ` and has no fallback value,
+    because a literal default once put a live bot token in a public repo. Those
+    two facts together produced a session that had all four secrets stored
+    correctly and still printed "Telegram disabled" — the harvester, the upload
+    bot and Atlas had simply never asked. The advice in the boot log was to
+    export them by hand in the launch cell, which works and which puts the
+    burden in the one place a credential should never end up: a notebook.
+
+    So the launcher asks once, and every process it spawns inherits the answer,
+    because `subprocess.Popen` passes this environment on. Nothing is written
+    to disk — `save_local` remains the single exception in this module, and it
+    refuses to run on Kaggle at all.
+
+    A variable that is already set always wins, so an explicit export is still
+    how you override a stored secret for one session without deleting it.
+    """
+    exported = {}
+    for name, val in _from_kaggle().items():
+        label = FIELDS[name][0]
+        if os.environ.get(label, "").strip():
+            continue
+        os.environ[label] = str(val)
+        exported[name] = label
+    return exported
+
+
 # ── the resolver ──────────────────────────────────────────────────────────
 def resolve(typed: dict | None = None) -> dict:
     """Merge the four sources. Returns {"values": {...}, "sources": {...}}.
