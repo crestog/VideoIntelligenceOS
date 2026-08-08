@@ -262,15 +262,19 @@ def _int_secret(*names: str, default: int = 0) -> int:
 API_ID     = _int_secret('VIOS_API_ID', 'TELEGRAM_API_ID')
 API_HASH   = _secret('VIOS_API_HASH', 'TELEGRAM_API_HASH')
 BOT_TOKEN  = _secret('VIOS_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN')
-# Not a credential — the channel id is an address, not a key.
-CHANNEL_ID = _int_secret('VIOS_CHANNEL_ID', 'TELEGRAM_CHANNEL_ID',
-                         default=-1003762735924)
+# No default. The channel id is not a key, but it is the address of somebody's
+# private archive, and this repo is public — a literal here ships one person's
+# channel to everyone who clones. It is also the failure that is hardest to
+# see: with a default, a misconfigured deployment does not stop, it quietly
+# reads and writes a channel that is not yours. Absent is louder than wrong.
+CHANNEL_ID = _int_secret('VIOS_CHANNEL_ID', 'TELEGRAM_CHANNEL_ID')
 
 # Names as the launcher/Kaggle Secrets should provide them, for error messages.
 _TELEGRAM_SECRETS = (
     ('API_ID', API_ID, 'TELEGRAM_API_ID'),
     ('API_HASH', API_HASH, 'TELEGRAM_API_HASH'),
     ('BOT_TOKEN', BOT_TOKEN, 'TELEGRAM_BOT_TOKEN'),
+    ('CHANNEL_ID', CHANNEL_ID, 'TELEGRAM_CHANNEL_ID'),
 )
 
 

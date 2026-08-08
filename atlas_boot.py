@@ -12,7 +12,7 @@ Credentials come from the environment, never from this file:
     VIOS_API_ID / TELEGRAM_API_ID        MTProto app id     (large parts)
     VIOS_API_HASH / TELEGRAM_API_HASH    MTProto app hash
     VIOS_BOT_TOKEN / TELEGRAM_BOT_TOKEN  bot token          (required)
-    ATLAS_CHANNEL_ID                     optional; defaults to the VIOS channel
+    VIOS_CHANNEL_ID / ATLAS_CHANNEL_ID   channel to read    (required, -100…)
 
 On Kaggle the port is not reachable from outside, so this asks for a tunnel and
 prints the URL. Without one it still serves on localhost, which is useful when

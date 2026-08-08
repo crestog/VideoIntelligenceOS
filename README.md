@@ -246,6 +246,9 @@ for env_key, secret_name in [
     ("VIOS_API_ID",          "TELEGRAM_API_ID"),
     ("VIOS_API_HASH",        "TELEGRAM_API_HASH"),
     ("VIOS_BOT_TOKEN",       "TELEGRAM_BOT_TOKEN"),
+    # The channel id is an address rather than a key, but it is also env-only:
+    # a default would point every clone of this public repo at one archive.
+    ("VIOS_CHANNEL_ID",      "TELEGRAM_CHANNEL_ID"),
 ]:
     try:
         os.environ[env_key] = secrets.get_secret(secret_name)
@@ -282,11 +285,11 @@ prints the tunnel URL, the **Omniscient** tab in the Command Deck serves the
 God-Mode Explorer, and the Telegram bot accepts video uploads on the priority lane.
 
 **Required Kaggle Secrets:** `github_token` (mandatory), `TELEGRAM_API_ID` /
-`TELEGRAM_API_HASH` / `TELEGRAM_BOT_TOKEN` (needed for the upload bot and channel
-harvesting — without them both stay disabled and everything else runs normally),
-`hf_token` (optional — all models are currently public), `nim_api_key` (optional —
-without it, GraphRAG extraction and answer synthesis are skipped and raw visual
-output is returned).
+`TELEGRAM_API_HASH` / `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHANNEL_ID` (needed for the
+upload bot and channel harvesting — without them both stay disabled and everything
+else runs normally), `hf_token` (optional — all models are currently public),
+`nim_api_key` (optional — without it, GraphRAG extraction and answer synthesis are
+skipped and raw visual output is returned).
 
 > **Credentials are env-only.** `config.py` carries no fallback values. An earlier
 > revision hardcoded a working bot token and API hash as defaults, which published

@@ -238,7 +238,7 @@ here.
 | `VIOS_BOT_TOKEN` / `TELEGRAM_BOT_TOKEN` | yes | reads the channel, downloads parts under 20 MB |
 | `VIOS_API_ID` / `TELEGRAM_API_ID` | for large files | MTProto — parts and videos over 20 MB |
 | `VIOS_API_HASH` / `TELEGRAM_API_HASH` | for large files | as above |
-| `ATLAS_CHANNEL_ID` | no | defaults to the VIOS channel |
+| `VIOS_CHANNEL_ID` / `ATLAS_CHANNEL_ID` | yes | which channel to read, `-100…` |
 | `NGROK_AUTH_TOKEN` | on Kaggle | public URL for the site |
 | `ATLAS_HOME` | no | where the database lives (default `/kaggle/working/atlas`) |
 | `ATLAS_CACHE_DIR` | no | where videos are cached (default `/kaggle/temp/atlas`) |

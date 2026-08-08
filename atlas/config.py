@@ -75,13 +75,17 @@ API_ID    = _int_secret("ATLAS_API_ID", "VIOS_API_ID", "TELEGRAM_API_ID")
 API_HASH  = _secret("ATLAS_API_HASH", "VIOS_API_HASH", "TELEGRAM_API_HASH")
 BOT_TOKEN = _secret("ATLAS_BOT_TOKEN", "VIOS_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
 
-# The channel id is an address, not a key, so it does carry a default.
+# No default. Not a key, but it is the address of somebody's private archive,
+# and this repo is public. A wrong-but-present channel id is also the quietest
+# way to fail: Atlas would read a channel that is not yours and report nothing
+# wrong. See the note in the root config.py.
 CHANNEL_ID = _int_secret("ATLAS_CHANNEL_ID", "VIOS_CHANNEL_ID",
-                         "TELEGRAM_CHANNEL_ID", default=-1003762735924)
+                         "TELEGRAM_CHANNEL_ID")
 
 _SECRET_NAMES = (("API_ID", API_ID, "TELEGRAM_API_ID"),
                  ("API_HASH", API_HASH, "TELEGRAM_API_HASH"),
-                 ("BOT_TOKEN", BOT_TOKEN, "TELEGRAM_BOT_TOKEN"))
+                 ("BOT_TOKEN", BOT_TOKEN, "TELEGRAM_BOT_TOKEN"),
+                 ("CHANNEL_ID", CHANNEL_ID, "TELEGRAM_CHANNEL_ID"))
 
 
 def missing_secrets() -> list:
