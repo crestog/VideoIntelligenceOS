@@ -274,6 +274,29 @@ def init_db():
     for note in res["skipped"]:
         logger.warning(f"lake schema — {note}")
 
+
+# Called here, at import — not only from the `__main__` block below.
+#
+# `if __name__ == "__main__"` is true exactly when this file is the program.
+# It is not the program when uvicorn is pointed at `ui_server:app`, when a
+# test drives the app through TestClient, or when anything imports a helper
+# from here. In every one of those cases lake.db was opened with no schema in
+# it, and /api/explore, /api/categories and /api/playlist all answered "no
+# such table: posts" against a database that was otherwise fine — three dead
+# tabs and nothing in the log explaining why.
+#
+# Every statement is CREATE ... IF NOT EXISTS (see lake_schema), so running it
+# on every import costs milliseconds against a populated file and removes the
+# entire class of failure.
+try:
+    init_db()
+except Exception as e:                                          # noqa: BLE001
+    # A schema that cannot be created is worth one loud line, not a dead
+    # server: routes that need those tables report it themselves, and the
+    # admin page — which is where you would go to fix it — still loads.
+    logger.error(f"lake schema at import — {type(e).__name__}: {e}")
+
+
 async def get_playlist_data(category):
     cache_key = f"playlist:{category}"
     cached = cache_get(cache_key, 3.0)
@@ -659,7 +682,10 @@ async def background_downloader():
             await asyncio.sleep(15)
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Insta-Vault Modular OS")
+# `docs_url=None` disables FastAPI's built-in Swagger route so the one below can
+# take /docs and give it the same footer every other page has. /openapi.json is
+# untouched — the page still reads its schema from there.
+app = FastAPI(title="Insta-Vault Modular OS", docs_url=None)
 
 
 # When the disk fills, SQLite raises "database or disk is full" from deep inside
@@ -850,18 +876,59 @@ _HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authori
                 "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 
 
+def _omni_notice(heading: str, body: str, code: int) -> HTMLResponse:
+    """A real page for /omni when there is no dashboard behind it.
+
+    The footer links /omni from every page in the system, so this URL is one
+    click away at all times — including on a run with `VIOS_OMNI=0`, where
+    nothing is listening on the dashboard port and never will be. What the
+    proxy produced there was a bare 503 with no navigation on it, so the only
+    way back was the browser's back button. It says what is wrong, and it
+    carries the same footer as everything else.
+    """
+    return HTMLResponse(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Explorer · VIOS</title><style>"
+        "body{background:#0d1117;color:#c9d1d9;margin:0;"
+        "font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif}"
+        ".w{max-width:640px;margin:0 auto;padding:96px 28px 0;text-align:center}"
+        "h2{font-weight:600;font-size:22px;margin:0 0 14px}"
+        "p{color:#8b949e;line-height:1.6;margin:0 0 10px}"
+        "code{background:#161b22;border:1px solid #21262d;border-radius:5px;"
+        "padding:2px 7px;font-size:13px;color:#c8cfda}"
+        "</style></head><body><div class='w'>"
+        f"<h2>{heading}</h2>{body}</div>"
+        "<script src='/sitemap.js'></script></body></html>", status_code=code)
+
+
 @app.get("/omni")
 async def omni_root_redirect():
+    """Hand off to the proxy, unless there is provably nothing to proxy to."""
+    if not OMNI_ENABLED:
+        return _omni_notice(
+            "🔮 The Omniscient layer is switched off",
+            "<p>This run set <code>VIOS_OMNI=0</code>, so the God-Mode "
+            "Explorer, its Postgres/Qdrant/Neo4j stores and its ~19 GB of "
+            "models were never started.</p>"
+            "<p>Everything else works without it — search and playback live "
+            "in <b>Atlas</b>, and the GPU passes run on the "
+            "<b>Process</b> page.</p>"
+            "<p>To turn it on, restart with <code>VIOS_OMNI=1</code>.</p>", 200)
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/omni/")   # trailing slash → relative URLs resolve
 
 
 @app.api_route("/omni/{path:path}", methods=["GET", "POST"])
 async def omni_proxy(request: Request, path: str = ""):
+    if not OMNI_ENABLED:
+        return await omni_root_redirect()
     try:
         import httpx
     except ImportError:
-        return HTMLResponse("<h3>httpx not installed — run setup.sh</h3>", status_code=500)
+        return _omni_notice("httpx is not installed",
+                            "<p>Run <code>setup.sh</code> — the Explorer is "
+                            "reached through an HTTP proxy and that is the "
+                            "client it uses.</p>", 500)
     try:
         client = httpx.AsyncClient(base_url=_OMNI_DASH_URL,
                                    timeout=httpx.Timeout(10.0, read=None))
@@ -887,12 +954,10 @@ async def omni_proxy(request: Request, path: str = ""):
                                  headers=resp_headers,
                                  media_type=resp.headers.get("content-type"))
     except Exception as e:
-        return HTMLResponse(
-            "<html><body style='background:#0d1117;color:#c9d1d9;font-family:sans-serif;"
-            "padding:50px;text-align:center;'><h2>🔮 Omniscient Engine is still booting…</h2>"
-            f"<p>The dashboard will appear once models finish loading.</p>"
-            f"<p style='color:#8b949e;font-size:0.8em'>{type(e).__name__}</p>"
-            "</body></html>", status_code=503)
+        return _omni_notice(
+            "🔮 Omniscient Engine is still booting…",
+            "<p>The dashboard appears here once its models finish loading.</p>"
+            f"<p style='font-size:.82em'>{type(e).__name__}</p>", 503)
 
 
 @app.websocket("/ws")
@@ -1098,6 +1163,31 @@ async def sitemap_script():
     from sitemap import sitemap_js
     return Response(sitemap_js(), media_type="application/javascript",
                     headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/docs", include_in_schema=False, response_class=HTMLResponse)
+async def api_docs():
+    """Swagger UI, with the footer every other page carries.
+
+    FastAPI's own /docs is generated, not a file, so the `<script src=
+    "/sitemap.js">` tag that puts the footer on the other seven pages has
+    nowhere to live in it — /docs was the one door in the sitemap that could
+    not lead anywhere else. Building the same page here and appending the tag
+    is the whole fix; `docs_url=None` on the app above frees the path.
+
+    The one override is the background. Swagger ships a near-white theme and
+    the footer is written for the dark ones, so its own colours would be grey
+    on white. `body .vios-sitemap` outranks the script's `.vios-sitemap` on
+    specificity, which matters because the script appends its stylesheet at
+    DOMContentLoaded — after anything static in the head.
+    """
+    from fastapi.openapi.docs import get_swagger_ui_html
+    page = get_swagger_ui_html(openapi_url=app.openapi_url,
+                               title=f"{app.title} — API").body.decode()
+    return HTMLResponse(page.replace(
+        "</body>",
+        "<style>body .vios-sitemap{background:#0d1117;margin-top:0;"
+        "border-top:0}</style><script src='/sitemap.js'></script></body>"))
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_main_ui():
