@@ -14,7 +14,9 @@ constraint is invisible in practice.
 """
 
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -32,6 +34,35 @@ def log(msg, level="INFO"):
 # Availability flags — set by ensure_services()/init_*; read by the engine
 AVAILABLE = {"postgres": False, "qdrant": False, "neo4j": False}
 
+# Why a backend is not available, in the operator's terms. Written by
+# ensure_services(), read by the admin panel. A boolean says the graph is off;
+# this says which of the six things that could have caused it actually did.
+DIAGNOSTICS = {"postgres": [], "neo4j": [], "qdrant": []}
+
+
+def _diag(service: str, line: str, level="WARN"):
+    DIAGNOSTICS.setdefault(service, []).append(line)
+    log(f"   │ {line}", level)
+
+
+def _run(cmd, timeout=60, env=None):
+    """Run a command, never raise. Returns (returncode, combined output).
+
+    -1 means the binary is not there, -2 means it hung. Both are answers, and
+    both used to be swallowed by a bare `except: pass` that left the operator
+    with "unreachable" and nothing else.
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=env)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except FileNotFoundError:
+        return -1, f"{cmd[0]}: not installed"
+    except subprocess.TimeoutExpired:
+        return -2, f"{' '.join(cmd[:3])}: timed out after {timeout}s"
+    except OSError as e:
+        return -3, f"{cmd[0]}: {e}"
+
 
 # ═══════════════════════════════════════════════════════════
 # STABLE 63-BIT IDS
@@ -46,32 +77,140 @@ def stable_id64(s: str) -> int:
 # ═══════════════════════════════════════════════════════════
 # SERVICE MANAGEMENT (idempotent — safe to call on every engine boot)
 # ═══════════════════════════════════════════════════════════
+def _psql(sql: str, timeout=30):
+    """Run one statement as the Postgres superuser, whatever this box allows.
+
+    Three transports, because the one that works depends on the image:
+    `sudo -u postgres` on a normal box, `su postgres -c` when sudo is absent
+    (slim containers frequently ship without it), and a plain socket connection
+    when we are already root and peer auth lets us straight in. Trying only the
+    first is why the omni role was never created on some images, and a missing
+    role reads exactly like a dead server: "unreachable".
+    """
+    quoted = sql.replace("'", "'\\''")
+    for cmd in (["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=0",
+                 "-c", sql],
+                ["su", "postgres", "-c", f"psql -c '{quoted}'"],
+                ["psql", "-U", "postgres", "-h", "/var/run/postgresql",
+                 "-c", sql]):
+        rc, out = _run(cmd, timeout=timeout)
+        if rc == -1:
+            continue                      # this transport does not exist here
+        return rc, out
+    return -1, "no way to reach psql as the postgres superuser"
+
+
+def _pg_cluster_state():
+    """(version, name, status) of the first cluster, or None if there is none.
+
+    A container image that installed postgresql without a locale ends up with
+    the binaries and the init script but no cluster at all — and then
+    `service postgresql start` exits 0 having started nothing. That silent
+    success is the single most confusing failure in this whole layer.
+    """
+    rc, out = _run(["pg_lsclusters", "--no-header"], timeout=20)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            return parts[0], parts[1], parts[3]
+    return None
+
+
 def _start_postgres():
-    """Start PostgreSQL and ensure the omni user/database exist."""
-    try:
-        subprocess.run(["service", "postgresql", "start"], capture_output=True, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass  # not a Debian-style host (local dev) — connection attempt decides
-    # Idempotent role/db creation (|| true semantics)
-    for sql in (f"CREATE USER {OMNI_PG_USER} WITH PASSWORD '{OMNI_PG_PASSWORD}';",
-                f"CREATE DATABASE {OMNI_PG_DB} OWNER {OMNI_PG_USER};"):
-        try:
-            subprocess.run(["sudo", "-u", "postgres", "psql", "-c", sql],
-                           capture_output=True, timeout=30)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            break
+    """Start PostgreSQL and ensure the omni user/database exist.
+
+    Returns True when a server is listening. Every failure names itself.
+    """
+    if not shutil.which("psql") and not os.path.isdir("/etc/postgresql"):
+        _diag("postgres", "PostgreSQL is not installed on this machine "
+                          "(no psql, no /etc/postgresql). setup.sh installs it "
+                          "— check that the apt step ran and had network.")
+        return False
+
+    rc, out = _run(["service", "postgresql", "start"], timeout=90)
+    if rc not in (0, -1):
+        _diag("postgres", f"`service postgresql start` exited {rc}: {out[:200]}")
+
+    cluster = _pg_cluster_state()
+    if cluster is None:
+        # No cluster: create one. Kaggle's image has the packages but the
+        # postinst that would normally create `main` does not always run.
+        rc, out = _run(["pg_createcluster", "--start", "16", "main"], timeout=180)
+        if rc != 0:
+            for ver in ("15", "14", "13", "17"):
+                rc, out = _run(["pg_createcluster", "--start", ver, "main"],
+                               timeout=180)
+                if rc == 0:
+                    break
+        if rc != 0:
+            _diag("postgres", f"no cluster exists and one could not be created: "
+                              f"{out[:200]}")
+        else:
+            log("PostgreSQL cluster created", "INFO")
+        cluster = _pg_cluster_state()
+
+    if cluster and cluster[2] != "online":
+        rc, out = _run(["pg_ctlcluster", cluster[0], cluster[1], "start"],
+                       timeout=120)
+        if rc != 0:
+            _diag("postgres", f"cluster {cluster[0]}/{cluster[1]} would not "
+                              f"start: {out[:200]}")
+
+    # Idempotent role/db creation. "already exists" is the expected answer on
+    # every run after the first, so its exit code is not a failure.
+    rc, out = _psql(f"CREATE USER {OMNI_PG_USER} WITH PASSWORD "
+                    f"'{OMNI_PG_PASSWORD}' SUPERUSER;")
+    if rc == -1:
+        _diag("postgres", "psql is unreachable as the postgres superuser — the "
+                          "omni role cannot be created")
+    elif rc != 0 and "already exists" not in out:
+        _diag("postgres", f"could not create the {OMNI_PG_USER} role: {out[:200]}")
+
+    rc, out = _psql(f"CREATE DATABASE {OMNI_PG_DB} OWNER {OMNI_PG_USER};")
+    if rc not in (0, -1) and "already exists" not in out:
+        _diag("postgres", f"could not create the {OMNI_PG_DB} database: "
+                          f"{out[:200]}")
+    return True
+
+
+def _java_version(home: str) -> int:
+    """Major version of the JRE at `home`, or 0 if it will not answer.
+
+    Presence is not enough. Kaggle images ship Java 11 for Spark, and Neo4j 5
+    refuses it — but only after the launcher has forked, so the failure lands
+    in neo4j.log thirty seconds later and the start command itself exits 0.
+    """
+    rc, out = _run([os.path.join(home, "bin", "java"), "-version"], timeout=25)
+    if rc != 0 and not out:
+        return 0
+    m = re.search(r'version "?(\d+)', out)
+    if not m:
+        return 0
+    major = int(m.group(1))
+    return 8 if major == 1 else major       # 1.8.0_x is Java 8
 
 
 def _find_java():
     """
-    Locate a JRE for Neo4j. Returns a JAVA_HOME path, or None.
+    Locate a JRE Neo4j will accept. Returns a JAVA_HOME path, or None.
 
     Neo4j 5.x needs Java 17+. The configured default is Kaggle's usual OpenJDK
-    17 location, but that moves between image builds, so fall back to probing.
-    Returning None lets the caller report "no JRE" instead of Neo4j failing with
-    an opaque error 30-90 seconds later.
+    17 location, but that moves between image builds, so fall back to probing —
+    and check the version of each candidate rather than taking the first
+    `bin/java` found, because the first one is often the wrong one.
     """
-    if os.path.isfile(os.path.join(JAVA_HOME, "bin", "java")):
+    seen = []
+
+    def usable(path):
+        if not path or not os.path.isfile(os.path.join(path, "bin", "java")):
+            return False
+        v = _java_version(path)
+        seen.append(f"{path} (Java {v or '?'})")
+        return v >= 17
+
+    if usable(JAVA_HOME):
         return JAVA_HOME
 
     for base in ("/usr/lib/jvm",):
@@ -80,12 +219,18 @@ def _find_java():
         # Newest version first — Neo4j rejects anything below 17.
         for name in sorted(os.listdir(base), reverse=True):
             cand = os.path.join(base, name)
-            if os.path.isfile(os.path.join(cand, "bin", "java")):
+            if usable(cand):
                 return cand
 
     java = shutil.which("java")
     if java:  # .../<home>/bin/java
-        return os.path.dirname(os.path.dirname(os.path.realpath(java)))
+        cand = os.path.dirname(os.path.dirname(os.path.realpath(java)))
+        if usable(cand):
+            return cand
+
+    if seen:
+        _diag("neo4j", "found Java, but none of it is 17 or newer: "
+                       + "; ".join(seen[:4]))
     return None
 
 
@@ -137,22 +282,39 @@ def _start_neo4j():
     """
     neo4j_bin = os.path.join(NEO4J_HOME, "bin", "neo4j")
     if not os.path.exists(neo4j_bin):
-        log(f"Neo4j not installed at {NEO4J_HOME} — knowledge graph disabled "
-            f"(setup.sh downloads it; check the tarball step)", "WARN")
+        _diag("neo4j", f"not installed at {NEO4J_HOME} — setup.sh downloads the "
+                       f"community tarball; that step failed or was skipped")
         return False
 
     java_home = _find_java()
     if not java_home:
-        log("No Java 17+ runtime found — Neo4j cannot start, knowledge graph "
-            "disabled (install openjdk-17-jre)", "WARN")
+        _diag("neo4j", "no Java 17+ runtime — run `apt-get install -y "
+                       "openjdk-17-jre`, or set VIOS_NEO4J_HOME's JAVA_HOME")
         return False
 
     for sub in ("data", "logs", "transactions"):
         try:
             os.makedirs(os.path.join(NEO4J_DATA_DIR, sub), exist_ok=True)
         except OSError as e:
-            log(f"Neo4j data dir {NEO4J_DATA_DIR} not writable ({e}) — graph disabled", "WARN")
+            _diag("neo4j", f"data dir {NEO4J_DATA_DIR} is not writable: {e}")
             return False
+
+    # A leftover pid file from a container that was killed rather than shut
+    # down makes the launcher refuse to start with "already running", and the
+    # process it names died with the previous session.
+    for pid_file in (os.path.join(NEO4J_DATA_DIR, "run", "neo4j.pid"),
+                     os.path.join(NEO4J_HOME, "run", "neo4j.pid")):
+        try:
+            with open(pid_file, encoding="utf-8") as fh:
+                pid = int(fh.read().strip())
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            try:
+                os.remove(pid_file)
+                log("Removed a stale Neo4j pid file from a previous session",
+                    "INFO")
+            except OSError:
+                pass
 
     if not _write_neo4j_conf():
         return False
@@ -163,22 +325,16 @@ def _start_neo4j():
     # install can pick up a stale conf from a different prefix.
     env["NEO4J_CONF"] = os.path.join(NEO4J_HOME, "conf")
 
-    try:
-        proc = subprocess.run([neo4j_bin, "start"], env=env, capture_output=True,
-                              text=True, timeout=180)
-    except FileNotFoundError as e:
-        log(f"Neo4j launcher not executable: {e}", "WARN")
-        return False
-    except subprocess.TimeoutExpired:
-        log("Neo4j start timed out after 180s — graph disabled", "WARN")
-        return False
-
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " · ")
-        log(f"Neo4j start failed (exit {proc.returncode}): {detail[:300]}", "WARN")
-        return False
-
-    return True
+    rc, out = _run([neo4j_bin, "start"], timeout=180, env=env)
+    if rc == 0:
+        return True
+    # "already running" is success wearing a failure's exit code.
+    if "already running" in out.lower():
+        log("Neo4j was already running", "INFO")
+        return True
+    _diag("neo4j", f"launcher exited {rc}: "
+                   f"{out.replace(chr(10), ' · ')[:300] or 'no output'}")
+    return False
 
 
 def _tail_neo4j_log(lines=12):
@@ -197,19 +353,39 @@ def _tail_neo4j_log(lines=12):
 
 def ensure_services():
     """Start Postgres + Neo4j (idempotent), verify connectivity, set flags."""
-    _start_postgres()
+    for k in DIAGNOSTICS:
+        DIAGNOSTICS[k] = []
+
+    try:
+        import psycopg2                                  # noqa: F401,PLC0415
+        pg_driver = True
+    except ImportError:
+        pg_driver = False
+        _diag("postgres", "the psycopg2 driver is not installed "
+                          "(pip install psycopg2-binary)")
+
+    pg_present = _start_postgres() if pg_driver else False
     neo4j_started = _start_neo4j()
 
     # Postgres: quick probe with retries (service start is fast)
-    for _ in range(10):
-        try:
-            get_pg_conn().close()
-            AVAILABLE["postgres"] = True
-            break
-        except Exception:
-            time.sleep(2)
+    last_pg = None
+    if pg_present:
+        for _ in range(10):
+            try:
+                get_pg_conn().close()
+                AVAILABLE["postgres"] = True
+                break
+            except Exception as e:
+                last_pg = e
+                time.sleep(2)
     log(f"PostgreSQL: {'✅ online' if AVAILABLE['postgres'] else '❌ unreachable'}",
         "SUCCESS" if AVAILABLE["postgres"] else "WARN")
+    if not AVAILABLE["postgres"]:
+        if last_pg:
+            _diag("postgres", f"last connection error: {str(last_pg)[:200]}")
+        log("   └─ VIOS continues without it: narratives and frame rows are "
+            "skipped, vectors still index, and the Explorer table will look "
+            "empty. Everything else is unaffected.", "WARN")
 
     # Neo4j: JVM boot takes ~15-30s — poll bolt connectivity, but only if the
     # launcher actually reported success. Probing for 60s after a failed start
@@ -235,22 +411,75 @@ def ensure_services():
     else:
         log("Neo4j: ❌ unreachable (graph features off)", "WARN")
         if neo4j_started and last_err:
-            log(f"   └─ last bolt error: {str(last_err)[:200]}", "WARN")
+            _diag("neo4j", f"bolt never answered on {NEO4J_BOLT}: "
+                           f"{str(last_err)[:180]}")
             for line in _tail_neo4j_log():
-                log(f"   │ {line[:200]}", "WARN")
+                _diag("neo4j", f"log: {line[:180]}")
         log("   └─ VIOS continues without the graph: vectors + relational "
             "indexing are unaffected, GraphRAG entity queries are disabled.", "WARN")
+
+    _publish_report()
     return AVAILABLE
+
+
+def _publish_report():
+    """Put the report where the UI process can read it.
+
+    The omni layer runs as its own process, so `AVAILABLE` in the FastAPI
+    worker is always three falses — the admin panel was reporting the flags of
+    a module that had never started a service. Redis already carries the log
+    buffer across the same boundary; the report rides with it.
+    """
+    try:
+        from queue_manager import get_redis            # noqa: PLC0415
+        r = get_redis()
+        r.set("VIOS_OMNI_SERVICES", json.dumps(service_report()), ex=3600)
+    except Exception:
+        pass                # a report that cannot be published is not an error
+
+
+def service_report() -> dict:
+    """What is up, what is down, and why — for the admin panel.
+
+    The flags alone were never actionable. This is the same information the
+    boot log carries, but readable after the log has scrolled past.
+    """
+    return {
+        "available": dict(AVAILABLE),
+        "diagnostics": {k: list(v) for k, v in DIAGNOSTICS.items()},
+        "postgres": {"database": OMNI_PG_DB, "user": OMNI_PG_USER,
+                     "host": OMNI_PG_HOST},
+        "neo4j": {"home": NEO4J_HOME, "bolt": NEO4J_BOLT,
+                  "installed": os.path.exists(
+                      os.path.join(NEO4J_HOME, "bin", "neo4j")),
+                  "java": _find_java() or ""},
+        "qdrant": {"path": QDRANT_PATH},
+    }
 
 
 # ═══════════════════════════════════════════════════════════
 # POSTGRESQL
 # ═══════════════════════════════════════════════════════════
 def get_pg_conn():
+    """A live connection, over TCP or the unix socket, whichever answers.
+
+    `localhost` alone is not enough on a default Debian cluster: the packaged
+    pg_hba.conf authenticates host connections with scram, and an image that
+    never set a password for the role rejects them while the socket — peer or
+    trust — lets the same role straight in. Falling back means one less thing
+    that has to be configured correctly for the layer to come up.
+    """
     import psycopg2
-    return psycopg2.connect(dbname=OMNI_PG_DB, user=OMNI_PG_USER,
-                            password=OMNI_PG_PASSWORD, host=OMNI_PG_HOST,
-                            connect_timeout=10)
+    last = None
+    for kw in ({"host": OMNI_PG_HOST, "password": OMNI_PG_PASSWORD},
+               {"host": "/var/run/postgresql"},
+               {"host": "127.0.0.1", "password": OMNI_PG_PASSWORD}):
+        try:
+            return psycopg2.connect(dbname=OMNI_PG_DB, user=OMNI_PG_USER,
+                                    connect_timeout=10, **kw)
+        except Exception as e:
+            last = e
+    raise last
 
 
 # ── Graceful degradation: no-op stand-ins used when Postgres is unavailable ──

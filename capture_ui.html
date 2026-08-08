@@ -500,6 +500,13 @@ details.step .in{padding:15px 16px 18px}
                    style="font-family:var(--body);padding:8px">
           </div>
           <div class="field">
+            <label>…or a path to the file on this machine <span class="note">—
+              no upload, so nothing can drop in transit</span></label>
+            <input type="text" id="filePath" spellcheck="false"
+                   placeholder="/kaggle/input/ig-export/instagram-you.zip"
+                   style="font-family:var(--mono);padding:8px">
+          </div>
+          <div class="field">
             <label>…or paste links <span class="note">— <code>## Category</code>
               headings are read as collections</span></label>
             <textarea id="paste" placeholder="## Business&#10;https://www.instagram.com/reel/…&#10;https://www.instagram.com/reel/…" spellcheck="false"></textarea>
@@ -839,9 +846,36 @@ function say(el, msg, kind){
   n.textContent = msg; n.className = 'result show ' + (kind || '');
 }
 async function post(url, body){
-  const r = await fetch(url, {method:'POST', body});
-  let j; try { j = await r.json(); } catch { j = {ok:false, error:'bad response'}; }
-  return j;
+  // A rejected fetch used to escape this function and kill the click handler
+  // silently, leaving whatever "…" message was on screen there forever. Every
+  // failure now comes back as a normal {ok:false} so the caller can say so.
+  try{
+    const r = await fetch(url, {method:'POST', body});
+    try { return await r.json(); }
+    catch { return {ok:false, error:`server sent a ${r.status} with no JSON`}; }
+  }catch(e){
+    return {ok:false, error:'could not reach the server — ' + (e.message || e)};
+  }
+}
+/* Upload with a progress callback. fetch() cannot report request progress, and
+   a 20 MB export over a Cloudflare quick tunnel takes long enough that silence
+   is indistinguishable from a hang. */
+function upload(url, body, onProgress){
+  return new Promise(resolve => {
+    const x = new XMLHttpRequest();
+    x.open('POST', url);
+    x.upload.onprogress = e => {
+      if(e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    };
+    x.onload = () => {
+      try { resolve(JSON.parse(x.responseText)); }
+      catch { resolve({ok:false, error:`server sent a ${x.status} with no JSON`}); }
+    };
+    x.onerror = () => resolve({ok:false,
+      error:'the upload failed in transit — try the file-path box instead'});
+    x.ontimeout = () => resolve({ok:false, error:'the upload timed out'});
+    x.send(body);
+  });
 }
 function form(obj){
   const f = new FormData();
@@ -1014,30 +1048,60 @@ $('#bSavePace').onclick = async () => {
 };
 
 $('#bImport').onclick = async () => {
-  const f = $('#file').files[0], txt = $('#paste').value;
-  if(!f && !txt.trim()){ say('#rImport', 'Choose a file or paste some links.', 'no'); return; }
-  say('#rImport', 'Reading…', 'busy');
+  const f = $('#file').files[0], txt = $('#paste').value,
+        pth = ($('#filePath') ? $('#filePath').value : '').trim();
+  if(!f && !txt.trim() && !pth){
+    say('#rImport', 'Choose a file, give a path, or paste some links.', 'no');
+    return;
+  }
   const fd = new FormData();
-  if(f) fd.append('file', f);
-  if(txt.trim()) fd.append('text', txt);
-  const j = await post('/api/capture/import', fd);
-  if(j.ok){
-    const cols = Object.entries(j.collections || {})
+  let j;
+  if(pth){
+    fd.append('path', pth);
+    say('#rImport', 'Reading ' + pth + '…', 'busy');
+    j = await post('/api/capture/import', fd);
+  } else if(f){
+    fd.append('file', f);
+    if(txt.trim()) fd.append('text', txt);
+    say('#rImport', `Uploading ${mb(f.size)}…`, 'busy');
+    j = await upload('/api/capture/import', fd, (sent, total) => {
+      const pct = Math.round(sent / total * 100);
+      say('#rImport', pct < 100
+        ? `Uploading ${mb(f.size)} — ${pct}%`
+        : 'Uploaded. Parsing the export…', 'busy');
+    });
+  } else {
+    fd.append('text', txt);
+    say('#rImport', 'Reading…', 'busy');
+    j = await post('/api/capture/import', fd);
+  }
+  if(!j.ok){ say('#rImport', j.error, 'no'); return; }
+
+  // Parsing runs on the task thread now, so the answer arrives by polling.
+  const poll = setInterval(async () => {
+    let t;
+    try { t = await (await fetch('/api/capture/task')).json(); }
+    catch { return; }                       // a dropped poll is not a failure
+    if(t.running){ say('#rImport', t.message || 'Parsing…', 'busy'); return; }
+    clearInterval(poll);
+    if(t.error){ say('#rImport', t.error, 'no'); return; }
+    const r = t.result || {};
+    const cols = Object.entries(r.collections || {})
       .sort((a, b) => b[1] - a[1]).slice(0, 8)
       .map(([k, v]) => `${k} (${v})`).join(', ');
     // Read as: how many distinct reels the file describes, then what changed.
     // "already known" counts reels this ledger had before the import, never a
     // reel's second collection tag — that distinction is the whole point.
-    const bits = [`${num(j.added)} new to the queue`];
-    if(j.duplicate) bits.push(`${num(j.duplicate)} already in the ledger`
-      + (j.captured ? ` (${num(j.captured)} captured)` : ''));
-    if(j.memberships) bits.push(`${num(j.memberships)} collection tags`);
-    if(j.unrecognised) bits.push(`${num(j.unrecognised)} lines not permalinks`);
-    say('#rImport', `${num(j.unique ?? j.found)} distinct reels in `
-      + `${j.format || 'the file'}.\n` + bits.join(', ') + '.'
+    const bits = [`${num(r.added)} new to the queue`];
+    if(r.duplicate) bits.push(`${num(r.duplicate)} already in the ledger`
+      + (r.captured ? ` (${num(r.captured)} captured)` : ''));
+    if(r.memberships) bits.push(`${num(r.memberships)} collection tags`);
+    if(r.unrecognised) bits.push(`${num(r.unrecognised)} lines not permalinks`);
+    say('#rImport', `${num(r.unique ?? r.found)} distinct reels in `
+      + `${r.format || 'the file'}.\n` + bits.join(', ') + '.'
       + (cols ? `\nCollections: ${cols}` : ''), 'ok');
     $('#paste').value = ''; tick();
-  } else say('#rImport', j.error, 'no');
+  }, 900);
 };
 
 async function runScan(target){
@@ -1168,5 +1232,6 @@ tick(); loadLog();
 setInterval(tick, 2000);
 setInterval(loadLog, 6000);
 </script>
+<script src="/sitemap.js" defer></script>
 </body>
 </html>

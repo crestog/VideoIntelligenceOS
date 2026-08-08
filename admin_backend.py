@@ -722,6 +722,34 @@ def system_health():
 # ───────────────────────────────────────────────────────────────────────────
 # 8. GET /api/admin/logs — Recent logs
 # ───────────────────────────────────────────────────────────────────────────
+@admin_router.get("/api/admin/services")
+def omni_services():
+    """Postgres / Qdrant / Neo4j: up or down, and when down, why.
+
+    The engine that starts these lives in another process, so its own module
+    flags are not readable from here. It publishes the report to Redis after
+    every `ensure_services()`; this reads that. No report means the omni layer
+    has not booted yet, which is itself the answer.
+    """
+    try:
+        r = _safe_redis()
+        raw = r.get("VIOS_OMNI_SERVICES") if r is not None else None
+        if raw:
+            report = json.loads(raw)
+            report["source"] = "omni engine"
+            return report
+        return {
+            "available": {"postgres": False, "qdrant": False, "neo4j": False},
+            "diagnostics": {"postgres": [
+                "the omni engine has not reported yet — it is still booting, "
+                "or it is disabled (VIOS_OMNI=0), or it exited before it "
+                "reached the database step. Check the log for 🔮 [OMNI]."]},
+            "source": "not reported",
+        }
+    except Exception as exc:
+        return _error(exc)
+
+
 @admin_router.get("/api/admin/logs")
 def get_logs():
     try:

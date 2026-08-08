@@ -8,6 +8,7 @@ Logs are also stored in a Redis list for real-time UI access (Admin panel).
 import time
 import redis
 import json
+import socket
 from collections import deque
 
 # ═══════════════════════════════════════════════════════════
@@ -56,6 +57,24 @@ _redis_next_try = 0.0        # monotonic deadline; don't reconnect before this
 _REDIS_RETRY_BACKOFF = 30.0  # seconds to stay quiet after a failed connect
 
 
+def _port_open(host, port, timeout=1.5):
+    """Is anything listening? A plain socket, because redis-py's own
+    `socket_connect_timeout` does not bound the total attempt.
+
+    Measured on a box with no Redis: `Redis(socket_connect_timeout=2).ping()`
+    takes 48 seconds to give up — the client walks every address the name
+    resolves to and applies its own retry policy on top. Logging is called from
+    inside worker loops, so the first line after a Redis outage stalled the
+    whole subsystem for the better part of a minute. One connect attempt with a
+    real deadline is all this needs to know.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _get_redis():
     """
     Best-effort Redis handle for the cross-process log buffer.
@@ -71,6 +90,8 @@ def _get_redis():
     if time.monotonic() < _redis_next_try:
         return None
     try:
+        if not _port_open('localhost', 6379):
+            raise OSError("nothing listening on localhost:6379")
         client = redis.Redis(host='localhost', port=6379, decode_responses=True,
                              socket_timeout=2, socket_connect_timeout=2,
                              retry_on_timeout=False)

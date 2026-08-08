@@ -443,6 +443,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; display: flex
           </div>
           <div class="comp-grid" id="compGrid"></div>
           <div class="qm-grid" id="qmGrid" style="margin-top:15px"></div>
+          <div id="svcBox" style="margin-top:18px"></div>
         </div>
       </section>
 
@@ -1427,6 +1428,39 @@ async function loadSystem() {
       ? entries.map(([k, v]) => `<div class="stat"><div class="lbl">${k.replace(/_/g, ' ')}</div><div class="val">${v}</div></div>`).join('')
       : '<div style="color:var(--text-dim);font-size:12px">No queue metrics available.</div>';
   } catch (e) { /* keep last known state */ }
+  loadServices();
+}
+
+/* The three databases behind the Omniscient layer. A red dot alone was never
+   actionable — "Neo4j unreachable" could be six different things and the boot
+   log that said which had long scrolled past. The reasons are printed here. */
+async function loadServices() {
+  const box = $('svcBox');
+  if (!box) return;
+  let d;
+  try { d = await api('/api/admin/services'); }
+  catch (e) { box.innerHTML = ''; return; }
+  const avail = d.available || {};
+  const diag = d.diagnostics || {};
+  const NAMES = {postgres: 'PostgreSQL', qdrant: 'Qdrant', neo4j: 'Neo4j'};
+  const WHAT = {
+    postgres: 'frame rows and narratives',
+    qdrant: 'vector search',
+    neo4j: 'the knowledge graph',
+  };
+  const rows = Object.keys(NAMES).map(k => {
+    const on = !!avail[k];
+    const why = (diag[k] || []).map(m =>
+      `<div style="color:var(--text-dim);font-size:12px;margin-left:18px">${esc(m)}</div>`).join('');
+    return `<div style="margin-bottom:8px">
+      <span class="dot ${on ? 'on' : 'off'}" style="margin-right:8px"></span>
+      <b>${NAMES[k]}</b>
+      <span style="color:var(--text-dim);font-size:12px">— ${on ? 'online' : 'off, so ' + WHAT[k] + ' is unavailable'}</span>
+      ${why}</div>`;
+  }).join('');
+  box.innerHTML = `<div style="font-size:12px;letter-spacing:.08em;color:var(--text-dim);
+    text-transform:uppercase;margin-bottom:10px">Omniscient databases
+    <span style="text-transform:none;letter-spacing:0">· ${esc(d.source || '')}</span></div>${rows}`;
 }
 
 /* ═══════ SYSTEM CONTROL ═══════
@@ -1721,5 +1755,6 @@ async function loadLogs() {
   setInterval(() => { if (!document.hidden) { loadDbHealth(); } }, 45000);
 })();
 </script>
+<script src="/sitemap.js" defer></script>
 </body>
 </html>

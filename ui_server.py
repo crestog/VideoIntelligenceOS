@@ -1087,6 +1087,18 @@ def get_state():
 async def analyze_ui(id: str = "", t: str = ""):
     return f"<html><body style='background:#050505; color:white; font-family:sans-serif; padding:50px; text-align:center;'><h2 style='color:#00e5ff;'>🔍 Pattern Recognition Module</h2><p><b>Video ID:</b> {id}</p><p><b>Exact Timestamp:</b> {t}s</p></body></html>"
 
+@app.get("/sitemap.js")
+async def sitemap_script():
+    """The footer every page shares.
+
+    Served rather than pasted: the page list lives in one file, so a page
+    added later shows up everywhere at once instead of in the one interface
+    whoever added it happened to remember.
+    """
+    from sitemap import sitemap_js
+    return Response(sitemap_js(), media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache"})
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_main_ui():
     with open("main_ui.html", "r", encoding="utf-8") as f:

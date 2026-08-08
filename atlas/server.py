@@ -234,6 +234,27 @@ def favicon():
     return Response(status_code=204)
 
 
+@app.get("/sitemap.js")
+def sitemap_js_standalone():
+    """The shared footer, for when Atlas runs on its own port.
+
+    Mounted under the main server, `/sitemap.js` is answered by the parent app
+    and never reaches here. Standalone (`atlas_boot.py`) there is no parent, so
+    Atlas serves the same file itself rather than 404-ing its own footer away.
+    """
+    try:
+        import sys
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from sitemap import sitemap_js          # noqa: PLC0415
+        return Response(sitemap_js(), media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
+    except Exception:
+        # A missing footer is not worth a 500 on a page that works fine.
+        return Response("", media_type="application/javascript")
+
+
 # ── state ─────────────────────────────────────────────────────────────────
 @app.get("/api/status")
 def api_status():

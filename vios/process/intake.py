@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -42,6 +43,15 @@ BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 
 SHARD_PREFIX = "vios-evidence-"
 SHARD_SUFFIX = ".jsonl.gz"
+
+# What counts as a video file when scanning a folder the operator pointed at.
+_VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+
+
+def _safe(key: str) -> str:
+    """A video key as a filename stem. Keys are shortcodes, but never trust a
+    string that arrived in a URL with a path join."""
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in key)[:64]
 
 
 class SourceError(RuntimeError):
@@ -129,6 +139,64 @@ def capture_head(video: dict) -> dict:
         return {}
     head = meta.get("capture")
     return head if isinstance(head, dict) else {}
+
+
+def adopt_folder(store, folder: str, limit: int = 0) -> dict:
+    """Register every video file in a folder as a processable row.
+
+    The capture ledger is one way videos arrive; a folder is the other. A
+    Kaggle dataset of reels, a rescued scratch directory, a hand-assembled test
+    set — none of them have a Telegram message id, and requiring one meant the
+    processing engine could not touch a video that was already sitting on the
+    disk it was running on.
+
+    The row records its own path, so `Source.ensure` finds it with no network
+    at all. Idempotent by key, so re-running after adding files is safe.
+    """
+    out = {"seen": 0, "added": 0, "folder": folder}
+    if not os.path.isdir(folder):
+        out["reason"] = f"no folder at {folder}"
+        return out
+
+    known = set(store.video_keys())
+    found: list = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            if fn.lower().endswith(_VIDEO_EXT):
+                found.append(os.path.join(root, fn))
+        if limit and len(found) >= limit:
+            break
+    found.sort()
+    if limit:
+        found = found[:limit]
+
+    for path in found:
+        out["seen"] += 1
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size <= 4096:
+            # `Source.ensure` treats anything this small as not-a-video, so
+            # adopting it would mint a row that can never be sourced and
+            # fails on every sweep forever.
+            out["too_small"] = out.get("too_small", 0) + 1
+            continue
+        stem = os.path.splitext(os.path.basename(path))[0]
+        # A file named after its shortcode keeps its identity, so a folder of
+        # capture-engine output merges with the ledger rows instead of
+        # duplicating them.
+        key = _safe(stem) or f"file{out['seen']:06d}"
+        if key in known:
+            continue
+        store.add_video(video_key=key, url="", uploader="", duration=None,
+                        width=None, height=None, bytes=size, taken_at=None,
+                        meta={"capture": {}, "local_path": path,
+                              "origin": "folder"})
+        known.add(key)
+        out["added"] += 1
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -339,13 +407,62 @@ class Source:
     Missing *bytes* are fatal for that video and nothing else.
     """
 
-    def __init__(self, tg=None, channel: Channel | None = None, log=None):
+    def __init__(self, tg=None, channel: Channel | None = None, log=None,
+                 local_dirs=None):
         self.tg = tg
         self.channel = channel
         self.log = log or (lambda m: None)
+        self.local_dirs = [d for d in (local_dirs or []) if d]
         self.downloaded = 0
         self.bytes = 0
         self.reused = 0
+        self.from_disk = 0
+
+    @staticmethod
+    def _local_path(video: dict) -> str:
+        """The path `adopt_folder` recorded, if the file is still there."""
+        meta = video.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta or "{}")
+            except json.JSONDecodeError:
+                return ""
+        if not isinstance(meta, dict):
+            return ""
+        path = meta.get("local_path") or ""
+        if path and os.path.exists(path) and os.path.getsize(path) > 4096:
+            return path
+        return ""
+
+    def find_local(self, key: str) -> str:
+        """The reel's mp4 somewhere on this machine, or "".
+
+        Telegram is the archive, but it is not the only place the bytes are.
+        The capture engine leaves its work directory behind, a Kaggle dataset
+        can be mounted read-only, and an operator with a folder of downloads
+        should not have to upload them just to get them back. Checked before
+        any network call, because a local file is both free and instant.
+        """
+        stem = _safe(key)
+        for root in self.local_dirs:
+            if not os.path.isdir(root):
+                continue
+            for cand in (os.path.join(root, f"{stem}.mp4"),
+                         os.path.join(root, stem, "source.mp4"),
+                         os.path.join(root, stem, f"{stem}.mp4")):
+                if os.path.exists(cand) and os.path.getsize(cand) > 4096:
+                    return cand
+            # A shallow walk, not a full one: an unbounded recursive scan of a
+            # Kaggle input mount runs for minutes per video.
+            try:
+                for entry in os.scandir(root):
+                    if (entry.is_file() and stem in entry.name
+                            and entry.name.lower().endswith(_VIDEO_EXT)
+                            and entry.stat().st_size > 4096):
+                        return entry.path
+            except OSError:
+                continue
+        return ""
 
     def ensure(self, video: dict, workdir: str) -> str:
         os.makedirs(workdir, exist_ok=True)
@@ -363,6 +480,19 @@ class Source:
         record_id = head.get("record_msg_id")
         file_id = head.get("file_id") or ""
         size = int(video.get("bytes") or 0)
+
+        # On disk already? Then nothing else needs to happen for the bytes.
+        if not have_source:
+            found = self._local_path(video) or self.find_local(
+                str(video.get("video_key") or ""))
+            if found:
+                try:
+                    if os.path.abspath(found) != os.path.abspath(dest):
+                        shutil.copyfile(found, dest)
+                    have_source = True
+                    self.from_disk += 1
+                except OSError as exc:
+                    self.log(f"found {found} but could not use it: {exc}")
 
         # MTProto first: it can fetch both messages in one round trip, and it
         # is the only transport that can reach the record document at all.
@@ -415,7 +545,7 @@ class Source:
             return ("this video has no Telegram message id and no file id — "
                     "the capture ledger row is incomplete, so there is nothing "
                     "to fetch. Re-run the capture tab's channel scan to repair "
-                    "it.")
+                    "it, or put the file on disk where the engine can find it.")
 
         err = getattr(self.channel, "last_error", "") if self.channel else ""
         if err:
@@ -426,12 +556,15 @@ class Source:
             why = (getattr(self.channel, "reason", "") if self.channel
                    else "no MTProto session was opened")
             over = (size and size > BOT_DOWNLOAD_LIMIT)
+            where = (f" Nothing matching was found on disk either (looked in "
+                     f"{', '.join(self.local_dirs)})." if self.local_dirs else "")
             return (f"message {msg_id or '?'} needs MTProto and it is not "
                     f"available ({why or 'reason unknown'})."
                     + (f" The file is {size / 1048576:.0f} MB, over the Bot "
                        f"API's 20 MB download limit, so there is no fallback."
                        if over else
-                       " Add the API id and API hash on the Setup page."))
+                       " Add the API id and API hash on the Setup page.")
+                    + where)
 
         return (f"message {msg_id or '?'} is gone from the channel — the "
                 f"session can read the channel, but that message id returned "

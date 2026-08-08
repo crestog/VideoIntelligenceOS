@@ -596,6 +596,23 @@ details.step .in{padding:15px 16px 18px}
         </div>
         <div class="result" id="dbResult"></div>
       </div>
+
+      <div class="sec">
+        <h3>Videos already on this disk</h3>
+        <p class="lede" style="margin-bottom:12px">A reel does not need a Telegram message to be
+          processed. Point this at a folder — a Kaggle dataset, the capture engine's own scratch
+          directory, a pile of downloads — and every video file under it becomes a row in the
+          work table, read straight off the disk with no network at all. A file named after its
+          shortcode keeps its identity, so a folder of capture output merges with the ledger rows
+          instead of duplicating them. Safe to run twice.</p>
+        <div class="field"><label>Folder <span class="note">full path on the machine running this
+          server</span></label>
+          <input type="text" id="fFolder" placeholder="/kaggle/input/my-reels"></div>
+        <div class="btns">
+          <button class="btn primary" id="bAdopt">Add this folder</button>
+        </div>
+        <div class="result" id="adoptResult"></div>
+      </div>
     </section>
 
     <!-- ══ SETUP ════════════════════════════════════════════════════ -->
@@ -671,6 +688,11 @@ details.step .in{padding:15px 16px 18px}
           <div class="field" style="margin-top:14px"><label>Capture ledger
             <span class="note">leave alone unless it lives somewhere unusual</span></label>
             <input type="text" id="fLedger" placeholder="…/capture_ledger.db"></div>
+          <div class="field" style="margin-top:12px"><label>Folders to search for video files
+            <span class="note">one per line — checked before Telegram, so a reel that is
+            already here costs nothing</span></label>
+            <textarea id="fVideoDirs" rows="3" spellcheck="false"
+              placeholder="…/_scratch/capture"></textarea></div>
           <div class="btns">
             <button class="btn primary" id="bSave">Save settings</button>
             <button class="btn" id="bCheck">Run readiness check</button>
@@ -859,14 +881,16 @@ function say(sel, msg, kind){
 async function post(url, body){
   try{
     const r = await fetch(url, {method:'POST', body});
-    return await r.json();
-  }catch(e){ return {ok:false, error:String(e)}; }
+    try{ return await r.json(); }
+    catch{ return {ok:false, error:'the server answered ' + r.status + ' with no JSON'}; }
+  }catch(e){ return {ok:false, error:'could not reach the server — ' + (e.message || e)}; }
 }
 async function get(url){
   try{
     const r = await fetch(url);
-    return await r.json();
-  }catch(e){ return {ok:false, error:String(e)}; }
+    try{ return await r.json(); }
+    catch{ return {ok:false, error:'the server answered ' + r.status + ' with no JSON'}; }
+  }catch(e){ return {ok:false, error:'could not reach the server — ' + (e.message || e)}; }
 }
 function form(obj){
   const f = new FormData();
@@ -1315,6 +1339,23 @@ $('#bSync').onclick = async () => {
   if(!r.ok) return say('#dbResult', r.error, 'no');
   pollTask('#dbResult', () => { loadDb(); tick(); });
 };
+$('#bAdopt').onclick = async () => {
+  const folder = $('#fFolder').value.trim();
+  if(!folder) return say('#adoptResult', 'Give the full path to a folder of videos.', 'no');
+  say('#adoptResult', 'Scanning ' + folder + '…', 'busy');
+  const r = await post('/api/process/adopt', form({folder}));
+  if(!r.ok) return say('#adoptResult', r.error, 'no');
+  pollTask('#adoptResult', async () => {
+    const s = await get('/api/process/task');
+    const g = s.result;
+    if(g) say('#adoptResult',
+      `${g.added} new video${g.added === 1 ? '' : 's'} added from ${g.seen} file${g.seen === 1 ? '' : 's'}`
+      + (g.too_small ? ` · ${g.too_small} skipped as too small to be video` : '')
+      + (g.added ? '. They can be processed now — no Telegram needed.' : '.'),
+      g.added ? 'ok' : '');
+    loadDb(); loadPlan(); tick();
+  });
+};
 
 async function pollTask(target, done){
   const t = setInterval(async () => {
@@ -1338,6 +1379,7 @@ function fillSettings(s){
   $('#fFollow').checked = !!s.follow; $('#fSync').checked = !!s.sync_on_start;
   $('#fRestore').checked = !!s.restore_on_start;
   $('#fLedger').placeholder = s.ledger_path || '';
+  if(Array.isArray(s.video_dirs)) $('#fVideoDirs').value = s.video_dirs.join('\n');
 }
 
 $('#bSave').onclick = async () => {
@@ -1353,6 +1395,7 @@ $('#bSave').onclick = async () => {
     sync_on_start: $('#fSync').checked ? '1' : '0',
     restore_on_start: $('#fRestore').checked ? '1' : '0',
     ledger_path: $('#fLedger').value.trim(),
+    video_dirs: $('#fVideoDirs').value.trim(),
   }));
   if(r.ok){
     // Clear the secret fields the moment they are accepted. They are in the
@@ -1406,5 +1449,6 @@ tickLog();
 setInterval(tick, 1200);
 setInterval(tickLog, 3000);
 </script>
+<script src="/sitemap.js" defer></script>
 </body>
 </html>

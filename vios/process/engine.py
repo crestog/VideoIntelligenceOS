@@ -156,6 +156,15 @@ class ProcessEngine:
         self.disk_floor_mb = DISK_FLOOR_MB
         self.video_limit = 0            # 0 = the whole partition
 
+        # Folders searched for a reel's bytes before Telegram is asked. The
+        # capture engine's own scratch is here by default, which is what lets a
+        # session process what it just captured without a round trip through
+        # the channel — the single biggest saving in the whole pipeline.
+        self.video_dirs: list = [
+            os.path.join(_default_scratch(self.base), "capture"),
+            os.path.join(self.base, "videos"),
+        ]
+
         # ── credentials ──────────────────────────────────────────────────
         # Never written by this class. Read once at construction from Kaggle
         # Secrets / the environment / the laptop file, so a session that has
@@ -257,7 +266,7 @@ class ProcessEngine:
                   video_limit: int | None = None,
                   sync_on_start: bool | None = None,
                   restore_on_start: bool | None = None,
-                  ledger_path: str = "") -> dict:
+                  ledger_path: str = "", video_dirs=None) -> dict:
         """Accept settings from the tab. Blank fields keep their value.
 
         Credentials live here and only here — instance attributes on a running
@@ -317,6 +326,8 @@ class ProcessEngine:
                 self.video_limit = max(0, int(video_limit))
             if ledger_path and ledger_path.strip():
                 self.ledger_path = ledger_path.strip()
+            if video_dirs is not None:
+                self.video_dirs = [d.strip() for d in video_dirs if d.strip()]
         return self.settings()
 
     def settings(self) -> dict:
@@ -347,6 +358,7 @@ class ProcessEngine:
             "cache_budget_mb": self.cache_budget_mb,
             "video_limit": self.video_limit,
             "ledger_path": self.ledger_path,
+            "video_dirs": list(self.video_dirs),
             "db_path": self.db_path,
             "cache_dir": self.cache_dir,
             "worker": self.worker,
@@ -402,12 +414,22 @@ class ProcessEngine:
         # ── something to process ─────────────────────────────────────────
         synced = intake.sync(self.store, self.ledger_path) \
             if os.path.exists(self.ledger_path) else {"seen": 0}
+        # A folder that was configured but never adopted is picked up here, so
+        # "point the engine at a folder and press Start" is one step, not two.
+        adopted = 0
+        for d in self.video_dirs:
+            if os.path.isdir(d):
+                try:
+                    adopted += intake.adopt_folder(self.store, d).get("added", 0)
+                except Exception as exc:
+                    self._log(f"folder {d}: {type(exc).__name__}: {exc}", "warn")
         have = len(self.store.video_keys())
         ok("Videos to process", have > 0,
            f"{have} in the evidence store, {synced.get('seen', 0)} uploaded in "
-           f"the capture ledger" if have else
-           f"nothing yet — run the capture engine first, or point this at an "
-           f"existing ledger ({self.ledger_path})",
+           f"the capture ledger"
+           + (f", {adopted} adopted from disk" if adopted else "") if have else
+           f"nothing yet — capture some reels first, point this at an existing "
+           f"ledger ({self.ledger_path}), or give it a folder of videos",
            block=True)
 
         # ── hardware ─────────────────────────────────────────────────────
@@ -668,7 +690,8 @@ class ProcessEngine:
             for e in got.get("errors", [])[:5]:
                 self._log(f"shard: {e}", "warn")
 
-        self._source = intake.Source(self._tg, self._channel, self._log)
+        self._source = intake.Source(self._tg, self._channel, self._log,
+                                     local_dirs=self.video_dirs)
 
         while not self._stopping():
             res = resources.probe(self.cache_dir)
@@ -1266,6 +1289,27 @@ class ProcessEngine:
         got = intake.sync(self.store, self.ledger_path)
         self._log(f"Sync: {got.get('added', 0)} new videos of "
                   f"{got.get('seen', 0)} uploaded")
+        return got
+
+    def adopt_folder_now(self, folder: str) -> dict:
+        """Take every video in a folder into the work table.
+
+        The other half of `sync_now`. A reel that is already on this disk needs
+        no ledger row and no Telegram message to be worth processing, and the
+        engine could previously not be pointed at one at all.
+        """
+        folder = os.path.expanduser((folder or "").strip().strip('"').strip("'"))
+        if not folder:
+            raise ValueError("Give the folder that holds the videos.")
+        if not os.path.isdir(folder):
+            raise ValueError(f"No folder at {folder}.")
+        got = intake.adopt_folder(self.store, folder)
+        with self._lock:
+            if folder not in self.video_dirs:
+                self.video_dirs.append(folder)
+        self._cov = None                  # the partition counts just changed
+        self._log(f"Folder: {got.get('added', 0)} new videos of "
+                  f"{got.get('seen', 0)} files in {folder}")
         return got
 
     def video_detail(self, key: str) -> dict:

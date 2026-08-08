@@ -44,11 +44,19 @@ _NAME_KEYS = ("title", "name", "collection_name", "saved_collection_name",
 _INTERESTING = re.compile(
     r"(saved|collection|bookmark|liked)", re.IGNORECASE)
 
+# ...except these, which match the filter by accident. A *comment* you liked is
+# not a reel you saved, and importing the posts they hang off would queue
+# thousands of videos the user never asked for.
+_BORING = re.compile(r"(comment|music|audio|hashtag)", re.IGNORECASE)
+
 MD_HEADER = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 
 # Export members whose name describes a container rather than a category.
+# `liked_posts` is deliberately absent: it is a real distinction worth keeping,
+# so those arrive labelled "liked posts" and can be skipped with one entry in
+# the skip-collections box.
 _GENERIC = re.compile(
-    r"^(saved_?posts?|saved_?saved_?media|saved|liked_?posts?|bookmarks?|"
+    r"^(saved_?posts?|saved_?saved_?media|saved|bookmarks?|"
     r"your_?saved|posts?)$", re.IGNORECASE)
 
 
@@ -183,6 +191,91 @@ def _label_of(node) -> str:
     return ""
 
 
+# ── the export's current envelope: label_values ──────────────────────────
+#
+# Meta's 2025+ JSON export does not use `string_map_data` for saved content at
+# all. Every record is a list of `{"label": …, "value": …}` fields, and related
+# entities hang off it as `{"dict": [...], "title": "Owner"}` groups:
+#
+#   saved_collections.json          saved_posts.json
+#   ─────────────────────           ────────────────
+#   label_values:                   label_values:
+#     {label: Name,  value: brain}    {label: URL,   value: …/reel/ABC/}
+#     {label: Type,  value: Default}  {label: Caption, value: …}
+#     {dict: [ …33 posts… ],          {dict: […], title: Owner}
+#      title: Media}                     └─ {label: Username, value: someone}
+#
+# Walked generically, the Owner group's `Username` looks exactly like a name and
+# becomes the "collection" for every reel that follows it — which is how 82 real
+# collections turned into 9,353 imaginary ones named after creators. So the
+# shape is parsed structurally instead: a record's name comes only from its own
+# direct `Name` field, and entity groups are never descended into.
+_ENTITY_GROUPS = {"owner", "brand partner", "brand partners", "hashtags",
+                  "co-author", "co-authors", "coauthor", "tagged",
+                  "collaborators", "participants", "sharer"}
+
+
+def _field_list(node):
+    """The record's field list, under whichever key this export version used."""
+    if not isinstance(node, dict):
+        return None
+    for key in ("label_values", "dict"):
+        v = node.get(key)
+        if isinstance(v, list):
+            return v
+    return None
+
+
+def _field(fields, label: str) -> str:
+    """The direct string value of one label. Groups are not searched."""
+    for e in fields:
+        if not isinstance(e, dict) or "dict" in e:
+            continue
+        if str(e.get("label") or "").strip().lower() == label:
+            v = e.get("value")
+            if isinstance(v, str):
+                return v
+    return ""
+
+
+def _walk_fields(fields, inherited: str, out: list, depth: int):
+    """One `label_values` record: emit its link, or name a collection.
+
+    A record that carries a URL *is* a saved item, so it keeps the collection it
+    was found in and its own `Name`-ish fields are ignored. A record with no URL
+    but a `Name` is a collection, and that name is passed down to the group of
+    posts nested inside it.
+    """
+    own = ""
+    for lab in ("url", "link", "permalink", "media url"):
+        own = _field(fields, lab)
+        if own:
+            break
+
+    label = inherited
+    if not own:
+        for lab in ("name", "collection", "collection name", "folder", "title"):
+            named = _clean_collection(_field(fields, lab))
+            if named:
+                label = named
+                break
+
+    if own and "instagram.com" in own:
+        for m in PERMALINK.finditer(own):
+            out.append((m.group(0), inherited))
+
+    for e in fields:
+        if not isinstance(e, dict):
+            continue
+        group = e.get("dict")
+        if not isinstance(group, list):
+            continue
+        if str(e.get("title") or "").strip().lower() in _ENTITY_GROUPS:
+            continue
+        for member in group:
+            _walk_json(member, label, out, depth + 1)
+
+
 def _walk_json(node, inherited: str, out: list, depth: int = 0):
     """Depth-first walk collecting permalinks with their nearest label.
 
@@ -202,6 +295,13 @@ def _walk_json(node, inherited: str, out: list, depth: int = 0):
     if depth > 24:
         return
     if isinstance(node, dict):
+        # The current export shape is handled structurally — see _walk_fields.
+        # Falling through to the generic walk for these records is what
+        # attributed every reel to its creator instead of its collection.
+        fields = _field_list(node)
+        if fields is not None:
+            _walk_fields(fields, inherited, out, depth)
+            return
         label = _label_of(node) or inherited
         for url in _links_in(node):
             out.append((url, label))
@@ -257,6 +357,8 @@ def _read_zip(source, all_files: bool = False) -> list:
                     or low.endswith(".htm")):
                 continue
             if not all_files and not _INTERESTING.search(low):
+                continue
+            if not all_files and _BORING.search(low):
                 continue
             try:
                 raw = z.read(name)
@@ -332,20 +434,27 @@ def parse_any(path: str, data: bytes | None = None) -> dict:
 
     # Dedupe while preserving first-seen order, but keep every collection a
     # reel appeared under — a reel saved in two collections is two memberships.
+    #
+    # The membership test is a set, not `in ordered`. A linear scan of a list
+    # that grows to five figures, run once per entry, is quadratic: an export
+    # with 18,000 entries spent minutes here while the tab said "Reading…".
     seen: dict = {}
+    emitted: set = set()
     ordered: list = []
     for url, col in items:
         can = canonical(url)
         if not can:
             continue
-        key = can[0]
+        key, clean = can[0], can[1]
         if key not in seen:
             seen[key] = set()
-            ordered.append((can[1], col))
+            ordered.append((clean, col))
+            emitted.add((clean, col))
         if col and col not in seen[key]:
             seen[key].add(col)
-            if (can[1], col) not in ordered:
-                ordered.append((can[1], col))
+            if (clean, col) not in emitted:
+                emitted.add((clean, col))
+                ordered.append((clean, col))
 
     tally: dict = {}
     for _u, c in ordered:

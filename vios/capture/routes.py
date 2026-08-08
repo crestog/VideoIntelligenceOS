@@ -222,25 +222,58 @@ def preflight():
 # Filling the queue
 # ═══════════════════════════════════════════════════════════════════════
 @capture_router.post("/api/capture/import")
-async def import_file(file: UploadFile = File(None), text: str = Form("")):
-    """Accept the export ZIP, the markdown list, or pasted links.
+async def import_file(file: UploadFile = File(None), text: str = Form(""),
+                      path: str = Form("")):
+    """Accept the export ZIP, the markdown list, pasted links, or a local path.
 
     The upload is read into memory rather than streamed to disk: an Instagram
     export ZIP is a few MB of JSON, and a temp file that must be cleaned up on
     every error path is more moving parts than the size justifies.
+
+    Parsing then happens on the task thread, not here. It is only a second or
+    two, but this route is `async` — doing it inline parks the event loop, so
+    the status poll that drives the whole tab stops answering and the page
+    looks hung at the exact moment the user most wants to see progress.
+
+    `path` is the escape hatch for when the browser upload is the problem: on
+    Kaggle the export is usually already on disk as a dataset, and pointing at
+    it skips a 20 MB round trip through the tunnel entirely.
     """
     try:
         eng = get_engine()
+
+        if path.strip():
+            src = os.path.expanduser(path.strip().strip('"').strip("'"))
+            if not os.path.isfile(src):
+                return _err(f"No file at {src}. Give the full path to the "
+                            f"export ZIP as it exists on this machine.")
+            return _run_task("import", lambda say: (
+                say(f"Reading {os.path.basename(src)}…"),
+                eng.import_file(src))[-1])
+
         if file is not None and file.filename:
             data = await file.read()
+            if not data:
+                return _err("That upload arrived empty — the connection "
+                            "probably dropped mid-transfer. Try again, or use "
+                            "the file-path box below.")
             if len(data) > 200 * 1024 * 1024:
                 return _err("That file is over 200 MB — it is probably the "
                             "full media export. Only the JSON export is "
                             "needed; the media itself gets re-downloaded.")
-            return _ok(**eng.import_file(file.filename, data))
+            name = file.filename
+            return _run_task("import", lambda say: (
+                say(f"Parsing {name} ({len(data) / 1048576:.1f} MB)…"),
+                eng.import_file(name, data))[-1])
+
         if text.strip():
-            return _ok(**eng.import_text(text, source="pasted"))
-        return _err("Nothing to import — choose a file or paste some links.")
+            body = text
+            return _run_task("import", lambda say: (
+                say("Reading pasted links…"),
+                eng.import_text(body, source="pasted"))[-1])
+
+        return _err("Nothing to import — choose a file, give a path, or paste "
+                    "some links.")
     except Exception as exc:
         return _err(exc)
 

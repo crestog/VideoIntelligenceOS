@@ -259,12 +259,17 @@ async def config(
     cache_budget_mb: str = Form(""),
     video_limit: str = Form(""),
     ledger_path: str = Form(""),
+    video_dirs: str = Form(""),
 ):
     """Take the tab's form. Blank means "leave it alone", so the operator can
     change the partition on day two without re-typing three credentials."""
     try:
         picked = ([c.strip() for c in components.split(",") if c.strip()]
                   if components.strip() else None)
+        # Newline or comma: a path list is pasted, and a Windows path has no
+        # comma in it but a Kaggle input mount is easier to paste one per line.
+        dirs = ([d.strip() for d in video_dirs.replace(",", "\n").split("\n")
+                 if d.strip()] if video_dirs.strip() else None)
         out = get_engine().configure(
             bot_token=bot_token.strip(),
             channel_id=_int(channel_id),
@@ -282,6 +287,7 @@ async def config(
             cache_budget_mb=_int(cache_budget_mb),
             video_limit=_int(video_limit),
             ledger_path=ledger_path.strip(),
+            video_dirs=dirs,
         )
         return _ok(settings=out)
     except ValueError as exc:
@@ -348,6 +354,20 @@ def intake_restore(eng, say):
         eng.store, eng._tg, eng._channel,
         on_progress=lambda seen, head, n: say(
             f"{seen}/{head} messages scanned · {n} shards imported"))
+
+
+@process_router.post("/api/process/adopt")
+def adopt(folder: str = Form(...)):
+    """Take a folder of video files into the work table.
+
+    The counterpart to `sync`: reels that are already on this disk — a Kaggle
+    dataset, a rescued scratch directory, the capture engine's own working
+    folder — need neither a ledger row nor a Telegram message to be processed.
+    """
+    def _job(say):
+        say(f"Scanning {folder} for videos…")
+        return get_engine().adopt_folder_now(folder)
+    return _run_task("adopt", _job)
 
 
 @process_router.post("/api/process/publish")
