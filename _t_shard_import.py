@@ -1,0 +1,180 @@
+"""Does Atlas's own importer read a shard the engine actually wrote?
+
+_t_seam.py replayed a shard by hand to prove the reflection layer. This proves
+the thing that ships: tgchannel.looks_like_shard on a real message shape, then
+ingest.import_shard against a real gzipped JSONL, with no help from vios.
+"""
+import os, tempfile, sqlite3, json
+
+BASE = tempfile.mkdtemp()
+os.environ["VIOS_BASE_DIR"] = BASE
+os.environ["ATLAS_HOME"] = os.path.join(BASE, "atlas")
+os.environ["ATLAS_CACHE_DIR"] = os.path.join(BASE, "cache")
+os.environ["VIOS_OMNI"] = "0"
+os.makedirs(os.environ["ATLAS_HOME"], exist_ok=True)
+
+from vios.process import store as S           # writer only — Atlas never imports it
+
+st = S.Store(os.path.join(BASE, "ev.db"))
+st.add_video(video_key="REEL1", url="https://instagram.com/p/REEL1/",
+             uploader="chef", duration=None, width=1080, height=1920,
+             bytes=5_000_000, taken_at=None, meta={})
+st.set_shots("REEL1", [{"t0": 0.0, "t1": 4.0}, {"t0": 4.0, "t1": 9.5}],
+             "pyscenedetect")
+oid = st.observer("transcript", "whisper", "large-v3", {})
+st.add_claims("REEL1", oid, [
+    {"channel": "speech", "kind": "transcript", "shot_idx": 0,
+     "value": "today we are making a garlic butter steak"},
+    {"channel": "speech", "kind": "transcript", "shot_idx": 1,
+     "value": "get the pan properly screaming hot"}])
+oid2 = st.observer("ocr", "paddle", "v4", {})
+st.add_claims("REEL1", oid2, [
+    {"channel": "ocr", "kind": "text", "shot_idx": 0, "value": "MEDIUM RARE 54C"}])
+# A vector, so the opaque-payload rule has something real to reject.
+st.add_vector("REEL1", "clip", [0.01 * i for i in range(384)], oid, shot_idx=0)
+
+from vios.process import intake
+sid = f"{intake.site_id(st)}-0001"
+shard = os.path.join(BASE, intake.shard_name(sid))
+stats = st.export_shard(shard, 0, st.max_claim_id(), 0, st.max_vector_id(), "gpu")
+print(f"engine wrote {intake.shard_name(sid)} — {stats['claims']} claims, "
+      f"{stats['vectors']} vectors, {stats['bytes']}b")
+
+# ── from here on, only Atlas ──────────────────────────────────────────────
+from atlas import ingest, tgchannel, reflect, index, search
+
+MSG = {"message_id": 5150, "date": 1754700000,
+       "caption": f"vios evidence · {sid}\n3 claims, 1 vectors",
+       "document": {"file_name": intake.shard_name(sid),
+                    "file_id": "FAKE", "file_size": stats["bytes"],
+                    "mime_type": "application/gzip"}}
+info = tgchannel.message_document(MSG)
+
+print("\n== recognition ==")
+print("   looks_like_shard   ", tgchannel.looks_like_shard(info))
+print("   looks_like_manifest", tgchannel.looks_like_manifest(info))
+print("   shard_seq          ", repr(tgchannel.shard_seq(info)))
+assert tgchannel.looks_like_shard(info)
+assert not tgchannel.looks_like_manifest(info), "a shard must not read as a bundle"
+assert tgchannel.shard_seq(info) == sid
+
+# Caption-only (a future engine renames the file) and name-only (caption lost).
+assert tgchannel.looks_like_shard({"file_name": "", "caption": f"vios evidence · {sid}"})
+assert tgchannel.looks_like_shard({"file_name": intake.shard_name(sid), "caption": ""})
+# A reel is not a shard.
+assert not tgchannel.looks_like_shard(
+    {"file_name": "REEL1.mp4", "caption": "Creator: @chef\nLikes: 4200"})
+# A manifest is not a shard.
+assert not tgchannel.looks_like_shard(
+    {"file_name": "manifest-0007.json", "caption": "✅ VIOS bundle 0007"})
+
+# The download the importer would do, without a network.
+import shutil
+tgchannel.fetch_document = lambda i, dest: bool(shutil.copyfile(shard, dest)) or True
+
+conn = ingest.connect(os.path.join(os.environ["ATLAS_HOME"], "atlas.sqlite"))
+ingest.ensure_meta(conn)
+
+print("\n== import ==")
+res = ingest.import_shard(info, conn, BASE)
+print("  ", res)
+assert res["ok"], res
+
+built = {r[0]: r[1] for r in conn.execute(
+    "SELECT name, sql FROM sqlite_master WHERE type='table' "
+    "AND name NOT LIKE 'sqlite_%' ORDER BY name")}
+print("\n== what Atlas built for itself ==")
+for name, sql in built.items():
+    if name in ("bundles", "atlas_meta"):
+        continue
+    print("  ", " ".join(sql.split())[:120])
+
+cols = {r[1]: r[2] for r in conn.execute('PRAGMA table_info("claim")')}
+print("\n   claim column types:", cols)
+assert cols.get("t0") == "REAL", cols          # a timestamp, not a string
+assert cols.get("shot_idx") == "INTEGER", cols
+assert cols.get("value") == "TEXT", cols
+assert "data" not in {r[1] for r in conn.execute('PRAGMA table_info("vector")')}, \
+    "the embedding payload should have been dropped, not stored"
+
+idx = [r[0] for r in conn.execute(
+    "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")]
+print("\n   unique indexes Atlas inferred:")
+for s in idx:
+    print("     ", " ".join(s.split()))
+
+# ── idempotency: the same shard twice must change nothing ────────────────
+before = {t: conn.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
+          for t in built if t not in ("bundles", "atlas_meta")}
+ingest.import_shard(info, conn, BASE)
+after = {t: conn.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
+         for t in before}
+print("\n== re-import ==")
+print("   before", before)
+print("   after ", after)
+assert before == after, (before, after)
+
+# ── enrichment: a later shard that measured the duration fills the blank ──
+print("\n== enrichment ==")
+vcols = {r[1] for r in conn.execute('PRAGMA table_info("video")')}
+print("   video columns after shard 1:", sorted(vcols))
+assert "duration" not in vcols, \
+    "a column that was null in every row should not exist yet — typed on that " \
+    "evidence it becomes TEXT and stores 30.0 as a string forever"
+st.conn.execute("UPDATE video SET duration=30.0 WHERE video_key='REEL1'")
+st.conn.commit()
+st.add_claims("REEL1", oid, [{"channel": "speech", "kind": "transcript",
+                              "shot_idx": 1, "value": "butter at the very end"}])
+sid2 = f"{intake.site_id(st)}-0002"
+shard2 = os.path.join(BASE, intake.shard_name(sid2))
+st.export_shard(shard2, stats["hi_id"], st.max_claim_id(), 0, 0, "gpu")
+tgchannel.fetch_document = lambda i, dest: bool(shutil.copyfile(shard2, dest)) or True
+info2 = dict(info, file_name=intake.shard_name(sid2),
+             caption=f"vios evidence · {sid2}", message_id=5151)
+r2 = ingest.import_shard(info2, conn, BASE)
+print("  ", r2)
+dur = conn.execute("SELECT duration FROM video WHERE video_key='REEL1'").fetchone()[0]
+print("   duration after :", repr(dur),
+      conn.execute("SELECT typeof(duration) FROM video "
+                   "WHERE video_key='REEL1'").fetchone()[0])
+assert dur == 30.0, "a later shard should fill the blank, not be ignored"
+assert isinstance(dur, float), f"duration came back as {type(dur).__name__}"
+assert conn.execute("SELECT COUNT(*) FROM video").fetchone()[0] == 1
+
+# ── and the whole point: is it searchable? ────────────────────────────────
+print("\n== searchable ==")
+r = index.rebuild(conn, embed=False)
+print("  ", {k: r.get(k) for k in ("ok", "moments", "videos")})
+for q, want in (("garlic butter steak", "speech"), ("medium rare", "ocr"),
+                ("butter at the very end", "speech")):
+    hits = search.search(conn, q, limit=3).get("results") or []
+    best = (hits[0].get("best") or {}) if hits else {}
+    print(f'   "{q}" -> {hits[0]["video_key"] if hits else None} '
+          f'@ {best.get("t_start")}-{best.get("t_end")}s [{best.get("source")}]')
+    assert hits and hits[0]["video_key"] == "REEL1", q
+    assert best.get("source") == want, (q, best.get("source"))
+    assert best.get("t_start") is not None, q
+
+rows = ingest.bundle_rows(conn)
+print("\n== Sources tab ==")
+for b in rows:
+    print(f"   {b['seq']:20s} msg {b['manifest_id']}  {b['status']:7s} "
+          f"{b['counts']}\n{'':26s}{b['note'][:80]}")
+assert {b["seq"] for b in rows} == {f"shard:{sid}", f"shard:{sid2}"}
+# Re-importing shard 1 must not have rewritten its history to say it held
+# nothing — the Sources tab answers "what arrived", not "what this run added".
+first = [b for b in rows if b["seq"] == f"shard:{sid}"][0]
+assert first["counts"].get("claim") == 3, first["counts"]
+
+# ── nothing silently dropped between the claims and the passages ─────────
+texts = {r[0] for r in conn.execute("SELECT value FROM claim")}
+moments = {r[0] for r in conn.execute("SELECT text FROM moments")}
+missing = [t for t in texts if not any(t in m for m in moments)]
+print("\n   4 claim value(s) ->",
+      conn.execute("SELECT COUNT(*) FROM moments").fetchone()[0], "moment(s)")
+for m in conn.execute("SELECT video_key,t_start,t_end,source,text FROM moments "
+                      "ORDER BY t_start"):
+    print("     ", m)
+assert not missing, f"claim text that reached no moment: {missing}"
+
+print("\nIMPORTER OK — Atlas reads the GPU plane's shards on its own")
