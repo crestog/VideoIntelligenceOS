@@ -49,6 +49,21 @@ How that is built
 At the resulting mean (~2 min, minus breaks) 5,000 reels is about 8 days of
 wall clock. That is the number the user asked for and accepted.
 
+The fast profile
+────────────────
+All of the above protects the *account*. When the account is disposable that
+protection is worth nothing and the eight days are pure cost, so `FAST_FLOOR`
+exists: set `profile="fast"` and the floor drops from 25 s to 2 s, breaks and
+quiet hours switch off, and the run goes roughly forty times faster.
+
+This is a deliberate, named trade and not a tuning knob. It will burn the
+account — the request rate lands near the ~30/min band where 403s begin, and
+that is the point: it finishes in hours, and the login it burns is a throwaway.
+Everything already captured is in the channel and the ledger, so the cost of
+the ban is one login, never any data. The backoff still works, because even on
+a doomed account there is no reason to hammer a limiter that has already said
+no.
+
 Nothing in here sleeps for longer than SLICE seconds at a time, so a stop
 request is honoured within a second even in the middle of a 40 minute break.
 """
@@ -64,6 +79,14 @@ DEFAULT_TARGET = 120.0      # mean seconds between reels
 MIN_GAP = 25.0              # never faster than this, whatever the maths says
 MAX_GAP = 900.0             # never slower than this outside a deliberate break
 SIGMA = 0.45                # lognormal shape; ~±50% spread around the target
+
+# The fast profile's floor. Not zero: back-to-back requests with no gap at all
+# stall on Instagram's own connection limits and produce timeouts rather than
+# throughput, so the run ends up slower *and* louder. Two seconds is roughly
+# where the curve flattens.
+FAST_FLOOR = 2.0
+FAST_TARGET = 6.0
+FAST_SIGMA = 0.30           # a tighter spread; there is no one to fool now
 
 BURST_MIN, BURST_MAX = 18, 40         # reels between long breaks
 BREAK_MIN, BREAK_MAX = 720.0, 2400.0  # 12–40 minutes
@@ -83,8 +106,10 @@ class Pacer:
 
     def __init__(self, target: float = DEFAULT_TARGET,
                  quiet_hours: bool = True, breaks: bool = True,
+                 profile: str = "safe",
                  rng: random.Random | None = None):
-        self.target = max(MIN_GAP, float(target))
+        self.profile = "fast" if profile == "fast" else "safe"
+        self.target = max(self.floor, float(target))
         self.quiet_hours = quiet_hours
         self.breaks = breaks
         self.rng = rng or random.Random()
@@ -96,6 +121,38 @@ class Pacer:
         self.slept_total = 0.0
         self.consecutive_ok = 0
 
+    @property
+    def floor(self) -> float:
+        """The fastest this pacer will ever go, profile included."""
+        return FAST_FLOOR if self.profile == "fast" else MIN_GAP
+
+    @property
+    def sigma(self) -> float:
+        return FAST_SIGMA if self.profile == "fast" else SIGMA
+
+    def set_profile(self, profile: str) -> None:
+        """Switch profile, moving the target with it.
+
+        The target is re-aimed rather than kept: a run switched to fast while
+        still asking for one reel every two minutes has changed nothing, and
+        the operator who pressed "fast" would watch it crawl and conclude the
+        button is broken. Going back to safe restores the safe default for the
+        same reason — a 6-second target with a 25-second floor is a lie.
+        """
+        want = "fast" if profile == "fast" else "safe"
+        if want == self.profile:
+            return
+        self.profile = want
+        if want == "fast":
+            self.target = FAST_TARGET
+            self.breaks = False
+            self.quiet_hours = False
+        else:
+            self.target = DEFAULT_TARGET
+            self.breaks = True
+            self.quiet_hours = True
+        self.target = max(self.floor, self.target)
+
     # ── shaping ──────────────────────────────────────────────────────────
     def _lognormal(self, mean: float) -> float:
         """A draw whose *arithmetic* mean is `mean`.
@@ -105,8 +162,9 @@ class Pacer:
         average comes out ~10% below what the operator asked for, and over a
         week that is a day of drift they did not ask for.
         """
-        mu = math.log(mean) - (SIGMA ** 2) / 2.0
-        return self.rng.lognormvariate(mu, SIGMA)
+        sigma = self.sigma
+        mu = math.log(mean) - (sigma ** 2) / 2.0
+        return self.rng.lognormvariate(mu, sigma)
 
     def _quiet_multiplier(self) -> float:
         if not self.quiet_hours:
@@ -118,7 +176,7 @@ class Pacer:
         gap = self._lognormal(self.target)
         gap *= self._quiet_multiplier()
         gap *= self.backoff
-        gap = max(MIN_GAP, min(MAX_GAP * self.backoff, gap))
+        gap = max(self.floor, min(MAX_GAP * self.backoff, gap))
         self.last_gap = gap
         return gap
 
@@ -194,7 +252,9 @@ class Pacer:
 
     def describe(self) -> dict:
         return {
+            "profile": self.profile,
             "target": round(self.target, 1),
+            "floor": self.floor,
             "last_gap": round(self.last_gap, 1),
             "backoff": round(self.backoff, 2),
             "until_break": max(0, self.burst_len - self.since_break),

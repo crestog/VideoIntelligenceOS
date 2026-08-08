@@ -211,7 +211,7 @@ def _run(argv: list, timeout: float) -> tuple[int, str]:
 
 
 def _ytdlp_argv(url: str, work: str, cookies: str | None,
-                comments: bool) -> list:
+                comments: bool, fast: bool = False) -> list:
     argv = [
         sys.executable, "-m", "yt_dlp",
         "--no-warnings", "--no-progress", "--no-color",
@@ -224,8 +224,10 @@ def _ytdlp_argv(url: str, work: str, cookies: str | None,
         "--socket-timeout", "45",
         # yt-dlp's own inter-request sleep, on top of our pacer. This spaces
         # the two or three requests a single reel makes (page, media,
-        # comments) so one reel is not itself a small burst.
-        "--sleep-requests", "3",
+        # comments) so one reel is not itself a small burst. In fast mode it
+        # drops to nothing: it was costing ~9 s per reel, which at a 6 s target
+        # would have been most of the run time.
+        "--sleep-requests", "0" if fast else "3",
         "--user-agent", USER_AGENT,
         "--add-header", "Accept-Language:en-US,en;q=0.9",
 
@@ -242,6 +244,11 @@ def _ytdlp_argv(url: str, work: str, cookies: str | None,
         "-o", "%(id)s.%(ext)s",
         "-P", work,
     ]
+    if fast:
+        # Split the file across connections. Worth it only in fast mode: at a
+        # two-minute pace the download is not the bottleneck and four parallel
+        # range requests per reel is a louder fingerprint than one.
+        argv += ["--concurrent-fragments", "4"]
     if comments:
         argv.append("--write-comments")
     if cookies and os.path.isfile(cookies):
@@ -251,7 +258,7 @@ def _ytdlp_argv(url: str, work: str, cookies: str | None,
 
 
 def run_ytdlp(url: str, work: str, cookies: str | None = None,
-              timeout: float = 420.0) -> str:
+              timeout: float = 420.0, fast: bool = False) -> str:
     """Fetch with yt-dlp. Returns the combined output for the journal.
 
     Comments are requested first and dropped on the retry: `--write-comments`
@@ -260,7 +267,7 @@ def run_ytdlp(url: str, work: str, cookies: str | None = None,
     would be a poor trade. The retry is not paced differently — it is the same
     post, seconds later, which is ordinary browsing behaviour.
     """
-    code, out = _run(_ytdlp_argv(url, work, cookies, comments=True), timeout)
+    code, out = _run(_ytdlp_argv(url, work, cookies, True, fast), timeout)
     if code == 0 and _find(work, VIDEO_EXT + IMAGE_EXT):
         return out
 
@@ -268,7 +275,7 @@ def run_ytdlp(url: str, work: str, cookies: str | None = None,
     if kind == "hostile":
         raise FetchError(_first_error(out), "hostile")
 
-    code2, out2 = _run(_ytdlp_argv(url, work, cookies, comments=False), timeout)
+    code2, out2 = _run(_ytdlp_argv(url, work, cookies, False, fast), timeout)
     if code2 == 0 and _find(work, VIDEO_EXT + IMAGE_EXT):
         return out + "\n[retried without comments]\n" + out2
 
@@ -431,18 +438,22 @@ def build_record(url: str, key: str, work: str, info: dict,
 def fetch(url: str, key: str, work: str, cookies: str | None = None,
           collections: list | None = None,
           allow_gallery_dl: bool = True,
-          timeout: float = 420.0) -> dict:
+          timeout: float = 420.0,
+          fast: bool = False) -> dict:
     """Fetch one permalink into `work`. Raises FetchError on failure.
 
     Returns {video, images, record, record_path, info, bytes, sha256, tool}.
     `video` is None for a photo-only post — the caller decides what to do with
     that, and the right answer is to keep it: the caption and comments are
     still signal, and the ledger should not pretend the post never existed.
+
+    `fast` drops yt-dlp's own inter-request sleep and splits the download
+    across connections. See `vios.capture.pacing` for what that costs.
     """
     os.makedirs(work, exist_ok=True)
     tool = "yt-dlp"
     try:
-        log = run_ytdlp(url, work, cookies, timeout)
+        log = run_ytdlp(url, work, cookies, timeout, fast=fast)
     except FetchError as first:
         # A photo post is the one failure where the second downloader is not a
         # long shot but the correct tool: yt-dlp only does video, gallery-dl
@@ -483,12 +494,23 @@ def fetch(url: str, key: str, work: str, cookies: str | None = None,
     info = _load_info(work)
     record = build_record(url, key, work, info, collections or [], log, tool)
 
-    size = os.path.getsize(video) if video else 0
-    digest = _sha256(video) if video else ""
+    # For a photo post the "media" is the slides. Reporting 0 bytes and an
+    # empty digest — which is what measuring only `video` did — made every
+    # photo look like a zero-byte capture in the ledger and gave the dedup
+    # check nothing to compare, so two imports of the same carousel could not
+    # be told apart.
+    if video:
+        size = os.path.getsize(video)
+        digest = _sha256(video)
+    else:
+        size = sum(os.path.getsize(p) for p in images)
+        digest = _sha256(images[0]) if images else ""
+
     record["media"] = {
         "filename": os.path.basename(video) if video else "",
         "bytes": size,
         "sha256": digest,
+        "kind": "video" if video else "photo",
         "images": [os.path.basename(p) for p in images],
     }
 

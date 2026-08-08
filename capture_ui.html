@@ -456,6 +456,16 @@ details.step .in{padding:15px 16px 18px}
         <h3>Pace — how invisible you want to be</h3>
         <div class="card">
           <div class="band" style="background:var(--visual)"></div>
+          <div class="field">
+            <label>Profile <span class="note">— what you are willing to spend</span></label>
+            <select id="speed">
+              <option value="safe" selected>Careful — protect the account, about a week for 5,000</option>
+              <option value="fast">Fast — burn the account, a few hours for 5,000</option>
+            </select>
+          </div>
+          <p class="lede" id="speedNote" style="margin:-2px 0 12px">
+            Careful keeps the request rate sixty times under the level where Instagram starts
+            refusing, and shapes the gaps so there is no rhythm to detect.</p>
           <div class="row">
             <div class="field">
               <label>Seconds between reels <span class="note">— average, not fixed</span></label>
@@ -470,6 +480,14 @@ details.step .in{padding:15px 16px 18px}
               <label>Give up after <span class="note">— attempts per reel</span></label>
               <input type="number" id="maxAttempts" value="5" min="1" max="20">
             </div>
+          </div>
+          <div class="field" id="fastRow" style="display:none">
+            <label>Seconds between reels <span class="note">— fast profile</span></label>
+            <select id="targetFast">
+              <option value="2">2s — as fast as this goes, expect a block within the hour</option>
+              <option value="6" selected>6s — about 600/hour, the usual fast setting</option>
+              <option value="15">15s — about 240/hour, aggressive but not suicidal</option>
+            </select>
           </div>
           <label class="check"><input type="checkbox" id="breaks" checked>
             Take a 12–40 minute break every 18–40 reels</label>
@@ -918,6 +936,7 @@ async function tick(){
 
 function render(s){
   const st = s.state || 'idle';
+  fillPace(s.settings);
   const pill = $('#pill');
   pill.className = 'pill ' + (st === 'running' ? 'running'
     : st === 'paused' ? 'paused' : st === 'error' ? 'error' : '');
@@ -1031,19 +1050,67 @@ $('#bSaveCk').onclick = async () => {
   } else say('#rCk', j.error, 'no');
 };
 
+// Show what the engine is actually set to, once. Only once: the status poll
+// runs every two seconds, and rewriting the controls under an operator who is
+// mid-edit would silently discard what they typed.
+let paceFilled = false;
+function fillPace(cfg){
+  if(paceFilled || !cfg) return;
+  paceFilled = true;
+  if(cfg.speed) $('#speed').value = cfg.speed;
+  const t = String(Math.round(cfg.target_seconds || 0));
+  const box = cfg.speed === 'fast' ? $('#targetFast') : $('#target');
+  if([...box.options].some(o => o.value === t)) box.value = t;
+  if(typeof cfg.breaks === 'boolean') $('#breaks').checked = cfg.breaks;
+  if(typeof cfg.quiet_hours === 'boolean') $('#quiet').checked = cfg.quiet_hours;
+  if(typeof cfg.gallery_dl_fallback === 'boolean')
+    $('#galleryDl').checked = cfg.gallery_dl_fallback;
+  if(cfg.max_attempts) $('#maxAttempts').value = cfg.max_attempts;
+  if(Array.isArray(cfg.skip_collections))
+    $('#skipCols').value = cfg.skip_collections.join(', ');
+  paceMode();
+}
+
+// Which controls are meaningful depends on the profile: breaks and quiet
+// hours are camouflage, and camouflage on a run that is deliberately loud is
+// just a slower run. The engine turns them off on switch; this keeps the form
+// honest about it rather than showing ticked boxes that no longer apply.
+function paceMode(){
+  const fast = $('#speed').value === 'fast';
+  $('#fastRow').style.display = fast ? '' : 'none';
+  // The field, not its row — the row also holds "Give up after", which is
+  // just as meaningful when the run is loud.
+  $('#target').closest('.field').style.display = fast ? 'none' : '';
+  $('#breaks').closest('.check').style.display = fast ? 'none' : '';
+  $('#quiet').closest('.check').style.display = fast ? 'none' : '';
+  $('#speedNote').textContent = fast
+    ? 'Fast drops the gap to a few seconds, turns off breaks and quiet hours, and '
+      + 'splits each download across four connections. Expect Instagram to start '
+      + 'refusing — everything already captured is safe in the channel, so the cost '
+      + 'is the login, never the data.'
+    : 'Careful keeps the request rate sixty times under the level where Instagram '
+      + 'starts refusing, and shapes the gaps so there is no rhythm to detect.';
+}
+$('#speed').onchange = paceMode;
+paceMode();
+
 $('#bSavePace').onclick = async () => {
+  const fast = $('#speed').value === 'fast';
   const j = await post('/api/capture/config', form({
-    target_seconds: $('#target').value,
+    speed: $('#speed').value,
+    target_seconds: fast ? $('#targetFast').value : $('#target').value,
     max_attempts: $('#maxAttempts').value,
-    breaks: $('#breaks').checked ? '1' : '0',
-    quiet_hours: $('#quiet').checked ? '1' : '0',
+    breaks: fast ? '0' : ($('#breaks').checked ? '1' : '0'),
+    quiet_hours: fast ? '0' : ($('#quiet').checked ? '1' : '0'),
     gallery_dl: $('#galleryDl').checked ? '1' : '0',
     skip_collections: $('#skipCols').value,
   }));
   if(j.ok){
-    const s = j.settings;
-    say('#rPace', `One reel every ${s.target_seconds}s on average — about `
-      + `${Math.round(86400 / s.target_seconds)} a day.`, 'ok');
+    const s = j.settings, t = s.target_seconds;
+    const rate = t < 60 ? `about ${Math.round(3600 / t)} an hour`
+                        : `about ${Math.round(86400 / t)} a day`;
+    say('#rPace', `${s.speed === 'fast' ? 'Fast' : 'Careful'} — one reel every `
+      + `${t}s on average, ${rate}.`, 'ok');
   } else say('#rPace', j.error, 'no');
 };
 

@@ -47,6 +47,11 @@ API_ROOT = "https://api.telegram.org"
 BOT_UPLOAD_LIMIT = 50 * 1024 * 1024
 CAPTION_LIMIT = 1024
 
+# Instagram's own carousel ceiling is 20 slides. Anything past that is an
+# extractor handing back a directory rather than a post, and uploading it
+# would be a burst the pacer never authorised.
+MAX_CAROUSEL = 20
+
 CONNECT_TIMEOUT = 20.0
 READ_TIMEOUT = 180.0
 WRITE_TIMEOUT = 900.0
@@ -74,6 +79,20 @@ def _esc(text: str) -> str:
     """
     return (str(text or "").replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+# The document types this module actually sends. `mimetypes` is not used: it
+# reads the machine's registry, which on Windows is edited by installed
+# software and has been observed returning `image/pjpeg` for .jpg.
+_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+         ".webp": "image/webp", ".heic": "image/heic", ".gif": "image/gif",
+         ".mp4": "video/mp4", ".mov": "video/quicktime",
+         ".json": "application/json", ".db": "application/x-sqlite3"}
+
+
+def _mime_for(name: str) -> str:
+    return _MIME.get(os.path.splitext(name)[1].lower(),
+                     "application/octet-stream")
 
 
 def build_caption(record: dict, collections=()) -> str:
@@ -284,10 +303,15 @@ class Telegram:
                       reply_to: int | None = None,
                       file_name: str | None = None) -> dict:
         name = file_name or os.path.basename(path)
+        # Guessed from the name, not hardcoded: this method sends the record
+        # JSON *and* carousel images, and labelling a JPEG application/json
+        # makes Telegram serve it back with that content type — which breaks
+        # anything downstream that trusts the type instead of sniffing.
+        mime = _mime_for(name)
 
         def _factory():
             handle = open(path, "rb")
-            return ({"document": (name, handle, "application/json")}, [handle])
+            return ({"document": (name, handle, mime)}, [handle])
 
         data = {"chat_id": self.channel, "caption": caption[:CAPTION_LIMIT],
                 "disable_notification": True}
@@ -457,33 +481,60 @@ class _ProgressFile:
 # ═══════════════════════════════════════════════════════════════════════
 def publish(tg: Telegram, result: dict, collections=(),
             progress=None) -> dict:
-    """Upload one captured reel: video, then record, then extra images.
+    """Upload one captured post: media, then record, then the rest of a carousel.
 
-    Order matters. The video goes first because it is the irreplaceable
+    Order matters. The media goes first because it is the irreplaceable
     artifact — if the process dies between the two messages, the bytes are
     safe and the record can be regenerated from the temp directory or, in the
     worst case, re-derived. The reverse order would leave metadata pointing at
     nothing.
+
+    A photo post is uploaded, not skipped: the caption and the comments are
+    signal, and a hole in the ledger is worse than a post with no video. A
+    *carousel* uploads every slide — an earlier version sent `images[0]` and
+    dropped the other nine without saying so, which is the quiet kind of data
+    loss that is only discovered years later when the images are gone from
+    Instagram too.
     """
     record = result["record"]
     caption = build_caption(record, collections)
+    images = list(result.get("images") or [])
+    extra_ids, extra_msgs, failed = [], [], []
 
     if result.get("video"):
         sent = tg.send_video(result["video"], caption, progress=progress)
     else:
-        # A photo-only post. Still worth keeping: caption and comments carry
-        # signal, and a gap in the ledger is worse than a post with no video.
-        first = result["images"][0] if result.get("images") else None
-        if not first:
+        if not images:
             raise UploadError("nothing to upload")
-        sent = tg.send_document(first, caption)
-        sent = {"message_id": sent["message_id"], "file_id": sent["file_id"],
+        # Slide 1 carries the caption and becomes the post's anchor message,
+        # so the ledger's msg_id points at something with the permalink on it.
+        first = tg.send_document(images.pop(0), caption)
+        sent = {"message_id": first["message_id"], "file_id": first["file_id"],
                 "thumb_file_id": "", "duration": None,
                 "width": None, "height": None}
 
     rec = tg.send_document(result["record_path"],
                            caption=f"metadata · vios:{record.get('key','')}",
                            reply_to=sent["message_id"])
+
+    # Remaining slides, threaded under the anchor. Capped: a bad extractor can
+    # hand back a directory of hundreds of files, and a hundred uploads is a
+    # burst against a rate limit that the pacer never sees.
+    key = record.get("key", "")
+    for n, path in enumerate(images[:MAX_CAROUSEL], start=2):
+        try:
+            more = tg.send_document(
+                path, caption=f"slide {n} · vios:{key}",
+                reply_to=sent["message_id"])
+            extra_msgs.append(more["message_id"])
+            extra_ids.append(more["file_id"])
+        except UploadError as exc:
+            # One rejected slide does not undo the post. The anchor and the
+            # record are already up; losing slide 7 is recorded, not raised.
+            failed.append(f"{os.path.basename(path)}: {str(exc)[:120]}")
+    if len(images) > MAX_CAROUSEL:
+        failed.append(f"{len(images) - MAX_CAROUSEL} further slide(s) not sent "
+                      f"— more than {MAX_CAROUSEL} in one post")
 
     return {
         "msg_id": sent["message_id"],
@@ -493,6 +544,10 @@ def publish(tg: Telegram, result: dict, collections=(),
         "duration": sent.get("duration"),
         "width": sent.get("width"),
         "height": sent.get("height"),
+        "extra_msg_ids": extra_msgs,
+        "extra_file_ids": extra_ids,
+        "slides": 1 + len(extra_msgs) if not result.get("video") else 0,
+        "slides_failed": failed,
     }
 
 

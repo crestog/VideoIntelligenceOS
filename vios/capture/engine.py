@@ -165,7 +165,8 @@ class CaptureEngine:
                   target: float | None = None, quiet_hours: bool | None = None,
                   breaks: bool | None = None, skip_collections=None,
                   max_attempts: int | None = None,
-                  allow_gallery_dl: bool | None = None) -> dict:
+                  allow_gallery_dl: bool | None = None,
+                  speed: str | None = None) -> dict:
         """Accept settings from the admin form. Blank fields keep their value,
         so the operator can change the pace mid-week without re-typing a token.
         """
@@ -185,8 +186,12 @@ class CaptureEngine:
 
             if cookies_text and cookies_text.strip():
                 self._write_cookies(cookies_text)
+            # Before `target`: switching profile re-aims the target, so an
+            # explicit target sent in the same call has to win over it.
+            if speed:
+                self.pacer.set_profile(speed)
             if target:
-                self.pacer.target = max(25.0, float(target))
+                self.pacer.target = max(self.pacer.floor, float(target))
             if quiet_hours is not None:
                 self.pacer.quiet_hours = bool(quiet_hours)
             if breaks is not None:
@@ -250,6 +255,7 @@ class CaptureEngine:
             "stored_credentials": stored,
             "cookies_set": bool(self._cookies_path
                                 and os.path.isfile(self._cookies_path)),
+            "speed": self.pacer.profile,
             "target_seconds": round(self.pacer.target, 1),
             "quiet_hours": self.pacer.quiet_hours,
             "breaks": self.pacer.breaks,
@@ -494,7 +500,8 @@ class CaptureEngine:
             result = fetch_one(
                 url, key, work, cookies=self._cookies_path or None,
                 collections=self._collections(led, key),
-                allow_gallery_dl=self.allow_gallery_dl)
+                allow_gallery_dl=self.allow_gallery_dl,
+                fast=(self.pacer.profile == "fast"))
 
             self.current["phase"] = "uploading"
             self.current["bytes"] = result["bytes"]
@@ -504,13 +511,18 @@ class CaptureEngine:
             rec = result["record"]
             post = rec.get("post", {})
             eng = rec.get("engagement", {})
+            media = rec.get("media", {}) or {}
+            is_photo = not result.get("video")
             led.mark_uploaded(
                 key,
                 msg_id=sent["msg_id"], record_msg_id=sent["record_msg_id"],
                 file_id=sent["file_id"], file_size=result["bytes"],
                 sha256=result["sha256"],
-                ext=(rec.get("media", {}).get("filename", "")
-                     .rsplit(".", 1)[-1][:8]),
+                # A photo post has no filename to take an extension from, so
+                # say what it is. Without this the row's `ext` stays empty and
+                # the processing plane cannot tell a photo from a failed video.
+                ext=((media.get("filename", "").rsplit(".", 1)[-1][:8])
+                     or ("photo" if is_photo else "")),
                 duration=sent.get("duration") or post.get("duration"),
                 width=sent.get("width") or post.get("width"),
                 height=sent.get("height") or post.get("height"),
@@ -519,10 +531,13 @@ class CaptureEngine:
                 comment_count=eng.get("comments"),
                 comments_got=rec.get("comments_captured"),
                 taken_at=post.get("taken_at"))
+            what = (f"{sent.get('slides', 0)} photo(s)" if is_photo
+                    else f"{result['bytes'] / 1048576:.1f} MB")
             led.log("captured",
-                    f"{post.get('uploader') or '?'} · "
-                    f"{result['bytes'] / 1048576:.1f} MB · "
+                    f"{post.get('uploader') or '?'} · {what} · "
                     f"{rec.get('comments_captured', 0)} comments", key)
+            for miss in (sent.get("slides_failed") or []):
+                led.log("slide-missing", miss, key)
 
             self.session_done += 1
             self.since_snapshot += 1

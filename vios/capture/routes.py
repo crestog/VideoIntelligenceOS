@@ -172,6 +172,7 @@ async def config(
     skip_collections: str = Form(""),
     max_attempts: str = Form(""),
     gallery_dl: str = Form(""),
+    speed: str = Form(""),
 ):
     """Take the admin form. Blank means "leave it alone", so the operator can
     change the pace on day four without re-typing a token."""
@@ -199,6 +200,10 @@ async def config(
                                if c.strip()] if skip_collections else None),
             max_attempts=_int(max_attempts),
             allow_gallery_dl=_bool(gallery_dl),
+            # Only "fast" or "safe" reach the engine; anything else is a typo
+            # and must not silently mean one of them.
+            speed=(speed.strip().lower()
+                   if speed.strip().lower() in ("fast", "safe") else None),
         )
         return _ok(settings=out)
     except Exception as exc:
