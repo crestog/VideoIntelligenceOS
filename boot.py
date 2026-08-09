@@ -235,9 +235,11 @@ try:
         print(f"⚠️ [SECRETS] Telegram disabled — not set: {', '.join(_absent)}", flush=True)
         print("      The web UI, CV pipeline, dashboard and queues all still run.", flush=True)
         print("      To enable channel harvesting and the upload bot, add these", flush=True)
-        print("      as Kaggle Secrets under their VIOS_ names (Add-ons →", flush=True)
-        print("      Secrets) and restart. Phase 0 above picks them up on its", flush=True)
-        print("      own — nothing needs exporting in the launch cell.", flush=True)
+        print("      as Kaggle Secrets (Add-ons → Secrets) and restart. Any of", flush=True)
+        print("      VIOS_BOT_TOKEN / VIOS_TELEGRAM_BOT_TOKEN / TELEGRAM_BOT_TOKEN", flush=True)
+        print("      is accepted, and likewise for CHANNEL_ID, API_ID, API_HASH.", flush=True)
+        print("      Phase 0 above picks them up on its own — nothing needs", flush=True)
+        print("      exporting in the launch cell.", flush=True)
     else:
         print("🔑 [SECRETS] Telegram credentials present.", flush=True)
     if not NIM_API_KEY:
@@ -288,6 +290,17 @@ print("   🖥️ [UI]        → ui_server.py      (FastAPI + Ghost Worker)", f
 print("   🎞️ [CV-ENGINE] → frame_worker.py   (OpenCV frame extraction)", flush=True)
 if OMNI_ENABLED:
     print("   🔮 [OMNI]      → omni_engine.py    (Tri-partite DB + GraphRAG + Bot)", flush=True)
+else:
+    # Said out loud, because the silent version cost a session. VIOS_OMNI=0
+    # switches off Neo4j, Postgres, GraphRAG, the narrative passes and /omni,
+    # and with no line here the boot log of a crippled stack was identical to a
+    # complete one — the failure only surfaced later as empty pages.
+    print("   🔮 [OMNI]      → DISABLED (VIOS_OMNI=0) — no Neo4j, no Postgres,",
+          flush=True)
+    print("                    no GraphRAG, no narratives, /omni is a notice.",
+          flush=True)
+    print("                    Unset VIOS_OMNI in the launch cell to restore it.",
+          flush=True)
 print("=" * 60, flush=True)
 print("", flush=True)
 

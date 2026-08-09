@@ -180,10 +180,19 @@ def _rewrite_moments(c, msg_id):
 # ANALYSIS STAGES
 # ═══════════════════════════════════════════════════════════
 def analyze_audio(msg_id, video_path):
-    """Whisper transcript → transcripts table. Returns segment count."""
+    """Whisper transcript → transcripts table. Returns segment count.
+
+    Raises if Whisper is not loaded. It used to return 0, which the caller
+    logged as "0 transcript segments" — the same line a silent video produces.
+    A whole library can be transcribed as silent that way and nothing in the
+    log says otherwise.
+    """
     whisper = WARM_MODELS.get('whisper_model')
     if not whisper:
-        return 0
+        raise RuntimeError(
+            "Whisper is not loaded — see the ❌ line from warm-up above. "
+            "Usually faster-whisper is missing (rerun setup.sh) or the "
+            "large-v3 download failed. No audio can be analysed until it loads.")
     segments, _info = whisper.transcribe(video_path, word_timestamps=False, vad_filter=True)
     rows = [(msg_id, s.start, s.end, s.text.strip(), time.time())
             for s in segments if s.text and s.text.strip()]
@@ -204,6 +213,11 @@ def _sample_frames(folder_id, fps):
     frames_dir = os.path.join(VIDEO_DIR, folder_id)
     frames = sorted(glob.glob(os.path.join(frames_dir, 'frame_*.jpg')))
     if not frames:
+        # Said out loud. An empty directory here yields no notes, and "0 frame
+        # notes" reads exactly like a video with nothing in it — so a broken
+        # handoff between the CV engine and this one looked like a boring reel.
+        log(f"⚠️ no frames in {frames_dir} — the CV engine wrote none, or wrote "
+            f"them under a different folder_id", "WARN")
         return
     step = max(1, round(fps / ANALYZE_SAMPLE_FPS)) if fps > 0 else 15
     for i in range(0, len(frames), step):
@@ -287,7 +301,14 @@ def process_analyze_job(payload):
     else:
         log(f"⚠️ #{msg_id}: video file missing — skipping transcript (frames only)", "WARN")
 
-    note_count = analyze_frames(msg_id, folder_id, fps)
+    # Frames and audio are independent analyses over the same video; an audio
+    # failure must not take the frame notes down with it (it would otherwise
+    # surface as "no chunks analysed at all").
+    note_count = 0
+    try:
+        note_count = analyze_frames(msg_id, folder_id, fps)
+    except Exception as e:
+        log(f"⚠️ #{msg_id}: frame analysis failed — {type(e).__name__}: {e}", "WARN")
     log(f"🧠 #{msg_id}: {note_count} frame notes | analysis done in {time.time() - t0:.1f}s")
     clear_ram()
 
@@ -309,6 +330,7 @@ if __name__ == "__main__":
         push_job("QUEUE_MODELS", {"model_name": model})
 
     # Phase 1: drain QUEUE_MODELS (blocking until empty)
+    failed = {}
     while True:
         job = pop_job("QUEUE_MODELS", timeout=2)
         if not job:
@@ -320,10 +342,27 @@ if __name__ == "__main__":
                 clear_ram()
                 log(f"✅ {m_name.upper()} loaded into VRAM.", "SUCCESS")
             except Exception as e:
+                failed[m_name] = f"{type(e).__name__}: {e}"
                 log(f"❌ Failed to load {m_name}: {e}", "ERROR")
                 clear_ram()
 
-    log(f"🧠 Warm-up complete ({len(WARM_MODELS)} engines). Consuming {QUEUE_ANALYZE}...")
+    # A roll call, because the per-model lines scroll past during a 20-minute
+    # warm-up and the next thing printed used to be "Warm-up complete", which
+    # is true and misleading. Whisper failing is the whole audio pass; YOLO and
+    # EasyOCR failing is the whole frame pass. Both used to be recoverable-
+    # looking single ERROR lines in the middle of a wall of download bars.
+    log(f"🧠 Warm-up complete — {len(WARM_MODELS)} engine(s) resident, "
+        f"{len(failed)} failed.")
+    if failed:
+        for m_name, why in failed.items():
+            log(f"   ❌ {m_name}: {why}", "ERROR")
+        if "whisper" in failed:
+            log("   ⚠️ NO AUDIO WILL BE ANALYSED — every video will be "
+                "transcribed as silent until Whisper loads.", "ERROR")
+        if failed.keys() & {"yolo", "easyocr"}:
+            log("   ⚠️ Frame notes will be thin — objects and on-screen text "
+                "come from exactly these two.", "ERROR")
+    log(f"Consuming {QUEUE_ANALYZE}...")
 
     # Phase 2: reliable analysis loop
     while True:

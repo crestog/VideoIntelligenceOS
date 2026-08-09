@@ -61,10 +61,52 @@ FIELDS = {
     "ig_cookies": ("VIOS_IG_COOKIES", "Instagram cookie jar"),
 }
 
+# Other names the same credential is known by, tried after the canonical one.
+#
+# This exists because a stored secret that is never asked for is
+# indistinguishable from a missing one. A session with all four Telegram
+# secrets saved correctly still printed "Telegram disabled", because they had
+# been stored as TELEGRAM_BOT_TOKEN and VIOS_TELEGRAM_BOT_TOKEN while this
+# module only ever called get_secret("VIOS_BOT_TOKEN"). Nothing was wrong with
+# the secrets, the bridge, or the engine — the two halves just disagreed about
+# spelling, and the log blamed the user for not doing the thing they had done.
+#
+# The three-way pattern is not arbitrary: root config.py already accepts
+# TELEGRAM_* as an environment alias and atlas/config.py already accepts
+# ATLAS_*, so these names are what the rest of the tree reads. The only piece
+# missing was asking Kaggle for them.
+ALIASES = {
+    "bot_token":  ("VIOS_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN",
+                   "ATLAS_BOT_TOKEN"),
+    "channel_id": ("VIOS_TELEGRAM_CHANNEL_ID", "TELEGRAM_CHANNEL_ID",
+                   "ATLAS_CHANNEL_ID"),
+    "api_id":     ("VIOS_TELEGRAM_API_ID", "TELEGRAM_API_ID",
+                   "ATLAS_API_ID"),
+    "api_hash":   ("VIOS_TELEGRAM_API_HASH", "TELEGRAM_API_HASH",
+                   "ATLAS_API_HASH"),
+    "hf_token":   ("VIOS_HUGGINGFACE_TOKEN", "HF_TOKEN", "HUGGINGFACE_TOKEN"),
+    "ig_cookies": ("VIOS_INSTAGRAM_COOKIES", "IG_COOKIES"),
+}
+
+# Secrets this module does not resolve as credentials, but which the rest of
+# the system reads straight from os.environ under exactly this name. Bridged
+# verbatim so storing one in Kaggle Secrets is enough — VIOS_NIM_API_KEY is
+# read by config.py and gates GraphRAG entity extraction.
+PASSTHROUGH = ("VIOS_NIM_API_KEY",)
+
 SECRET = "kaggle-secrets"
 ENV = "environment"
 FILE = "local file"
 TYPED = "typed this session"
+
+
+def labels(name: str) -> tuple:
+    """Every name a credential may be stored under, canonical first.
+
+    The canonical name is the one written back into the environment, so which
+    alias a value arrived under never leaks into the rest of the system.
+    """
+    return (FIELDS[name][0],) + tuple(ALIASES.get(name, ()))
 
 _local_path_override = ""
 
@@ -91,6 +133,13 @@ def _from_kaggle() -> dict:
 
     Every read is individually guarded: a secret that has not been added
     raises, and one missing secret must not hide the five that are present.
+    Each field is tried under all of its names and stops at the first hit, so
+    the cost is one call per credential when the canonical name was used and a
+    handful of failed calls when it was not. That is paid once, at boot.
+
+    Passthrough secrets come back keyed by their own env-var name, which is
+    never a key in FIELDS — so `resolve` and `describe`, which filter on
+    FIELDS, ignore them, and only `export_to_env` passes them on.
     """
     try:
         from kaggle_secrets import UserSecretsClient  # noqa: PLC0415
@@ -100,23 +149,36 @@ def _from_kaggle() -> dict:
         client = UserSecretsClient()
     except Exception:
         return {}
-    out = {}
-    for name, (label, _desc) in FIELDS.items():
+
+    def _get(label):
         try:
             val = client.get_secret(label)
         except Exception:
-            continue
-        if val and str(val).strip():
-            out[name] = str(val).strip()
+            return ""
+        return str(val).strip() if val else ""
+
+    out = {}
+    for name in FIELDS:
+        for label in labels(name):
+            val = _get(label)
+            if val:
+                out[name] = val
+                break
+    for label in PASSTHROUGH:
+        val = _get(label)
+        if val:
+            out[label] = val
     return out
 
 
 def _from_env() -> dict:
     out = {}
-    for name, (label, _desc) in FIELDS.items():
-        val = os.environ.get(label, "")
-        if val and val.strip():
-            out[name] = val.strip()
+    for name in FIELDS:
+        for label in labels(name):
+            val = os.environ.get(label, "")
+            if val and val.strip():
+                out[name] = val.strip()
+                break
     return out
 
 
@@ -159,14 +221,38 @@ def export_to_env() -> dict:
 
     A variable that is already set always wins, so an explicit export is still
     how you override a stored secret for one session without deleting it.
+
+    A value found under an alias is written back under the canonical name as
+    well as left where it was, so a credential stored as TELEGRAM_BOT_TOKEN
+    reaches code that only ever looks up VIOS_BOT_TOKEN. Normalising here means
+    no other file needs an alias list.
     """
+    from_kaggle = _from_kaggle()
     exported = {}
-    for name, val in _from_kaggle().items():
-        label = FIELDS[name][0]
+
+    for name in FIELDS:
+        canonical = FIELDS[name][0]
+        if os.environ.get(canonical, "").strip():
+            continue                       # an explicit export outranks a store
+        val = ""
+        for label in labels(name)[1:]:     # an alias already in the environment
+            if os.environ.get(label, "").strip():
+                val = os.environ[label].strip()
+                break
+        val = val or from_kaggle.get(name, "")
+        if not val:
+            continue
+        os.environ[canonical] = str(val)
+        exported[name] = canonical
+
+    for label in PASSTHROUGH:              # bridged under their own name
         if os.environ.get(label, "").strip():
             continue
-        os.environ[label] = str(val)
-        exported[name] = label
+        val = from_kaggle.get(label, "")
+        if val:
+            os.environ[label] = str(val)
+            exported[label] = label
+
     return exported
 
 
@@ -209,6 +295,7 @@ def describe(typed: dict | None = None) -> dict:
     for name, (label, desc) in FIELDS.items():
         rows.append({
             "name": name, "label": label, "description": desc,
+            "aliases": list(labels(name)[1:]),
             "present": bool(values.get(name)),
             "source": sources.get(name, ""),
         })
