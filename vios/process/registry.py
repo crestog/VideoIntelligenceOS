@@ -46,7 +46,11 @@ from . import CHANNELS
 
 # What a component can write. Used by the tab to show, per pass, whether it
 # contributed evidence, geometry, files, or vectors.
-OUTPUTS = ("video", "shots", "claims", "vectors", "artifacts")
+# `metrics` is per-frame numbers written as packed columns (`frame_metric`)
+# rather than a row per reading. It is listed separately from `claims` because a
+# pass that writes only metrics writes no evidence rows at all, and the tab
+# would otherwise report it as having contributed nothing.
+OUTPUTS = ("video", "shots", "claims", "vectors", "artifacts", "metrics")
 
 # Coarse ordering. Components sort by stage first, so a cohort never contains a
 # perception pass scheduled ahead of the shot detection it reads.
@@ -96,6 +100,11 @@ class Component:
 
     tier: str = "core"               # core | deep | optional
     default_on: bool = True
+    # False means: this pass is known not to run on Kaggle's 2×T4. It is data,
+    # not a deletion — the component stays in the registry, the engine reports
+    # it as `deferred` rather than `failed`, and a machine that can run it
+    # picks it up later. Nothing is fought into working where it does not.
+    kaggle_ok: bool = True
     notes: str = ""
 
     @property
@@ -187,10 +196,23 @@ _STRUCTURE = [
             "every file present, the count against the stream's own "
             "declaration, every timestamp read rather than interpolated, and "
             "every wall-clock second holding at least one frame. That last "
-            "check is the one a frame count cannot substitute for."),
-        needs=("probe",), produces=("artifacts",), seconds=30.0, ram_mb=1024,
+            "check is the one a frame count cannot substitute for.\n\n"
+            "Two tiers come out of the one decode, because the models want "
+            "different things and neither compromise is acceptable. The 384 px "
+            "analysis tier is at or above what SigLIP, CLIP and Depth-Anything "
+            "ingest. The full tier keeps source resolution for OCR, detection "
+            "and faces, where a twelve-pixel caption or a face at the back of "
+            "a room is legible at 1080x1920 and simply absent at 384. The "
+            "filter graph splits after decoding once, so the second tier costs "
+            "an encode rather than another pass over the file."),
+        needs=("probe",), produces=("artifacts",), seconds=45.0, ram_mb=1024,
         requires=("subprocess",),
-        params={"analysis_width": 384, "full_tier": False, "full_width": 0},
+        # `full_tier` ships on. It is roughly 200-400 MB per reel across both
+        # tiers, in a Kaggle working directory that dies with the session
+        # anyway, and the engine's cache budget evicts it once the last
+        # consumer in the cohort is done. Resolution here is chosen for output
+        # quality; scratch space is not the thing being optimised.
+        params={"analysis_width": 384, "full_tier": True, "full_width": 0},
     ),
 ]
 
@@ -235,33 +257,44 @@ _SIGNAL = [
             "This one reads the complete frame set the allframes pass wrote "
             "and measures all of it, so the archive can answer what was "
             "happening at any moment rather than at forty moments. The "
-            "per-frame numbers are written as columnar arrays in "
-            "perframe.json rather than as claims: a 900-frame reel on six "
-            "metrics is 5,400 rows, and across the archive that is "
-            "twenty-seven million rows nobody queries one at a time. Only the "
-            "summary becomes claims. The perceptual hash earns its place by "
+            "per-frame numbers go to the store as packed columnar arrays — one "
+            "row per metric per video, not one row per frame. A 900-frame reel "
+            "on six metrics would be 5,400 rows and twenty-seven million "
+            "across the archive, none of which anyone queries one at a time; "
+            "as arrays it is six rows that load in one read. Only the summary "
+            "becomes claims. The perceptual hash earns its place by "
             "finding freeze frames - a run of identical hashes is the "
             "difference between a video that ended and one that broke - and "
             "by making near-duplicate reels findable without a model."),
-        seconds=6.0, ram_mb=1024, needs=("allframes",),
+        seconds=10.0, ram_mb=1024, needs=("allframes",),
+        revision="2",
         requires=("cv2", "numpy"),
+        produces=("claims", "metrics"),
         kinds=("brightness_mean", "brightness_min", "brightness_max",
                "contrast_mean", "saturation_mean", "temperature_mean",
                "sharpness_mean", "motion_mean", "black_frames",
                "freeze_spans", "longest_freeze", "unique_frames"),
+        params={"tier": "analysis", "stride": 1},
     ),
     Component(
         id="colour", title="Colour", stage=STAGE_SIGNAL, family="signal",
         channel="style",
-        summary="Per-shot palette in CIELAB, brightness, contrast, saturation.",
+        summary="Per-shot palette in CIELAB, plus per-frame colour statistics.",
         detail=(
             "k-means in CIELAB rather than RGB, because perceptual distance is "
             "the thing being measured and RGB distance is not it. Produces a "
             "five-swatch palette per shot plus the statistics that let 'high "
-            "contrast, cool, desaturated' become a searchable query."),
-        seconds=2.5, needs=("keyframes",), requires=("cv2", "numpy"),
+            "contrast, cool, desaturated' become a searchable query. The "
+            "palette stays shot-level — a palette is a property of a look, and "
+            "clustering one frame's pixels tells you less than clustering the "
+            "shot's. The statistics are per-frame, because a grade that shifts "
+            "mid-shot is exactly the kind of thing worth being able to find."),
+        seconds=12.0, needs=("keyframes", "allframes"),
+        revision="2",
+        requires=("cv2", "numpy"),
+        produces=("claims", "metrics"),
         kinds=("palette", "brightness", "contrast", "saturation", "temperature"),
-        params={"swatches": 5},
+        params={"swatches": 5, "tier": "analysis", "stride": 1},
     ),
     Component(
         id="motion", title="Motion and camera", stage=STAGE_SIGNAL, family="signal",
@@ -270,11 +303,19 @@ _SIGNAL = [
         detail=(
             "Estimates a global affine transform between consecutive frames and "
             "reads the camera move out of its parameters — translation is a "
-            "pan, uniform scale is a zoom, high residual is handheld. Classifying "
-            "camera movement by fitting a transform is exact where asking a "
-            "vision model the same question is a guess dressed as an answer."),
-        seconds=7.0, needs=("shots",), requires=("cv2", "numpy"),
+            "pan, uniform scale is a zoom, high residual is handheld. "
+            "Classifying camera movement by fitting a transform is exact where "
+            "asking a vision model the same question is a guess dressed as an "
+            "answer. Fitted between every consecutive pair from the extracted "
+            "frame set rather than by re-decoding, so the motion curve is "
+            "sampled at the video's own frame rate and the fit is against the "
+            "frames every other pass saw."),
+        seconds=25.0, needs=("shots", "allframes"),
+        revision="2",
+        requires=("cv2", "numpy"),
+        produces=("claims", "metrics"),
         kinds=("camera_move", "motion_energy", "stability"),
+        params={"tier": "analysis", "stride": 1},
     ),
     Component(
         id="loudness", title="Loudness", stage=STAGE_SIGNAL, family="signal",
@@ -285,8 +326,11 @@ _SIGNAL = [
             "profile over time is what separates a reel that opens on a beat "
             "drop from one that opens on a whisper, and the silence ratio is a "
             "reliable structural marker for pauses used as emphasis."),
-        seconds=1.5, needs=("artifacts",), requires=("numpy", "soundfile"),
-        kinds=("lufs", "true_peak", "dynamic_range", "silence_ratio"),
+        seconds=1.5, revision=2,
+        needs=("artifacts",), requires=("numpy", "soundfile"),
+        produces=("claims", "metrics"),
+        kinds=("lufs", "true_peak", "dynamic_range", "silence_ratio",
+               "loudness_curve", "shot_level", "silence"),
     ),
     Component(
         id="music", title="Tempo and key", stage=STAGE_SIGNAL, family="signal",
@@ -322,7 +366,7 @@ _PERCEPTION = [
             "the video is flagged rather than transcribed badly."),
         model="Systran/faster-whisper-large-v3", weights="whisper-large-v3",
         quant="int8_float16", device="gpu", vram_mb=3100, disk_mb=3100,
-        seconds=9.0, ram_mb=2048,
+        seconds=9.0, ram_mb=2048, revision=2,
         needs=("artifacts",), produces=("claims",),
         requires=("faster_whisper",),
         kinds=("transcript", "segment", "words", "language",
@@ -330,7 +374,10 @@ _PERCEPTION = [
         params={"beam_size": 5, "vad_filter": True, "word_timestamps": True,
                 "condition_on_previous_text": False},
         notes="condition_on_previous_text off: it causes repetition loops on "
-              "music-heavy reels, which is most of them.",
+              "music-heavy reels, which is most of them. Segments keep "
+              "Whisper's own boundaries and additionally carry the frame span "
+              "they cover, so speech shares one index with everything the "
+              "vision passes wrote.",
     ),
     Component(
         id="transcribe-alt", title="Transcribe (second reader)",
@@ -344,7 +391,8 @@ _PERCEPTION = [
             "signal in the entire pipeline."),
         model="mobiuslabsgmbh/faster-whisper-large-v3-turbo", weights="whisper-turbo",
         quant="int8_float16", device="gpu", vram_mb=1600, disk_mb=1600,
-        seconds=5.0, needs=("artifacts",), requires=("faster_whisper",),
+        seconds=5.0, revision=2,
+        needs=("artifacts",), requires=("faster_whisper",),
         kinds=("transcript", "segment", "language", "agreement", "contested"),
         params={"beam_size": 1, "vad_filter": True},
     ),
@@ -358,26 +406,43 @@ _PERCEPTION = [
             "information that changes how every other reading of the reel "
             "should be interpreted. No identity is inferred or stored."),
         model="pyannote/speaker-diarization-3.1", weights="pyannote-3.1",
-        device="gpu", vram_mb=1400, disk_mb=100, seconds=7.0,
+        device="gpu", vram_mb=1400, disk_mb=100, seconds=7.0, revision=2,
         needs=("artifacts",), requires=("pyannote.audio",),
         kinds=("speaker_turn", "speaker_count", "speaker_share", "overlap"),
-        notes="Needs a Hugging Face token and gated-model acceptance.",
+        notes="Needs a Hugging Face token and gated-model acceptance. A turn "
+              "is written as the frame span it covers, not the shot it began "
+              "in — the speaker changes mid-shot far more often than at a cut.",
     ),
     Component(
         id="audio-tag", title="Sound events", stage=STAGE_PERCEPTION, family="audio",
         channel="audio",
-        summary="PANNs over AudioSet classes plus CLAP embeddings of the track.",
+        summary="CLAP over a gapless 0.96 s grid: every sound, at full resolution.",
         detail=(
             "Music, laughter, applause, whooshes, room tone, silence. A "
             "transcript records the words and misses everything else, and on "
-            "short-form video the everything else is half the craft. CLAP also "
-            "yields an audio embedding, which makes 'sounds like this' a real "
-            "query."),
+            "short-form video the everything else is half the craft. "
+            "Scoring runs on a fixed grid of 0.96 s windows at a 0.48 s hop "
+            "covering the whole track with no gaps — the audio equivalent of "
+            "'every frame' — because a sound attributed to a shot answers "
+            "'there was applause somewhere in these eleven seconds', which "
+            "cannot place a moment. 0.96 s is also what CLAP was trained to "
+            "ingest, so a window is one whole model input rather than a slice "
+            "of one. Every label keeps its full score curve as a packed metric "
+            "array, so a later feature can pick its own threshold without "
+            "re-running the model over the archive, and each label that stays "
+            "above threshold across consecutive windows collapses into one "
+            "run-length claim carrying the frame span it covers. CLAP also "
+            "yields per-window embeddings, which makes 'find the moment that "
+            "sounds like this' a query over one timeline rather than a "
+            "comparison of pooled averages."),
         model="laion/clap-htsat-fused", weights="clap-panns", device="gpu",
-        vram_mb=1300, disk_mb=1800, seconds=3.0,
-        needs=("artifacts",), produces=("claims", "vectors"),
+        vram_mb=1300, disk_mb=1800, seconds=14.0, revision=2,
+        needs=("artifacts",),
+        produces=("claims", "vectors", "metrics"),
         requires=("torch", "transformers"),
         kinds=("sound_event", "music_presence"),
+        params={"batch": 16, "window_seconds": 0.96, "hop_seconds": 0.48,
+                "top_k": 3, "min_similarity": 0.05},
     ),
 
     # ── on-screen text ──────────────────────────────────────────────────
@@ -388,15 +453,20 @@ _PERCEPTION = [
         detail=(
             "Reels caption themselves; the words burned into the frame are "
             "often the whole message and never appear in the transcript. "
-            "Detection runs per keyframe, then identical strings across "
-            "adjacent shots are collapsed into a single claim spanning a shot "
-            "range, so a caption held for eight seconds is one piece of "
-            "evidence rather than forty."),
+            "Detection runs on every frame at source resolution, then identical "
+            "consecutive readings collapse into one claim spanning a frame run, "
+            "so a caption held for eight seconds is one row that still answers "
+            "exactly what was on screen at any frame inside it. Reading "
+            "keyframes instead would have meant one frame per shot: a caption "
+            "that appears and leaves inside a single shot was invisible, and "
+            "that is most captions."),
         model="PaddlePaddle/PP-OCRv5", weights="ppocr-v5", device="gpu",
-        vram_mb=1500, disk_mb=400, seconds=8.0,
-        needs=("keyframes",), requires=("paddleocr",),
+        revision="2",
+        vram_mb=1500, disk_mb=400, seconds=90.0,
+        needs=("allframes",), requires=("paddleocr",),
         kinds=("text", "text_region", "text_density", "text_style"),
-        params={"languages": ["en", "devanagari"], "min_confidence": 0.6},
+        params={"languages": ["en", "devanagari"], "min_confidence": 0.6,
+                "tier": "full", "batch": 8, "stride": 1},
     ),
     Component(
         id="ocr-alt", title="On-screen text (second reader)",
@@ -409,27 +479,34 @@ _PERCEPTION = [
             "the failures do not overlap, and agreement between them is a much "
             "stronger signal than either one's own confidence score."),
         model="microsoft/Florence-2-large", weights="florence-2-large",
-        quant="fp16", device="gpu", vram_mb=1700, disk_mb=1600, seconds=6.0,
-        needs=("keyframes",), requires=("transformers", "torch"),
+        quant="fp16", device="gpu", vram_mb=1700, disk_mb=1600, seconds=110.0,
+        revision="2",
+        needs=("allframes",), requires=("transformers", "torch"),
         kinds=("text",),
+        params={"tier": "full", "batch": 4, "stride": 1},
     ),
 
     # ── what is in frame ────────────────────────────────────────────────
     Component(
         id="detect", title="Objects", stage=STAGE_PERCEPTION, family="vision",
         channel="visual",
-        summary="YOLO11 over keyframes: boxes, classes, counts, screen share.",
+        summary="YOLO11 over every frame: boxes, classes, counts, screen share.",
         detail=(
             "A closed vocabulary, deliberately. Eighty classes detected "
             "reliably with boxes and counts are worth more than a thousand "
             "classes guessed, because counts and positions are the inputs to "
             "later arithmetic — screen share over time, entrance and exit, "
-            "how much of the frame the subject occupies."),
+            "how much of the frame the subject occupies. Every one of those "
+            "is a per-frame quantity: a keyframe told you a person was in the "
+            "shot, and every frame tells you when they entered it, where they "
+            "moved and when they left."),
         model="Ultralytics/YOLO11", weights="yolo11x", quant="fp16",
-        device="gpu", vram_mb=1200, disk_mb=120, seconds=4.0,
-        needs=("keyframes",), requires=("ultralytics",),
-        kinds=("object", "object_count", "screen_share"),
-        params={"conf": 0.35, "imgsz": 960},
+        device="gpu", vram_mb=1200, disk_mb=120, seconds=70.0,
+        revision="2",
+        needs=("allframes",), requires=("ultralytics",),
+        kinds=("object", "object_count", "screen_share", "object_track"),
+        params={"conf": 0.35, "imgsz": 960, "tier": "full", "batch": 16,
+                "stride": 1},
     ),
     Component(
         id="faces", title="Faces and framing", stage=STAGE_PERCEPTION,
@@ -437,46 +514,87 @@ _PERCEPTION = [
         summary="SCRFD detection and tracking: how many people, how close.",
         detail=(
             "Face count, box size relative to frame, and track continuity "
-            "across shots. Face size is the most reliable proxy for shot scale "
-            "on people-centred video, and 'talking head cut to b-roll cut back' "
-            "is a structure that can be detected geometrically. Embeddings are "
-            "used only to link tracks within one video and are not stored as "
-            "identity."),
+            "across every frame. Face size is the most reliable proxy for shot "
+            "scale on people-centred video, and 'talking head cut to b-roll cut "
+            "back' is a structure that can be detected geometrically. Per-frame "
+            "coverage is what makes the tracks real rather than inferred: a "
+            "face present in two keyframes might be one person throughout or "
+            "two people either side of a cut, and only the frames between them "
+            "answer that. Embeddings are used only to link tracks within one "
+            "video and are not stored as identity."),
         model="deepinsight/insightface-scrfd", weights="insightface",
-        device="gpu", vram_mb=900, disk_mb=350, seconds=4.0,
-        needs=("keyframes",), requires=("insightface",),
+        device="gpu", vram_mb=900, disk_mb=350, seconds=60.0,
+        revision="2",
+        needs=("allframes",), requires=("insightface",),
         kinds=("face_count", "face_scale", "face_track"),
+        params={"tier": "full", "batch": 8, "stride": 1},
     ),
     Component(
         id="depth", title="Shot scale", stage=STAGE_PERCEPTION, family="vision",
         channel="style",
-        summary="Depth Anything V2 small — close-up, medium, or wide.",
+        summary="Depth Anything V2 small — close-up, medium, or wide, per frame.",
         detail=(
-            "Relative depth over the keyframe, reduced to the depth spread of "
+            "Relative depth over every frame, reduced to the depth spread of "
             "the central region. A close-up has a flat, near histogram; a wide "
             "shot has a long tail. This gives shot scale for footage with no "
-            "faces in it, where the face-size proxy has nothing to measure."),
+            "faces in it, where the face-size proxy has nothing to measure. The "
+            "per-frame spread is stored as a packed metric array rather than as "
+            "claims, because it is a curve to be read as a curve — a push-in is "
+            "a slope in it, and that is invisible in one number per shot."),
         model="depth-anything/Depth-Anything-V2-Small", weights="depth-anything-v2-s",
-        quant="fp16", device="gpu", vram_mb=500, disk_mb=100, seconds=3.0,
-        needs=("keyframes",), requires=("transformers", "torch"),
+        quant="fp16", device="gpu", vram_mb=500, disk_mb=100, seconds=45.0,
+        revision="2",
+        needs=("allframes",), requires=("transformers", "torch"),
+        produces=("claims", "metrics"),
         kinds=("shot_scale", "depth_spread"),
+        params={"tier": "analysis", "batch": 16, "stride": 1},
         tier="optional",
     ),
     Component(
         id="visual-embed", title="Visual embedding", stage=STAGE_PERCEPTION,
         family="vision", channel="visual",
-        summary="SigLIP-2 per keyframe — the vectors behind visual search.",
+        summary="SigLIP-2 per frame — the vectors behind visual search.",
         detail=(
-            "One vector per shot and one pooled vector per video. This is what "
-            "makes 'find the shot that looks like this' work, what powers "
-            "near-duplicate detection across five thousand reels, and what the "
-            "aesthetic head and the zero-shot tagger both read. Computed once, "
-            "used by four things."),
+            "One vector per frame, one per shot and one pooled per video. This "
+            "is what makes 'find the moment that looks like this' work, what "
+            "powers near-duplicate detection across five thousand reels, and "
+            "what the aesthetic head and the zero-shot tagger both read. "
+            "Per-frame is the difference between finding the reel and finding "
+            "the second: a shot-level vector is an average of everything in the "
+            "shot, and the one frame the query is actually about is averaged "
+            "away. Computed once, used by four things."),
         model="google/siglip2-so400m-patch14-384", weights="siglip2-so400m",
-        quant="fp16", device="gpu", vram_mb=1800, disk_mb=1700, seconds=3.0,
-        needs=("keyframes",), produces=("vectors",),
+        quant="fp16", device="gpu", vram_mb=1800, disk_mb=1700, seconds=40.0,
+        revision="2",
+        needs=("allframes",), produces=("vectors",),
         requires=("transformers", "torch"),
         kinds=(),
+        params={"tier": "analysis", "batch": 32, "stride": 1},
+    ),
+    Component(
+        id="clip-embed", title="Visual embedding (second space)",
+        stage=STAGE_PERCEPTION, family="vision", channel="visual",
+        summary="CLIP ViT-L/14 over the same frames — a second, independent "
+                "retrieval space.",
+        detail=(
+            "Not redundancy. SigLIP and CLIP were trained on different data "
+            "with different objectives and they fail on different queries: "
+            "CLIP is stronger on proper nouns, logos and the kind of "
+            "internet-native phrasing a search box actually receives, SigLIP "
+            "on dense scene description. A moment retrievable by either is "
+            "retrievable, which is what 'accurate' has to mean when the query "
+            "is written by a person rather than chosen from a list. Where the "
+            "two disagree that is evidence about the frame too, and both are "
+            "kept. fp16 because Kaggle's T4s are sm_75 — no BF16, no FP8. The "
+            "load key matches the v1 loader's so the two generations share one "
+            "copy of the weights instead of each paying 1.7 GB."),
+        model="openai/clip-vit-large-patch14",
+        weights="openai/clip-vit-large-patch14",
+        quant="fp16", device="gpu", vram_mb=1700, disk_mb=1700, seconds=35.0,
+        needs=("allframes",), produces=("vectors",),
+        requires=("transformers", "torch"),
+        kinds=(),
+        params={"tier": "analysis", "batch": 32, "stride": 1},
     ),
     Component(
         id="tag", title="Zero-shot tags", stage=STAGE_PERCEPTION, family="vision",
@@ -487,10 +605,14 @@ _PERCEPTION = [
             "specific to this archive — is embedded once, and tagging is then a "
             "matrix multiply against vectors that already exist. Free, "
             "deterministic, and extensible: adding forty new labels next month "
-            "re-tags five thousand reels in seconds without touching a GPU."),
-        needs=("visual-embed",), seconds=0.3,
+            "re-tags five thousand reels in seconds without touching a GPU. "
+            "Now run against the per-frame vectors, so a tag carries the frame "
+            "run it was true over instead of being a property of the whole "
+            "video — which is what makes a tag a way to find a moment."),
+        needs=("visual-embed",), seconds=2.0,
+        revision="2",
         requires=("numpy",), kinds=("tag",),
-        params={"top_k": 12, "min_similarity": 0.22},
+        params={"top_k": 12, "min_similarity": 0.22, "min_run": 2},
     ),
     Component(
         id="aesthetic", title="Frame quality", stage=STAGE_PERCEPTION,
@@ -504,14 +626,19 @@ _PERCEPTION = [
             "shot' text embeddings against the SigLIP vector that already "
             "exists. Deliberately not the LAION aesthetic MLP: that head is "
             "trained on CLIP ViT-L/14 features and would be meaningless over "
-            "SigLIP ones. Useful less as a verdict than as a filter — when a "
-            "pattern only appears in badly-exposed frames, the pattern is "
-            "about the exposure."),
+            "SigLIP ones. Measured on every frame and stored as packed metric "
+            "arrays, because the useful question is which *moments* are badly "
+            "shot, not whether the reel on average was. Useful less as a "
+            "verdict than as a filter — when a pattern only appears in "
+            "badly-exposed frames, the pattern is about the exposure."),
         weights="aesthetic-probe", device="gpu", vram_mb=200, disk_mb=0,
-        seconds=1.5,
-        needs=("visual-embed",), requires=("cv2", "numpy"),
+        seconds=25.0,
+        revision="2",
+        needs=("visual-embed", "allframes"), requires=("cv2", "numpy"),
+        produces=("claims", "metrics"),
         kinds=("aesthetic", "sharpness", "exposure", "clipping", "noise",
                "colourfulness"),
+        params={"tier": "analysis", "batch": 32, "stride": 1},
         tier="optional",
     ),
 ]
@@ -659,6 +786,39 @@ _LANGUAGE = [
         tier="deep", default_on=False,
         notes="Two cards. Nothing else can be resident while this runs.",
     ),
+
+    # ── the same quality tier, on someone else's hardware ───────────────
+    Component(
+        id="narrate-cloud", title="Narrative (cloud)", stage=STAGE_LANGUAGE,
+        family="cloud", channel="narrative",
+        summary="The deep reading through NVIDIA's hosted API — one call per video.",
+        detail=(
+            "`narrate-deep` is the one pass that genuinely does not belong on "
+            "a T4: a 38B model sharded over PCIe, ninety-five seconds a video, "
+            "nothing else resident. Rather than fight that, this runs the same "
+            "reading against a hosted frontier model. It costs no VRAM at all, "
+            "so the packer schedules it *alongside* a full GPU cohort instead "
+            "of displacing one — the frontier-quality reading happens in the "
+            "gaps between local passes. "
+            "One call per video, never one per chunk: the account is limited "
+            "to roughly forty requests a minute and metered in credits, and "
+            "calling per chunk against a 550B model is exactly what produced "
+            "`ResourceExhausted (33/32)` in the v1 log. A rate-limited video "
+            "is deferred with a clock on it, never failed, because coverage is "
+            "idempotent and resuming tomorrow costs nothing but time."),
+        model="", weights="", device="cpu", vram_mb=0, disk_mb=0,
+        seconds=25.0, ram_mb=256,
+        needs=("describe", "transcribe", "ocr", "narrate", "detect"),
+        requires=("openai",),
+        produces=("claims",),
+        kinds=("premise", "hook", "hook_why", "beat", "turn", "payoff",
+               "why_it_works", "assertion", "answers", "audience", "subject",
+               "critique"),
+        params={"temperature": 0.2, "max_tokens": 2048},
+        tier="deep", default_on=False,
+        notes=("Needs VIOS_NIM_API_KEY in Kaggle Secrets. VIOS_NIM_MODEL "
+               "picks the model; VIOS_NIM_RPM caps the request rate."),
+    ),
 ]
 
 CATALOGUE = tuple(_STRUCTURE + _SIGNAL + _PERCEPTION + _LANGUAGE)
@@ -682,6 +842,37 @@ def all_ids() -> list:
 
 def defaults() -> list:
     return [c.id for c in CATALOGUE if c.default_on]
+
+
+def stage_of(component_id: str) -> str:
+    """The stage name a component belongs to, or "" if it is not in the
+    catalogue at all."""
+    c = BY_ID.get(component_id)
+    return c.stage_name if c else ""
+
+
+def stages_of(ids) -> list:
+    """The stage names present in `ids`, in stage order.
+
+    Used to cut the channel bundles: a cohort is a VRAM grouping and can hold
+    two stages at once, so "which stages did this cohort touch" is a question
+    the engine has to ask rather than assume.
+    """
+    have = {BY_ID[i].stage for i in ids if i in BY_ID}
+    return [STAGE_NAMES[s] for s in sorted(have) if s in STAGE_NAMES]
+
+
+def components_in_stage(stage: str, ids=None) -> list:
+    """Component ids in one stage, restricted to `ids` when given.
+
+    The restriction matters: a stage report for a session that deselected half
+    of `perception` must describe what was actually planned, not what the
+    catalogue could have run. Otherwise every bundle would look permanently
+    incomplete.
+    """
+    pool = list(ids) if ids is not None else all_ids()
+    return [i for i in pool
+            if i in BY_ID and BY_ID[i].stage_name == stage]
 
 
 def validate() -> list:

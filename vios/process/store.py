@@ -36,11 +36,28 @@ filled in from the shot table by this module. A model that emits "at 4.2
 seconds" is making a number up — MLLMs hallucinate temporal localisation badly
 and confidently — so the schema does not offer it the opportunity. Models emit
 shot indices; arithmetic turns those into seconds.
+
+**A frame is addressable, and a run of frames is one row.** A shot is the right
+unit for "what is this scene about"; it is far too coarse for "find the moment
+the price appeared on screen". So a claim may also carry `frame_idx` — and
+`frame_hi`, which turns *frames 100 through 142 all read "SUBSCRIBE"* into a
+single row that is still answerable per frame with
+`frame_idx <= ? AND frame_hi >= ?`. Coverage stays total; storage is
+run-length. The frame timestamp still comes from the extractor's manifest,
+which reads the container's presentation timestamps, so time remains measured
+rather than claimed.
+
+Per-frame embeddings and per-frame scalars do not go in `claim` or `vector` at
+all. 900 frames × 1152 dimensions as 900 rows is a row-store answering a
+column-store question; instead `frame_vector` and `frame_metric` hold one row
+per (video, space, observer) with the frame indices and the values as packed
+blobs. One reel of SigLIP is one row of about 1.4 MB.
 """
 
 from __future__ import annotations
 
 import array
+import bisect
 import gzip
 import hashlib
 import json
@@ -52,6 +69,13 @@ import time
 from . import CHANNELS, SCHEMA_VERSION
 
 _CHANNEL_SET = frozenset(CHANNELS)
+
+# Shard schema versions this build can replay. Mirrors
+# `db_restore.SUPPORTED_SCHEMAS`, and the reason is the same: the channel holds
+# the only copy of every earlier session's work, so a shard written last month
+# must still import. A v1 shard replays with NULL frame columns, which is
+# exactly what "this claim is about a shot" already means.
+SHARD_SCHEMAS = (1, 2)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -120,7 +144,9 @@ CREATE TABLE IF NOT EXISTS claim (
     confidence  REAL DEFAULT 1.0,
     observer_id TEXT NOT NULL,
     ordinal     INTEGER DEFAULT 0,
-    created_at  REAL NOT NULL
+    created_at  REAL NOT NULL,
+    frame_idx   INTEGER,          -- v2. NULL = about a shot or the whole video
+    frame_hi    INTEGER           -- v2. inclusive end of a run; NULL = one frame
 );
 
 CREATE INDEX IF NOT EXISTS ix_claim_video   ON claim(video_key, channel);
@@ -143,6 +169,42 @@ CREATE TABLE IF NOT EXISTS vector (
     created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_vector_space ON vector(space, video_key);
+
+-- v2. Per-frame embeddings, packed. One row per (video, space, observer) run:
+-- `frames` is int32×n of frame indices, `data` is n×dim in `dtype`. A 900-frame
+-- reel of SigLIP is one row of ~1.4 MB rather than 900 rows of base64, and a
+-- similarity search reads it as one contiguous buffer instead of 900 seeks.
+CREATE TABLE IF NOT EXISTS frame_vector (
+    id          INTEGER PRIMARY KEY,
+    uid         TEXT NOT NULL UNIQUE,
+    video_key   TEXT NOT NULL,
+    space       TEXT NOT NULL,    -- 'siglip','clip','clap' — never mix spaces
+    dim         INTEGER NOT NULL,
+    n           INTEGER NOT NULL, -- how many frames this row covers
+    dtype       TEXT NOT NULL,    -- 'f16' normally, 'f32' where numpy is absent
+    frames      BLOB NOT NULL,    -- int32 little-endian, len == n*4
+    data        BLOB NOT NULL,    -- dtype little-endian, len == n*dim*itemsize
+    observer_id TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_fvec_space ON frame_vector(space, video_key);
+
+-- v2. Per-frame scalars, packed the same way: brightness, sharpness, motion
+-- magnitude, depth mean, aesthetic score, one audio class's activation. The
+-- registry's own note on `perframe` — 27 million rows that would only ever be
+-- queried one at a time — is why this is columnar rather than a claim per frame.
+CREATE TABLE IF NOT EXISTS frame_metric (
+    id          INTEGER PRIMARY KEY,
+    uid         TEXT NOT NULL UNIQUE,
+    video_key   TEXT NOT NULL,
+    name        TEXT NOT NULL,    -- 'brightness','motion','depth_mean'…
+    n           INTEGER NOT NULL,
+    frames      BLOB NOT NULL,    -- int32 little-endian
+    values_     BLOB NOT NULL,    -- float32 little-endian
+    observer_id TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_fmet_name ON frame_metric(name, video_key);
 
 -- Derived media: poster, proxy, sprite sheet, waveform. Small, regenerable,
 -- but expensive enough in aggregate to be worth putting in Telegram once.
@@ -199,10 +261,141 @@ WHEN new.value IS NOT NULL BEGIN
 END;
 """
 
+# Columns added after v1. Applied to an existing database in place, never by
+# recreating it: this file holds the evidence of every video processed so far,
+# and re-earning that costs the GPU hours it originally took. The ordering used
+# by `coverage.py` is followed here too — table, then columns, then indexes —
+# because an index over a column that does not exist yet is the one statement
+# that turns a migration into a broken startup.
+MIGRATIONS = (
+    ("claim", "frame_idx", "INTEGER"),
+    ("claim", "frame_hi", "INTEGER"),
+)
+
+# Built after the migration, for the same reason.
+LATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS ix_claim_frame ON claim(video_key, frame_idx);
+CREATE INDEX IF NOT EXISTS ix_claim_frun  ON claim(video_key, frame_idx, frame_hi);
+"""
+
 
 def _uid(*parts) -> str:
     raw = "\x1f".join("" if p is None else str(p) for p in parts)
     return hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def observer_id(component: str, model: str, revision: str = "",
+                params: dict | None = None) -> str:
+    """The observer id a pass would write, without registering a run.
+
+    The reconcile step that marks coverage done for evidence that already came
+    back in a shard needs to know which observer produced that evidence, and
+    it must not do so by calling `Store.observer` — that would bump `runs` on
+    the same row the restore just imported, claiming credit for a pass that ran
+    elsewhere. Computing the id here, from the same bytes `observer()` hashes,
+    keeps the two derivations from ever drifting apart: one function is the
+    definition, the other is the side effect that uses it.
+    """
+    return observer_id_from(model, revision, params, component)
+
+
+def observer_id_from(model: str, revision: str = "",
+                     params: dict | None = None,
+                     component: str = "") -> str:
+    """Pure derivation, split out so both the writer and the reconciler use it.
+
+    `component` is only a prefix in the id, not part of the hash: a component
+    edits its prompt and the id changes, and the same model read by two
+    components produces two ids because the prefix differs.
+    """
+    blob = json.dumps(params or {}, sort_keys=True, ensure_ascii=False)
+    return f"{component}@{_uid(model, revision, blob)[:12]}"
+
+
+def _numpy():
+    """numpy if this interpreter has it, else None.
+
+    Every machine that runs a model has numpy. A machine that only *reads* this
+    database — a restore, a stats call, the schema check — may not, and the
+    store refusing to import there would make the evidence unreadable on the one
+    kind of host most likely to be inspecting it. So numpy is an optimisation
+    for the packing path, not a dependency of the module.
+    """
+    try:
+        import numpy as np  # noqa: PLC0415
+        return np
+    except Exception:
+        return None
+
+
+def _pack_i32(values) -> bytes:
+    buf = array.array("i", [int(v) for v in values])
+    if buf.itemsize != 4:                      # 'i' is 4 bytes everywhere we run
+        buf = array.array("l", [int(v) for v in values])
+    if sys.byteorder != "little":
+        buf.byteswap()
+    return buf.tobytes()
+
+
+def _unpack_i32(blob: bytes) -> list:
+    buf = array.array("i")
+    buf.frombytes(blob)
+    if sys.byteorder != "little":
+        buf.byteswap()
+    return list(buf)
+
+
+def _pack_f32(values) -> bytes:
+    buf = array.array("f", [float(v) for v in values])
+    if sys.byteorder != "little":
+        buf.byteswap()
+    return buf.tobytes()
+
+
+def _unpack_f32(blob: bytes) -> list:
+    buf = array.array("f")
+    buf.frombytes(blob)
+    if sys.byteorder != "little":
+        buf.byteswap()
+    return list(buf)
+
+
+def _pack_matrix(rows) -> tuple:
+    """(dtype, blob) for an n×dim matrix.
+
+    fp16 halves the file for a loss that is below the noise floor of cosine
+    similarity over normalised embeddings — the values are already in [-1, 1]
+    and the retrieval order does not change. `array` has no half type, so this
+    is the one place numpy earns its keep; without it the store falls back to
+    fp32 and records that in the `dtype` column rather than writing bytes a
+    reader would misinterpret.
+    """
+    np = _numpy()
+    if np is not None:
+        m = np.asarray(rows, dtype=np.float16)
+        if sys.byteorder != "little":
+            m = m.byteswap()
+        return "f16", m.tobytes()
+    flat = []
+    for row in rows:
+        flat.extend(float(v) for v in row)
+    return "f32", _pack_f32(flat)
+
+
+def _unpack_matrix(blob: bytes, n: int, dim: int, dtype: str) -> list:
+    """The matrix back as a list of `n` lists of `dim` floats."""
+    if dtype == "f16":
+        np = _numpy()
+        if np is None:
+            raise RuntimeError(
+                "this frame_vector row is fp16 and numpy is not installed; "
+                "install numpy to read per-frame embeddings")
+        m = np.frombuffer(blob, dtype=np.float16)
+        if sys.byteorder != "little":
+            m = m.byteswap()
+        return m.astype("float32").reshape(n, dim).tolist()
+    flat = _unpack_f32(blob)
+    return [flat[i * dim:(i + 1) * dim] for i in range(n)]
 
 
 def partition_of(video_key: str, buckets: int = 64) -> int:
@@ -232,6 +425,8 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.conn.executescript(LATE_INDEXES)
         try:
             self.conn.executescript(FTS)
             self.fts = True
@@ -239,15 +434,47 @@ class Store:
             self.fts = False
         cur = self.conn.execute("SELECT v FROM meta WHERE k='schema'")
         row = cur.fetchone()
-        if row is None:
-            self.conn.execute("INSERT INTO meta(k,v) VALUES('schema',?)",
-                              (str(SCHEMA_VERSION),))
-        elif int(row["v"]) != SCHEMA_VERSION:
+        found = SCHEMA_VERSION if row is None else int(row["v"])
+        if found > SCHEMA_VERSION:
+            # Forward is the one direction that cannot be recovered from. A
+            # newer build may have written columns this code will silently drop
+            # on the next export, so the shard would be quietly lossy.
             raise RuntimeError(
-                f"evidence store at {path} is schema v{row['v']}, this code "
-                f"speaks v{SCHEMA_VERSION}. Migrate or start a new file — do "
-                f"not let two schemas share one database.")
+                f"evidence store at {path} is schema v{found}, this code "
+                f"speaks v{SCHEMA_VERSION}. Update the code — do not let an "
+                f"older build write to a newer database.")
+        if row is None or found != SCHEMA_VERSION:
+            # The columns are already in place by here; `_migrate` is additive
+            # and idempotent, so recording the new version is the last step and
+            # not the first. A crash between the two leaves a database that
+            # migrates again harmlessly on the next open.
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('schema',?)",
+                (str(SCHEMA_VERSION),))
+            self.migrated_from = found if row is not None else 0
+        else:
+            self.migrated_from = 0
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after v1, in place.
+
+        SQLite makes an added column NULL in every existing row, which is
+        exactly the meaning v2 assigns to a NULL `frame_idx`: *this claim is
+        about a shot, not a frame*. So the migration needs no backfill and no
+        rewrite — every v1 row is already correct under the v2 schema.
+        """
+        seen: dict = {}
+        for table, name, spec in MIGRATIONS:
+            have = seen.get(table)
+            if have is None:
+                have = {r["name"] for r in
+                        self.conn.execute(f"PRAGMA table_info({table})")}
+                seen[table] = have
+            if name not in have:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+                have.add(name)
 
     # ── videos ──────────────────────────────────────────────────────────
     def add_video(self, video_key: str, **fields) -> None:
@@ -370,6 +597,37 @@ class Store:
         return {r["idx"]: (r["t0"], r["t1"]) for r in self.conn.execute(
             "SELECT idx,t0,t1 FROM shot WHERE video_key=?", (video_key,))}
 
+    def _shot_spans(self, video_key: str) -> tuple:
+        """(starts, indices) sorted by t0, for turning a frame time into a shot.
+
+        A per-frame pass emits hundreds of claims per video and each one needs
+        its containing shot, so this is a binary search over a prepared list
+        rather than `Job.shot_at`'s linear scan: at 900 frames × 40 shots the
+        scan is 36,000 comparisons per pass per video, which is pure waste when
+        the boundaries are already sorted.
+        """
+        rows = [(r["t0"], r["t1"], r["idx"]) for r in self.conn.execute(
+            "SELECT idx,t0,t1 FROM shot WHERE video_key=? ORDER BY t0",
+            (video_key,))]
+        return [r[0] for r in rows], rows
+
+    @staticmethod
+    def _shot_of(t: float, starts: list, rows: list):
+        """Which shot contains this timestamp, or None if there are no shots.
+
+        Clamped rather than rejected at both ends: the extractor's last frame
+        can land a few microseconds past the final shot boundary because the
+        boundary came from a detector and the timestamp came from the container.
+        Dropping that frame's evidence over a rounding difference would put a
+        hole in the coverage this whole change exists to close.
+        """
+        if not rows:
+            return None
+        i = bisect.bisect_right(starts, t) - 1
+        if i < 0:
+            return int(rows[0][2])
+        return int(rows[i][2])
+
     # ── observers ───────────────────────────────────────────────────────
     def observer(self, component: str, model: str, revision: str = "",
                  params: dict | None = None, device: str = "") -> str:
@@ -381,7 +639,7 @@ class Store:
         can still trust in a year and one you cannot.
         """
         blob = json.dumps(params or {}, sort_keys=True, ensure_ascii=False)
-        oid = f"{component}@{_uid(model, revision, blob)[:12]}"
+        oid = observer_id(component, model, revision, params)
         self.conn.execute(
             "INSERT OR IGNORE INTO observer(observer_id,component,model,"
             "revision,params,device,first_seen,runs) VALUES(?,?,?,?,?,?,?,0)",
@@ -395,6 +653,78 @@ class Store:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM observer ORDER BY component, first_seen")]
 
+    def evidence_by_observer(self, observer_ids=None) -> dict:
+        """What each observer has actually written, per video.
+
+        `{video_key: {observer_id: {"claims": n, "vectors": n}}}` — the question
+        the coverage reconcile asks after a restore, and the reason a session
+        that dies at hour twelve does not repeat hour one. A shard replay puts
+        rows back into this database without touching the coverage table, so
+        without this read the two disagree: the evidence is present and the work
+        table still says `queued`.
+
+        All four evidence tables are counted, not just `claim`. `visual-embed`
+        and `clip-embed` write nothing but vectors, `depth` writes nothing but
+        packed metrics — asking only about claims would send every embedding
+        pass in the archive round again for rows it already holds.
+
+        `observer_ids`, when given, restricts the scan to the observers this
+        build would produce. That restriction is the whole correctness argument
+        for reconciling at all: evidence from a superseded revision must *not*
+        satisfy the current one, or bumping a revision to get better output
+        would silently mark the better output as already done.
+        """
+        want = set(observer_ids) if observer_ids is not None else None
+        if want is not None and not want:
+            return {}
+
+        out: dict = {}
+        # Chunked so a large selection cannot overrun SQLite's variable limit
+        # (999 by default). Thirty-four components is well inside it today; a
+        # future build that reconciles several revisions at once is not.
+        def _chunks(ids, n=400):
+            ids = list(ids)
+            for i in range(0, len(ids), n):
+                yield ids[i:i + n]
+
+        plans = (("claim", "claims"), ("vector", "vectors"),
+                 ("frame_vector", "vectors"), ("frame_metric", "vectors"))
+        for table, bucket in plans:
+            if want is None:
+                sql = (f"SELECT video_key, observer_id, COUNT(*) n "
+                       f"FROM {table} GROUP BY video_key, observer_id")
+                batches = [((), sql)]
+            else:
+                batches = []
+                for part in _chunks(want):
+                    marks = ",".join("?" * len(part))
+                    batches.append((tuple(part), (
+                        f"SELECT video_key, observer_id, COUNT(*) n "
+                        f"FROM {table} WHERE observer_id IN ({marks}) "
+                        f"GROUP BY video_key, observer_id")))
+            for params, sql in batches:
+                for r in self.conn.execute(sql, params):
+                    per = out.setdefault(r["video_key"], {})
+                    e = per.setdefault(r["observer_id"],
+                                       {"claims": 0, "vectors": 0})
+                    e[bucket] += int(r["n"] or 0)
+        return out
+
+    def observed_components(self) -> dict:
+        """`{component: [observer_id, …]}` for everything this database holds.
+
+        Used to report what a restore brought back that the current build no
+        longer recognises — a pass whose revision moved on. Those rows are the
+        audit trail and are never deleted; naming them is how a "reconciled 0"
+        becomes a legible sentence instead of a suspicion that nothing worked.
+        """
+        out: dict = {}
+        for r in self.conn.execute(
+                "SELECT observer_id, component FROM observer "
+                "ORDER BY component, observer_id"):
+            out.setdefault(r["component"], []).append(r["observer_id"])
+        return out
+
     # ── claims ──────────────────────────────────────────────────────────
     def add_claims(self, video_key: str, observer_id: str, claims: list) -> int:
         """Write a batch of claims. Returns how many were new.
@@ -403,8 +733,17 @@ class Store:
         shot_idx, num, confidence, ordinal. Times are ignored if supplied —
         they are looked up from the shot table, because a model's opinion about
         when something happened is not evidence.
+
+        A per-frame claim carries `frame_idx` and `frame_t` instead of
+        `shot_idx`, and optionally `frame_hi`/`frame_t1` to make it a run. The
+        shot index is then derived from the frame's timestamp, and `t0`/`t1`
+        come from the frame times — which the extractor read out of the
+        container's presentation timestamps, so time is still measured. A run
+        that spans a shot boundary keeps the shot it started in; the frame range
+        is the precise answer and `shot_idx` is the coarse one.
         """
         times = self._shot_times(video_key)
+        starts, spans = self._shot_spans(video_key)
         dur = self.conn.execute("SELECT duration FROM video WHERE video_key=?",
                                 (video_key,)).fetchone()
         whole = (0.0, float(dur["duration"] or 0.0) if dur else 0.0)
@@ -417,23 +756,51 @@ class Store:
                 # and it would be found months later by its absence.
                 raise ValueError(
                     f"unknown channel {ch!r}; expected one of {sorted(_CHANNEL_SET)}")
+
+            fi = c.get("frame_idx")
+            fi = None if fi is None else int(fi)
+            fhi = c.get("frame_hi")
+            fhi = None if fhi is None else int(fhi)
+            if fhi is not None and fi is not None and fhi < fi:
+                raise ValueError(
+                    f"{video_key}: frame run {fi}..{fhi} ends before it starts")
+
             si = c.get("shot_idx")
             si = None if si is None else int(si)
+            if fi is not None and si is None:
+                ft = c.get("frame_t")
+                si = None if ft is None else self._shot_of(float(ft), starts, spans)
             if si is not None and si not in times:
                 raise ValueError(
                     f"{video_key}: claim references shot {si}, which does not "
                     f"exist ({len(times)} shots). Run the shots pass first.")
-            t0, t1 = times.get(si, whole) if si is not None else whole
+
+            if fi is not None and c.get("frame_t") is not None:
+                t0 = float(c["frame_t"])
+                t1 = float(c.get("frame_t1", t0))
+            elif si is not None:
+                t0, t1 = times[si]
+            else:
+                t0, t1 = whole
+
             val = c.get("value")
             if isinstance(val, (dict, list)):
                 val = json.dumps(val, ensure_ascii=False)
             ordinal = int(c.get("ordinal", n))
+            # The uid drops the frame terms entirely when there is no frame, so
+            # every claim written by v1 hashes to exactly the same value under
+            # v2 and shard replay stays idempotent across the version boundary.
+            if fi is None:
+                uid = _uid(video_key, observer_id, ch, c.get("kind", ""), si,
+                           ordinal)
+            else:
+                uid = _uid(video_key, observer_id, ch, c.get("kind", ""), si,
+                           ordinal, "f", fi, fhi)
             rows.append((
-                _uid(video_key, observer_id, ch, c.get("kind", ""), si, ordinal),
-                video_key, si, t0, t1, ch, str(c.get("kind", "")),
+                uid, video_key, si, t0, t1, ch, str(c.get("kind", "")),
                 None if val is None else str(val),
                 c.get("num"), float(c.get("confidence", 1.0)),
-                observer_id, ordinal, now))
+                observer_id, ordinal, now, fi, fhi))
         if not rows:
             return 0
         # `cursor.rowcount`, not `conn.total_changes`. The FTS trigger writes to
@@ -442,11 +809,29 @@ class Store:
         # statement itself inserted, which is what "how many were new" means.
         cur = self.conn.executemany(
             "INSERT OR IGNORE INTO claim(uid,video_key,shot_idx,t0,t1,channel,"
-            "kind,value,num,confidence,observer_id,ordinal,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            "kind,value,num,confidence,observer_id,ordinal,created_at,"
+            "frame_idx,frame_hi) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         written = max(cur.rowcount, 0)
         self.conn.commit()
         return written
+
+    def frame_claims(self, video_key: str, frame_idx: int,
+                     channel: str = "") -> list:
+        """Every claim covering one frame, runs included.
+
+        This is the query the run-length encoding exists to serve: a claim that
+        collapsed frames 100–142 into one row is still the answer to "what was
+        on screen at frame 117".
+        """
+        sql = ("SELECT * FROM claim WHERE video_key=? AND frame_idx IS NOT NULL "
+               "AND frame_idx <= ? AND COALESCE(frame_hi, frame_idx) >= ?")
+        args: list = [video_key, frame_idx, frame_idx]
+        if channel:
+            sql += " AND channel=?"
+            args.append(channel)
+        sql += " ORDER BY channel, kind, ordinal"
+        return [dict(r) for r in self.conn.execute(sql, args)]
 
     def claims(self, video_key: str, channel: str = "", kind: str = "",
                observer_id: str = "", limit: int = 2000) -> list:
@@ -509,6 +894,120 @@ class Store:
             out.append({"shot_idx": r["shot_idx"], "values": list(arr)})
         return out
 
+    # ── per-frame vectors and metrics ───────────────────────────────────
+    def add_frame_vectors(self, video_key: str, space: str, frames,
+                          matrix, observer_id: str) -> bool:
+        """Store one video's per-frame embeddings as a single row.
+
+        `frames` and `matrix` must be parallel: `frames[i]` is the frame index
+        whose embedding is `matrix[i]`. The pairing is stored explicitly rather
+        than assumed contiguous, because a pass that fails on one unreadable
+        JPEG should record the 899 frames it did read with their real indices,
+        not shift every subsequent frame by one.
+        """
+        frames = [int(f) for f in frames]
+        rows = [list(r) for r in matrix]
+        if len(frames) != len(rows):
+            raise ValueError(
+                f"{video_key}: {len(frames)} frame indices for {len(rows)} "
+                f"embeddings — these must be parallel")
+        if not rows:
+            return False
+        dim = len(rows[0])
+        if any(len(r) != dim for r in rows):
+            raise ValueError(
+                f"{video_key}: ragged embedding matrix in space {space!r}; "
+                f"every frame must have {dim} dimensions")
+        dtype, blob = _pack_matrix(rows)
+        uid = _uid(video_key, observer_id, space, "frames")
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO frame_vector(uid,video_key,space,dim,n,"
+            "dtype,frames,data,observer_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (uid, video_key, space, dim, len(rows), dtype,
+             _pack_i32(frames), blob, observer_id, time.time()))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def frame_vectors(self, video_key: str, space: str = "",
+                      observer_id: str = "") -> list:
+        """Unpacked per-frame embeddings: [{space, observer_id, frames, values}].
+
+        `values` is a list of lists, parallel to `frames`. The caller that wants
+        speed rather than convenience should read the blobs directly — see
+        `frame_vector_blobs`.
+        """
+        sql = ("SELECT space,observer_id,dim,n,dtype,frames,data "
+               "FROM frame_vector WHERE video_key=?")
+        args: list = [video_key]
+        for col, val in (("space", space), ("observer_id", observer_id)):
+            if val:
+                sql += f" AND {col}=?"
+                args.append(val)
+        out = []
+        for r in self.conn.execute(sql, args):
+            out.append({
+                "space": r["space"], "observer_id": r["observer_id"],
+                "dim": r["dim"], "frames": _unpack_i32(r["frames"]),
+                "values": _unpack_matrix(r["data"], r["n"], r["dim"],
+                                        r["dtype"])})
+        return out
+
+    def frame_vector_blobs(self, space: str, limit: int = 0) -> list:
+        """Every video's packed rows in one space, still packed.
+
+        The search path in Atlas wants to run cosine over the whole archive
+        without turning 4 million embeddings into Python floats first, so this
+        hands back the raw buffers and lets numpy do the work.
+        """
+        sql = ("SELECT video_key,observer_id,dim,n,dtype,frames,data "
+               "FROM frame_vector WHERE space=? ORDER BY video_key")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return [dict(r) for r in self.conn.execute(sql, (space,))]
+
+    def add_frame_metric(self, video_key: str, name: str, frames, values,
+                         observer_id: str) -> bool:
+        """Store one per-frame scalar series as a single row."""
+        frames = [int(f) for f in frames]
+        values = [float(v) for v in values]
+        if len(frames) != len(values):
+            raise ValueError(
+                f"{video_key}: {len(frames)} frame indices for {len(values)} "
+                f"values of {name!r} — these must be parallel")
+        if not values:
+            return False
+        uid = _uid(video_key, observer_id, "metric", name)
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO frame_metric(uid,video_key,name,n,frames,"
+            "values_,observer_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (uid, video_key, name, len(values), _pack_i32(frames),
+             _pack_f32(values), observer_id, time.time()))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def frame_metrics(self, video_key: str, name: str = "") -> list:
+        """Unpacked per-frame scalars: [{name, observer_id, frames, values}]."""
+        sql = ("SELECT name,observer_id,n,frames,values_ FROM frame_metric "
+               "WHERE video_key=?")
+        args: list = [video_key]
+        if name:
+            sql += " AND name=?"
+            args.append(name)
+        sql += " ORDER BY name"
+        return [{"name": r["name"], "observer_id": r["observer_id"],
+                 "frames": _unpack_i32(r["frames"]),
+                 "values": _unpack_f32(r["values_"])}
+                for r in self.conn.execute(sql, args)]
+
+    def max_frame_vector_id(self) -> int:
+        return self.conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM frame_vector").fetchone()[0]
+
+    def max_frame_metric_id(self) -> int:
+        return self.conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM frame_metric").fetchone()[0]
+
     def vectors(self, space: str, limit: int = 0) -> list:
         sql = ("SELECT video_key,shot_idx,dim,data FROM vector WHERE space=? "
                "ORDER BY video_key, shot_idx")
@@ -542,7 +1041,9 @@ class Store:
     # ── shards: how this database survives a session ────────────────────
     def export_shard(self, path: str, lo_id: int = 0, hi_id: int = 0,
                      lo_vec: int = 0, hi_vec: int = 0,
-                     component: str = "") -> dict:
+                     component: str = "",
+                     lo_fvec: int = 0, hi_fvec: int = 0,
+                     lo_fmet: int = 0, hi_fmet: int = 0) -> dict:
         """Write claims and vectors in an id range to a gzipped JSONL file.
 
         Why a range and not "everything since a timestamp": ids are assigned by
@@ -555,30 +1056,42 @@ class Store:
         Merging ten SQLite files means attaching and inserting anyway; JSONL
         skips the step and compresses better.
 
-        Claims and vectors carry **separate** id ranges. An embedding pass
-        writes vectors and no claims at all, so keying the vector export off the
-        claim range would silently drop every embedding the cohort produced —
-        and it would look like a successful upload.
+        Every table carries its **own** id range. An embedding pass writes
+        vectors and no claims at all, so keying the vector export off the claim
+        range would silently drop every embedding the cohort produced — and it
+        would look like a successful upload. The same trap applies twice more
+        now that per-frame vectors and per-frame metrics are their own tables:
+        a pass that writes only `frame_metric` rows must still publish them.
         """
         hi_id = hi_id or self.max_claim_id()
         hi_vec = hi_vec or self.max_vector_id()
+        hi_fvec = hi_fvec or self.max_frame_vector_id()
+        hi_fmet = hi_fmet or self.max_frame_metric_id()
 
-        # The set of videos this shard touches, from either side.
-        keys = "(SELECT video_key FROM claim WHERE id>? AND id<=? " \
-               "UNION SELECT video_key FROM vector WHERE id>? AND id<=?)"
-        span = (lo_id, hi_id, lo_vec, hi_vec)
+        # The set of videos this shard touches, from any side.
+        keys = ("(SELECT video_key FROM claim WHERE id>? AND id<=? "
+                "UNION SELECT video_key FROM vector WHERE id>? AND id<=? "
+                "UNION SELECT video_key FROM frame_vector WHERE id>? AND id<=? "
+                "UNION SELECT video_key FROM frame_metric WHERE id>? AND id<=?)")
+        span = (lo_id, hi_id, lo_vec, hi_vec, lo_fvec, hi_fvec,
+                lo_fmet, hi_fmet)
 
-        n_claims = n_vectors = 0
+        n_claims = n_vectors = n_fvec = n_fmet = 0
         with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as fh:
             fh.write(json.dumps({
                 "_": "vios-evidence-shard", "schema": SCHEMA_VERSION,
                 "component": component, "lo_id": lo_id, "hi_id": hi_id,
-                "lo_vec": lo_vec, "hi_vec": hi_vec, "at": time.time()}) + "\n")
+                "lo_vec": lo_vec, "hi_vec": hi_vec,
+                "lo_fvec": lo_fvec, "hi_fvec": hi_fvec,
+                "lo_fmet": lo_fmet, "hi_fmet": hi_fmet,
+                "at": time.time()}) + "\n")
 
             for r in self.conn.execute(
                     "SELECT * FROM observer WHERE observer_id IN ("
                     " SELECT observer_id FROM claim WHERE id>? AND id<=?"
-                    " UNION SELECT observer_id FROM vector WHERE id>? AND id<=?)",
+                    " UNION SELECT observer_id FROM vector WHERE id>? AND id<=?"
+                    " UNION SELECT observer_id FROM frame_vector WHERE id>? AND id<=?"
+                    " UNION SELECT observer_id FROM frame_metric WHERE id>? AND id<=?)",
                     span):
                 fh.write(json.dumps({"t": "observer", **dict(r)},
                                     ensure_ascii=False) + "\n")
@@ -602,10 +1115,31 @@ class Store:
                 d["data"] = d["data"].hex()
                 fh.write(json.dumps({"t": "vector", **d}) + "\n")
                 n_vectors += 1
+            for r in self.conn.execute(
+                    "SELECT * FROM frame_vector WHERE id>? AND id<=? ORDER BY id",
+                    (lo_fvec, hi_fvec)):
+                d = dict(r)
+                d.pop("id", None)
+                d["frames"] = d["frames"].hex()
+                d["data"] = d["data"].hex()
+                fh.write(json.dumps({"t": "frame_vector", **d}) + "\n")
+                n_fvec += 1
+            for r in self.conn.execute(
+                    "SELECT * FROM frame_metric WHERE id>? AND id<=? ORDER BY id",
+                    (lo_fmet, hi_fmet)):
+                d = dict(r)
+                d.pop("id", None)
+                d["frames"] = d["frames"].hex()
+                d["values_"] = d["values_"].hex()
+                fh.write(json.dumps({"t": "frame_metric", **d}) + "\n")
+                n_fmet += 1
 
         return {"path": path, "claims": n_claims, "vectors": n_vectors,
+                "frame_vectors": n_fvec, "frame_metrics": n_fmet,
                 "lo_id": lo_id, "hi_id": hi_id,
                 "lo_vec": lo_vec, "hi_vec": hi_vec,
+                "lo_fvec": lo_fvec, "hi_fvec": hi_fvec,
+                "lo_fmet": lo_fmet, "hi_fmet": hi_fmet,
                 "bytes": os.path.getsize(path)}
 
     def import_shard(self, path: str) -> dict:
@@ -615,17 +1149,24 @@ class Store:
         any one of them can pull all of them and end up with the union. Order
         does not matter, duplicates do not matter, and a partial shard from a
         session that died mid-upload is simply a shorter file.
+
+        Every schema in `SHARD_SCHEMAS` replays, not only the current one. A v1
+        shard has no frame columns and no per-frame tables; its claims land with
+        NULL `frame_idx`, which is precisely what they meant when they were
+        written. Refusing them would strand every hour of work done before this
+        version, since the channel is the only place that work still exists.
         """
         counts = {"claim": 0, "vector": 0, "video": 0, "shot": 0,
-                  "observer": 0, "artifact": 0, "skipped": 0}
+                  "observer": 0, "artifact": 0, "frame_vector": 0,
+                  "frame_metric": 0, "skipped": 0}
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             header = json.loads(fh.readline() or "{}")
             if header.get("_") != "vios-evidence-shard":
                 raise ValueError(f"{path} is not an evidence shard")
-            if int(header.get("schema", 0)) != SCHEMA_VERSION:
+            if int(header.get("schema", 0)) not in SHARD_SCHEMAS:
                 raise ValueError(
                     f"{path} is schema v{header.get('schema')}, this code "
-                    f"speaks v{SCHEMA_VERSION}")
+                    f"replays {'/'.join('v%d' % v for v in SHARD_SCHEMAS)}")
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -671,15 +1212,54 @@ class Store:
                 (rec["video_key"], rec["idx"], rec["t0"], rec["t1"],
                  rec.get("score"), rec.get("detector"), rec.get("keyframe")))
         elif t == "claim":
+            # `frame_idx`/`frame_hi` are absent from a v1 shard, and `.get`
+            # returning None is the correct reading of that: the claim was
+            # about a shot. No branch on the shard's schema is needed.
             self.conn.execute(
                 "INSERT OR IGNORE INTO claim(uid,video_key,shot_idx,t0,t1,"
                 "channel,kind,value,num,confidence,observer_id,ordinal,"
-                "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "created_at,frame_idx,frame_hi) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rec["uid"], rec["video_key"], rec.get("shot_idx"),
                  rec.get("t0"), rec.get("t1"), rec["channel"], rec["kind"],
                  rec.get("value"), rec.get("num"), rec.get("confidence", 1.0),
                  rec["observer_id"], rec.get("ordinal", 0),
+                 rec.get("created_at", time.time()),
+                 rec.get("frame_idx"), rec.get("frame_hi")))
+        elif t == "frame_vector":
+            frames = bytes.fromhex(rec["frames"])
+            data = bytes.fromhex(rec["data"])
+            n = int(rec["n"])
+            dim = int(rec["dim"])
+            width = 2 if rec.get("dtype", "f16") == "f16" else 4
+            # A shard that lost bytes in transit would otherwise land as a row
+            # that unpacks into garbage vectors, and a wrong embedding is worse
+            # than a missing one: it returns confident nonsense from search.
+            if len(frames) != n * 4 or len(data) != n * dim * width:
+                raise ValueError(
+                    f"frame_vector {rec.get('uid','?')}: blob sizes disagree "
+                    f"with n={n} dim={dim} dtype={rec.get('dtype')}")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO frame_vector(uid,video_key,space,dim,n,"
+                "dtype,frames,data,observer_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (rec["uid"], rec["video_key"], rec["space"], dim, n,
+                 rec.get("dtype", "f16"), frames, data, rec["observer_id"],
                  rec.get("created_at", time.time())))
+        elif t == "frame_metric":
+            frames = bytes.fromhex(rec["frames"])
+            vals = bytes.fromhex(rec["values_"])
+            n = int(rec["n"])
+            if len(frames) != n * 4 or len(vals) != n * 4:
+                raise ValueError(
+                    f"frame_metric {rec.get('uid','?')}: blob sizes disagree "
+                    f"with n={n}")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO frame_metric(uid,video_key,name,n,"
+                "frames,values_,observer_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (rec["uid"], rec["video_key"], rec["name"], n, frames, vals,
+                 rec["observer_id"], rec.get("created_at", time.time())))
         elif t == "vector":
             self.conn.execute(
                 "INSERT OR IGNORE INTO vector(uid,video_key,shot_idx,space,dim,"
@@ -752,13 +1332,28 @@ class Store:
             "videos": q("SELECT COUNT(*) FROM video"),
             "shots": q("SELECT COUNT(*) FROM shot"),
             "claims": q("SELECT COUNT(*) FROM claim"),
+            "frame_claims": q("SELECT COUNT(*) FROM claim "
+                              "WHERE frame_idx IS NOT NULL"),
+            # Rows are run-length, so the honest measure of per-frame coverage
+            # is frames spanned, not rows written. A pass that collapsed 900
+            # frames into 12 runs has still read all 900.
+            "frames_claimed": q(
+                "SELECT COALESCE(SUM(COALESCE(frame_hi,frame_idx)-frame_idx+1),0)"
+                " FROM claim WHERE frame_idx IS NOT NULL"),
             "vectors": q("SELECT COUNT(*) FROM vector"),
+            "frame_vectors": q("SELECT COUNT(*) FROM frame_vector"),
+            "frame_vector_frames": q(
+                "SELECT COALESCE(SUM(n),0) FROM frame_vector"),
+            "frame_metrics": q("SELECT COUNT(*) FROM frame_metric"),
+            "frame_metric_frames": q(
+                "SELECT COALESCE(SUM(n),0) FROM frame_metric"),
             "observers": q("SELECT COUNT(*) FROM observer"),
             "artifacts": q("SELECT COUNT(*) FROM artifact"),
             "shards": q("SELECT COUNT(*) FROM shard"),
             "by_channel": by_channel,
             "by_observer": by_observer,
             "fts": self.fts,
+            "schema": SCHEMA_VERSION,
             "bytes": os.path.getsize(self.path) if os.path.exists(self.path) else 0,
         }
 

@@ -147,6 +147,36 @@ p.lede{color:var(--dim);font-size:14px;max-width:66ch;margin-top:7px}
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .now .clock{font-family:var(--mono);font-size:26px;color:var(--focus);letter-spacing:-.02em}
 .now.idle .clock{color:var(--dim)}
+/* Frame progress inside one pass. A 900-frame OCR run is fifteen minutes on one
+   line of text without this; the bar is the difference between "working" and
+   "hung", which is the whole question being asked of this panel. */
+.now .prog{height:2px;background:var(--line);border-radius:2px;margin-top:9px;overflow:hidden}
+.now .prog i{display:block;height:100%;width:0;background:var(--focus);
+  transition:width .35s linear}
+
+/* ── STAGES ──────────────────────────────────────────────────────── */
+.stg{display:flex;flex-direction:column;gap:8px}
+.stg .s{background:var(--slate);border:1px solid var(--line);border-radius:var(--r);
+  padding:12px 15px;position:relative}
+.stg .s.on{border-color:var(--focus);background:rgba(125,211,252,.06)}
+.stg .s.done{background:rgba(134,239,172,.045)}
+.stg .s .hd{display:flex;align-items:baseline;gap:10px;font-family:var(--mono);
+  font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim)}
+.stg .s .hd b{font-size:12px;letter-spacing:.06em;color:var(--paper);font-weight:600}
+.stg .s.done .hd b{color:var(--good)}
+.stg .s.on .hd b{color:var(--focus)}
+.stg .s .hd .rt{margin-left:auto;text-transform:none;letter-spacing:0;font-size:11px}
+.stg .s .ln{margin-top:7px;font-family:var(--mono);font-size:11.5px;color:#c3c9d1}
+.stg .s .bar{height:2px;background:var(--line);border-radius:2px;margin-top:9px;overflow:hidden}
+.stg .s .bar i{display:block;height:100%;width:0;background:var(--dim);
+  transition:width .6s cubic-bezier(.4,0,.2,1)}
+.stg .s.done .bar i{background:var(--good)}
+.stg .s.on .bar i{background:var(--focus)}
+.stg .s .tag{font-family:var(--mono);font-size:9.5px;padding:1px 6px;border-radius:4px;
+  border:1px solid var(--line);color:var(--dim)}
+.stg .s .tag.up{border-color:rgba(134,239,172,.32);color:var(--good)}
+.stg .s .tag.wait{border-color:rgba(253,230,138,.32);color:var(--warn)}
+.stg .s .tag.bad{border-color:rgba(252,165,165,.35);color:var(--bad)}
 .loaded{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}
 .loaded s{text-decoration:none;font-family:var(--mono);font-size:10px;padding:2px 7px;
   border-radius:5px;border:1px solid rgba(94,234,212,.28);color:var(--concept);
@@ -415,12 +445,19 @@ details.step .in{padding:15px 16px 18px}
         <h3>Now</h3>
         <div class="now idle" id="now">
           <div>
-            <div class="k">Idle</div>
+            <div class="k" id="nowK">Idle</div>
             <div class="v" id="nowV">Nothing running</div>
             <div class="sub" id="nowS">Press Start on Setup once the readiness check is clean.</div>
+            <div class="sub" id="nowFrames" hidden></div>
+            <div class="prog" id="nowProg" hidden><i id="nowProgI"></i></div>
             <div class="loaded" id="nowLoaded"></div>
           </div>
           <div class="clock" id="nowClock">—</div>
+        </div>
+        <div id="nowOther" class="card" hidden style="margin-top:10px">
+          <div class="n" style="font-family:var(--mono);font-size:10px;letter-spacing:.13em;
+            text-transform:uppercase;color:var(--dim)">Also running · capture plane</div>
+          <div id="nowOtherLine" style="font-family:var(--mono);font-size:12.5px;margin-top:6px;color:#c3c9d1">—</div>
         </div>
         <div class="btns">
           <button class="btn primary" id="bStart">Start</button>
@@ -430,6 +467,26 @@ details.step .in{padding:15px 16px 18px}
           <button class="btn" id="bPublish">Publish shard now</button>
         </div>
         <div class="result" id="runResult"></div>
+      </div>
+
+      <div class="sec">
+        <h3>Stages <span class="act" id="bPublishStage">publish the current stage now →</span></h3>
+        <p class="lede" style="margin-bottom:12px">Each stage uploads the whole database to the
+          channel when it finishes, so a later stage breaking is debuggable on its own and a
+          session that dies mid-sweep restores without replaying anything.</p>
+        <div id="stageRows" class="stg"><div class="skel">No stage has been planned yet.</div></div>
+        <div class="result" id="stageResult"></div>
+      </div>
+
+      <div class="sec">
+        <h3>Errors <span class="act" id="bErrToggle">show every error →</span></h3>
+        <p class="lede" style="margin-bottom:12px">Every pass that failed or was declined, newest
+          first — with the video, the reason and whether it will retry itself. Nothing here needs
+          the Kaggle log to be readable.</p>
+        <div class="tbl-wrap" style="max-height:320px">
+          <table><thead><tr><th>When</th><th>Pass</th><th>Video</th><th>Reason</th><th class="r">State</th></tr></thead>
+          <tbody id="tErrors"><tr><td colspan="5" class="skel">Nothing has failed.</td></tr></tbody></table>
+        </div>
       </div>
 
       <div class="sec">
@@ -592,8 +649,15 @@ details.step .in{padding:15px 16px 18px}
         </div>
         <div class="btns">
           <button class="btn" id="bRestore">Replay shards from the channel</button>
+          <button class="btn" id="bReconcile">Match evidence to the work table</button>
           <button class="btn" id="bSync">Pull new captures from the ledger</button>
         </div>
+        <!-- The restore's other half. The shards land in the evidence tables and
+             the work table does not hear about it, so without this the sweep
+             re-earns with the GPU what the channel already handed back. Shown as
+             a line rather than a table because there is exactly one number that
+             matters: how much of the archive is genuinely still to do. -->
+        <div class="lede" id="dReconcile" style="margin-top:10px">Reconcile has not run yet.</div>
         <div class="result" id="dbResult"></div>
       </div>
 
@@ -962,6 +1026,8 @@ function render(s){
   renderSpectrum(s);
   renderRotation(s);
   renderNow(s);
+  renderStages(s);
+  renderErrors(s);
 
   const ses = s.session || {};
   $('#kVideos').textContent = num(ses.videos);
@@ -979,6 +1045,7 @@ function render(s){
   $('#dVectors').textContent = num(store.vectors);
   $('#dObservers').textContent = num(store.observers);
   $('#dPending').textContent = num((s.shards || {}).pending);
+  renderReconcile(s);
   $('#dDisk').textContent = s.disk_free_mb ? (s.disk_free_mb/1024).toFixed(0) + ' GB' : '—';
   const src = s.source || {};
   $('#dFetch').textContent = src.downloaded ? src.downloaded + ' / ' + src.mb + ' MB' : '—';
@@ -989,6 +1056,33 @@ function render(s){
   $('#bPause').hidden = paused; $('#bPause').disabled = !run;
   $('#bResume').hidden = !paused;
   $('#bStop').disabled = !(run || paused);
+}
+
+function renderReconcile(s){
+  // "Never ran" and "ran and matched nothing" are opposite statements and a bare
+  // count renders them identically — the first means the archive is genuinely new
+  // to this build, the second means the step did not happen and the sweep is
+  // about to redo work. The timestamp is what separates them, so it is what this
+  // reads first.
+  const el = $('#dReconcile'); if(!el) return;
+  const r = s.reconciled || {};
+  if(r.error) {
+    el.innerHTML = `Reconcile failed — <span class="bad">${esc(r.error)}</span>. `
+      + `Passes it would have marked done will simply run again.`;
+    return;
+  }
+  if(!r.at) { el.textContent = 'Reconcile has not run yet.'; return; }
+  if(!r.rows) {
+    el.textContent = 'Reconcile ran and matched nothing — no evidence here was '
+      + 'written by the passes this build would run. Everything selected is still to do.';
+    return;
+  }
+  const per = r.per_component || {};
+  const top = Object.keys(per).sort((a,b) => per[b] - per[a]).slice(0, 8);
+  el.innerHTML = `<b>${num(r.rows)}</b> passes across <b>${num(r.videos)}</b> videos `
+    + `were already done and will not run again — `
+    + top.map(c => `${esc(c)} ${num(per[c])}`).join(', ')
+    + (Object.keys(per).length > top.length ? ' …' : '');
 }
 
 function renderSpectrum(s){
@@ -1034,9 +1128,11 @@ function renderRotation(s){
 
 function renderNow(s){
   const n = $('#now'), cur = s.current || {};
+  const v1 = ((s.planes || {}).v1) || {};
+  const auto = (((s.planes || {}).v2) || {}).autostart || {};
   if(cur.video_key){
     n.classList.remove('idle');
-    n.querySelector('.k').textContent = 'Cohort ' + ((cur.cohort ?? 0) + 1) +
+    $('#nowK').textContent = 'Cohort ' + ((cur.cohort ?? 0) + 1) +
       ' · pass ' + (cur.component || '—');
     $('#nowV').textContent = cur.title || cur.component || cur.video_key;
     $('#nowS').textContent = cur.video_key + (cur.note ? ' · ' + cur.note : '') +
@@ -1044,15 +1140,117 @@ function renderNow(s){
     $('#nowClock').textContent = clock(cur.elapsed);
   }else{
     n.classList.add('idle');
-    n.querySelector('.k').textContent = s.state === 'running' ? 'Working' : 'Idle';
-    $('#nowV').textContent = s.state === 'running' ? 'Preparing…' : 'Nothing running';
-    $('#nowS').textContent = s.message || '';
+    // "Nothing running" used to be printed whenever this engine was idle, while
+    // the capture plane was visibly downloading and captioning. Two planes, one
+    // panel: say which one is working rather than denying both.
+    const busy = s.state === 'running';
+    const autoBusy = ['waiting','restoring','starting'].includes(auto.state);
+    $('#nowK').textContent = busy ? 'Working'
+      : autoBusy ? 'Starting itself'
+      : v1.working ? 'Capture plane' : 'Idle';
+    $('#nowV').textContent = busy ? 'Preparing…'
+      : autoBusy ? (auto.message || 'Starting…')
+      : v1.working ? (v1.status || 'Downloading and captioning')
+      : 'Nothing running';
+    $('#nowS').textContent = s.message || auto.error ||
+      (v1.working ? v1QueueLine(v1) : (v1.status || ''));
     $('#nowClock').textContent = '—';
   }
+
+  // Progress inside the pass in flight, computed by the engine from the same
+  // heartbeat string that renews the lease — so the bar cannot disagree with
+  // what the worker thinks it is doing.
+  const done = cur.frames_done || 0, total = cur.frames_total || 0;
+  const detail = cur.detail || '';
+  $('#nowFrames').hidden = !detail;
+  if(detail) $('#nowFrames').textContent = detail;
+  $('#nowProg').hidden = !(total > 0);
+  if(total > 0) $('#nowProgI').style.width =
+    Math.max(0, Math.min(100, done / total * 100)).toFixed(1) + '%';
+
+  // The other plane, when it is doing something and this one is too — so the
+  // panel never has to choose which truth to tell.
+  const other = $('#nowOther');
+  const showOther = v1.present && v1.working && !!cur.video_key;
+  other.hidden = !showOther;
+  if(showOther) $('#nowOtherLine').textContent =
+    (v1.status || 'working') + ' · ' + v1QueueLine(v1);
+
   const loaded = s.loaded || [];
   $('#nowLoaded').innerHTML = loaded.length
     ? loaded.map(k => `<s>${esc(k)}</s>`).join('')
     : '';
+}
+
+function v1QueueLine(v1){
+  const qs = Object.entries(v1.queues || {});
+  if(!qs.length) return 'no queued work';
+  return qs.map(([q, d]) =>
+    `${q.replace(/^QUEUE_/,'').toLowerCase()} ${d.processing}/${d.pending}`).join(' · ');
+}
+
+/* Stages. The question this answers is "which stage went wrong", which a
+   thirty-four row component matrix does not answer at a glance. */
+function renderStages(s){
+  const el = $('#stageRows'), rows = s.stages || [];
+  if(!rows.length){
+    el.innerHTML = '<div class="skel">No stage has been planned yet.</div>';
+    return;
+  }
+  const cur = (s.current || {}).component || '';
+  el.innerHTML = rows.map(r => {
+    if(r.error) return `<div class="s"><div class="hd"><b>${esc(r.stage)}</b>
+      <span class="tag bad">unreadable</span></div>
+      <div class="ln">${esc(r.error)}</div></div>`;
+    const c = r.counts || {};
+    const tot = c.total || 0, dn = (c.done || 0) + (c.skipped || 0);
+    const pct = tot ? Math.round(100 * dn / tot) : 0;
+    const on = (r.components || []).includes(cur);
+    const b = r.bundle;
+    const tag = r.bundle_pending
+      ? '<span class="tag wait">bundle waiting to upload</span>'
+      : b ? `<span class="tag up">bundle · ${num(b.parts || 1)} part${
+              (b.parts || 1) === 1 ? '' : 's'} · ${mb(b.bytes)}</span>`
+          : '<span class="tag">no bundle yet</span>';
+    const errs = r.error_count || 0;
+    return `<div class="s ${r.complete ? 'done' : on ? 'on' : ''}">
+      <div class="hd"><b>${esc(r.stage)}</b>
+        <span>${(r.components || []).length} passes</span>
+        ${tag}
+        ${errs ? `<span class="tag bad">${num(errs)} error${errs === 1 ? '' : 's'}</span>` : ''}
+        <span class="rt">${num(dn)} / ${num(tot)} · ${pct}%</span></div>
+      <div class="ln">${num(r.videos)} videos · ${num(r.claims)} claims ·
+        ${num(r.vectors)} vectors${r.frames ? ' · ' + num(r.frames) + ' frames' : ''}${
+        r.remaining ? ' · ' + num(r.remaining) + ' left' : ''}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+    </div>`;
+  }).join('');
+}
+
+/* Errors, individually and newest first. `failures` on the Coverage page groups
+   by message, which answers "what is wrong with this run"; this answers "what
+   just went wrong", and both get asked. */
+let errAll = false;
+function renderErrors(s){
+  const rows = (s.errors || []).slice(0, errAll ? 200 : 25);
+  const tb = $('#tErrors');
+  if(!rows.length){
+    tb.innerHTML = '<tr><td colspan="5" class="skel">Nothing has failed.</td></tr>';
+    return;
+  }
+  const now = Date.now() / 1000;
+  tb.innerHTML = rows.map(r => {
+    const when = r.at ? human(now - r.at) + ' ago' : '—';
+    const state = r.retrying
+      ? `<span class="tag wait">retry ${r.attempts}${
+          r.next_try_at ? ' · ' + human(Math.max(r.next_try_at - now, 0)) : ''}</span>`
+      : r.state === 'skipped'
+        ? '<span class="tag">declined</span>'
+        : '<span class="tag bad">gave up</span>';
+    return `<tr><td>${esc(when)}</td><td>${esc(r.component)}</td>
+      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis">${esc(r.video_key)}</td>
+      <td>${esc(r.error)}</td><td class="r">${state}</td></tr>`;
+  }).join('');
 }
 
 async function tick(){
@@ -1097,6 +1295,22 @@ $('#bPublish').onclick = async () => {
   const r = await post('/api/process/publish');
   if(r.ok && r.shard) say('#runResult', 'Published ' + r.shard, 'ok');
   else say('#runResult', r.error || 'Nothing new to publish.', r.ok ? '' : 'no');
+};
+$('#bPublishStage').onclick = async () => {
+  // The sweep finalises a stage's standing on its own; this is the button for
+  // closing a session early, when the sweep will not get the chance.
+  say('#stageResult', 'Cutting the current stage bundle…', 'busy');
+  const r = await post('/api/process/publish_stage', form({stage: ''}));
+  const msg = r.stages && r.stages.length
+    ? r.stages.map(x => `${x.stage}: ${x.ok ? 'uploaded' : (x.reason || x.error || 'failed')}`).join(' · ')
+    : (r.message || r.error || 'Nothing to publish.');
+  say('#stageResult', msg, (r.ok || r.stages) ? 'ok' : 'no');
+  tick();
+};
+$('#bErrToggle').onclick = () => {
+  errAll = !errAll;
+  $('#bErrToggle').textContent = errAll ? 'show fewer →' : 'show every error →';
+  renderErrors(last || {});
 };
 
 /* ══ PASSES ════════════════════════════════════════════════════════ */
@@ -1336,6 +1550,12 @@ $('#bRestore').onclick = async () => {
 $('#bSync').onclick = async () => {
   say('#dbResult', 'Reading the capture ledger…', 'busy');
   const r = await post('/api/process/sync');
+  if(!r.ok) return say('#dbResult', r.error, 'no');
+  pollTask('#dbResult', () => { loadDb(); tick(); });
+};
+$('#bReconcile').onclick = async () => {
+  say('#dbResult', 'Matching evidence against the work table…', 'busy');
+  const r = await post('/api/process/reconcile');
   if(!r.ok) return say('#dbResult', r.error, 'no');
   pollTask('#dbResult', () => { loadDb(); tick(); });
 };

@@ -111,13 +111,30 @@ def _run_whisper(job: Job, *, alt: bool) -> Emission:
         if n % 10 == 0:
             job.heartbeat(f"segment {n}")
         start = float(seg.start or 0.0)
+        end = float(seg.end or start)
         # `avg_logprob` is a mean log probability per token, so exponentiating
         # gives a per-token likelihood in 0..1 — a usable confidence, and the
         # only one Whisper offers that is not a hand-tuned threshold.
         conf = min(max(math.exp(float(getattr(seg, "avg_logprob", -0.5) or -0.5)),
                        0.0), 1.0)
-        em.claim("speech", "segment", text, shot_idx=job.shot_at(start),
-                 num=round(start, 3), confidence=round(conf, 4), ordinal=n)
+        # Whisper's own segment boundaries are kept — they come from the decoder
+        # and are better than any grid would be — but the segment is *also*
+        # stamped with the frame it starts and ends on, so speech lands on the
+        # same index as everything the vision passes wrote. That is what makes
+        # "what was said while this was on screen" a join instead of a float
+        # comparison. When frames were never extracted, `frame_at` returns None
+        # and the claim falls back to its shot, which is the old behaviour.
+        fi = job.frame_at(start)
+        if fi is None:
+            em.claim("speech", "segment", text, shot_idx=job.shot_at(start),
+                     num=round(start, 3), confidence=round(conf, 4), ordinal=n)
+        else:
+            fhi = job.frame_at(end)
+            em.frame_claim(fi, start, "speech", "segment", text,
+                           frame_hi=(fhi if fhi and fhi > fi else None),
+                           frame_t1=(end if end > start else None),
+                           num=round(start, 3), confidence=round(conf, 4),
+                           ordinal=n)
         texts.append(text)
         for w in (getattr(seg, "words", None) or []):
             words.append({"w": (w.word or "").strip(),
@@ -220,9 +237,21 @@ def diarize(job: Job) -> Emission:
         speakers[label] = speakers.get(label, 0.0) + (end - start)
         total += end - start
         spans.append((start, end))
-        em.claim("speech", "speaker_turn", str(label),
-                 shot_idx=job.shot_at(start), num=round(start, 3),
-                 ordinal=n)
+        # A turn is a span, so it is written as one: the frames it covers, not
+        # the shot it happened to begin in. "Who was speaking at this instant"
+        # then has an exact answer, which is what a two-voice reel needs — the
+        # speaker changes mid-shot far more often than at a cut.
+        fi = job.frame_at(start)
+        if fi is None:
+            em.claim("speech", "speaker_turn", str(label),
+                     shot_idx=job.shot_at(start), num=round(start, 3),
+                     ordinal=n)
+        else:
+            fhi = job.frame_at(end)
+            em.frame_claim(fi, start, "speech", "speaker_turn", str(label),
+                           frame_hi=(fhi if fhi and fhi > fi else None),
+                           frame_t1=(end if end > start else None),
+                           num=round(start, 3), ordinal=n)
 
     if not speakers:
         raise SkipPass("no speech regions found")
@@ -267,13 +296,27 @@ SOUND_LABELS = (
 
 
 def audio_tag(job: Job) -> Emission:
-    """CLAP over windows of the track: sound events, music presence, a vector.
+    """CLAP over every window of the track: sound events, music, vectors.
 
     Zero-shot again, and for the same reason as the visual tagger — the answer
     is a cosine between two embeddings, so it can be low but it cannot be
-    invented. The pooled embedding is stored as a vector, which is what makes
-    "find reels that sound like this one" a query rather than a listening
-    session.
+    invented.
+
+    The grid is the point. This pass used to score one ten-second window per
+    ten seconds and attribute the result to a shot, which answered "there was
+    applause somewhere in this shot" — a sentence that cannot place a moment.
+    It now scores `job.audio_grid()`: 0.96 s windows on a 0.48 s hop, covering
+    `[0, duration)` with no gaps, which is the audio equivalent of "every
+    frame". 0.96 s is also what CLAP was trained to ingest, so each window is
+    one whole model input rather than a slice of one.
+
+    Two things come out of that. Every class gets a per-window score series
+    stored as a packed `frame_metric` array — the numbers, at full resolution,
+    for anything that wants to threshold them differently later. And every
+    class that stays above threshold across consecutive windows becomes one
+    run-length claim carrying the *frame* index of its span, so a sound and a
+    shot share one index and "what was heard while this was on screen" is a
+    join rather than a float comparison.
     """
     import numpy as np  # noqa: PLC0415
 
@@ -327,40 +370,101 @@ def audio_tag(job: Job) -> Emission:
         tvec = model.get_text_features(**text_in)
         tvec = (tvec / tvec.norm(dim=-1, keepdim=True)).cpu().numpy()
 
-    window = int(rate * float(job.params.get("window_seconds", 10.0)))
-    starts = list(range(0, max(len(data) - window // 2, 1), window)) or [0]
-    em = Emission()
-    pooled, per_window = None, 0
+    grid = job.audio_grid()
+    if not grid:
+        raise SkipPass("no duration — cannot build the analysis grid")
 
-    for n, start in enumerate(starts):
-        chunk = data[start:start + window]
-        if len(chunk) < rate // 2:
+    batch_size = max(1, int(job.params.get("batch", 16)))
+    floor = float(job.params.get("min_similarity", 0.05))
+    em = Emission()
+    idxs: list = []                       # window index per scored window
+    times: list = []                      # (t0, t1) per scored window
+    vecs: list = []                       # the audio embedding per window
+    sims: list = []                       # label scores per window
+
+    for wi, spans in job.audio_batches(batch_size):
+        chunks, keep_i, keep_t = [], [], []
+        for i, (t0, t1) in zip(wi, spans):
+            a = int(t0 * rate)
+            b = min(int(t1 * rate), len(data))
+            seg = data[a:b]
+            if len(seg) < rate // 20:     # under 50 ms of samples: nothing to read
+                continue
+            chunks.append(seg)
+            keep_i.append(i)
+            keep_t.append((t0, t1))
+        if not chunks:
             continue
-        job.heartbeat(f"window {n + 1}/{len(starts)}")
         with torch.no_grad():
-            audio_in = proc(audios=chunk, sampling_rate=rate,
-                            return_tensors="pt")
+            audio_in = proc(audios=chunks, sampling_rate=rate,
+                            return_tensors="pt", padding=True)
             if device == "cuda":
                 audio_in = {k: v.to("cuda") for k, v in audio_in.items()}
             avec = model.get_audio_features(**audio_in)
-            avec = (avec / avec.norm(dim=-1, keepdim=True)).cpu().numpy()[0]
+            avec = (avec / avec.norm(dim=-1, keepdim=True)).cpu().numpy()
+        for row, i, t in zip(avec, keep_i, keep_t):
+            idxs.append(i)
+            times.append(t)
+            vecs.append(row)
+            sims.append(tvec @ row)
 
-        pooled = avec if pooled is None else pooled + avec
-        per_window += 1
-        sims = tvec @ avec
-        t = start / rate
-        idx = job.shot_at(t)
-        for rank, i in enumerate(np.argsort(-sims)[:3]):
-            if float(sims[i]) < float(job.params.get("min_similarity", 0.05)):
-                break
-            em.claim("audio", "sound_event", SOUND_LABELS[i], shot_idx=idx,
-                     num=round(float(sims[i]), 4),
-                     confidence=round(float(sims[i]), 4),
-                     ordinal=n * 3 + rank)
-
-    if pooled is None:
+    if not vecs:
         raise SkipPass("no usable audio windows")
-    pooled = pooled / per_window
+
+    matrix = np.vstack(vecs)
+    scores = np.vstack(sims)              # (windows, labels)
+
+    # The shared index, or an honest admission that there isn't one. `frame_at`
+    # returns None when frames were never extracted, and in that case the
+    # series is keyed by window instead — under a *different* metric name, so
+    # the two indexing schemes can never be silently mixed by a reader that
+    # assumes frames. Audio does not depend on `allframes` in the registry on
+    # purpose: a frame-extraction failure must not cost the transcript.
+    frame_ids = [job.frame_at(t0) for t0, _t1 in times]
+    on_frames = all(f is not None for f in frame_ids)
+    if not on_frames:
+        job.note("frames unavailable — audio metrics are keyed by window "
+                 "index (metric names carry a 'win:' prefix)")
+    keys = frame_ids if on_frames else idxs
+    prefix = "clap:" if on_frames else "win:clap:"
+
+    # Per-window embeddings, packed. This is what makes "find the moment that
+    # sounds like this" a query over one video's own timeline rather than a
+    # comparison of pooled averages between videos.
+    if on_frames:
+        em.frame_vector_set("clap", frame_ids, matrix)
+
+    # Every label's full score curve, at grid resolution. Stored as numbers so a
+    # later feature can pick its own threshold without re-running CLAP over the
+    # archive — which is the whole reason the raw series is kept and not just
+    # the thresholded claims.
+    for li, label in enumerate(SOUND_LABELS):
+        col = scores[:, li]
+        if float(col.max()) < floor:
+            continue                      # never once plausible: keep no series
+        em.frame_metric(f"{prefix}{label}", keys,
+                        [round(float(x), 4) for x in col])
+
+    # Run-length claims: a label is "present" in a window when it is both above
+    # the floor and among the top few for that window. Top-k rather than a bare
+    # threshold because the cosines are not calibrated across labels — "music
+    # playing" sits higher than "a record scratch" on everything — so ranking
+    # within a window is the comparison that means something.
+    topk = max(1, int(job.params.get("top_k", 3)))
+    rows = 0
+    order = np.argsort(-scores, axis=1)[:, :topk]
+    for li, label in enumerate(SOUND_LABELS):
+        readings = []
+        for w, (i, (t0, t1)) in enumerate(zip(idxs, times)):
+            hit = (li in order[w]) and float(scores[w, li]) >= floor
+            readings.append((i, t0, t1, label if hit else None))
+        rows += em.window_runs("audio", "sound_event", readings,
+                               confidence=0.6, frame_of=job.frame_at)
+
+    # The pooled vector and the video-level reading stay: they are what
+    # cross-video "sounds like this reel" search runs on, and they are now an
+    # average over total coverage rather than over ten-second samples.
+    pooled = matrix.mean(axis=0)
     pooled = pooled / (float(np.linalg.norm(pooled)) + 1e-9)
     em.vector("clap", [float(x) for x in pooled])
 
@@ -373,7 +477,11 @@ def audio_tag(job: Job) -> Emission:
     for rank, i in enumerate(np.argsort(-overall)[:6]):
         em.claim("audio", "sound_event", SOUND_LABELS[i],
                  num=round(float(overall[i]), 4),
-                 confidence=round(float(overall[i]), 4), ordinal=rank)
+                 confidence=round(float(overall[i]), 4), ordinal=10_000 + rank)
 
-    em.notes = {"windows": per_window, "labels": len(SOUND_LABELS)}
+    covered = sum(t1 - t0 for t0, t1 in times)
+    em.notes = {"windows": len(idxs), "grid": len(grid),
+                "labels": len(SOUND_LABELS), "runs": rows,
+                "seconds_covered": round(covered, 1),
+                "duration": round(float(job.duration or 0.0), 1)}
     return em

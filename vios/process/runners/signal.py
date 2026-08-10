@@ -310,8 +310,41 @@ def _palette(img, k: int = 5):
     return swatches
 
 
+_COLOUR_NAMES = (
+    # (name, hue lower, hue upper) in OpenCV's 0–179 hue scale.
+    ("red", 0, 9), ("orange", 10, 22), ("yellow", 23, 33),
+    ("green", 34, 77), ("cyan", 78, 96), ("blue", 97, 126),
+    ("purple", 127, 148), ("pink", 149, 168), ("red", 169, 179),
+)
+
+
+def _colour_name(hue: float, sat: float, val: float) -> str:
+    """A frame's dominant colour as a word, from HSV means.
+
+    Achromatic first: a frame with almost no saturation has a hue, and it is
+    meaningless — reporting "green" for a grey frame because its hue landed at
+    60 is the classic way a colour index becomes untrustworthy.
+    """
+    if val < 0.12:
+        return "black"
+    if sat < 0.12:
+        return "white" if val > 0.75 else "grey"
+    for name, lo, hi in _COLOUR_NAMES:
+        if lo <= hue <= hi:
+            return name
+    return "neutral"
+
+
 def colour(job: Job) -> Emission:
-    """Per-shot palette and the statistics that make style searchable."""
+    """Palette per shot, and the colour of every single frame.
+
+    Two granularities on purpose. A five-swatch k-means palette is the right
+    description of a *shot* and costs too much to run 900 times; the dominant
+    colour of a *frame* is a hue histogram, costs nothing, and is what makes
+    "find the moment the screen goes red" answerable. The palette comes from the
+    keyframes, the per-frame curves and colour runs from the complete set — which
+    is why this component declares both as inputs.
+    """
     import cv2  # noqa: PLC0415
     np = _np()
 
@@ -325,7 +358,7 @@ def colour(job: Job) -> Emission:
 
     for n, f in enumerate(frames):
         if n % 20 == 0:
-            job.heartbeat(f"frame {n}/{len(frames)}")
+            job.heartbeat(f"palette {n}/{len(frames)}")
         img = cv2.imread(f["path"])
         if img is None:
             continue
@@ -368,7 +401,48 @@ def colour(job: Job) -> Emission:
              "cool" if np.mean(temps) < -0.02 else
              "warm" if np.mean(temps) > 0.02 else "neutral",
              num=round(float(np.mean(temps)), 4))
-    em.notes = {"frames": len(brights)}
+
+    # ── every frame ─────────────────────────────────────────────────────
+    idxs, hues, dominant = [], [], []
+    read = 0
+    for b_idx, b_t, b_paths in job.frame_batches(64):
+        for i, t, path in zip(b_idx, b_t, b_paths):
+            img = cv2.imread(path)
+            if img is None:
+                continue
+            read += 1
+            hsv = cv2.cvtColor(cv2.resize(img, (64, 64),
+                                          interpolation=cv2.INTER_AREA),
+                               cv2.COLOR_BGR2HSV)
+            h = hsv[:, :, 0].astype(np.float32)
+            s = hsv[:, :, 1].astype(np.float32) / 255.0
+            v = hsv[:, :, 2].astype(np.float32) / 255.0
+            # Hue averaged over the saturated pixels only, and by histogram
+            # peak rather than mean: hue is circular, so the mean of red at 178
+            # and red at 2 is cyan.
+            mask = (s > 0.15) & (v > 0.15)
+            if mask.any():
+                hist = np.bincount(h[mask].astype("int64"), minlength=180)
+                peak = float(int(hist.argmax()))
+            else:
+                peak = 0.0
+            idxs.append(int(i))
+            hues.append(peak)
+            dominant.append((int(i), float(t),
+                             _colour_name(peak, float(s.mean()),
+                                          float(v.mean()))))
+
+    if read:
+        em.frame_metric("hue", idxs, hues)
+        runs = em.frame_runs("style", "dominant_colour", dominant,
+                             confidence=0.8)
+        em.notes = {"shots": len(brights), "frames": read,
+                    "frames_available": job.frame_count() or read,
+                    "colour_runs": runs}
+    else:
+        job.note("no frames in the allframes set were readable — the "
+                 "per-shot palette was written, the per-frame colour was not")
+        em.notes = {"shots": len(brights), "frames": 0}
     return em
 
 
@@ -393,64 +467,83 @@ def motion(job: Job) -> Emission:
     if not rows:
         raise SkipPass("no shots")
 
-    cap = cv2.VideoCapture(job.media)
-    fps = cap.get(cv2.CAP_PROP_FPS) or float(job.video.get("fps") or 30.0)
-    step = max(int(round(fps / 10.0)), 1)     # ~10 samples per second
+    # Read the extracted frames rather than re-decoding the container. Two
+    # reasons, and the second is the one that matters: decoding again would
+    # sample at ~10 fps and label the motion of frames nothing else measured,
+    # so a camera move could never be joined to the OCR or the objects at the
+    # same instant. Reading `allframes` puts every measurement on one index.
+    frames = job.all_frames()
+    if len(frames) < 2:
+        raise SkipPass("fewer than two frames in the allframes set")
 
-    prev, prev_t, samples = None, 0.0, []
-    i = 0
-    while True:
-        ok = cap.grab()
-        if not ok:
-            break
-        if i % step == 0:
-            ok, frame = cap.retrieve()
-            if ok:
-                g = cv2.cvtColor(cv2.resize(frame, (320, 180)),
-                                 cv2.COLOR_BGR2GRAY)
-                t = i / fps
-                if prev is not None:
-                    samples.append((prev_t, t, prev, g))
-                prev, prev_t = g, t
-        i += 1
-        if i % 300 == 0:
-            job.heartbeat(f"frame {i}")
-    cap.release()
+    samples = []                       # (frame_idx, t, prev_grey, grey)
+    prev = None
+    read = 0
+    for b_idx, b_t, b_paths in job.frame_batches(64):
+        for i, t, path in zip(b_idx, b_t, b_paths):
+            img = cv2.imread(path)
+            if img is None:
+                continue
+            read += 1
+            g = cv2.cvtColor(cv2.resize(img, (320, 180)), cv2.COLOR_BGR2GRAY)
+            if prev is not None:
+                samples.append((int(i), float(t), prev, g))
+            prev = g
 
     if not samples:
-        raise SkipPass("could not decode frames for motion")
+        raise SkipPass("could not read frames for motion")
 
     per_shot: dict = {}
-    for t0, t1, a, b in samples:
-        idx = job.shot_at((t0 + t1) / 2.0)
+    f_idx, f_energy, f_drift, f_zoom = [], [], [], []
+    f_label = []
+    for idx_f, t, a, b in samples:
+        idx = job.shot_at(t)
         pts = cv2.goodFeaturesToTrack(a, maxCorners=200, qualityLevel=0.01,
                                       minDistance=8)
         entry = per_shot.setdefault(idx, {"dx": [], "dy": [], "scale": [],
                                           "resid": [], "energy": []})
-        entry["energy"].append(float(np.abs(
-            b.astype(float) - a.astype(float)).mean() / 255.0))
-        if pts is None or len(pts) < 8:
-            continue
-        nxt, status, _err = cv2.calcOpticalFlowPyrLK(a, b, pts, None)
-        if nxt is None:
-            continue
-        good_a = pts[status.flatten() == 1]
-        good_b = nxt[status.flatten() == 1]
-        if len(good_a) < 8:
-            continue
-        matrix, inliers = cv2.estimateAffinePartial2D(
-            good_a, good_b, method=cv2.RANSAC, ransacReprojThreshold=3)
-        if matrix is None:
-            continue
-        dx, dy = float(matrix[0, 2]), float(matrix[1, 2])
-        scale = float(math.hypot(matrix[0, 0], matrix[1, 0]))
-        share = float(inliers.mean()) if inliers is not None else 0.0
-        entry["dx"].append(dx)
-        entry["dy"].append(dy)
-        entry["scale"].append(scale)
-        entry["resid"].append(1.0 - share)
+        energy = float(np.abs(
+            b.astype(float) - a.astype(float)).mean() / 255.0)
+        entry["energy"].append(energy)
+        f_idx.append(idx_f)
+        f_energy.append(energy)
+
+        dx = dy = 0.0
+        scale = 1.0
+        resid = 1.0
+        ok = False
+        if pts is not None and len(pts) >= 8:
+            nxt, status, _err = cv2.calcOpticalFlowPyrLK(a, b, pts, None)
+            if nxt is not None:
+                good_a = pts[status.flatten() == 1]
+                good_b = nxt[status.flatten() == 1]
+                if len(good_a) >= 8:
+                    matrix, inliers = cv2.estimateAffinePartial2D(
+                        good_a, good_b, method=cv2.RANSAC,
+                        ransacReprojThreshold=3)
+                    if matrix is not None:
+                        dx, dy = float(matrix[0, 2]), float(matrix[1, 2])
+                        scale = float(math.hypot(matrix[0, 0], matrix[1, 0]))
+                        share = (float(inliers.mean())
+                                 if inliers is not None else 0.0)
+                        resid = 1.0 - share
+                        ok = True
+        f_drift.append(math.hypot(dx, dy))
+        f_zoom.append(scale - 1.0)
+        f_label.append((idx_f, t, _move_label(dx, dy, scale - 1.0, 0.0, resid)
+                        if ok else None))
+        if ok:
+            entry["dx"].append(dx)
+            entry["dy"].append(dy)
+            entry["scale"].append(scale)
+            entry["resid"].append(resid)
 
     em = Emission()
+    em.frame_metric("motion_energy", f_idx, f_energy)
+    em.frame_metric("camera_drift", f_idx, f_drift)
+    em.frame_metric("camera_zoom", f_idx, f_zoom)
+    em.frame_runs("style", "camera_move", _smooth_labels(f_label),
+                  confidence=0.6)
     labels = []
     for idx in sorted(per_shot):
         e = per_shot[idx]
@@ -464,15 +557,7 @@ def motion(job: Job) -> Emission:
         jitter = float(np.std(e["dx"]) + np.std(e["dy"]))
         resid = float(np.mean(e["resid"]))
 
-        if abs(zoom) > 0.004 and abs(zoom) > drift / 160.0:
-            label = "push in" if zoom > 0 else "pull out"
-        elif drift > 1.2 and jitter < drift * 1.6:
-            label = ("pan right" if dx < -0.8 else "pan left" if dx > 0.8 else
-                     "tilt down" if dy < 0 else "tilt up")
-        elif jitter > 2.2 or resid > 0.45:
-            label = "handheld"
-        else:
-            label = "static"
+        label = _move_label(dx, dy, zoom, jitter, resid)
         labels.append(label)
         em.claim("style", "camera_move", label, shot_idx=idx,
                  num=round(drift, 3),
@@ -484,8 +569,54 @@ def motion(job: Job) -> Emission:
         common = max(set(labels), key=labels.count)
         em.claim("style", "camera_move", common,
                  num=labels.count(common) / len(labels))
-    em.notes = {"shots_measured": len(per_shot), "samples": len(samples)}
+    em.notes = {"shots_measured": len(per_shot), "samples": len(samples),
+                "frames": read, "frames_available": job.frame_count() or read}
     return em
+
+
+def _move_label(dx: float, dy: float, zoom: float, jitter: float,
+                resid: float) -> str:
+    """Camera move from affine parameters, in one place for both granularities.
+
+    Shared so the per-frame run and the per-shot claim cannot drift apart: two
+    copies of these thresholds would eventually disagree, and a database where
+    the frame says "pan left" while the shot says "static" is worse than one
+    that only had the shot.
+
+    The order of the tests is the meaning. Zoom is checked first because a push
+    in also translates slightly and would otherwise read as a pan; jitter is
+    checked last because handheld is the residual category, what is left when
+    there is movement without direction.
+    """
+    drift = math.hypot(dx, dy)
+    if abs(zoom) > 0.004 and abs(zoom) > drift / 160.0:
+        return "push in" if zoom > 0 else "pull out"
+    if drift > 1.2 and jitter < drift * 1.6:
+        return ("pan right" if dx < -0.8 else "pan left" if dx > 0.8 else
+                "tilt down" if dy < 0 else "tilt up")
+    if jitter > 2.2 or resid > 0.45:
+        return "handheld"
+    return "static"
+
+
+def _smooth_labels(readings: list, window: int = 5) -> list:
+    """Majority-vote a per-frame label series over a small window.
+
+    Frame-to-frame affine fits are noisy: a single frame of "handheld" inside a
+    steady pan is a fitting artefact, not a camera move, and left alone it would
+    split one run-length claim into three. The window is odd and short, so a
+    genuine move that lasts a fifth of a second still survives.
+    """
+    n = len(readings)
+    if n < window:
+        return readings
+    half = window // 2
+    out = []
+    for i, (idx, t, _value) in enumerate(readings):
+        near = [v for _, _, v in readings[max(0, i - half): i + half + 1]
+                if v is not None]
+        out.append((idx, t, max(set(near), key=near.count) if near else None))
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -546,6 +677,27 @@ def loudness(job: Job) -> Emission:
              f"{silent * 100:.0f}% near-silent", num=round(silent, 4))
     em.claim("audio", "loudness_curve",
              [round(float(x), 2) for x in db], num=float(db.mean()))
+
+    # The same curve again, as numbers on the shared time index. The JSON claim
+    # above stays because the hook pass reads it as a whole; this is what makes
+    # the curve *queryable* — "find the frame where the audio drops 12 dB" is a
+    # comparison over this array, and asking it of a JSON blob would mean
+    # parsing every video's claim to answer it once. Written only when frames
+    # exist: a metric keyed by 100 ms slot and one keyed by frame are different
+    # namespaces, and silently mixing them would corrupt every later reader.
+    frames = [job.frame_at(i * 0.1) for i in range(len(db))]
+    if all(f is not None for f in frames):
+        em.frame_metric("loudness_db", frames,
+                        [round(float(x), 2) for x in db])
+        # Silence as a run rather than a ratio: where the reel actually holds a
+        # beat before the punchline, addressable to the frame.
+        quiet = max(floor, -60.0)
+        em.window_runs(
+            "audio", "silence",
+            [(i, i * 0.1, i * 0.1 + 0.1,
+              "near-silent" if float(db[i]) < quiet else None)
+             for i in range(len(db))],
+            confidence=0.9, frame_of=job.frame_at)
 
     # Per-shot mean level, so "the loudest shot" is a query and not a listen.
     for s in job.shots():
@@ -855,10 +1007,15 @@ def perframe(job: Job) -> Emission:
     thousand videos it is twenty-seven million rows carrying numbers nobody
     queries individually. What people query is the summary — "reels that get
     dark in the last third", "shots with a freeze frame" — and what people plot
-    is the whole curve at once. So the per-frame numbers are written as
-    columnar arrays in `perframe.json`, one array per metric indexed by frame,
-    which is both two orders of magnitude smaller than a row per frame and the
-    shape a plot actually wants. Only the summary lands as claims.
+    is the whole curve at once. So the per-frame numbers go in as columnar
+    arrays, one packed row per metric, which is two orders of magnitude smaller
+    than a row per frame and the shape a plot actually wants.
+
+    They now go into the **database** as `frame_metric` rows as well as into
+    `perframe.json`. The JSON was written next to frames that are deleted with
+    the workdir, so every number this pass computed died with the session and
+    none of it reached v17, Atlas or a shard. The columnar shape is what made
+    that fixable without the 27 million rows: same arrays, durable table.
 
     `phash` earns its place by answering a question nothing else here can: a
     run of identical hashes is a freeze frame, and a freeze frame is the
@@ -881,7 +1038,7 @@ def perframe(job: Job) -> Emission:
     root = job.path("allframes")
     cols = {k: [] for k in ("t", "brightness", "contrast", "saturation",
                             "temperature", "sharpness", "motion")}
-    hashes, black, unreadable = [], 0, 0
+    idxs, hashes, black, unreadable = [], [], 0, 0
     prev_small = None
 
     for n, e in enumerate(entries):
@@ -915,6 +1072,7 @@ def perframe(job: Job) -> Emission:
         prev_small = small
 
         cols["t"].append(e["t"])
+        idxs.append(int(e.get("i", n)))
         cols["brightness"].append(round(bright, 4))
         cols["contrast"].append(round(float(v.std()), 4))
         cols["saturation"].append(round(float(s.mean()), 4))
@@ -950,6 +1108,21 @@ def perframe(job: Job) -> Emission:
     em = Emission()
     em.artifact("perframe", job.path("allframes/perframe.json"),
                 {"frames": measured, "metrics": len(cols) - 1})
+
+    # The curves, into the database. `t` is not among them: time is derived
+    # from the frame index everywhere else in this system and storing a second
+    # copy here would be the one place it could disagree.
+    for name in ("brightness", "contrast", "saturation", "temperature",
+                 "sharpness", "motion"):
+        em.frame_metric(name, idxs, cols[name])
+
+    # Freeze spans as run-length claims, so "where did it stall" is a query
+    # rather than a file that no longer exists.
+    if hashes:
+        em.frame_runs("style", "freeze",
+                      [(idxs[i], cols["t"][i],
+                        "freeze" if (i and hashes[i] == hashes[i - 1]) else None)
+                       for i in range(len(hashes))], confidence=0.9)
 
     for name in ("brightness", "contrast", "saturation", "temperature",
                  "sharpness", "motion"):

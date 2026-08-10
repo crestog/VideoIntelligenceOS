@@ -248,17 +248,20 @@ try:
 except Exception as e:
     print(f"⚠️ [SECRETS] Preflight unavailable: {e}", flush=True)
 
-# ── Restore hint ───────────────────────────────────────────────────────────
+# ── Restore notice ─────────────────────────────────────────────────────────
 # A fresh container has an empty database: scratch is wiped and PostgreSQL runs
 # from the Debian default data directory on that same ephemeral disk, so last
 # session's narratives are gone. The bundles in the channel are the only copy.
 #
-# Deliberately a hint and not an automatic restore. It would have to run here,
-# before ignition, and at this point omni_engine has not started PostgreSQL
-# yet — so the Postgres half of a bundle could not be loaded, and a restore
-# that silently recovers the harvest DB while dropping the narratives is worse
-# than none. Restore is a two-step action in the admin panel instead, where it
-# runs against live services and states what it will overwrite first.
+# The restore still cannot happen *here*. At this point omni_engine has not
+# started PostgreSQL, so the Postgres half of a bundle could not be loaded, and
+# a restore that silently recovers the harvest DB while dropping the narratives
+# is worse than none. That reasoning did not change — the action moved instead.
+# `vios/process/routes.py: autostart` now runs it from the web process, where
+# the services are live: it waits for Postgres, restores the harvest database if
+# and only if it is empty, replays every evidence shard in the channel, and then
+# reconciles the coverage table so nothing already done is processed again.
+# This block says so, and says how to turn it off.
 if is_fresh_session:
     try:
         import sqlite3
@@ -274,12 +277,14 @@ if is_fresh_session:
                 _c.close()
         if _posts == 0:
             print("", flush=True)
-            print("📦 [RESTORE] Empty database on a fresh container.", flush=True)
-            print("      If a bundle was exported previously, open /admin →", flush=True)
-            print("      Database Restore → Check for a Bundle to continue that", flush=True)
-            print("      database instead of re-narrating every reel.", flush=True)
+            print("📦 [RESTORE] Empty database on a fresh container —", flush=True)
+            print("      automatic restore armed. Once the services are up it", flush=True)
+            print("      pulls the last bundle, replays every evidence shard,", flush=True)
+            print("      and marks what is already done so it is not redone.", flush=True)
+            print("      Watch it at /process. VIOS_PROCESS_AUTOSTART=0 turns", flush=True)
+            print("      it off; /admin → Database Restore is the manual path.", flush=True)
     except Exception:
-        pass          # a hint that cannot be printed is not worth a warning
+        pass          # a notice that cannot be printed is not worth a warning
 
 print("", flush=True)
 print("=" * 60, flush=True)

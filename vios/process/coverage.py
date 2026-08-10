@@ -330,6 +330,59 @@ class Coverage:
              video_key, component))
         self.conn.commit()
 
+    def reconcile(self, rows: list) -> dict:
+        """Mark done every pass whose evidence this database already holds.
+
+        This is the step that makes "nothing is ever reprocessed" true rather
+        than hopeful. A restore replays shards into the evidence tables and does
+        not touch this one, so after it the two disagree: the claims are back
+        and the work table still reads `queued`. Left alone, the sweep re-earns
+        with the GPU what the channel already had.
+
+        `rows` is `(video_key, component, observer_id, claims, vectors,
+        seconds)` — already decided by the caller, because deciding *what
+        counts as evidence* needs the registry and this module deliberately
+        does not import it. What belongs here is the write, and its rules:
+
+        Rows already `done` are left exactly as they are — their `claims` and
+        `seconds` are the record of the run that produced them and are not
+        overwritten by a count taken after the fact. `running` rows are left
+        because another worker holds that lease and stealing it would let two
+        workers believe they own the same pass. `skipped` rows are left because
+        a decline is terminal and was made for a stated reason.
+
+        Returns per-component counts: "reconciled 4 118 rows" is a number an
+        operator has to trust, and a breakdown is what makes it checkable
+        against the coverage matrix on the same screen.
+        """
+        rows = [r for r in (rows or []) if r and r[0] and r[1]]
+        if not rows:
+            return {"rows": 0, "matched": 0, "per_component": {}, "videos": 0}
+
+        now = time.time()
+        per, vids = {}, set()
+        payload = []
+        for video_key, component, oid, claims, vectors, seconds in rows:
+            payload.append((now, float(seconds or 0.0), int(claims or 0),
+                            int(vectors or 0), oid or "", video_key, component))
+            per[component] = per.get(component, 0) + 1
+            vids.add(video_key)
+
+        cur = self.conn.executemany(
+            "UPDATE coverage SET state=?, done_at=?, seconds=?, "
+            "claims=?, vectors=?, observer_id=?, lease_until=0, token=NULL, "
+            "next_try_at=0, last_error=NULL, checkpoint=NULL "
+            "WHERE video_key=? AND component=? AND state IN (?,?)",
+            [(DONE,) + p + (QUEUED, FAILED) for p in payload])
+        self.conn.commit()
+        changed = max(cur.rowcount, 0)
+        # `executemany` reports one total across every statement, so the
+        # per-component tally is an upper bound whenever some rows were already
+        # done. Scaling it down would invent precision; reporting both numbers
+        # is the honest shape.
+        return {"rows": changed, "matched": len(payload),
+                "per_component": per, "videos": len(vids)}
+
     def fail(self, video_key: str, component: str, error: str) -> str:
         """Record a failure. Returns the resulting state.
 
@@ -362,6 +415,28 @@ class Coverage:
             (state, str(error)[:800], next_try, video_key, component))
         self.conn.commit()
         return state
+
+    def defer(self, video_key: str, component: str, why: str,
+              retry_after: float = 300.0) -> None:
+        """Put the row back without spending an attempt.
+
+        The difference from `fail()` is the whole point: `attempts` is not
+        incremented and `MAX_ATTEMPTS` is never approached, because nothing
+        failed. A NIM account with forty requests a minute will defer thousands
+        of times across an archive, and every one of those is the system
+        working correctly — the pass is simply waiting for its turn.
+
+        `last_error` still carries the reason so the tab can say what is being
+        waited on, and `deferred()` already reports rows with a future
+        `next_try_at`, so this needs no new state value and no migration.
+        """
+        self.conn.execute(
+            "UPDATE coverage SET state=?, last_error=?, lease_until=0, "
+            "next_try_at=?, worker=NULL, token=NULL "
+            "WHERE video_key=? AND component=?",
+            (QUEUED, str(why)[:800], time.time() + max(5.0, float(retry_after)),
+             video_key, component))
+        self.conn.commit()
 
     def skip(self, video_key: str, component: str, why: str) -> None:
         """Terminal, but not a failure: no audio means no transcription, and
@@ -446,6 +521,114 @@ class Coverage:
             e["eta_seconds"] = round(left * e["seconds"], 1) if e["seconds"] else None
         return sorted(by.values(), key=lambda e: e["component"])
 
+    def stage_report(self, stage: str, components: list) -> dict:
+        """Everything one registry stage did, and everything it broke on.
+
+        A stage is the unit the operator actually reasons about — "perception
+        finished, language is where it went wrong" — and it is the unit the
+        channel bundle is cut on, so this report is what travels with the
+        database. It is built entirely from columns that already exist; a stage
+        is a grouping of components, not a new kind of state, and inventing a
+        `stage` column would have created a second place for the truth to live.
+
+        `errors` carries the individual rows rather than the grouped summary
+        `failures()` returns, because the bundle is read later by someone who no
+        longer has the session in front of them: the video key is the only thing
+        that makes a failure reproducible, and a count of eleven is not.
+
+        `observers` is per component and is the audit trail. Two revisions of
+        the same pass produce two observer ids, and a bundle that lists both is
+        the record of which reading each claim came from.
+        """
+        comps = [c for c in (components or []) if c]
+        out = {
+            "stage": stage,
+            "components": comps,
+            "videos": 0,
+            "counts": {s: 0 for s in (QUEUED, RUNNING, DONE, FAILED, SKIPPED)},
+            "claims": 0, "vectors": 0, "seconds": 0.0,
+            "per_component": [], "errors": [], "observers": {},
+            "started": None, "ended": None, "complete": False,
+        }
+        out["counts"]["total"] = 0
+        if not comps:
+            return out
+
+        marks = ",".join("?" * len(comps))
+        mine = self._mine()          # " AND video_key IN (...)" — goes in WHERE
+        per: dict = {}
+        for r in self.conn.execute(
+                f"SELECT component, state, COUNT(*) n, SUM(claims) c, "
+                f"SUM(vectors) v, SUM(seconds) s, MIN(started_at) t0, "
+                f"MAX(done_at) t1 FROM coverage WHERE component IN ({marks})"
+                + mine + " GROUP BY component, state", comps):
+            e = per.setdefault(r["component"], {
+                "component": r["component"], "total": 0,
+                QUEUED: 0, RUNNING: 0, DONE: 0, FAILED: 0, SKIPPED: 0,
+                "claims": 0, "vectors": 0, "seconds": 0.0})
+            e[r["state"]] = r["n"]
+            e["total"] += r["n"]
+            e["claims"] += r["c"] or 0
+            e["vectors"] += r["v"] or 0
+            e["seconds"] += round(r["s"] or 0.0, 2)
+            out["counts"][r["state"]] = out["counts"].get(r["state"], 0) + r["n"]
+            out["counts"]["total"] += r["n"]
+            out["claims"] += r["c"] or 0
+            out["vectors"] += r["v"] or 0
+            out["seconds"] += r["s"] or 0.0
+            if r["t0"] and (out["started"] is None or r["t0"] < out["started"]):
+                out["started"] = r["t0"]
+            if r["t1"] and (out["ended"] is None or r["t1"] > out["ended"]):
+                out["ended"] = r["t1"]
+
+        out["seconds"] = round(out["seconds"], 2)
+        out["per_component"] = [per[c] for c in comps if c in per]
+
+        row = self.conn.execute(
+            f"SELECT COUNT(DISTINCT video_key) n FROM coverage "
+            f"WHERE component IN ({marks})" + mine, comps).fetchone()
+        out["videos"] = row["n"] or 0
+
+        for r in self.conn.execute(
+                f"SELECT component, observer_id, COUNT(*) n FROM coverage "
+                f"WHERE component IN ({marks}) AND observer_id IS NOT NULL"
+                + mine + " GROUP BY component, observer_id", comps):
+            out["observers"].setdefault(r["component"], []).append(
+                {"observer_id": r["observer_id"], "videos": r["n"]})
+
+        # Every row that carries an error and is not done, not just the ones
+        # that have given up. `fail()` returns a row to `queued` with a backoff
+        # until its attempts are spent, so filtering on state='failed' would
+        # hide the entire first two attempts of every failure — which is most of
+        # them, and the ones a bundle is read to diagnose. The state travels
+        # with the row so "still retrying" and "out of attempts" stay distinct.
+        #
+        # Deliberately unbounded in row count but bounded in text: a list
+        # truncated to twenty would hide exactly the long tail it exists to
+        # preserve, while a 4 KB traceback repeated four hundred times would
+        # swamp the file it travels in.
+        for r in self.conn.execute(
+                f"SELECT video_key, component, state, attempts, revivals, "
+                f"last_error, done_at, next_try_at FROM coverage "
+                f"WHERE component IN ({marks}) AND state<>? "
+                f"AND last_error IS NOT NULL AND last_error<>''" + mine
+                + " ORDER BY component, video_key",
+                comps + [DONE]):
+            out["errors"].append({
+                "video_key": r["video_key"], "component": r["component"],
+                "state": r["state"],
+                "retrying": r["state"] not in TERMINAL
+                            and (r["attempts"] or 0) < MAX_ATTEMPTS,
+                "attempts": r["attempts"] or 0, "revivals": r["revivals"] or 0,
+                "error": (r["last_error"] or "")[:400],
+                "at": r["done_at"], "next_try_at": r["next_try_at"] or 0})
+
+        left = (out["counts"][QUEUED] + out["counts"][RUNNING]
+                + out["counts"][FAILED])
+        out["complete"] = bool(out["counts"]["total"]) and left == 0
+        out["remaining"] = left
+        return out
+
     def running(self) -> list:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM coverage WHERE state=? ORDER BY started_at", (RUNNING,))]
@@ -474,6 +657,40 @@ class Coverage:
             due = e.pop("due", 0) or 0
             e["retry_in"] = round(max(due - now, 0)) if due and e["retrying"] else 0
             rows.append(e)
+        return rows
+
+    def recent_errors(self, limit: int = 40) -> list:
+        """Individual error rows, newest first — what the tab's panel lists.
+
+        `failures()` groups by component and message, which is the right shape
+        for "what is wrong with this run" and the wrong shape for "what just
+        went wrong". Both exist because both questions get asked, and answering
+        the second from the first means an operator watching a sweep sees a
+        count go from 4 to 5 with no way to learn which video it was.
+
+        Includes rows that `fail()` returned to `queued` with a backoff, for the
+        same reason `stage_report` does: those are the first two attempts of
+        every failure, so a panel filtered to `state='failed'` would show
+        nothing at all until a video had already failed three times.
+        """
+        rows = []
+        for r in self.conn.execute(
+                "SELECT video_key, component, state, attempts, revivals, "
+                "last_error, done_at, next_try_at FROM coverage "
+                "WHERE state<>? AND last_error IS NOT NULL AND last_error<>''"
+                + self._mine()
+                + " ORDER BY COALESCE(done_at,0) DESC LIMIT ?",
+                (DONE, max(1, min(int(limit), 300)))):
+            rows.append({
+                "video_key": r["video_key"], "component": r["component"],
+                "state": r["state"],
+                "retrying": r["state"] not in TERMINAL
+                            and (r["attempts"] or 0) < MAX_ATTEMPTS,
+                "attempts": r["attempts"] or 0,
+                "revivals": r["revivals"] or 0,
+                "error": (r["last_error"] or "")[:400],
+                "at": r["done_at"] or 0,
+                "next_try_at": r["next_try_at"] or 0})
         return rows
 
     def retry_state(self) -> dict:

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import importlib
 
-from .base import Emission, Job, ModelCache, SkipPass  # noqa: F401 — re-export
+from .base import DeferPass, Emission, Job, ModelCache, SkipPass  # noqa: F401
 
 # component id → (module in this package, function name)
 RUNNERS: dict = {
@@ -48,6 +48,7 @@ RUNNERS: dict = {
     "faces":          ("vision", "faces"),
     "depth":          ("vision", "depth"),
     "visual-embed":   ("vision", "visual_embed"),
+    "clip-embed":     ("vision", "clip_embed"),
     "tag":            ("signal", "tag"),
     "aesthetic":      ("vision", "aesthetic"),
 
@@ -60,6 +61,9 @@ RUNNERS: dict = {
     "text-embed":     ("language", "text_embed"),
     "hook":           ("signal", "hook"),
     "narrate-deep":   ("language", "narrate_deep"),
+
+    # stage 3 — language, on someone else's GPUs
+    "narrate-cloud":  ("cloud", "narrate_cloud"),
 }
 
 _cache: dict = {}

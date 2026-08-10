@@ -759,6 +759,7 @@ except Exception as _capture_exc:      # pragma: no cover - import guard
 # design and nothing else, and a torch that will not import on this box must
 # not cost the operator the capture tab as well.
 try:
+    from vios.process import routes as _process_routes
     from vios.process.routes import process_router
     app.include_router(process_router)
     _PROCESS_READY = True
@@ -766,6 +767,53 @@ except Exception as _process_exc:      # pragma: no cover - import guard
     _PROCESS_READY = False
     _PROCESS_WHY = f"{type(_process_exc).__name__}: {_process_exc}"
     custom_print(f"⚠️ process tab unavailable — {_PROCESS_WHY}")
+
+
+def _v1_liveness() -> dict:
+    """What the first-generation plane is doing, for the Process tab.
+
+    The tab used to print "Nothing running" whenever the v2 engine was idle,
+    which on a session where the ghost worker was downloading and the vision
+    worker was captioning was flatly untrue — and the operator's reasonable
+    conclusion was that the processing plane had died.
+
+    Nothing here may raise or block for long: it is called on a status poll that
+    happens once a second per open tab. `get_queue_metrics` is a Redis
+    round-trip, so it is cached, and a Redis that is down returns empty rather
+    than an error page.
+    """
+    out = {"status": globals().get("GLOBAL_STATUS", "")}
+    cached = cache_get("v1:liveness", 2.0)
+    if cached is None:
+        depths, busy = {}, 0
+        try:
+            metrics = get_queue_metrics()
+        except Exception:
+            metrics = {}
+        for q, m in (metrics or {}).items():
+            if not isinstance(m, dict) or q.startswith("_"):
+                continue
+            pend = int(m.get("pending_total") or 0)
+            proc = int(m.get("processing") or 0)
+            if pend or proc:
+                depths[q] = {"pending": pend, "processing": proc,
+                             "dead": int(m.get("dead_letter") or 0)}
+            busy += proc
+        cached = cache_put("v1:liveness", {"queues": depths, "busy": busy},
+                           2.0)
+    out.update(cached)
+    # "Working" is claimed only on evidence: a job actually in a processing
+    # list. A non-empty pending queue with no worker touching it is a backlog,
+    # not activity, and calling it activity would be the same lie in reverse.
+    out["working"] = bool(cached.get("busy"))
+    return out
+
+
+if _PROCESS_READY:
+    try:
+        _process_routes.set_v1_probe(_v1_liveness)
+    except Exception as _probe_exc:     # pragma: no cover
+        custom_print(f"⚠️ v1 liveness probe not registered — {_probe_exc}")
 
 
 # A tab that failed to import must still answer, or the page it backs shows a
@@ -1215,6 +1263,23 @@ if __name__ == "__main__":
                     break
 
     threading.Thread(target=start_cloudflared, daemon=True).start()
+
+    # The processing plane starts itself. Everything the tab reported before
+    # this line was accurate — nothing had ever started it, so a session left
+    # alone for twelve hours did twelve hours of nothing. Armed after the
+    # server thread so the tab is answering by the time the first step is
+    # reported, and delayed so the restore's channel scan is not competing with
+    # boot for the same seconds.
+    #
+    # `VIOS_PROCESS_AUTOSTART=0` turns it off for a session opened to read the
+    # database rather than to add to it.
+    if _PROCESS_READY:
+        try:
+            _process_routes.autostart(delay=25.0)
+            custom_print("🎬 [PROCESS] autostart armed — restore, then sweep "
+                         "(VIOS_PROCESS_AUTOSTART=0 to disable)")
+        except Exception as e:
+            custom_print(f"⚠️ [PROCESS] autostart could not be armed: {e}")
 
     def run_server():
         uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error")

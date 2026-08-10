@@ -43,7 +43,9 @@ mid-sweep, the next one re-reads the shards and continues.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -53,8 +55,9 @@ from . import intake, media, registry, resources
 from .coverage import Coverage, worker_id
 from .runners import get as get_runner
 from .runners import missing as missing_runners
-from .runners.base import Job, ModelCache, SkipPass
+from .runners.base import DeferPass, Job, ModelCache, SkipPass
 from .store import Store
+from .store import observer_id as store_observer_id
 
 from ..capture.upload import Telegram, UploadError
 
@@ -65,6 +68,17 @@ IDLE, RUNNING, PAUSED, STOPPING, ERROR = (
 # a few hundred kilobytes gzipped — small enough that a killed session loses
 # almost nothing, large enough that the channel does not fill with noise.
 PUBLISH_EVERY = 50
+
+# One stage bundle part. The Bot API refuses a document over 50 MB and this
+# engine's uploader has no MTProto document path, so a bundle that would exceed
+# it is split rather than lost. 45 leaves room for the multipart envelope.
+STAGE_PART_BYTES = 45 * 1024 * 1024
+
+# Bundle file naming. Kept distinct from `intake.SHARD_PREFIX` on purpose: a
+# restore walking the channel must be able to tell a replayable delta from a
+# whole-database snapshot by filename alone, because downloading the wrong one
+# and replaying it would either do nothing or duplicate a database.
+STAGE_PREFIX = "vios-stage-"
 
 # Extra VRAM to leave unclaimed, *on top of* the 1 GB `resources.probe` already
 # holds back. The allocator fragments over a twelve-hour session in a way a
@@ -78,6 +92,20 @@ CACHE_BUDGET_MB = 12_000
 DISK_FLOOR_MB = 4_000
 
 IDLE_POLL_SECONDS = 90
+
+# How recently the channel must have been scanned for the sweep to trust the
+# scan and not repeat it. The boot restore and `restore_on_start` do the same
+# walk over thousands of messages, seconds apart, and the second one downloads
+# nothing — but it still costs the minutes the first one cost. Ten minutes is
+# far longer than the gap between them and far shorter than a session, so a
+# sweep restarted hours later scans properly.
+SHARDS_FRESH_SECONDS = 10 * 60
+
+# `frame 320/900`, `window 64/1200`, `shots 12-19 of 40` — every runner's
+# heartbeat string that carries a position. Matching once here turns the live
+# panel's progress bar into a number the engine computed rather than one the
+# browser guessed from a label.
+_PROGRESS_RE = re.compile(r"(\d+)\s*(?:/|\s+of\s+)\s*(\d+)")
 
 # artifact kind (as the store records it) → the file it writes in the workdir.
 # Used to notice that a later cohort's input has been evicted.
@@ -156,6 +184,23 @@ class ProcessEngine:
         self.disk_floor_mb = DISK_FLOOR_MB
         self.video_limit = 0            # 0 = the whole partition
 
+        # When this container last replayed shards from the channel. The boot
+        # restore and `restore_on_start` are the same scan over thousands of
+        # messages, and the autostart runs the first one moments before the
+        # second — so the sweep asks this before repeating it. A timestamp
+        # rather than a flag on the setting: the operator's choice to restore on
+        # start is theirs and is not quietly rewritten, it is only not obeyed
+        # twice in the same minute.
+        self._shards_at = 0.0
+
+        # What the last reconcile matched. Kept because the number is the whole
+        # answer to "will it process the archive again?", and an operator asking
+        # that question at hour six cannot scroll back to the boot log to find
+        # it. `at=0` means no reconcile has run yet, which is a different
+        # statement from "it ran and matched nothing" and is reported as such.
+        self._reconciled = {"at": 0.0, "rows": 0, "videos": 0, "matched": 0,
+                            "per_component": {}, "error": ""}
+
         # Folders searched for a reel's bytes before Telegram is asked. The
         # capture engine's own scratch is here by default, which is what lets a
         # session process what it just captured without a round trip through
@@ -181,8 +226,8 @@ class ProcessEngine:
         self.cohort_index = -1
         self.current: dict = {}
         self.session = {"videos": 0, "passes": 0, "claims": 0, "vectors": 0,
-                        "skipped": 0, "failed": 0, "seconds": 0.0,
-                        "downloaded": 0, "shards": 0}
+                        "skipped": 0, "failed": 0, "deferred": 0,
+                        "seconds": 0.0, "downloaded": 0, "shards": 0}
         self.last_publish: float | None = None
         self.since_publish = 0
 
@@ -249,8 +294,18 @@ class ProcessEngine:
             return self._cov
 
     def _log(self, text: str, level: str = "info") -> None:
+        """One activity line, and stdout too when it is a fault.
+
+        The ring buffer holds 500 entries and dies with the process, so it is
+        the wrong and only place for an error to live. Warnings and errors are
+        also printed, which on Kaggle means they land in the cell output that
+        outlives the session — the log someone actually reads when asking why
+        a twelve-hour run stopped producing.
+        """
         self._activity.append({"at": time.time(), "level": level,
                                "text": str(text)[:400]})
+        if level in ("warn", "error"):
+            print(f"[process] {level}: {str(text)[:400]}", flush=True)
 
     # ══════════════════════════════════════════════════════════════════════
     # Configuration
@@ -578,7 +633,8 @@ class ProcessEngine:
             self.started_at = time.time()
             self.session = {"videos": 0, "passes": 0, "claims": 0,
                             "vectors": 0, "skipped": 0, "failed": 0,
-                            "seconds": 0.0, "downloaded": 0, "shards": 0}
+                            "deferred": 0, "seconds": 0.0,
+                            "downloaded": 0, "shards": 0}
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="vios-process")
             self._thread.start()
@@ -674,7 +730,8 @@ class ProcessEngine:
                       + (f" — {got['reason']}" if got.get("reason") else ""))
 
         self._open_channel()
-        if self.restore_on_start and self._channel and self._channel.ready:
+        if (self.restore_on_start and self._channel and self._channel.ready
+                and time.time() - self._shards_at > SHARDS_FRESH_SECONDS):
             self.message = "Replaying evidence shards from the channel."
             self._log("Scanning the channel for evidence shards")
             got = intake.restore_shards(
@@ -683,12 +740,16 @@ class ProcessEngine:
                     self, "message",
                     f"Replaying shards — {seen}/{head} messages, {n} imported"),
                 should_stop=self._stopping)
+            self._shards_at = time.time()
             self._log(f"Shards: {got.get('imported', 0)} imported, "
                       f"{got.get('skipped', 0)} already held, "
                       f"{got.get('claims', 0)} claims recovered"
                       + (f" — {got['reason']}" if got.get("reason") else ""))
             for e in got.get("errors", [])[:5]:
                 self._log(f"shard: {e}", "warn")
+        elif self.restore_on_start and self._shards_at:
+            self._log("Shards were replayed moments ago by the boot restore — "
+                      "not scanning the channel twice")
 
         self._source = intake.Source(self._tg, self._channel, self._log,
                                      local_dirs=self.video_dirs)
@@ -720,6 +781,32 @@ class ProcessEngine:
                 self._log(f"Auto-revived {revived['revived']} failed rows "
                           f"(exhausted: {revived['exhausted']})")
 
+            # The restore above put evidence back without touching the work
+            # table, and `plan` has just created a queued row for every pair it
+            # covers. This is the moment the two disagree, and the only moment
+            # both halves exist to be compared — reconciling before `plan` would
+            # update rows that are not there yet, and reconciling in the caller
+            # would cover the autostart path and miss the Start button.
+            #
+            # Repeated once per rotation, not once per session: `plan` adds rows
+            # whenever a newly captured video arrives or a component is enabled,
+            # and a shard restored by a *different* worker can land at any time.
+            # The scan is four grouped counts over indexed columns.
+            try:
+                with self._lock:
+                    self.message = "Matching restored evidence to the work table."
+                self.reconcile_now(runnable)
+            except Exception as exc:               # noqa: BLE001
+                # A reconcile that fails costs repeated work and nothing else:
+                # the passes it would have marked done simply run again and
+                # collapse on their uids. Never a reason to refuse to process.
+                self._log(f"Reconcile failed, continuing: "
+                          f"{type(exc).__name__}: {exc}", "warn")
+                with self._lock:
+                    self._reconciled = {
+                        **self._reconciled, "at": time.time(),
+                        "error": f"{type(exc).__name__}: {exc}"[:300]}
+
             budget = max(res.get("usable_vram_mb", 0) - self.vram_headroom_mb,
                          512)
             cohorts = registry.plan_cohorts(
@@ -729,6 +816,23 @@ class ProcessEngine:
                 self.cohorts = [c.as_dict() for c in cohorts]
             self._log(f"Plan: {len(cohorts)} cohorts over {len(runnable)} "
                       f"passes, {budget} MB per card")
+            self._preflight_cloud(runnable)
+
+            # Where each registry stage ends. A cohort is a VRAM grouping and
+            # can straddle two stages, so the boundary is "the last cohort that
+            # holds any component of this stage" — computed from the plan rather
+            # than assumed from cohort order, because the packer is free to
+            # split a stage across cohorts and routinely does.
+            stage_end: dict = {}
+            for c in cohorts:
+                for cid in c.components:
+                    comp = registry.BY_ID.get(cid)
+                    if comp is not None:
+                        stage_end[comp.stage_name] = max(
+                            stage_end.get(comp.stage_name, -1), c.index)
+            ends_at: dict = {}
+            for st, idx in stage_end.items():
+                ends_at.setdefault(idx, []).append(st)
 
             worked = 0
             for cohort in cohorts:
@@ -737,6 +841,12 @@ class ProcessEngine:
                 worked += self._run_cohort(cohort)
                 self._unload(f"cohort {cohort.index} complete")
                 self._publish(f"cohort-{cohort.index}")
+                self._retry_pending_stages(runnable)
+                for st in ends_at.get(cohort.index, []):
+                    if self._stopping():
+                        break
+                    self._publish_stage(
+                        st, registry.components_in_stage(st, runnable))
 
             if self._stopping():
                 break
@@ -767,6 +877,10 @@ class ProcessEngine:
                     self._log("Sweep complete"
                               + (f"; {deferred['rows']} rows deferred to a "
                                  f"later run" if deferred["rows"] else ""))
+                    # The sweep is the point at which a stage's standing is
+                    # final for this run, so any stage whose bundle never went
+                    # up gets its last chance here rather than next session.
+                    self._retry_pending_stages(runnable)
                     return
                 with self._lock:
                     self.message = ("Caught up. Watching for new captures — "
@@ -904,9 +1018,24 @@ class ProcessEngine:
             self.session["skipped"] += 1
             return "skipped"
 
+        # A dependency that deferred has not failed — it is waiting on a clock.
+        # Skipping this pass would make a rate limit permanent for the video,
+        # so it waits with it.
+        waiting = [n for n in comp.needs if states.get(n) == "deferred"]
+        if waiting:
+            why = f"waiting on {', '.join(waiting)}, which is deferred"
+            cov.defer(key, cid, why, 300.0)
+            self.session["deferred"] = self.session.get("deferred", 0) + 1
+            return "deferred"
+
         with self._lock:
             self.current.update({"component": cid, "title": comp.title,
-                                 "component_since": time.time(), "note": ""})
+                                 "component_since": time.time(), "note": "",
+                                 "detail": "", "detail_at": 0.0,
+                                 "frames_done": 0, "frames_total": 0})
+        # So a load or unload fault names the pass that provoked it rather than
+        # whichever pass happened to be running when the log was read.
+        self._cache.context = cid
 
         params = dict(comp.params)
         if self._hf_token:
@@ -916,6 +1045,7 @@ class ProcessEngine:
             workdir=workdir, params=params, resources=self.resources,
             cache=self._cache,
             renew=lambda progress="", k=key, c=cid: cov.renew(k, c, progress),
+            progress=self._progress,
             log=self._note)
 
         t0 = time.time()
@@ -928,15 +1058,42 @@ class ProcessEngine:
             self.session["skipped"] += 1
             self._log(f"{key} · {cid}: skipped — {exc}")
             return "skipped"
+        except DeferPass as exc:
+            # Not a failure and not a skip: the work is runnable, the moment
+            # is wrong. No attempt is spent, so an archive cannot exhaust its
+            # retries against a rate limit that clears on its own.
+            wait = max(30.0, min(float(getattr(exc, "retry_after", 300.0)),
+                                 3600.0))
+            cov.defer(key, cid, str(exc), wait)
+            self.session["deferred"] = self.session.get("deferred", 0) + 1
+            self._log(f"{key} · {cid}: deferred {wait:.0f}s — {exc}")
+            return "deferred"
         except (KeyboardInterrupt, SystemExit):
             cov.release(key, cid)
             raise
         except Exception as exc:
-            state = cov.fail(key, cid, f"{type(exc).__name__}: {exc}")
+            # Name the weights if the fault happened while loading them. A row
+            # that reads "OutOfMemoryError" tells the operator nothing they can
+            # act on; one that reads "loading Qwen/Qwen3-VL-8B-AWQ" tells them
+            # which model to move off this card.
+            blame = self._loading_blame(exc, t0)
+            reason = f"{type(exc).__name__}: {exc}"
+            if blame:
+                reason = f"{reason} [{blame}]"
+            state = cov.fail(key, cid, reason)
             self.session["failed"] += 1
             self._log(f"{key} · {cid}: {type(exc).__name__}: "
-                      f"{str(exc)[:200]}", "error")
+                      f"{str(exc)[:200]}" + (f" — while {blame}" if blame else ""),
+                      "error")
             if self._is_oom(exc):
+                v = ModelCache.vram()
+                self._log(f"Out of VRAM on {cid}"
+                          + (f" while {blame}" if blame else "")
+                          + (f" — {v.get('allocated', 0)} MB allocated, "
+                             f"{v.get('free', 0)} MB free of "
+                             f"{v.get('total', 0)}; resident: "
+                             f"{', '.join(self._cache.loaded()) or 'nothing'}"
+                             if v else ""), "error")
                 self._unload("out of VRAM — dropping every resident model")
             return state
 
@@ -950,6 +1107,19 @@ class ProcessEngine:
             for v in em.vectors:
                 if store.add_vector(key, v["space"], v["values"], observer,
                                     v.get("shot_idx")):
+                    n_vectors += 1
+            # Per-frame embeddings and scalars are packed one row per
+            # (video, space|name, observer), so nine hundred frames of SigLIP
+            # is a single row of about 1.4 MB rather than nine hundred rows of
+            # base64. Counted as vectors for the session tally because that is
+            # what they are to everything downstream.
+            for fv in getattr(em, "frame_vectors", ()):
+                if store.add_frame_vectors(key, fv["space"], fv["frames"],
+                                           fv["matrix"], observer):
+                    n_vectors += 1
+            for fm in getattr(em, "frame_metrics", ()):
+                if store.add_frame_metric(key, fm["name"], fm["frames"],
+                                          fm["values"], observer):
                     n_vectors += 1
             for a in em.artifacts:
                 size = 0
@@ -980,12 +1150,64 @@ class ProcessEngine:
                 self.current["note"] = str(message)[:200]
         self._log(message)
 
+    def _progress(self, detail: str) -> None:
+        """A pass's own report of where it is inside itself.
+
+        Deliberately not logged. `job.heartbeat` fires once per batch, so a
+        900-frame OCR pass produces about thirty of these per video and several
+        thousand per sweep; putting them in the activity ring would push out
+        every error the ring exists to keep. They go to `current` only, which is
+        what the live panel reads.
+
+        `frame 320/900` is parsed into counters here rather than in the browser
+        so the shape stays in one place: the runners already emit that string,
+        and a progress bar in the interface should not depend on a regex in
+        JavaScript agreeing with a format string in Python.
+        """
+        detail = str(detail)[:200]
+        with self._lock:
+            if not self.current:
+                return
+            self.current["detail"] = detail
+            done = total = 0
+            hit = _PROGRESS_RE.search(detail)
+            if hit:
+                done, total = int(hit.group(1)), int(hit.group(2))
+            self.current["frames_done"] = done
+            self.current["frames_total"] = total
+            self.current["detail_at"] = time.time()
+
     @staticmethod
     def _is_oom(exc: Exception) -> bool:
         name = type(exc).__name__
         return ("OutOfMemory" in name
                 or "CUDA out of memory" in str(exc)
                 or "CUBLAS_STATUS_ALLOC_FAILED" in str(exc))
+
+    def _loading_blame(self, exc: Exception, since: float) -> str:
+        """"loading <key>", when this failure came out of a model load.
+
+        `ModelCache` records every load fault as it happens, with the key it
+        was loading. Matching on the exception text rather than re-raising a
+        wrapper keeps the original traceback intact — which is what someone
+        reading the Kaggle log actually needs — while still putting the model
+        name in the coverage row, where it is queryable.
+        """
+        try:
+            msg = str(exc)[:300]
+            for f in reversed(self._cache.recent_failures(8)):
+                if f.get("at", 0) < since - 1.0:
+                    break
+                if f.get("phase") == "load" and f.get("key"):
+                    same = msg and msg[:120] in f.get("error", "")
+                    return (f"loading {f['key']}" if same
+                            else f"loading {f['key']} had just failed")
+        except Exception:
+            pass
+        # Nothing recorded: the fault happened during inference, not during a
+        # load. Saying nothing is the honest answer — naming the resident model
+        # here would blame whichever one happened to be loaded.
+        return ""
 
     # ── the cross-cohort problem ─────────────────────────────────────────
     def _ensure_inputs(self, job: Job, comp) -> None:
@@ -1004,7 +1226,7 @@ class ProcessEngine:
         store already holds it.
         """
         needs = set(comp.needs)
-        if not needs & {"artifacts", "keyframes"}:
+        if not needs & {"artifacts", "keyframes", "allframes"}:
             return
 
         # The artifact table is the authority on what *should* be on disk. A
@@ -1021,6 +1243,51 @@ class ProcessEngine:
         if "keyframes" in needs and not os.path.exists(
                 job.path("frames/index.json")):
             self._rebuild(job, "keyframes", "frame index absent")
+
+        # The complete frame set is the expensive one, and the one every
+        # perception pass now depends on. Without this branch a cohort that
+        # starts after the workdir was evicted would see every full-coverage
+        # pass skip with "no allframes manifest" — coverage marked `allframes`
+        # done in an earlier cohort, so it will never run again on its own.
+        #
+        # The manifest alone is not proof. It lists the frames by name, and the
+        # cache eviction that removed the JPEGs may well have left the small
+        # JSON behind, so a spot check on the first and last frame of the tier
+        # this component actually reads is what decides. Two `os.path.exists`
+        # calls against a re-extraction that costs half a minute.
+        if "allframes" in needs and not self._allframes_present(job, comp):
+            self._rebuild(job, "allframes",
+                          "complete frame set evicted or made elsewhere")
+
+    @staticmethod
+    def _allframes_present(job: Job, comp) -> bool:
+        """Is the frame set this component reads actually on disk right now?"""
+        root = job.path("allframes")
+        mpath = os.path.join(root, "manifest.json")
+        if not os.path.exists(mpath):
+            return False
+        try:
+            with open(mpath, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        entries = manifest.get("frames") or []
+        if not entries:
+            return False
+        tier = str((comp.params or {}).get("tier") or "analysis")
+        if tier == "full" and not manifest.get("full_tier"):
+            # The extractor was asked for one tier and this component wants the
+            # other. Re-extract, so OCR reads source resolution as configured
+            # instead of silently falling back to 384 px for the whole archive.
+            return False
+        for probe in (entries[0], entries[-1]):
+            rel = str(probe.get("file") or "")
+            if tier != "analysis" and rel.startswith("analysis/"):
+                rel = tier + rel[len("analysis"):]
+            if not os.path.exists(os.path.join(root, rel.replace("/", os.sep))):
+                return False
+        return True
 
     def _rebuild(self, job: Job, what: str, why: str) -> None:
         """Re-run a structural pass whose output this cohort needs.
@@ -1054,11 +1321,39 @@ class ProcessEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _unload(self, why: str = "") -> None:
+        """Drop every resident model and say what actually came back.
+
+        The reclaimed total is logged against the cohort that held the models,
+        because that is the only moment the number is attributable. A leak
+        found later — as an OOM in the next cohort — names the wrong pass.
+        """
         loaded = self._cache.loaded()
-        self._cache.unload_all()
-        if loaded:
-            self._log(f"Unloaded {len(loaded)} models"
-                      + (f" — {why}" if why else ""))
+        expected = sum(self._cache.footprints().get(k, 0) for k in loaded)
+        before = ModelCache.vram()
+        freed = self._cache.unload_all()
+        after = ModelCache.vram()
+        if not loaded:
+            return
+
+        line = (f"Unloaded {len(loaded)} models — {freed} MB reclaimed"
+                + (f" of {expected} MB held" if expected else "")
+                + (f" — {why}" if why else ""))
+        self._log(line)
+        if after:
+            self._log(f"VRAM now {after.get('allocated', 0)} MB allocated, "
+                      f"{after.get('free', 0)} MB free of "
+                      f"{after.get('total', 0)}; resident: "
+                      f"{', '.join(self._cache.loaded()) or 'nothing'}")
+        # Still resident after an unload_all means a drop raised and the
+        # reference survived. Loud, because the packer's next plan is wrong.
+        if self._cache.loaded():
+            self._log(f"Models still resident after unload: "
+                      f"{', '.join(self._cache.loaded())} — the next cohort "
+                      f"is planned against VRAM that is not free", "error")
+        elif expected >= 512 and freed < expected // 2 and before:
+            self._log(f"Only {freed} MB of {expected} MB came back after "
+                      f"{why or 'unload'} — the next cohort has that much "
+                      f"less than the packer assumed", "warn")
 
     def _publish(self, note: str) -> str:
         """Export everything written since the last shard and send it up.
@@ -1072,9 +1367,19 @@ class ProcessEngine:
         with self._lock:
             lo_id = int(store.get_meta("shard_lo_id", "0") or 0)
             lo_vec = int(store.get_meta("shard_lo_vec", "0") or 0)
+            # Per-frame rows are watermarked separately for the same reason
+            # claims and vectors always were: a cohort of embedding passes
+            # writes `frame_vector` rows and nothing else, so keying their
+            # export off the claim range would upload an empty shard and then
+            # advance past the work as though it had been published.
+            lo_fvec = int(store.get_meta("shard_lo_fvec", "0") or 0)
+            lo_fmet = int(store.get_meta("shard_lo_fmet", "0") or 0)
             hi_id = store.max_claim_id()
             hi_vec = store.max_vector_id()
-            if hi_id <= lo_id and hi_vec <= lo_vec:
+            hi_fvec = store.max_frame_vector_id()
+            hi_fmet = store.max_frame_metric_id()
+            if (hi_id <= lo_id and hi_vec <= lo_vec
+                    and hi_fvec <= lo_fvec and hi_fmet <= lo_fmet):
                 self.since_publish = 0
                 return ""
 
@@ -1083,17 +1388,22 @@ class ProcessEngine:
             path = os.path.join(self.shard_dir, intake.shard_name(sid))
             try:
                 stats = store.export_shard(path, lo_id, hi_id, lo_vec, hi_vec,
-                                           note)
+                                           note, lo_fvec, hi_fvec,
+                                           lo_fmet, hi_fmet)
             except Exception as exc:
                 self._log(f"Shard export failed: {type(exc).__name__}: {exc}",
                           "error")
                 return ""
 
+            frame_note = ""
+            if stats["frame_vectors"] or stats["frame_metrics"]:
+                frame_note = (f"\n{stats['frame_vectors']} frame-vector rows, "
+                              f"{stats['frame_metrics']} frame-metric rows")
             msg_id = None
             if self._tg and self._tg.token:
                 caption = (f"vios evidence · {sid}\n"
                            f"{stats['claims']} claims, {stats['vectors']} "
-                           f"vectors\nworker {self.index + 1}/"
+                           f"vectors{frame_note}\nworker {self.index + 1}/"
                            f"{self.partitions} · {note}")
                 try:
                     res = self._tg.send_document(
@@ -1111,6 +1421,8 @@ class ProcessEngine:
             # counted, which is the honest state: exported, not yet published.
             store.set_meta("shard_lo_id", str(stats["hi_id"]))
             store.set_meta("shard_lo_vec", str(stats["hi_vec"]))
+            store.set_meta("shard_lo_fvec", str(stats["hi_fvec"]))
+            store.set_meta("shard_lo_fmet", str(stats["hi_fmet"]))
             store.set_meta("shard_seq", str(seq))
             store.checkpoint()
 
@@ -1119,6 +1431,8 @@ class ProcessEngine:
             self.session["shards"] += 1
             self._log(f"Shard {sid}: {stats['claims']} claims, "
                       f"{stats['vectors']} vectors, "
+                      f"{stats['frame_vectors']} frame-vector rows, "
+                      f"{stats['frame_metrics']} frame-metric rows, "
                       f"{stats['bytes'] / 1024:.0f} KB"
                       + (f" → message {msg_id}" if msg_id else
                          " (held locally — no upload)"))
@@ -1131,6 +1445,366 @@ class ProcessEngine:
         closing a Kaggle session early."""
         sid = self._publish("manual")
         return {"ok": bool(sid), "shard": sid}
+
+    # ── stage bundles ────────────────────────────────────────────────────
+    #
+    # A shard is a delta and a bundle is a database. Both are needed and they
+    # answer different questions. The shard is what makes ten workers converge:
+    # it replays into any database by uid, idempotently, in any order. The
+    # bundle is what makes one *stage* debuggable on its own — it is the whole
+    # file as it stood when perception finished, with the stage's own error list
+    # beside it, so "language went wrong" can be investigated without first
+    # replaying four hundred shards to reconstruct the state it went wrong from.
+    #
+    # Coverage lives inside `evidence.db` (`Coverage` is constructed on the
+    # store's own connection), so one file carries both what was learned and
+    # what is left to learn, consistent with each other. That is why the bundle
+    # is one database and not two.
+
+    def _stage_signature(self, report: dict) -> str:
+        """A short fingerprint of a stage's standing.
+
+        Re-uploading an identical database because a later cohort happened to
+        re-enter the same stage would cost a multi-hundred-megabyte transfer and
+        add nothing, so a bundle is cut only when this string changes.
+        """
+        c = report.get("counts", {})
+        return (f"{c.get('total', 0)}:{c.get('done', 0)}:{c.get('skipped', 0)}:"
+                f"{c.get('failed', 0)}:{report.get('claims', 0)}:"
+                f"{report.get('vectors', 0)}")
+
+    def _stage_bundle_file(self, stage: str, seq: int) -> str:
+        return (f"{STAGE_PREFIX}{intake.site_id(self.store)}-{stage}-"
+                f"{seq:04d}.tar.gz")
+
+    def _build_stage_bundle(self, stage: str, report: dict, path: str) -> dict:
+        """Snapshot the database and the stage report into one gzip tarball.
+
+        `VACUUM INTO` rather than a file copy: it takes its own read transaction,
+        so the snapshot is consistent even though this engine is the writer, and
+        it compacts free pages that a copy would faithfully reproduce. The copy
+        is the fallback for an SQLite too old to have it (3.27, 2019 — Kaggle is
+        far newer, but a fallback that costs six lines is cheaper than a bundle
+        that does not exist).
+        """
+        import shutil          # noqa: PLC0415
+        import tarfile         # noqa: PLC0415
+
+        work = os.path.join(self.shard_dir, f"_stage-{stage}")
+        os.makedirs(work, exist_ok=True)
+        snap = os.path.join(work, "evidence.sqlite")
+        meta_path = os.path.join(work, "stage.json")
+        for p in (snap, meta_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+        self.store.checkpoint()
+        try:
+            self.store.conn.execute("VACUUM INTO ?", (snap,))
+        except Exception as exc:                # noqa: BLE001
+            self._log(f"stage {stage}: VACUUM INTO unavailable "
+                      f"({type(exc).__name__}) — falling back to a file copy",
+                      "warn")
+            shutil.copy2(self.db_path, snap)
+
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        with tarfile.open(path, "w:gz", compresslevel=6) as tar:
+            tar.add(meta_path, arcname="stage.json")
+            tar.add(snap, arcname="evidence.sqlite")
+
+        out = {"bytes": os.path.getsize(path),
+               "db_bytes": os.path.getsize(snap)}
+        for p in (snap, meta_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return out
+
+    def _split_parts(self, path: str) -> list:
+        """[path] when it fits, or the .partNNN files when it does not.
+
+        The Bot API refuses a document over 50 MB and this uploader has no
+        MTProto document path. Splitting is the difference between a large
+        archive publishing its bundles and silently publishing none of them.
+        """
+        size = os.path.getsize(path)
+        if size <= STAGE_PART_BYTES:
+            return [path]
+        parts, idx = [], 0
+        with open(path, "rb") as fin:
+            while True:
+                part = f"{path}.part{idx:03d}"
+                written = 0
+                with open(part, "wb") as fout:
+                    while written < STAGE_PART_BYTES:
+                        block = fin.read(min(1 << 20,
+                                             STAGE_PART_BYTES - written))
+                        if not block:
+                            break
+                        fout.write(block)
+                        written += len(block)
+                if written == 0:
+                    os.remove(part)
+                    break
+                parts.append(part)
+                idx += 1
+                if written < STAGE_PART_BYTES:
+                    break
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return parts
+
+    def _publish_stage(self, stage: str, components: list,
+                       force: bool = False) -> dict:
+        """Cut this stage's bundle and send it up. Never raises.
+
+        Order is load-bearing, and it is the same order `_publish` uses for the
+        same reason: the watermark advances **last**. A bundle whose upload fails
+        leaves `stage_done:<stage>` untouched and the stage name in
+        `stage_pending`, so the next publish tick tries again. Nothing is
+        recorded as published that is not in the channel.
+
+        A failure here never propagates. The bundle is a convenience for
+        debugging a stage in isolation; the database and the shards are the
+        durable record, and losing a snapshot must not stop the next stage from
+        running.
+        """
+        out = {"stage": stage, "ok": False, "reason": ""}
+        try:
+            report = self.coverage.stage_report(stage, components)
+        except Exception as exc:                # noqa: BLE001
+            out["reason"] = f"stage report failed: {type(exc).__name__}: {exc}"
+            self._log(f"stage {stage}: {out['reason']}", "error")
+            return out
+
+        sig = self._stage_signature(report)
+        store = self.store
+        if not force and store.get_meta(f"stage_sig:{stage}", "") == sig:
+            out["reason"] = "unchanged since the last bundle"
+            return out
+        if not report.get("counts", {}).get("total"):
+            out["reason"] = "no rows in this stage"
+            return out
+
+        # The delta first, so the shard stream stays continuous and a reader
+        # that only follows shards is never behind the bundle.
+        self._publish(f"stage-{stage}")
+
+        stats = store.stats()
+        report = dict(report)
+        report.update({
+            "site_id": intake.site_id(store),
+            "worker": {"index": self.index, "partitions": self.partitions,
+                       "id": self.worker},
+            "schema": stats.get("schema"),
+            "store": {k: stats.get(k) for k in (
+                "videos", "shots", "claims", "frame_claims", "frames_claimed",
+                "vectors", "frame_vectors", "frame_vector_frames",
+                "frame_metrics", "frame_metric_frames", "observers",
+                "artifacts", "shards")},
+            "frames": stats.get("frames_claimed", 0),
+            "cut_at": time.time(),
+            "signature": sig,
+        })
+
+        seq = int(store.get_meta("stage_seq", "0") or 0) + 1
+        name = self._stage_bundle_file(stage, seq)
+        path = os.path.join(self.shard_dir, name)
+        try:
+            built = self._build_stage_bundle(stage, report, path)
+        except Exception as exc:                # noqa: BLE001
+            out["reason"] = f"bundle build failed: {type(exc).__name__}: {exc}"
+            self._log(f"stage {stage}: {out['reason']}", "error")
+            self._mark_stage_pending(stage, add=True)
+            return out
+
+        mb = built["bytes"] / 1048576.0
+        self._log(f"stage {stage}: bundle {name} — {report['videos']} videos, "
+                  f"{report['claims']} claims, {report['vectors']} vectors, "
+                  f"{len(report['errors'])} errors, {mb:.1f} MB")
+
+        if not (self._tg and self._tg.token):
+            # A local-only session still gets the file, and still records that
+            # it has not been published. The bundle is on disk to be uploaded by
+            # hand or by a later session that has credentials.
+            out.update({"ok": False, "reason": "no Telegram credentials",
+                        "path": path, "bytes": built["bytes"]})
+            self._mark_stage_pending(stage, add=True)
+            return out
+
+        parts = self._split_parts(path)
+        msg_ids, failed = [], ""
+        for i, part in enumerate(parts):
+            caption = (
+                f"vios stage bundle · {stage} · {intake.site_id(store)}\n"
+                f"{report['videos']} videos · {report['claims']} claims · "
+                f"{report['vectors']} vectors\n"
+                f"{report['counts'].get('done', 0)} done, "
+                f"{report['counts'].get('skipped', 0)} skipped, "
+                f"{report['counts'].get('failed', 0)} failed · "
+                f"{len(report['errors'])} errors\n"
+                f"worker {self.index + 1}/{self.partitions}"
+                + (f" · part {i + 1}/{len(parts)}" if len(parts) > 1 else ""))
+            try:
+                res = self._tg.send_document(
+                    part, caption, file_name=os.path.basename(part))
+                msg_ids.append(int(res.get("message_id") or 0))
+            except UploadError as exc:
+                failed = str(exc)[:200]
+                break
+            except Exception as exc:            # noqa: BLE001
+                failed = f"{type(exc).__name__}: {str(exc)[:200]}"
+                break
+
+        # The local copies are scratch either way. On success they are in the
+        # channel; on failure the retry rebuilds from the database, which has
+        # moved on and is the better source anyway. Leaving half a split bundle
+        # in the shard directory would only fill the disk the next cohort needs.
+        for part in parts:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+        if failed or len(msg_ids) != len(parts):
+            out["reason"] = failed or "upload incomplete"
+            self._log(f"stage {stage}: bundle not uploaded — {out['reason']}",
+                      "warn")
+            self._mark_stage_pending(stage, add=True)
+            return out
+
+        # Pinned like `db_export`'s manifest so a restore finds the newest
+        # bundle in one getChat rather than a history walk the Bot API cannot do.
+        pinned = False
+        try:
+            pinned = bool(self._tg.pin(msg_ids[-1]))
+        except Exception:                       # noqa: BLE001
+            pinned = False
+
+        record = {"stage": stage, "seq": seq, "file": name,
+                  "parts": len(parts), "message_ids": msg_ids,
+                  "bytes": built["bytes"], "pinned": pinned,
+                  "at": time.time(), "signature": sig,
+                  "videos": report["videos"], "claims": report["claims"],
+                  "vectors": report["vectors"],
+                  "errors": len(report["errors"]),
+                  "complete": report.get("complete", False)}
+
+        # Watermark last. Everything above is inert until these three writes.
+        store.set_meta("stage_seq", str(seq))
+        store.set_meta(f"stage_done:{stage}", json.dumps(record))
+        store.set_meta(f"stage_sig:{stage}", sig)
+        self._mark_stage_pending(stage, add=False)
+        store.checkpoint()
+
+        self._log(f"stage {stage}: bundle published → message "
+                  f"{msg_ids[-1]}" + ("" if pinned else " (pin failed)"))
+        out.update({"ok": True, "record": record})
+        return out
+
+    def _mark_stage_pending(self, stage: str, add: bool) -> None:
+        """Remember a stage whose bundle did not make it up, or forget it.
+
+        Kept in `meta` rather than in memory because the reason a bundle fails
+        is usually that Telegram is refusing connections, and that outlives the
+        process far more often than it outlives the session.
+        """
+        try:
+            store = self.store
+            cur = json.loads(store.get_meta("stage_pending", "[]") or "[]")
+            if not isinstance(cur, list):
+                cur = []
+        except Exception:                       # noqa: BLE001
+            cur = []
+        if add and stage not in cur:
+            cur.append(stage)
+        elif not add and stage in cur:
+            cur = [s for s in cur if s != stage]
+        else:
+            return
+        try:
+            self.store.set_meta("stage_pending", json.dumps(cur))
+        except Exception:                       # noqa: BLE001
+            pass
+
+    def _retry_pending_stages(self, planned: list) -> None:
+        """Re-attempt every stage bundle that failed to upload earlier.
+
+        Called on the ordinary publish tick, which is the point: a stage never
+        waits on the one before it, and a transport outage costs a retry rather
+        than a bundle.
+        """
+        try:
+            pending = json.loads(
+                self.store.get_meta("stage_pending", "[]") or "[]")
+        except Exception:                       # noqa: BLE001
+            return
+        if not isinstance(pending, list) or not pending:
+            return
+        for stage in list(pending):
+            if self._stopping():
+                return
+            comps = registry.components_in_stage(stage, planned)
+            if not comps:
+                self._mark_stage_pending(stage, add=False)
+                continue
+            self._log(f"stage {stage}: retrying the bundle upload")
+            self._publish_stage(stage, comps, force=True)
+
+    def publish_stage_now(self, stage: str = "") -> dict:
+        """Manual cut, for the tab and for "I am about to close this session"."""
+        planned = list(self.selected)
+        names = ([stage] if stage else registry.stages_of(planned))
+        out = []
+        for s in names:
+            comps = registry.components_in_stage(s, planned)
+            if comps:
+                out.append(self._publish_stage(s, comps, force=True))
+        return {"ok": any(r.get("ok") for r in out), "stages": out}
+
+    def stage_status(self) -> list:
+        """Per-stage standing plus its last bundle, for the tab."""
+        planned = list(self.selected)
+        rows = []
+        try:
+            store, cov = self.store, self.coverage
+        except Exception:                       # noqa: BLE001
+            return rows
+        try:
+            pending = json.loads(store.get_meta("stage_pending", "[]") or "[]")
+        except Exception:                       # noqa: BLE001
+            pending = []
+        for s in registry.stages_of(planned):
+            comps = registry.components_in_stage(s, planned)
+            try:
+                rep = cov.stage_report(s, comps)
+            except Exception as exc:            # noqa: BLE001
+                rows.append({"stage": s, "components": comps,
+                             "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            try:
+                last = json.loads(store.get_meta(f"stage_done:{s}", "") or "{}")
+            except Exception:                   # noqa: BLE001
+                last = {}
+            rep["bundle"] = last or None
+            rep["bundle_pending"] = s in pending
+            # The error list travels in the bundle in full; the tab gets the
+            # most recent slice so the panel stays readable on a bad day.
+            rep["error_count"] = len(rep.get("errors", []))
+            rep["errors"] = rep.get("errors", [])[-25:]
+            rows.append(rep)
+        return rows
 
     # ══════════════════════════════════════════════════════════════════════
     # Transport
@@ -1177,6 +1851,7 @@ class ProcessEngine:
             return live
 
         pending = 0
+        stages: list = []
         try:
             stats = self.store.stats()
             matrix = self.coverage.matrix()
@@ -1185,8 +1860,22 @@ class ProcessEngine:
             running = self.coverage.running()
             retry = self.coverage.retry_state()
             shards = self.store.shards()
-            pending = max(self.store.max_claim_id() -
-                          int(self.store.get_meta("shard_lo_id", "0") or 0), 0)
+            # Per-stage standing, including each stage's last channel bundle.
+            # Cheap enough for the two-second cache: it is the same GROUP BY the
+            # matrix already runs, sliced four ways rather than thirty-four.
+            stages = self.stage_status()
+            # Unpublished rows across every watermarked table, not just claims.
+            # An embedding cohort writes no claims at all, and reporting "0
+            # pending" while a gigabyte of per-frame vectors sits unexported is
+            # exactly the kind of quiet lie this panel exists to prevent.
+            pending = 0
+            for table, mark in (
+                    (self.store.max_claim_id, "shard_lo_id"),
+                    (self.store.max_vector_id, "shard_lo_vec"),
+                    (self.store.max_frame_vector_id, "shard_lo_fvec"),
+                    (self.store.max_frame_metric_id, "shard_lo_fmet")):
+                pending += max(
+                    table() - int(self.store.get_meta(mark, "0") or 0), 0)
         except Exception as exc:
             stats, matrix, counts, failures, running, shards = (
                 {}, [], {}, [], [], [])
@@ -1227,6 +1916,11 @@ class ProcessEngine:
                        "published": self.session["shards"],
                        "last_at": self.last_publish,
                        "pending": pending},
+            "stages": stages,
+            # What the last reconcile spared. Sits next to `shards` because the
+            # two are one story: the channel gave the evidence back, and this is
+            # how much of the work table that evidence already answered.
+            "reconciled": dict(self._reconciled),
             "telegram": {
                 "configured": bool(self._tg and self._tg.token),
                 "mtproto": bool(self._channel and self._channel.ready),
@@ -1254,9 +1948,60 @@ class ProcessEngine:
             "current": cur,
             "session": dict(self.session),
             "loaded": self._cache.loaded(),
+            # What the GPU is actually doing, next to what the packer assumed
+            # it would be doing. A leak is visible here as a resident set whose
+            # footprints do not add up to the allocated total.
+            "models": {
+                "resident": self._cache.loaded(),
+                "footprints_mb": self._cache.footprints(),
+                "vram": ModelCache.vram(),
+                "failures": self._cache.recent_failures(10),
+            },
             "uptime": (round(time.time() - self.started_at, 1)
                        if self.started_at else 0),
+            "cloud": self._cloud_status(),
         }
+
+    def _preflight_cloud(self, runnable: list) -> None:
+        """Ask NIM what this key can reach, once, before the sweep starts.
+
+        Only when a cloud pass is actually planned — a run with no cloud
+        component should not spend a request, and an operator with no key
+        should see nothing about NIM at all. Doing it here rather than on the
+        first video means a wrong `VIOS_NIM_MODEL` is one clear line at the top
+        of the log, naming the models that do exist, instead of five thousand
+        identical 404s.
+        """
+        try:
+            if not any(registry.get(cid).family == "cloud"
+                       for cid in runnable):
+                return
+            from .runners.cloud import client  # noqa: PLC0415
+            nim = client()
+            if not nim.configured():
+                self._log("A cloud pass is planned but VIOS_NIM_API_KEY is "
+                          "not set — it will be skipped with that reason",
+                          "warn")
+                return
+            nim.preflight(self._log)
+        except Exception as exc:                # noqa: BLE001
+            self._log(f"NIM preflight raised {type(exc).__name__}: "
+                      f"{str(exc)[:160]}", "warn")
+
+    def _cloud_status(self) -> dict:
+        """NIM budget and usage, for the tab.
+
+        Imported here rather than at module scope so a web process with no
+        `openai` package still renders the tab. Exhaustion must never be
+        silent: calls made, deferrals and the last limit error are all on
+        screen, because the alternative is an archive that quietly stops
+        gaining its deepest reading and nobody notices for a day.
+        """
+        try:
+            from .runners.cloud import client  # noqa: PLC0415
+            return client().status()
+        except Exception:
+            return {"configured": False}
 
     def activity(self, limit: int = 120) -> list:
         items = list(self._activity)
@@ -1290,6 +2035,132 @@ class ProcessEngine:
         self._log(f"Sync: {got.get('added', 0)} new videos of "
                   f"{got.get('seen', 0)} uploaded")
         return got
+
+    # ── reconcile: what the channel already answered ─────────────────────
+    def expected_observers(self, components=None) -> dict:
+        """`{component: observer_id}` for the build that is about to run.
+
+        Derived, never registered: `Store.observer` bumps a run counter, and
+        asking "has this already been done" must not leave a fingerprint saying
+        it was done here.
+        """
+        out = {}
+        for cid in (components if components is not None else self.selected):
+            comp = registry.BY_ID.get(cid)
+            if comp is None:
+                continue
+            out[cid] = store_observer_id(
+                cid, comp.model or comp.family, comp.revision, comp.params)
+        return out
+
+    def reconcile_now(self, components=None) -> dict:
+        """Mark done every selected pass whose evidence is already here.
+
+        Runs after a restore and again at the top of every sweep. Without it a
+        fresh container replays five thousand videos' worth of shards into the
+        evidence tables, opens an empty coverage table beside them, and
+        processes the entire archive a second time — which is the "it
+        reprocesses everything" complaint exactly.
+
+        Two different questions, answered two different ways, and the split is
+        the whole design:
+
+        **A pass that writes evidence is judged only on its own evidence**,
+        keyed on `observer_id`. A revision bump is how a pass says "the old
+        reading is superseded"; matching on the component alone would let the
+        superseded reading satisfy the new one and silently cancel the upgrade
+        the bump was for.
+
+        **A pass that writes no evidence is inferred from its dependants.**
+        `probe`, `artifacts`, `shots`, `keyframes` and `allframes` produce
+        working files, not rows — a restored database holds no trace of them,
+        so an evidence check would leave all five queued for every video in the
+        archive and the sweep would download five thousand videos to rebuild
+        frames nothing is waiting for. But if `ocr` has claims for a video from
+        the current observer, then `allframes` demonstrably ran for that video:
+        the dependency edge is the proof. Their outputs are rebuilt on demand
+        by `_ensure_inputs` the moment a pass actually needs them, which is the
+        same guarantee that already lets cohort 1 run after cohort 0's workdir
+        was evicted.
+
+        The inference is applied *only* to passes that write nothing. Closing
+        the dependency graph over evidence-writing passes would be the exact
+        inversion described above — `tag` at an unchanged revision would mark a
+        freshly bumped `visual-embed` as done — so it is deliberately not done.
+        """
+        sel = list(components if components is not None else self.selected)
+        if not sel:
+            return {"rows": 0, "matched": 0, "per_component": {}, "videos": 0}
+
+        store, cov = self.store, self.coverage
+        expected = self.expected_observers(sel)
+        writes_rows = {cid for cid in sel
+                       if {"claims", "vectors", "metrics"}
+                       & set(registry.BY_ID[cid].produces)}
+        by_observer = {expected[cid]: cid for cid in writes_rows
+                       if expected.get(cid)}
+
+        evidence = store.evidence_by_observer(set(by_observer))
+        if not evidence:
+            # Recorded, not just returned. "Reconciled nothing" and "never
+            # reconciled" look identical on a panel that only shows a count, and
+            # they mean opposite things: the first says the archive is genuinely
+            # new to this build, the second says the step did not happen and the
+            # sweep is about to redo work. The timestamp is what separates them.
+            out = {"rows": 0, "matched": 0, "per_component": {}, "videos": 0,
+                   "message": "No restored evidence matches this build."}
+            with self._lock:
+                self._reconciled = {"at": time.time(), "error": "", **out}
+            return out
+
+        # Which structure pass each evidence-writing pass proves, transitively.
+        silent = [cid for cid in sel if cid not in writes_rows]
+        implied: dict = {}
+        for cid in writes_rows:
+            seen, stack = set(), list(registry.BY_ID[cid].needs)
+            while stack:
+                n = stack.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                stack.extend(registry.BY_ID[n].needs if n in registry.BY_ID
+                             else ())
+            implied[cid] = [n for n in seen if n in silent]
+
+        rows = []
+        for video_key, seen in evidence.items():
+            proved = set()
+            for oid, counts in seen.items():
+                cid = by_observer.get(oid)
+                if not cid:
+                    continue                      # a superseded revision
+                rows.append((video_key, cid, oid,
+                             counts.get("claims", 0), counts.get("vectors", 0),
+                             0.0))
+                proved.update(implied.get(cid, ()))
+            for cid in proved:
+                # Zero seconds and zero counts: this row was inferred, not run,
+                # and the coverage matrix should not claim a duration for work
+                # that happened on another machine on another day.
+                rows.append((video_key, cid, expected.get(cid, ""), 0, 0, 0.0))
+
+        out = cov.reconcile(rows)
+        with self._lock:
+            self._reconciled = {"at": time.time(), "rows": out.get("rows", 0),
+                                "videos": out.get("videos", 0),
+                                "matched": out.get("matched", 0),
+                                "per_component": dict(
+                                    out.get("per_component") or {}),
+                                "error": ""}
+        if out.get("rows"):
+            top = sorted(out["per_component"].items(),
+                         key=lambda kv: -kv[1])[:6]
+            self._log(
+                f"Reconciled {out['rows']} passes across {out['videos']} "
+                f"videos from evidence already held — "
+                + ", ".join(f"{c} {n}" for c, n in top)
+                + (" …" if len(out["per_component"]) > 6 else ""))
+        return out
 
     def adopt_folder_now(self, folder: str) -> dict:
         """Take every video in a folder into the work table.
