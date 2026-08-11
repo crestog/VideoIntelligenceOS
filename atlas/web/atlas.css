@@ -927,6 +927,74 @@ body[data-player-size="theatre"] .screen{
 .gkind .n{ font-family:var(--mono); font-size:10px; opacity:.65; }
 .gmode.on{ background:var(--text); color:var(--ink); border-color:var(--text); font-weight:600; }
 
+/* ── what colour and size mean ──
+   Stacked one per row rather than side by side, so the two labels line up and
+   neither select has to clip "by indexed moments" to fit half a rail. */
+.grail-encode{ display:flex; flex-direction:column; gap:6px; }
+.gsel{
+  display:flex; align-items:center; gap:8px;
+  padding:3px 5px 3px 12px; border-radius:99px;
+  background:rgba(17,30,33,.9); backdrop-filter:blur(9px);
+  border:1px solid var(--line);
+  font-family:var(--mono); font-size:10.5px; color:var(--dim);
+  letter-spacing:.05em; text-transform:uppercase;
+}
+.gsel > span{ flex:0 0 42px; }
+.gsel select{
+  flex:1 1 auto; min-width:0; height:26px;
+  background:transparent; border:0; cursor:pointer;
+  font-family:var(--body); font-size:12.5px; color:var(--text);
+  letter-spacing:0; text-transform:none;
+}
+.gsel select:focus{ outline:none; }
+.gsel:focus-within{ border-color:var(--line-2); }
+/* The rail is a translucent panel, but the dropdown list is drawn by the
+   platform and inherits none of it — without this the options land as dark
+   text on a dark surface in Firefox and on Windows. */
+.gsel option{ background:var(--ink-2); color:var(--text); }
+
+/* ── layout tuning, folded away ──
+   Closed, it is one more pill in the rail. A reader who is happy with the
+   layout should never have to look at the constants that produced it. */
+.grail-tune{
+  background:rgba(17,30,33,.9); backdrop-filter:blur(9px);
+  border:1px solid var(--line); border-radius:var(--r);
+}
+.grail-tune > summary{
+  padding:7px 12px; cursor:pointer; list-style:none;
+  font-family:var(--mono); font-size:10.5px; color:var(--dim);
+  letter-spacing:.06em; text-transform:uppercase;
+}
+.grail-tune > summary::-webkit-details-marker{ display:none; }
+.grail-tune > summary::after{ content:'  ▾'; opacity:.55; white-space:pre; }
+.grail-tune[open] > summary::after{ content:'  ▴'; }
+.grail-tune > summary:hover{ color:var(--text); }
+.gtune{
+  display:flex; align-items:center; gap:9px; padding:4px 12px;
+  font-family:var(--mono); font-size:10.5px; color:var(--dim);
+  letter-spacing:.05em; text-transform:uppercase; cursor:pointer;
+}
+.gtune:last-child{ padding-bottom:10px; }
+.gtune > span{ flex:0 0 58px; }
+/* Its own track rules rather than reusing `.mini-range`'s: that block belongs to
+   the search head, and reaching across two sections to share a thumb would mean
+   either section could not be restyled alone. */
+.gtune input[type="range"]{
+  -webkit-appearance:none; appearance:none;
+  flex:1 1 auto; height:3px; border-radius:2px; background:var(--line-2);
+  cursor:pointer; outline:none;
+}
+.gtune input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none;
+  width:12px; height:12px; border-radius:50%;
+  background:var(--text); border:none; cursor:pointer;
+}
+.gtune input[type="range"]::-moz-range-thumb{
+  width:12px; height:12px; border-radius:50%;
+  background:var(--text); border:none; cursor:pointer;
+}
+.gtune input[type="range"]:focus-visible::-webkit-slider-thumb{ background:var(--signal); }
+
 /* ── tools, bottom right, away from the detail slab ── */
 .graph-tools{
   position:absolute; right:calc(var(--gutter) + 0px); bottom:18px; z-index:8;
@@ -961,6 +1029,41 @@ body[data-player-size="theatre"] .screen{
   font-family:var(--mono); font-size:10.5px; color:var(--dim);
   max-width:38ch; line-height:1.8; pointer-events:none;
 }
+/* The key for a continuous colour. It only exists while one is on, so it is
+   appended and removed rather than hidden — an empty ramp reads as a scale
+   whose ends happen to be blank. */
+.glegend-scale{
+  display:flex; align-items:center; gap:7px; margin-top:7px;
+  font-size:10px; color:var(--muted);
+}
+.gls-bar{
+  display:flex; height:7px; width:104px; flex:none;
+  border-radius:2px; overflow:hidden; border:1px solid var(--line);
+}
+.gls-bar i{ flex:1 1 auto; }
+.gls-t{ white-space:nowrap; }
+.gls-l{ color:var(--dim); letter-spacing:.06em; text-transform:uppercase; }
+
+/* ── the minimap ──
+   Above the tools, not beside them: the row along the bottom is already full,
+   and the map has to stay clear of the legend on the left. */
+.graph-minimap{
+  position:absolute; right:var(--gutter); bottom:56px; z-index:8;
+  width:180px; height:120px;
+  background:rgba(11,20,22,.72); backdrop-filter:blur(9px);
+  border:1px solid var(--line); border-radius:var(--r-sm);
+  overflow:hidden; box-shadow:0 14px 34px rgba(0,0,0,.45);
+  opacity:.66; transition:opacity .16s var(--ease), border-color .16s var(--ease);
+}
+.graph-minimap:hover{ opacity:1; border-color:var(--line-2); }
+.graph-minimap[hidden]{ display:none; }
+#graphMini{
+  display:block; width:100%; height:100%;
+  cursor:crosshair; touch-action:none;
+}
+/* On a narrow window the map costs more room than the orientation it buys, and
+   the rail above it is already competing for the same corner. */
+@media (max-width:900px){ .graph-minimap{ display:none; } }
 
 .graph-empty{
   position:absolute; inset:0; display:grid; place-content:center;

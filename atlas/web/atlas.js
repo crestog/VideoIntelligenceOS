@@ -1837,6 +1837,13 @@ const G = {
   labelBoxes: [],
   traceFrom: null,            // first end of a "how are these two related" ask
   pathSet: null, pathEdges: null,
+  colorBy: 'kind', sizeBy: 'degree',
+  mini: null,                 // the minimap's world→map transform
+  spread: 3, pull: 3, labels: 3,
+  // Ranges for whatever continuous encoding is active, recomputed when the node
+  // set changes. Without them a scale would rescale on every repaint and the
+  // same node would change colour while nothing about it had.
+  scale: null,
 };
 
 const GRAPH_TICK = {
@@ -1865,8 +1872,91 @@ const RAW_SOURCE_COLOR = {
   ocr: '#E8705C', caption: '#8A9BA8', meta: '#6E7F8C',
 };
 
+/* A cool-to-hot ramp for the continuous encodings. It stays inside the palette
+   — dim through cyan to amber — so a heat scale still reads as Atlas and the
+   amber end keeps meaning "this is the one you want". */
+const GRAMP = ['#3C5F63', '#4E8890', '#5EC8D8', '#B9F18D', '#FFB020'];
+
+function gramp(t) {
+  if (!(t >= 0)) return GRAMP[0];
+  const x = Math.max(0, Math.min(0.999, t)) * (GRAMP.length - 1);
+  const i = Math.floor(x), f = x - i;
+  const a = GRAMP[i], b = GRAMP[Math.min(GRAMP.length - 1, i + 1)];
+  const mix = (p) => {
+    const av = parseInt(a.slice(p, p + 2), 16), bv = parseInt(b.slice(p, p + 2), 16);
+    return Math.round(av + (bv - av) * f).toString(16).padStart(2, '0');
+  };
+  return '#' + mix(1) + mix(3) + mix(5);
+}
+
+/* What each continuous encoding reads off a node. Returning null means "this
+   node has no value for this question" — it keeps the node visible in the
+   neutral tone rather than pretending it sits at zero. */
+function gvalue(node, what) {
+  const m = node.meta || {};
+  if (what === 'reach') return Number(node.deg) || 0;
+  if (what === 'recency') {
+    let t = Number(m.created_at);
+    if (!isFinite(t) || !t) return null;
+    if (t > 1e11) t = t / 1000;
+    return t;
+  }
+  if (what === 'moments') return Number(m.moments) || (Number(node.weight) || 0);
+  if (what === 'duration') {
+    const d = Number(m.duration);
+    return isFinite(d) && d > 0 ? d : null;
+  }
+  return null;
+}
+
+/* One pass over the live set fixes the domain of whichever scale is on. Log for
+   counts, because one hub with 400 links would otherwise flatten everything
+   else onto the same colour. */
+function gscale() {
+  const what = G.colorBy !== 'kind' && G.colorBy !== 'source' ? G.colorBy : null;
+  const sizeWhat = G.sizeBy === 'degree' || G.sizeBy === 'flat' ? null : G.sizeBy;
+  const dom = {};
+  for (const key of [what, sizeWhat]) {
+    if (!key) continue;
+    let lo = Infinity, hi = -Infinity;
+    for (const n of G.nodes.values()) {
+      const v = gvalue(n, key);
+      if (v === null) continue;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    dom[key] = lo <= hi ? { lo, hi } : null;
+  }
+  G.scale = dom;
+}
+
+function gnorm(node, key) {
+  if (!key) return null;
+  const d = G.scale && G.scale[key];
+  const v = gvalue(node, key);
+  if (!d || v === null) return null;
+  if (d.hi === d.lo) return 1;
+  // Counts are log-scaled; a timestamp is already linear in the thing a reader
+  // means by "more recent", so it is not.
+  if (key === 'recency') return (v - d.lo) / (d.hi - d.lo);
+  const l = Math.log2(Math.max(0, v) + 1);
+  const llo = Math.log2(Math.max(0, d.lo) + 1);
+  const lhi = Math.log2(Math.max(0, d.hi) + 1);
+  return lhi === llo ? 1 : (l - llo) / (lhi - llo);
+}
+
 function gcolor(node) {
   if (!node) return '#6E7F8C';
+  if (G.colorBy === 'reach' || G.colorBy === 'recency') {
+    const t = gnorm(node, G.colorBy);
+    return t === null ? '#3C5F63' : gramp(t);
+  }
+  if (G.colorBy === 'source') {
+    // Every node the evidence hues apply to, not only tags: a video shows the
+    // type of evidence that put it on the canvas.
+    const s = (node.meta && node.meta.source) || null;
+    return RAW_SOURCE_COLOR[s] || (node.kind === 'video' ? KIND_COLOR.video : '#6E7F8C');
+  }
   if (node.kind === 'tag') {
     const s = node.meta && node.meta.source;
     return RAW_SOURCE_COLOR[s] || KIND_COLOR.tag;
@@ -1875,11 +1965,26 @@ function gcolor(node) {
 }
 
 function gradius(node) {
+  if (G.sizeBy === 'flat') return node.kind === 'video' ? 11 : 9;
+  if (G.sizeBy !== 'degree') {
+    const t = gnorm(node, G.sizeBy);
+    // No value for the chosen measure: sit at the small end rather than vanish.
+    return 7 + (t === null ? 0 : t * 17);
+  }
   // Degree decides size, on a log curve: a creator with 400 videos should read
   // as bigger than one with 4, not a hundred times bigger.
   const w = Math.max(1, Number(node.weight) || 1);
   if (node.kind === 'video') return 9 + Math.min(7, Math.log2(w + 1) * 1.6);
   return 7 + Math.min(19, Math.log2(w + 1) * 3.4);
+}
+
+/* Re-encode without refetching: gdegree already recomputes the domains and
+   every radius in the right order, then the layout settles a little because the
+   spring rest lengths depend on radius. */
+function gre_encode() {
+  gdegree();
+  grenderLegend();
+  gheat(0.28);
 }
 
 const gkey = (e) => `${e.src}|${e.dst}|${e.rel}`;
@@ -1928,12 +2033,17 @@ function gmerge(payload, around) {
 }
 
 function gdegree() {
-  for (const n of G.nodes.values()) { n.deg = 0; n.r = gradius(n); }
+  // Degrees first, then the scale domains, then the radii — in that order,
+  // because a "by how connected" colour reads the degree it is about to scale,
+  // and a "by indexed moments" radius reads the domain that scale computes.
+  for (const n of G.nodes.values()) n.deg = 0;
   for (const e of G.edges.values()) {
     const a = G.nodes.get(e.src), b = G.nodes.get(e.dst);
     if (a) a.deg++;
     if (b) b.deg++;
   }
+  gscale();
+  for (const n of G.nodes.values()) n.r = gradius(n);
 }
 
 const gvisible = (n) => n && !G.off.has(n.kind);
@@ -2045,16 +2155,24 @@ function grepel(root, n, strength) {
   n.vx += fx; n.vy += fy;
 }
 
+/* The two sliders that touch the simulation, as multipliers around the tuned
+   default so the middle notch is exactly today's behaviour. */
+const gspreadMul = () => [0.45, 0.7, 1, 1.55, 2.3][(G.spread | 0) - 1] || 1;
+const gpullMul = () => [0.4, 0.68, 1, 1.5, 2.2][(G.pull | 0) - 1] || 1;
+
 function gtick() {
   const nodes = gliveNodes();
   if (!nodes.length) return;
   const alpha = G.alpha;
   const root = gtree(nodes);
+  const spread = gspreadMul();
 
   for (const n of nodes) {
-    if (root) grepel(root, n, GRAPH_TICK.charge * alpha);
-    n.vx += -n.x * GRAPH_TICK.gravity * alpha;
-    n.vy += -n.y * GRAPH_TICK.gravity * alpha;
+    if (root) grepel(root, n, GRAPH_TICK.charge * spread * alpha);
+    // Gravity resists spread, or turning it up walks the graph off screen
+    // instead of opening it out.
+    n.vx += -n.x * GRAPH_TICK.gravity * spread * alpha;
+    n.vy += -n.y * GRAPH_TICK.gravity * spread * alpha;
   }
 
   for (const { a, b } of gliveEdges()) {
@@ -2063,7 +2181,7 @@ function gtick() {
     // Longer rest length for hubs so their satellites form a readable ring
     // instead of a solid disc of overlapping labels.
     const rest = 58 + a.r + b.r + Math.min(120, (a.deg + b.deg) * 0.9);
-    const pull = (d - rest) * GRAPH_TICK.spring * alpha;
+    const pull = (d - rest) * GRAPH_TICK.spring * gpullMul() * alpha;
     const ux = (dx / d) * pull, uy = (dy / d) * pull;
     // Each end moves in inverse proportion to its own degree — degree is the
     // node's mass here. Without this a creator with 400 videos is dragged
@@ -2253,12 +2371,18 @@ function gdraw() {
   });
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
+  // The labels slider is a radius threshold: at 1 only hubs are named, at 5
+  // everything that fits is. Read once — it is the same for every node, and this
+  // loop runs on every frame.
+  const floor = [16, 12, 9, 6, 0][(G.labels | 0) - 1] ?? 9;
   for (const n of ranked) {
     const p = gtoScreen(n.x, n.y);
     const r = n.r * k;
     if (p.x < -40 || p.y < -40 || p.x > w + 40 || p.y > h + 40) continue;
+    // The selection and the hover are always named, whatever the setting —
+    // those two are answers to a direct question.
     const must = (G.sel && G.sel.id === n.id) || (G.hover && G.hover.id === n.id);
-    if (!must && r < 9) continue;
+    if (!must && r < floor) continue;
     const dim = focus && focus.id !== n.id && near && !near.has(n.id);
     if (dim && !must) continue;
 
@@ -2277,6 +2401,7 @@ function gdraw() {
     ctx.fillText(text, p.x, box.y + 2);
   }
   ctx.globalAlpha = 1;
+  gminidraw();
 }
 
 function gcollides(box) {
@@ -2285,6 +2410,72 @@ function gcollides(box) {
         box.y < b.y + b.h && box.y + box.h > b.y) return true;
   }
   return false;
+}
+
+/* ── the minimap ────────────────────────────────────────────────────────────
+ * The whole graph at a glance, with the window drawn on it. Zooming into a
+ * neighbourhood otherwise costs every landmark, and "fit" is a blunt way back
+ * because it throws away the zoom you had chosen. */
+let gmini = null, gminictx = null;
+
+function gminidraw() {
+  if (!gminictx) return;
+  const cv = gmini;
+  const w = cv.width, hh = cv.height;
+  gminictx.clearRect(0, 0, w, hh);
+
+  const nodes = gliveNodes();
+  if (!nodes.length) return;
+
+  let lo_x = Infinity, lo_y = Infinity, hi_x = -Infinity, hi_y = -Infinity;
+  for (const n of nodes) {
+    if (n.x < lo_x) lo_x = n.x;
+    if (n.x > hi_x) hi_x = n.x;
+    if (n.y < lo_y) lo_y = n.y;
+    if (n.y > hi_y) hi_y = n.y;
+  }
+  // The viewport is included in the extent, so panning off the nodes still
+  // shows the window rather than letting it slide out of the map.
+  const tl = gtoWorld(0, 0), br = gtoWorld(gsize.w, gsize.h);
+  lo_x = Math.min(lo_x, tl.x); lo_y = Math.min(lo_y, tl.y);
+  hi_x = Math.max(hi_x, br.x); hi_y = Math.max(hi_y, br.y);
+
+  const pad = 40;
+  const sx = w / Math.max(1, (hi_x - lo_x) + pad * 2);
+  const sy = hh / Math.max(1, (hi_y - lo_y) + pad * 2);
+  const s = Math.min(sx, sy);
+  const ox = (w - (hi_x - lo_x) * s) / 2 - lo_x * s;
+  const oy = (hh - (hi_y - lo_y) * s) / 2 - lo_y * s;
+  G.mini = { s, ox, oy };
+
+  for (const n of nodes) {
+    const x = n.x * s + ox, y = n.y * s + oy;
+    gminictx.beginPath();
+    gminictx.arc(x, y, Math.max(1.1, n.r * s * 0.9), 0, Math.PI * 2);
+    gminictx.fillStyle = gcolor(n);
+    gminictx.globalAlpha = (G.sel && G.sel.id === n.id) ? 1 : 0.62;
+    gminictx.fill();
+  }
+  gminictx.globalAlpha = 1;
+
+  gminictx.strokeStyle = '#FFB020';
+  gminictx.lineWidth = 1.4;
+  gminictx.strokeRect(tl.x * s + ox, tl.y * s + oy,
+                      (br.x - tl.x) * s, (br.y - tl.y) * s);
+}
+
+/* Clicking the map means "take me there" — the world point under the cursor
+   moves to the centre of the canvas, at whatever zoom is already set. */
+function gminiseek(ev) {
+  if (!G.mini || !gmini) return;
+  const rect = gmini.getBoundingClientRect();
+  const px = (ev.clientX - rect.left) / rect.width * gmini.width;
+  const py = (ev.clientY - rect.top) / rect.height * gmini.height;
+  const wx = (px - G.mini.ox) / G.mini.s;
+  const wy = (py - G.mini.oy) / G.mini.s;
+  G.view.x = gsize.w / 2 - wx * G.view.k;
+  G.view.y = gsize.h / 2 - wy * G.view.k;
+  gdraw();
 }
 
 function groundRect(ctx, x, y, w, hh, r) {
@@ -2935,6 +3126,30 @@ function grenderHud() {
   legend.appendChild(h('div', {
     text: 'drag to move · scroll to zoom · shift-drag a node to pin it',
   }));
+  grenderLegend();
+}
+
+/* A continuous colour with no key is decoration. When a scale is on, the
+   legend says what its two ends mean in the units a reader actually has. */
+function grenderLegend() {
+  const legend = $('graphLegend');
+  const old = legend.querySelector('.glegend-scale');
+  if (old) old.remove();
+  if (G.colorBy === 'kind' || G.colorBy === 'source') return;
+
+  const d = G.scale && G.scale[G.colorBy];
+  const row = h('div', { class: 'glegend-scale' });
+  const label = G.colorBy === 'reach' ? 'links' : 'date';
+  const fmt = (v) => G.colorBy === 'recency' ? (fmtWhen(v) || '—') : fmtInt(v);
+  row.appendChild(h('span', { class: 'gls-t',
+                              text: d ? fmt(d.lo) : 'no value' }));
+  const bar = h('span', { class: 'gls-bar' });
+  for (let i = 0; i < 24; i++)
+    bar.appendChild(h('i', { style: `background:${gramp(i / 23)}` }));
+  row.appendChild(bar);
+  row.appendChild(h('span', { class: 'gls-t', text: d ? fmt(d.hi) : '' }));
+  row.appendChild(h('span', { class: 'gls-l', text: label }));
+  legend.appendChild(row);
 }
 
 let graphFindTimer = 0;
@@ -3173,6 +3388,47 @@ function gwire() {
     G.off.clear();
     graphBoot(true);
   }));
+
+  /* ── how the graph is encoded ──
+   * All five of these read nodes already on screen, so none of them fetches
+   * anything. Colour repaints; size has to settle, because the spring rest
+   * length is a function of radius. */
+  $('graphColorBy').addEventListener('change', (ev) => {
+    G.colorBy = ev.target.value;
+    gscale();
+    grenderLegend();
+    gdraw();
+  });
+  $('graphSizeBy').addEventListener('change', (ev) => {
+    G.sizeBy = ev.target.value;
+    gre_encode();
+  });
+  for (const [id, key] of [['graphSpread', 'spread'], ['graphPull', 'pull']]) {
+    $(id).addEventListener('input', (ev) => {
+      G[key] = Number(ev.target.value) || 3;
+      // A layout change has to be re-simulated to be seen at all.
+      gheat(0.6);
+    });
+  }
+  $('graphLabels').addEventListener('input', (ev) => {
+    G.labels = Number(ev.target.value) || 3;
+    gdraw();   // labels are a paint decision, nothing moves
+  });
+
+  gmini = $('graphMini');
+  if (gmini) {
+    gminictx = gmini.getContext('2d');
+    let miniDown = false;
+    gmini.addEventListener('pointerdown', (ev) => {
+      miniDown = true;
+      gmini.setPointerCapture(ev.pointerId);
+      gminiseek(ev);
+    });
+    // Dragging scrubs the view rather than requiring a click per hop.
+    gmini.addEventListener('pointermove', (ev) => { if (miniDown) gminiseek(ev); });
+    gmini.addEventListener('pointerup', () => { miniDown = false; });
+    gmini.addEventListener('pointercancel', () => { miniDown = false; });
+  }
 
   $('graphQ').addEventListener('input', (ev) => {
     clearTimeout(graphFindTimer);

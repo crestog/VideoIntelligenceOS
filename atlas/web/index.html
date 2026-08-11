@@ -198,6 +198,51 @@
             <button class="gmode on" data-mode="data">Relationships</button>
             <button class="gmode" data-mode="schema">Schema</button>
           </div>
+
+          <!-- Colour and size are the two questions a graph answers without
+               being read: what kind of thing is this, and which ones matter.
+               Both are re-derived from nodes already on screen, so changing
+               either repaints and never refetches. -->
+          <div class="grail-encode">
+            <label class="gsel">
+              <span>colour</span>
+              <select id="graphColorBy">
+                <option value="kind">by kind</option>
+                <option value="reach">by how connected</option>
+                <option value="recency">by how recent</option>
+                <option value="source">by evidence type</option>
+              </select>
+            </label>
+            <label class="gsel">
+              <span>size</span>
+              <select id="graphSizeBy">
+                <option value="degree">by connections</option>
+                <option value="moments">by indexed moments</option>
+                <option value="duration">by length</option>
+                <option value="flat">all the same</option>
+              </select>
+            </label>
+          </div>
+
+          <!-- The layout is an opinion, and on a dense neighbourhood it is
+               sometimes the wrong one. These three are the only constants worth
+               exposing; everything else about the simulation is not a reader's
+               problem. -->
+          <details class="grail-tune">
+            <summary>Layout</summary>
+            <label class="gtune">
+              <span>spread</span>
+              <input id="graphSpread" type="range" min="1" max="5" step="1" value="3">
+            </label>
+            <label class="gtune">
+              <span>link pull</span>
+              <input id="graphPull" type="range" min="1" max="5" step="1" value="3">
+            </label>
+            <label class="gtune">
+              <span>labels</span>
+              <input id="graphLabels" type="range" min="1" max="5" step="1" value="3">
+            </label>
+          </details>
         </div>
 
         <div class="graph-hud" id="graphHud"></div>
@@ -215,6 +260,14 @@
         </div>
 
         <div class="graph-legend" id="graphLegend"></div>
+
+        <!-- Where you are in something larger than the window. Zooming into a
+             neighbourhood otherwise loses every landmark, and "fit" is a blunt
+             way back. Click or drag it to move the view. -->
+        <div class="graph-minimap" id="graphMinimap">
+          <canvas id="graphMini" width="360" height="240"
+                  aria-label="Overview of the whole graph. Click to move the view."></canvas>
+        </div>
 
         <div class="graph-detail" id="graphDetail" hidden>
           <button class="gd-close" id="graphDetailClose" aria-label="Close">×</button>
