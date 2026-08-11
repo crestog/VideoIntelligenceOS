@@ -1465,6 +1465,7 @@ const G = {
   off: new Set(),             // kinds switched off in the rail
   counts: null, loaded: false,
   posters: new Map(),         // video key → Image | 'no'
+  posterOff: false,           // Frames toggle: read structure without imagery
   hits: [], hitIndex: -1,
   labelBoxes: [],
   traceFrom: null,            // first end of a "how are these two related" ask
@@ -1990,14 +1991,33 @@ function gpaintEntity(ctx, n, p, r, tone) {
   }
 }
 
+/* The frame painted inside a reel's node.
+ *
+ * The threshold used to be r < 11, which sounds harmless and meant that on any
+ * graph big enough to need fitting, gfit() left the zoom low enough that every
+ * video node fell under it — so the posters never loaded at all and the graph
+ * was a field of grey rectangles. It is now low enough that a fitted graph
+ * still paints, and instead of a size test doing the rationing there is an
+ * explicit limit on requests in flight: a hundred reels on screen must not
+ * become a hundred simultaneous channel reads.
+ */
+const GPOSTER_INFLIGHT_MAX = 6;
+let gposterBusy = 0;
+
 function gposter(key, r) {
-  if (r < 11) return null;                   // too small to be worth a request
+  if (G.posterOff) return null;
   const held = G.posters.get(key);
   if (held) return held;
+  if (r < 5) return null;                    // smaller than the frame's border
+  if (gposterBusy >= GPOSTER_INFLIGHT_MAX) return null;   // asked again next draw
+  gposterBusy++;
   const img = new Image();
   img.decoding = 'async';
-  img.onload = () => gdraw();
-  img.onerror = () => G.posters.set(key, 'no');
+  const done = () => { gposterBusy = Math.max(0, gposterBusy - 1); };
+  img.onload = () => { done(); gdraw(); };
+  // A 204 means this reel has no poster yet. Remembering that as 'no' is what
+  // stops the draw loop asking about it sixty times a second.
+  img.onerror = () => { done(); G.posters.set(key, 'no'); };
   G.posters.set(key, img);
   img.src = U(`/api/poster/${encodeURIComponent(key)}`);
   return img;
@@ -2735,6 +2755,29 @@ function gwire() {
   });
 
   $('graphFit').addEventListener('click', () => { gfit(); gdraw(); });
+
+  // Zoom about the middle of the stage, which is what a button press means —
+  // the wheel handler zooms about the pointer, which is what a wheel means.
+  const gzoom = (factor) => {
+    const cx = gsize.w / 2, cy = gsize.h / 2;
+    const before = gtoWorld(cx, cy);
+    G.view.k = Math.max(0.08, Math.min(4.2, G.view.k * factor));
+    const after = gtoWorld(cx, cy);
+    G.view.x += (after.x - before.x) * G.view.k;
+    G.view.y += (after.y - before.y) * G.view.k;
+    gdraw();
+  };
+  $('graphIn').addEventListener('click', () => gzoom(1.28));
+  $('graphOut').addEventListener('click', () => gzoom(1 / 1.28));
+
+  // Frames off is for reading structure: the shapes and colours stay, the
+  // imagery stops competing with them.
+  $('graphPosters').addEventListener('click', (ev) => {
+    G.posterOff = !G.posterOff;
+    ev.currentTarget.setAttribute('aria-pressed', String(!G.posterOff));
+    ev.currentTarget.classList.toggle('off', G.posterOff);
+    gdraw();
+  });
   $('graphClear').addEventListener('click', () => {
     G.loaded = false;
     G.traceFrom = null;

@@ -149,8 +149,14 @@
 
         <div class="graph-hud" id="graphHud"></div>
 
+        <!-- Scroll-to-zoom is not discoverable, and on a trackpad it is easy to
+             miss entirely, so the same transform gets visible buttons. -->
         <div class="graph-tools">
+          <button class="gtool gtool-icon" id="graphOut" title="Zoom out (−)">−</button>
+          <button class="gtool gtool-icon" id="graphIn" title="Zoom in (+)">+</button>
           <button class="gtool" id="graphFit" title="Fit everything on screen">Fit</button>
+          <button class="gtool" id="graphPosters" aria-pressed="true"
+                  title="Paint the opening frame inside each reel">Frames</button>
           <button class="gtool" id="graphFreeze" title="Pause the layout">Freeze</button>
           <button class="gtool" id="graphClear" title="Start over from the hubs">Reset</button>
         </div>
