@@ -167,6 +167,14 @@ const S = {
   resultMeta: null,
   sourceFilter: new Set(),
   searchCache: new Map(),      // query|offset|filter → response
+  // How the results are shaped, ordered and narrowed. `view` and `density` are
+  // pure presentation and never refetch; `sort` and `narrow` are questions for
+  // the server, because ordering and filtering happen over the whole matched
+  // pool rather than the page the browser happens to hold.
+  view: 'list',
+  density: 3,
+  sort: 'relevance',
+  narrow: { creator: '', category: '', min_dur: '', max_dur: '', min_hits: '' },
   facets: null,
   status: null,
   video: null,                 // the open video's search-result shape
@@ -229,9 +237,33 @@ function showTab(tab, { push = true } = {}) {
 /* ════════════════════════════════════════════════════════════════════════
    SEARCH
    ════════════════════════════════════════════════════════════════════════ */
+/* Everything the server saw goes in the key. `view` and `density` deliberately
+ * do not: they reshape rows the browser already has, so including them would
+ * throw away a good response to answer a question it already answers. */
 function cacheKey(q, offset) {
   const f = Array.from(S.sourceFilter).sort().join(',');
-  return `${q}|${offset}|${f}`;
+  const n = S.narrow;
+  return [q, offset, f, S.sort, n.creator, n.category,
+          n.min_dur, n.max_dur, n.min_hits].join('|');
+}
+
+/* The narrowing params, as the server wants them — empty strings dropped so a
+ * cleared field is absent rather than sent as an explicit "no length". */
+function narrowParams(p) {
+  const n = S.narrow;
+  if (n.creator) p.set('creator', n.creator);
+  if (n.category) p.set('category', n.category);
+  for (const k of ['min_dur', 'max_dur', 'min_hits']) {
+    const v = String(n[k] ?? '').trim();
+    if (v !== '' && isFinite(Number(v))) p.set(k, v);
+  }
+  return p;
+}
+
+function narrowActive() {
+  const n = S.narrow;
+  return Boolean(n.creator || n.category ||
+    String(n.min_dur).trim() || String(n.max_dur).trim() || String(n.min_hits).trim());
 }
 
 async function runSearch(query, { append = false } = {}) {
@@ -250,6 +282,8 @@ async function runSearch(query, { append = false } = {}) {
     q: query, limit: String(SEARCH_LIMIT), offset: String(offset),
   });
   if (S.sourceFilter.size) p.set('source', Array.from(S.sourceFilter).join(','));
+  if (S.sort && S.sort !== 'relevance') p.set('sort', S.sort);
+  narrowParams(p);
 
   try {
     const data = await api('/api/search?' + p.toString());
@@ -272,6 +306,21 @@ function applySearch(data, append) {
   $('emptySearch').hidden = true;
 
   if (!S.results.length) {
+    // "The query found nothing" and "your filters removed everything" need
+    // different answers, and only the second one is undone by a button.
+    if (data.matched && narrowActive()) {
+      $('results').hidden = false;
+      renderCount(data);
+      renderSourceFilters(data);
+      renderNarrow(data);
+      $('cards').textContent = '';
+      $('more').hidden = true;
+      $('cards').appendChild(h('li', { class: 'narrowed-out' },
+        h('p', { text: `“${S.query}” matched ${fmtInt(data.matched)} video` +
+                       `${data.matched === 1 ? '' : 's'}, but none of them get past the filters.` }),
+        h('button', { class: 'btn', onclick: clearNarrow }, 'Clear the filters')));
+      return;
+    }
     $('results').hidden = true;
     showEmpty('Nothing matched “' + S.query + '”',
       data.dense
@@ -283,6 +332,7 @@ function applySearch(data, append) {
   $('results').hidden = false;
   renderCount(data);
   renderSourceFilters(data);
+  renderNarrow(data);
   renderCards(S.results, append);
 
   const shown = S.results.length;
@@ -299,9 +349,15 @@ function renderCount(data) {
     `<b>${fmtInt(data.total)}</b> video${data.total === 1 ? '' : 's'}`,
     `<span class="lat">${data.cached ? 'cached' : data.took_ms + ' ms'}</span>`,
   ];
+  // `matched` is the pool before filtering. Saying "18 of 340" keeps the blame
+  // where it belongs — on the filters, not on the query.
+  if (data.matched && data.total < data.matched)
+    bits.splice(1, 0, `<span class="of">of ${fmtInt(data.matched)} matched</span>`);
   if (data.mode === 'hybrid') bits.push('meaning + words');
   else if (data.mode === 'lexical') bits.push('words only');
   else if (data.mode === 'dense') bits.push('meaning only');
+  if (data.sort && data.sort !== 'relevance')
+    bits.push(`<span class="by">by ${SORT_LABEL[data.sort] || data.sort}</span>`);
   $('resultsCount').innerHTML = bits.join(' <span class="sep">·</span> ');
   // What these results have in common is often the more interesting question,
   // and it is one click away rather than a separate search.
@@ -309,6 +365,79 @@ function renderCount(data) {
     class: 'plot-link', onclick: graphFromResults,
     title: 'Plot these results and what they share on the graph',
   }, 'see the graph'));
+}
+
+const SORT_LABEL = {
+  relevance: 'best match', matches: 'most moments', recent: 'newest',
+  oldest: 'oldest', longest: 'longest', shortest: 'shortest', liked: 'most liked',
+};
+
+/* ── narrowing ─────────────────────────────────────────────────────────────
+ * The creator and category chips are built from the response, not from the
+ * archive-wide facets the library uses: offering "Ana — 40" when this query
+ * reached none of her reels is an invitation to an empty page. */
+function renderNarrow(data) {
+  const facets = data.facets || {};
+  const rows = [
+    ['narrowCreators', 'creator', facets.creators],
+    ['narrowCategories', 'category', facets.categories],
+  ];
+
+  for (const [id, field, list] of rows) {
+    const box = $(id);
+    box.textContent = '';
+    const active = S.narrow[field];
+    const items = (list || []).slice();
+    // A chosen value that this response no longer lists still needs its own
+    // chip, or the only way to switch it off is Clear all.
+    if (active && !items.some(i => i.value === active))
+      items.unshift({ value: active, count: data.total || 0 });
+    if (!items.length) { box.hidden = true; continue; }
+    box.hidden = false;
+    box.appendChild(h('span', { class: 'narrow-label',
+                                text: field === 'creator' ? 'creator' : 'category' }));
+    for (const item of items) {
+      const on = active === item.value;
+      box.appendChild(h('button', {
+        class: 'facet', 'aria-pressed': String(on),
+        onclick: () => {
+          S.narrow[field] = on ? '' : item.value;
+          runSearch(S.query);
+        },
+      }, item.value, h('span', { class: 'n', text: fmtInt(item.count) })));
+    }
+  }
+
+  for (const [id, key] of [['narrowMinDur', 'min_dur'], ['narrowMaxDur', 'max_dur'],
+                           ['narrowMinHits', 'min_hits']]) {
+    const el = $(id);
+    if (el && document.activeElement !== el) el.value = S.narrow[key] ?? '';
+  }
+
+  const on = narrowActive();
+  $('searchNarrowBtn').setAttribute('aria-pressed', String(on));
+  $('searchNarrowBtn').textContent = on ? 'narrowing' : 'narrow';
+  // Opening the panel is a choice; an active filter forces it open so nothing
+  // is hiding results invisibly.
+  if (on) setNarrowOpen(true);
+
+  const note = $('narrowNote');
+  note.textContent = on && data.matched
+    ? `${fmtInt(data.total)} of ${fmtInt(data.matched)} matched videos shown. ` +
+      'Filtering happens after ranking, so every result keeps the score it would have had unfiltered.'
+    : '';
+}
+
+function setNarrowOpen(open) {
+  $('searchNarrow').hidden = !open;
+  $('searchNarrowBtn').setAttribute('aria-expanded', String(open));
+}
+
+function clearNarrow() {
+  S.narrow = { creator: '', category: '', min_dur: '', max_dur: '', min_hits: '' };
+  for (const id of ['narrowMinDur', 'narrowMaxDur', 'narrowMinHits'])
+    if ($(id)) $(id).value = '';
+  runSearch(S.query);
 }
 
 function renderSourceFilters(data) {
@@ -478,8 +607,35 @@ function previewOn(host, key, t, delay = 320) {
   return host;
 }
 
+/* ── layout ────────────────────────────────────────────────────────────────
+ * Rows and grid are one DOM under two stylesheets, not two render paths. The
+ * card already holds everything either layout needs, so switching is a class
+ * change — instant, and it never asks the server for rows it already has. */
+const SEARCH_DENSITY = { 1: 2, 2: 3, 3: 0, 4: 5, 5: 7 };   // 0 = the CSS default
+
+function setSearchView(view, { remember = true } = {}) {
+  S.view = view === 'grid' ? 'grid' : 'list';
+  $('cards').dataset.view = S.view;
+  $$('.rc-view').forEach(b => b.classList.toggle('on', b.dataset.view === S.view));
+  // Density only means anything when there is more than one result per row.
+  $('searchDensityWrap').hidden = S.view !== 'grid';
+  applySearchDensity(S.density);
+  previewStop();   // a preview mid-play under a relaid-out card keeps streaming
+  if (remember) { try { localStorage.setItem('atlas.searchView', S.view); } catch { /* private mode */ } }
+}
+
+function applySearchDensity(step, { remember = false } = {}) {
+  S.density = step;
+  const n = SEARCH_DENSITY[step] || 0;
+  const list = $('cards');
+  if (n && S.view === 'grid') list.style.setProperty('--card-cols', String(n));
+  else list.style.removeProperty('--card-cols');
+  if (remember) { try { localStorage.setItem('atlas.searchDensity', String(step)); } catch { /* private mode */ } }
+}
+
 function renderCards(results, append) {
   const list = $('cards');
+  list.dataset.view = S.view;
   if (!append) { previewStop(); list.textContent = ''; }
   const frag = document.createDocumentFragment();
 
@@ -575,6 +731,9 @@ function showOpening() {
   S.results = [];
   $('results').hidden = true;
   $('emptySearch').hidden = true;
+  // The narrowing panel belongs to a result set. With no results it is a set of
+  // controls governing nothing, so it goes away with them.
+  setNarrowOpen(false);
   $('opening').hidden = false;
   writeHash('search', new URLSearchParams(S.video ? { v: S.video.video_key } : {}));
 }
@@ -4098,6 +4257,12 @@ function wire() {
     ev.preventDefault();
     closeSuggest();
     S.sourceFilter.clear();
+    // A new question starts unnarrowed. Carrying the previous query's creator
+    // over would silently hide most of what this one found, and the filter
+    // doing it is scrolled out of sight. Sort is a standing preference, not a
+    // property of the query, so that one stays.
+    S.narrow = { creator: '', category: '', min_dur: '', max_dur: '', min_hits: '' };
+    for (const id of ['narrowMinDur', 'narrowMaxDur', 'narrowMinHits']) $(id).value = '';
     if (S.tab !== 'search') showTab('search', { push: false });
     runSearch($('q').value);
   });
@@ -4141,6 +4306,57 @@ function wire() {
   $('pulse').addEventListener('click', () => showTab('sources'));
 
   $('moreBtn').addEventListener('click', () => runSearch(S.query, { append: true }));
+
+  /* ── search layout, order and narrowing ── */
+  $$('.rc-view').forEach(b =>
+    b.addEventListener('click', () => {
+      setSearchView(b.dataset.view);
+      // Nothing is refetched — the rows in hand are relaid out in place.
+      if (S.results.length) renderCards(S.results, false);
+    }));
+
+  let savedView = '', savedSDensity = '';
+  try {
+    savedView = localStorage.getItem('atlas.searchView') || '';
+    savedSDensity = localStorage.getItem('atlas.searchDensity') || '';
+  } catch { /* private mode */ }
+  if (savedSDensity) $('searchDensity').value = savedSDensity;
+  S.density = Number($('searchDensity').value) || 3;
+  setSearchView(savedView || 'list', { remember: false });
+
+  $('searchDensity').addEventListener('input', (ev) => {
+    applySearchDensity(Number(ev.target.value), { remember: true });
+  });
+
+  $('searchSort').addEventListener('change', (ev) => {
+    S.sort = ev.target.value;
+    if (S.query) runSearch(S.query);
+  });
+
+  $('searchNarrowBtn').addEventListener('click', () => {
+    setNarrowOpen($('searchNarrow').hidden);
+  });
+  $('narrowClear').addEventListener('click', clearNarrow);
+
+  // Number fields debounce: typing "120" should not run a search at "1".
+  let narrowTimer = 0;
+  const narrowRun = () => {
+    clearTimeout(narrowTimer);
+    if (S.query) runSearch(S.query);
+  };
+  for (const [id, key] of [['narrowMinDur', 'min_dur'], ['narrowMaxDur', 'max_dur'],
+                           ['narrowMinHits', 'min_hits']]) {
+    const el = $(id);
+    el.addEventListener('input', () => {
+      S.narrow[key] = el.value.trim();
+      clearTimeout(narrowTimer);
+      narrowTimer = setTimeout(narrowRun, 420);
+    });
+    el.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); narrowRun(); }
+    });
+  }
+
   $('libMoreBtn').addEventListener('click', () => loadLibrary(false));
   $('libSort').addEventListener('change', () => loadLibrary(true));
   $('libHas').addEventListener('change', () => loadLibrary(true));

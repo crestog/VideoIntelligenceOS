@@ -356,17 +356,28 @@ def api_reindex(embed: bool = True):
 @app.get("/api/search")
 def api_search(q: str = Query("", description="natural language query"),
                limit: int = 24, offset: int = 0, source: str = "",
-               video: str = "", prefetch: bool = True):
+               video: str = "", prefetch: bool = True,
+               sort: str = "relevance", creator: str = "", category: str = "",
+               min_dur: float = None, max_dur: float = None,
+               min_hits: int = None):
     """The moment search.
 
     Prefetch fires from here rather than from the browser: the server already
     knows which videos won, and starting the transfers now buys the few hundred
     milliseconds a person spends reading the first result.
+
+    `sort` is validated against the known set rather than passed through, so a
+    typo in a URL falls back to relevance instead of silently ordering by
+    nothing.
     """
     conn = db()
     sources = [s for s in source.split(",") if s] if source else None
+    if sort not in search.SORTS:
+        sort = "relevance"
     out = search.search(conn, q, limit=limit, offset=offset, sources=sources,
-                        video_key=video or None)
+                        video_key=video or None, sort=sort,
+                        creator=creator or None, category=category or None,
+                        min_dur=min_dur, max_dur=max_dur, min_hits=min_hits)
     if prefetch and out.get("results"):
         media.prefetch_async(config.DB_PATH,
                              [r["video_key"] for r in out["results"]])

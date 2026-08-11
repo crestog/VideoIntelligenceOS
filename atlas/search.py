@@ -328,9 +328,20 @@ def _phrase_bonus(text: str, query: str) -> float:
 # ══════════════════════════════════════════════════════════════════════════
 # THE SEARCH
 # ══════════════════════════════════════════════════════════════════════════
+# Every ordering the grouped results understand. Unlike the library's sorts,
+# none of these becomes SQL — they run over the already-ranked pool in
+# `_order_key`, so the set lives here next to the code that reads it and the
+# HTTP layer validates against it rather than inventing its own list.
+SORTS = ("relevance", "recent", "oldest", "longest", "shortest",
+         "liked", "matches")
+
+
 def search(conn: sqlite3.Connection, query: str, limit: int = 24,
            offset: int = 0, sources: list = None, video_key: str = None,
-           candidates: int = None) -> dict:
+           candidates: int = None, sort: str = "relevance",
+           creator: str = None, category: str = None,
+           min_dur: float = None, max_dur: float = None,
+           min_hits: int = None) -> dict:
     """Run a hybrid search and return grouped video results.
 
     The whole pipeline, in order:
@@ -339,7 +350,14 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
       3. RRF fuse the two rank lists                 → per-moment score
       4. Weight by evidence type and phrase match    → per-moment score
       5. Group by video, best moment plus damped rest → per-video score
-      6. Attach every matching moment, sorted by time, for the ribbon
+      6. Filter and order the grouped videos          → the page
+      7. Attach every matching moment, sorted by time, for the ribbon
+
+    Filtering and sorting happen *after* grouping, never by narrowing the
+    candidate pool first: a `WHERE creator = …` in front of the ranking would
+    change which moments compete, so "the best matches, from this creator"
+    and "the best matches from this creator" would quietly differ. Every
+    result carries the same score it would have had unfiltered.
     """
     t0 = time.perf_counter()
     query = (query or "").strip()
@@ -347,7 +365,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
         return {"ok": True, "query": "", "results": [], "total": 0,
                 "took_ms": 0, "mode": "empty"}
 
-    cache_key = (query, limit, offset, tuple(sources or ()), video_key)
+    cache_key = (query, limit, offset, tuple(sources or ()), video_key,
+                 sort, creator, category, min_dur, max_dur, min_hits)
     with _CACHE_LOCK:
         hit = _CACHE.get(cache_key)
         if hit is not None:
@@ -422,12 +441,85 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
             ms, key=lambda m: (m["t_start"] if m["t_start"] is not None
                                else -1.0))
 
-    order = sorted(per_video.items(), key=lambda kv: -kv[1]["score"])
+    # Meta for every matched video, not just the page: the filters and the
+    # non-relevance sorts read columns that live here, so they cannot be
+    # applied until it is loaded. The pool is bounded by the candidate depth,
+    # so this is one extra query, not one per result.
+    meta = _video_meta(conn, list(per_video))
+
+    def _keep(vkey, slot):
+        m = meta.get(vkey, {})
+        if creator and (m.get("creator") or "") != creator:
+            return False
+        if category and (m.get("category") or "") != category:
+            return False
+        dur = float(m.get("duration") or 0.0)
+        # A video whose duration was never probed has 0.0, which is not the
+        # same as "shorter than the floor" — excluding it would hide real
+        # matches for a metadata gap, so an unknown duration passes.
+        if min_dur is not None and dur and dur < float(min_dur):
+            return False
+        if max_dur is not None and dur and dur > float(max_dur):
+            return False
+        if min_hits is not None and len(slot["moments"]) < int(min_hits):
+            return False
+        return True
+
+    kept = [(k, s) for k, s in per_video.items() if _keep(k, s)]
+
+    def _num(vkey, col):
+        v = meta.get(vkey, {}).get(col)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # Every ordering falls back to the relevance score, so a tie — or a column
+    # the bundle never filled — degrades to "best match first" rather than to
+    # an arbitrary order that changes between pages.
+    def _order_key(kv):
+        vkey, slot = kv
+        rel = -slot["score"]
+        if sort == "recent" or sort == "oldest":
+            when = _num(vkey, "created_at")
+            if when is None:
+                return (1, 0.0, rel)
+            return (0, -when if sort == "recent" else when, rel)
+        if sort == "longest" or sort == "shortest":
+            dur = _num(vkey, "duration")
+            if not dur:
+                return (1, 0.0, rel)
+            return (0, -dur if sort == "longest" else dur, rel)
+        if sort == "liked":
+            likes = _num(vkey, "likes")
+            if likes is None:
+                return (1, 0.0, rel)
+            return (0, -likes, rel)
+        if sort == "matches":
+            return (0, -len(slot["moments"]), rel)
+        return (0, rel, rel)
+
+    # Which creators and categories this query actually reached, counted over
+    # the matched pool rather than the whole archive: offering a filter that
+    # would return nothing is worse than offering no filter. Counted before
+    # `_keep` so the chip that is currently active still shows its own count
+    # and can be switched off.
+    facets = {"creators": {}, "categories": {}}
+    for vkey in per_video:
+        m = meta.get(vkey, {})
+        for field, col in (("creators", "creator"), ("categories", "category")):
+            val = (m.get(col) or "").strip()
+            if val:
+                facets[field][val] = facets[field].get(val, 0) + 1
+    facets = {
+        field: [{"value": v, "count": c}
+                for v, c in sorted(vals.items(), key=lambda kv: (-kv[1], kv[0]))[:14]]
+        for field, vals in facets.items()
+    }
+
+    order = sorted(kept, key=_order_key)
     total = len(order)
     page = order[offset:offset + limit]
-
-    keys = [k for k, _ in page]
-    meta = _video_meta(conn, keys)
 
     results = []
     for rank, (vkey, slot) in enumerate(page, start=offset + 1):
@@ -458,6 +550,16 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
         "ok": True, "query": query, "results": results, "total": total,
         "offset": offset, "limit": limit, "mode": mode,
         "dense": dense_ready(),
+        "sort": sort,
+        # `matched` is before filtering and `total` after, so the UI can say
+        # "18 of 340, narrowed by your filters" instead of implying the query
+        # itself only found 18.
+        "matched": len(per_video),
+        "facets": facets,
+        "filters": {"creator": creator, "category": category,
+                    "min_dur": min_dur, "max_dur": max_dur,
+                    "min_hits": min_hits,
+                    "sources": list(sources or ())},
         "candidates": {"lexical": len(lex), "dense": len(den),
                        "fused": len(fused)},
         "took_ms": round((time.perf_counter() - t0) * 1000, 1),

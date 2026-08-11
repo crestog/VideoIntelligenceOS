@@ -75,6 +75,59 @@
         <div class="results-head">
           <div class="results-count" id="resultsCount"></div>
           <div class="results-filters" id="sourceFilters"></div>
+          <!-- Shape of the list, then order, then how much of the archive is
+               allowed in. The evidence-type chips above stay where they are:
+               they narrow which passages count as a match, which is a different
+               question from which videos survive. -->
+          <div class="results-controls">
+            <div class="rc-views" role="group" aria-label="Result layout">
+              <button class="rc-view on" data-view="list" title="One result per row, with its matching passages">rows</button>
+              <button class="rc-view" data-view="grid" title="Thumbnail grid — hover any tile to watch its moment">grid</button>
+            </div>
+            <label class="mini-range" id="searchDensityWrap" hidden
+                   title="How many results per row">
+              <span>density</span>
+              <input id="searchDensity" type="range" min="1" max="5" step="1" value="3">
+            </label>
+            <select class="mini-select" id="searchSort" aria-label="Order results by">
+              <option value="relevance">Best match</option>
+              <option value="matches">Most matching moments</option>
+              <option value="recent">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="longest">Longest</option>
+              <option value="shortest">Shortest</option>
+              <option value="liked">Most liked</option>
+            </select>
+            <button class="rc-more" id="searchNarrowBtn" aria-expanded="false"
+                    title="Narrow these results by creator, category, length or match count">narrow</button>
+          </div>
+        </div>
+
+        <!-- Hidden until asked for: a query that found what you wanted needs
+             none of this, and a permanently open filter bar pushes the first
+             result off the screen. -->
+        <div class="narrow" id="searchNarrow" hidden>
+          <div class="narrow-row" id="narrowCreators"></div>
+          <div class="narrow-row" id="narrowCategories"></div>
+          <div class="narrow-row narrow-nums">
+            <label class="narrow-num">
+              <span>shortest</span>
+              <input id="narrowMinDur" type="number" min="0" step="1" placeholder="any" inputmode="numeric">
+              <em>sec</em>
+            </label>
+            <label class="narrow-num">
+              <span>longest</span>
+              <input id="narrowMaxDur" type="number" min="0" step="1" placeholder="any" inputmode="numeric">
+              <em>sec</em>
+            </label>
+            <label class="narrow-num">
+              <span>at least</span>
+              <input id="narrowMinHits" type="number" min="1" step="1" placeholder="1" inputmode="numeric">
+              <em>moments</em>
+            </label>
+            <button class="btn btn-quiet btn-tiny" id="narrowClear">Clear all</button>
+          </div>
+          <p class="narrow-note" id="narrowNote"></p>
         </div>
         <ol class="cards" id="cards"></ol>
         <div class="more" id="more" hidden>
