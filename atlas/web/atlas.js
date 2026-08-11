@@ -160,7 +160,7 @@ async function api(path, opts) {
 
 /* ── state ─────────────────────────────────────────────────────────────── */
 const S = {
-  tab: 'search',
+  tab: 'home',
   query: '',
   results: [],
   resultTotal: 0,
@@ -180,6 +180,7 @@ const S = {
   video: null,                 // the open video's search-result shape
   record: null,                // /api/video payload for the open video
   lib: { offset: 0, rows: [], total: 0, creator: '', category: '', inside: 0, q: '' },
+  home: { latest: null, counted: {} },   // the landing page's own fetch + count-up
   browse: { table: '', offset: 0, q: '' },
   prefetched: new Set(),
   suggestIndex: -1,
@@ -193,15 +194,15 @@ const LIB_LIMIT = 40;
    ROUTING
    ════════════════════════════════════════════════════════════════════════ */
 /* Every section that owns a URL. A tab missing from this list is unreachable
- * by link and silently falls back to search, which is how the Maps tab could
- * be opened by click but never by refresh. */
-const TABS = ['search', 'library', 'graph', 'maps', 'data', 'sources'];
+ * by link and silently falls back to the landing page, which is how the Maps
+ * tab could be opened by click but never by refresh. */
+const TABS = ['home', 'search', 'library', 'graph', 'maps', 'data', 'sources'];
 
 function readHash() {
   const raw = location.hash.replace(/^#\/?/, '');
   const [tab, qs] = raw.split('?');
   return {
-    tab: TABS.includes(tab) ? tab : 'search',
+    tab: TABS.includes(tab) ? tab : 'home',
     params: new URLSearchParams(qs || ''),
   };
 }
@@ -232,6 +233,7 @@ function showTab(tab, { push = true } = {}) {
   if (tab === 'maps') mapsBoot(false);
   if (tab === 'data' && !$('schema').childElementCount) loadSchema();
   if (tab === 'sources') loadSources();
+  if (tab === 'home') homeBoot();
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1588,6 +1590,7 @@ async function loadFacets() {
     S.facets = await api('/api/facets');
     renderFacets();
     renderOpening();
+    renderHome();
   } catch { /* the library still works without them */ }
 }
 
@@ -1639,6 +1642,230 @@ function renderOpening() {
   tries.appendChild(h('div', { class: 'tries-label', text: 'Start from what is in here' }));
   for (const p of picks)
     tries.appendChild(h('button', { class: 'try', onclick: () => runSearch(p) }, p));
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   HOME
+   ════════════════════════════════════════════════════════════════════════
+   The landing page reports the system rather than describing it. Every figure
+   comes from /api/status, which is already polled for the top-bar pulse, so
+   opening this tab costs one library call and nothing else. A stage that has
+   not run says so — an archive half-way through indexing should not advertise a
+   total it does not have. */
+const REDUCED = () => window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function homeBoot() {
+  renderHome();
+  // Only once: the six newest videos do not change while the tab is open, and
+  // re-fetching them on every visit would flicker posters that are already
+  // decoded.
+  if (S.home.latest === null) loadHomeLatest();
+}
+
+/* A number that counts up reads as a measurement being taken; a number that
+   jumps reads as a page loading. It runs once per tile per session, so a status
+   poll refreshing the value does not restart the animation from zero. */
+function countTo(el, value) {
+  const target = Number(value) || 0;
+  const key = el.dataset.k || '';
+  const seen = S.home.counted[key];
+  if (seen === target) return;
+  S.home.counted[key] = target;
+  if (REDUCED() || seen !== undefined || target <= 0) {
+    el.textContent = fmtInt(target);
+    return;
+  }
+  const started = performance.now(), span = 620;
+  const step = (now) => {
+    const t = Math.min(1, (now - started) / span);
+    // Ease out: the last digits settle rather than snapping.
+    const v = Math.round(target * (1 - Math.pow(1 - t, 3)));
+    el.textContent = fmtInt(v);
+    if (t < 1) requestAnimationFrame(step);
+    else el.textContent = fmtInt(target);
+  };
+  requestAnimationFrame(step);
+}
+
+function homeHours(seconds) {
+  const s = Number(seconds) || 0;
+  if (s < 3600) return { n: Math.round(s / 60), unit: 'minutes of footage' };
+  return { n: Math.round(s / 3600), unit: 'hours of footage' };
+}
+
+function renderHome() {
+  if ($('view-home').hidden && S.tab !== 'home') return;
+  renderHomeMetrics();
+  renderHomePipe();
+  renderHomeInside();
+}
+
+function renderHomeMetrics() {
+  const box = $('homeMetrics');
+  const st = S.status || {};
+  const se = st.search || {};
+  const f = S.facets;
+  const hours = homeHours(se.seconds);
+
+  const tiles = [
+    ['videos', se.videos || (f && f.totals.videos) || 0, 'read end to end'],
+    ['moments', se.moments || (f && f.totals.moments) || 0, 'passages indexed to the second'],
+    ['hours', hours.n, hours.unit],
+    ['vectors', se.dense_count || 0,
+     se.dense_model ? `meaning vectors · ${se.dense_model}` : 'meaning vectors'],
+    ['creators', se.creators || (f && f.creators ? f.creators.length : 0), 'creators represented'],
+    ['links', (st.graph && st.graph.edges) || 0, 'relationships derived'],
+  ];
+
+  // Rebuilt in place: the tiles exist after the first paint, so a poll updates
+  // the numbers without replacing the nodes the count-up is animating.
+  if (box.childElementCount !== tiles.length) {
+    box.textContent = '';
+    for (const [k, , label] of tiles)
+      box.appendChild(h('div', { class: 'metric', 'data-k': k },
+        h('span', { class: 'metric-n', 'data-k': k, text: '0' }),
+        h('span', { class: 'metric-l', text: label })));
+  }
+  tiles.forEach(([k, n, label], i) => {
+    const tile = box.children[i];
+    if (!tile) return;
+    countTo(tile.querySelector('.metric-n'), n);
+    tile.querySelector('.metric-l').textContent = label;
+  });
+}
+
+/* Each row is one stage, in the order the data actually moves through them, so
+   reading top to bottom is reading the pipeline. */
+function renderHomePipe() {
+  const st = S.status;
+  const box = $('homePipe');
+  box.textContent = '';
+  if (!st) {
+    box.appendChild(h('li', { class: 'pipe-row', 'data-state': 'wait' },
+      h('span', { class: 'pipe-k', text: 'server' }),
+      h('span', { class: 'pipe-v', text: 'still coming up' })));
+    return;
+  }
+
+  const ing = st.ingest || {}, idx = st.index || {}, mp = st.map || {};
+  const g = st.graph || {}, ca = st.cache || {};
+  const rows = [];
+
+  rows.push(['channel', ing.running
+    ? ['work', ing.bytes_total
+        ? `importing ${Math.round(100 * ing.bytes_done / ing.bytes_total)}%`
+        : (ing.scan_total ? `scanning ${fmtInt(ing.scanned)} of ${fmtInt(ing.scan_total)}`
+                          : (ing.current || 'scanning'))]
+    : (st.bundles ? ['ok', `${fmtInt(st.bundles)} bundle${st.bundles === 1 ? '' : 's'} imported`]
+                  : ['wait', ing.error || 'nothing imported yet'])]);
+
+  rows.push(['index', idx.running
+    ? ['work', idx.embed_total
+        ? `embedding ${fmtInt(idx.embedded)} of ${fmtInt(idx.embed_total)}`
+        : (idx.detail || idx.phase)]
+    : (idx.error ? ['bad', idx.error]
+      : idx.dense_ready ? ['ok', 'keywords and meaning both ready']
+      : idx.lexical_ready ? ['wait', 'keywords ready · meaning search off']
+      : ['wait', 'not indexed yet'])]);
+
+  rows.push(['graph', g.nodes
+    ? ['ok', `${fmtInt(g.nodes)} nodes · ${fmtInt(g.edges)} links`]
+    : ['wait', 'not derived yet']]);
+
+  rows.push(['maps', mp.running
+    ? ['work', mp.detail || mp.phase]
+    : (mp.phase === 'unavailable' ? ['wait', mp.detail || 'projection libraries unavailable']
+      : mp.error ? ['bad', mp.error]
+      : mp.points ? ['ok', `${fmtInt(mp.points)} points · ${fmtInt(mp.clusters)} clusters${mp.method ? ' · ' + mp.method : ''}`]
+      : ['wait', 'not projected yet'])]);
+
+  rows.push(['playback', (st.search && st.search.playable)
+    ? ['ok', `${fmtInt(st.search.playable)} playable now · ${fmtBytes(ca.bytes || 0)} cached`
+             + (ca.limit_gb ? ` of ${ca.limit_gb} GB` : '')]
+    : ['wait', 'nothing cached — the first play streams from the channel']]);
+
+  const tg = st.telegram || {};
+  if (!tg.configured)
+    rows.push(['channel access', ['bad',
+      'credentials missing' + ((tg.missing || []).length ? ': ' + tg.missing.join(', ') : '')]]);
+
+  for (const [k, [state, v]] of rows)
+    box.appendChild(h('li', { class: 'pipe-row', 'data-state': state },
+      h('span', { class: 'pipe-k', text: k }),
+      h('span', { class: 'pipe-v', text: v })));
+}
+
+function renderHomeInside() {
+  const box = $('homeInside');
+  const f = S.facets;
+  box.textContent = '';
+  if (!f || (!(f.categories || []).length && !(f.creators || []).length)) {
+    box.appendChild(h('p', { class: 'hint',
+      text: 'nothing indexed yet — this fills in as the archive imports' }));
+    return;
+  }
+  const add = (items, kind) => {
+    for (const it of (items || []).slice(0, 8))
+      box.appendChild(h('button', {
+        class: 'home-chip', 'data-kind': kind,
+        title: `Search the archive for “${it.value}”`,
+        onclick: () => { showTab('search'); $('q').value = it.value; runSearch(it.value); },
+      }, it.value, h('span', { class: 'n', text: fmtInt(it.count) })));
+  };
+  add(f.categories, 'category');
+  add(f.creators, 'creator');
+
+  // Openers built from the corpus, on the hero, for the same reason: an example
+  // query that returns nothing teaches the wrong thing about the archive.
+  const tries = $('homeTries');
+  tries.textContent = '';
+  const picks = [...(f.categories || []).slice(0, 2).map(c => c.value),
+                 ...(f.creators || []).slice(0, 2).map(c => c.value)];
+  if (!picks.length) return;
+  tries.appendChild(h('span', { class: 'tries-label', text: 'try' }));
+  for (const p of picks)
+    tries.appendChild(h('button', {
+      class: 'try',
+      onclick: () => { showTab('search'); $('q').value = p; runSearch(p); },
+    }, p));
+}
+
+async function loadHomeLatest() {
+  const box = $('homeLatest');
+  box.textContent = '';
+  box.appendChild(h('p', { class: 'hint', text: 'reading the library…' }));
+  try {
+    const data = await api('/api/library?limit=6&offset=0&sort=recent');
+    S.home.latest = data.results || [];
+  } catch {
+    S.home.latest = [];
+  }
+  box.textContent = '';
+  if (!S.home.latest.length) {
+    box.appendChild(h('p', { class: 'hint',
+      text: 'no videos yet — import a bundle from the channel and they appear here' }));
+    return;
+  }
+  // Warm the transfers for what is on screen: the tiles are the most likely
+  // first click on the page.
+  prefetch(S.home.latest.map(v => v.video_key));
+  for (const v of S.home.latest) {
+    const shot = posterImg(v, 0, 'ht-shot');
+    previewOn(shot, v.video_key, 0);
+    box.appendChild(h('button', {
+      class: 'htile', onclick: () => openVideo(v, null),
+      title: v.title || v.video_key,
+    },
+      shot,
+      h('span', { class: 'ht-title', text: v.title || v.caption || v.video_key }),
+      h('span', { class: 'ht-meta' },
+        h('span', { text: v.creator || 'unattributed' }),
+        h('span', { class: 'ht-dot', text: '·' }),
+        h('span', { text: v.duration ? timecode(v.duration) : '—' }),
+        h('span', { class: 'ht-dot', text: '·' }),
+        h('span', { text: `${fmtInt(v.moment_count || 0)} moments` }))));
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -4450,6 +4677,9 @@ async function pollStatus() {
     const st = await api('/api/status');
     S.status = st;
     paintPulse(st);
+    // The landing page is a live report, so it repaints on the same tick as the
+    // pulse rather than only when the tab is opened.
+    if (S.tab === 'home') renderHome();
 
     const phase = `${st.boot.phase}|${st.index.phase}|${st.ingest.phase}`;
     if (phase !== lastPhase) {
@@ -4557,9 +4787,26 @@ function wire() {
   $$('.tabs button').forEach(b =>
     b.addEventListener('click', () => showTab(b.dataset.tab)));
   document.querySelector('.brand').addEventListener('click', (ev) => {
-    ev.preventDefault(); showTab('search');
+    ev.preventDefault(); showTab('home');
   });
   $('pulse').addEventListener('click', () => showTab('sources'));
+
+  /* ── the landing page ──
+   * Its search field is the top bar's, at the size the page is about; handing
+   * the query to the same code path means the two can never disagree about what
+   * a query means. */
+  $('homeFind').addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const q = $('homeQ').value.trim();
+    if (!q) { $('homeQ').focus(); return; }
+    $('q').value = q;
+    showTab('search');
+    runSearch(q);
+  });
+  // Every "go here" button on the page, in one place: the doors, and the link
+  // out to the library.
+  $$('[data-goto]').forEach(b =>
+    b.addEventListener('click', () => showTab(b.dataset.goto)));
 
   $('moreBtn').addEventListener('click', () => runSearch(S.query, { append: true }));
 
@@ -4725,8 +4972,10 @@ function start() {
   pollStatus();
 
   const { tab, params } = readHash();
-  showTab(tab, { push: false });
   const q = params.get('q');
+  // A link carrying a query is a link to results, whatever tab the hash names —
+  // otherwise a shared URL lands on the landing page with the query invisible.
+  showTab(q ? 'search' : tab, { push: false });
   if (q) { $('q').value = q; runSearch(q); }
   const v = params.get('v');
   if (v) openVideoKey(v, null);

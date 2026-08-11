@@ -733,4 +733,12 @@ def stats(conn: sqlite3.Connection) -> dict:
         "dense_count": vec.get("count", 0),
         "dense_model": vec.get("model"),
         "cache_size": len(_CACHE),
+        # Two aggregates the landing page states as facts about the archive.
+        # Both are one indexed scan over a table that has one row per video, so
+        # they cost nothing next to the counts above, and a total that has to be
+        # assembled in the browser out of a paged library call would be wrong
+        # for every page but the last.
+        "seconds": one("SELECT COALESCE(SUM(duration), 0) FROM video_index"),
+        "creators": one("SELECT COUNT(DISTINCT creator) FROM video_index "
+                        "WHERE creator IS NOT NULL AND creator <> ''"),
     }

@@ -18,7 +18,7 @@
 
 <!-- ═══ TOP BAR ═════════════════════════════════════════════════════════ -->
 <header class="topbar">
-  <a class="brand" href="#" data-tab="search" aria-label="Atlas home">
+  <a class="brand" href="#" data-tab="home" aria-label="Atlas home">
     <span class="brand-mark" aria-hidden="true">
       <i></i><i></i><i></i><i></i>
     </span>
@@ -37,7 +37,8 @@
   </form>
 
   <nav class="tabs" role="tablist" aria-label="Sections">
-    <button role="tab" data-tab="search" aria-selected="true">Search</button>
+    <button role="tab" data-tab="home" aria-selected="true">Home</button>
+    <button role="tab" data-tab="search" aria-selected="false">Search</button>
     <button role="tab" data-tab="library" aria-selected="false">Library</button>
     <button role="tab" data-tab="graph" aria-selected="false">Graph</button>
     <button role="tab" data-tab="maps" aria-selected="false">Maps</button>
@@ -57,8 +58,107 @@
   <!-- ── left: whichever section is active ── -->
   <section class="pane pane-left" id="left">
 
+    <!-- HOME --------------------------------------------------------------
+         The landing surface. It exists to answer three questions before any
+         query is typed: what is in here, is it ready, and where do I go. Every
+         number on it is read from /api/status rather than written down, so a
+         half-built archive says so instead of advertising a total it does not
+         have yet. -->
+    <div class="view view-home" id="view-home" data-view="home">
+
+      <section class="hero">
+        <div class="hero-wash" aria-hidden="true"></div>
+        <p class="hero-eyebrow">Video Intelligence OS</p>
+        <h1 class="hero-title">Every second of the archive,<br><em>searchable</em>.</h1>
+        <p class="hero-lede">
+          Each video is read by a bench of models — what was said, what was
+          shown, what was written on screen, what it was about — and every
+          reading is stored with the moment it came from and the observer that
+          made it. Ask for a moment; Atlas returns the second it happens.
+        </p>
+
+        <!-- The same query field as the top bar, at the size the page is
+             actually about. It hands off to the Search tab rather than
+             rendering results here: one result surface, not two. -->
+        <form class="hero-find" id="homeFind" role="search">
+          <label class="sr-only" for="homeQ">Search every moment</label>
+          <input id="homeQ" type="search" spellcheck="false" autocomplete="off"
+                 placeholder="a moment, a phrase, an object, a look…">
+          <button class="btn hero-go" type="submit">Search</button>
+        </form>
+        <div class="hero-tries" id="homeTries"></div>
+      </section>
+
+      <section class="home-metrics" id="homeMetrics"
+               aria-label="What the archive contains"></section>
+
+      <div class="home-split">
+        <section class="home-card">
+          <h3>Pipeline</h3>
+          <p class="home-note">
+            What has finished and what is still working. A stage that is not
+            ready is named here rather than showing up later as an empty tab.
+          </p>
+          <ul class="pipe" id="homePipe"></ul>
+        </section>
+
+        <section class="home-card">
+          <h3>What is inside</h3>
+          <p class="home-note">
+            Drawn from the archive itself, so every one of these returns
+            something.
+          </p>
+          <div class="home-chips" id="homeInside"></div>
+        </section>
+      </div>
+
+      <section class="home-block">
+        <div class="home-block-head">
+          <h3>Most recently indexed</h3>
+          <button class="btn btn-quiet btn-tiny" data-goto="library">Browse the library</button>
+        </div>
+        <div class="home-latest" id="homeLatest"></div>
+      </section>
+
+      <section class="home-block">
+        <div class="home-block-head"><h3>Ways in</h3></div>
+        <div class="home-doors">
+          <button class="door" data-goto="search">
+            <span class="door-k">Search</span>
+            <span class="door-t">Find one moment</span>
+            <span class="door-d">One ranking fused across every kind of evidence. A result seeks the player to the second it describes.</span>
+          </button>
+          <button class="door" data-goto="library">
+            <span class="door-k">Library</span>
+            <span class="door-t">Browse everything</span>
+            <span class="door-d">Every video, sorted and filtered by what it contains rather than by what it is called.</span>
+          </button>
+          <button class="door" data-goto="graph">
+            <span class="door-k">Graph</span>
+            <span class="door-t">See what connects</span>
+            <span class="door-d">Creators, tags, objects and the videos between them. Click a link to read the rows that justify it.</span>
+          </button>
+          <button class="door" data-goto="maps">
+            <span class="door-k">Maps</span>
+            <span class="door-t">See the shape of it</span>
+            <span class="door-d">The whole archive laid out by meaning, by cluster, or against any two measures you choose.</span>
+          </button>
+          <button class="door" data-goto="data">
+            <span class="door-k">Data</span>
+            <span class="door-t">Read the database</span>
+            <span class="door-d">Every table behind the answers, with any cell traceable back to what produced it.</span>
+          </button>
+          <button class="door" data-goto="sources">
+            <span class="door-k">Sources</span>
+            <span class="door-t">Check the plumbing</span>
+            <span class="door-d">The channel, the bundles imported from it, the media cache and the live log.</span>
+          </button>
+        </div>
+      </section>
+    </div>
+
     <!-- SEARCH ------------------------------------------------------- -->
-    <div class="view" id="view-search" data-view="search">
+    <div class="view" id="view-search" data-view="search" hidden>
       <div class="opening" id="opening">
         <p class="opening-eyebrow">Moment retrieval</p>
         <h1 class="opening-title">Search <em>inside</em> the video.</h1>
