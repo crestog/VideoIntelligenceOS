@@ -74,8 +74,15 @@ def sync(store, ledger_path: str, limit: int = 0) -> dict:
     engagement figures the interface sorts by. The record itself is tens of
     kilobytes of JSON per reel and belongs in the working directory, not in a
     database that gets uploaded.
+
+    Videos uploaded straight into the channel come through here too, under
+    `up_<msg_id>` keys with no url. They are marked `uploader="user"` and given
+    the collection `user uploaded videos`, which is what makes them filterable
+    in the interface — and, via the claim written below, findable by search
+    alongside everything else rather than being a second-class category that
+    only the library tab knows about.
     """
-    out = {"seen": 0, "added": 0, "ledger": ledger_path}
+    out = {"seen": 0, "added": 0, "uploads": 0, "ledger": ledger_path}
     if not os.path.exists(ledger_path):
         out["reason"] = "no capture ledger yet"
         return out
@@ -98,33 +105,98 @@ def sync(store, ledger_path: str, limit: int = 0) -> dict:
         if limit:
             sql += f" LIMIT {int(limit)}"
         known = set(store.video_keys())
+        fresh_uploads: list = []
         for r in conn.execute(sql):
             out["seen"] += 1
             key = r["key"]
+            upload = _is_upload_key(key)
+            cols = sorted(collections.get(key, []))
+            if upload and UPLOAD_COLLECTION not in cols:
+                # The seeder tags these, but a row adopted before that branch
+                # existed — or by `adopt_upload` from the bot — would arrive
+                # bare. The collection is how the interface groups them, so it
+                # is asserted here rather than assumed.
+                cols.append(UPLOAD_COLLECTION)
             head = {
                 "msg_id": r["msg_id"],
                 "record_msg_id": r["record_msg_id"],
                 "file_id": r["file_id"],
-                "collections": sorted(collections.get(key, [])),
+                "collections": cols,
                 "title": r["title"],
                 "views": r["views"],
                 "likes": r["likes"],
                 "comment_count": r["comment_count"],
                 "comments_got": r["comments_got"],
                 "captured_at": r["done_at"],
+                **({"origin": "telegram-upload"} if upload else {}),
             }
             store.add_video(
-                key, url=r["url"], uploader=r["uploader"],
+                key, url=r["url"], uploader=(r["uploader"] or
+                                             ("user" if upload else "")),
                 duration=r["duration"], width=r["width"], height=r["height"],
                 bytes=r["file_size"], sha256=r["sha256"], msg_id=r["msg_id"],
                 taken_at=r["taken_at"], meta={"capture": head})
             if key not in known:
                 out["added"] += 1
+                if upload:
+                    out["uploads"] += 1
+                    fresh_uploads.append((key, r["title"] or ""))
+        if fresh_uploads:
+            out["claimed"] = _claim_uploads(store, fresh_uploads)
     except sqlite3.Error as exc:
         out["reason"] = f"capture ledger unreadable: {exc}"
     finally:
         conn.close()
     return out
+
+
+UPLOAD_COLLECTION = "user uploaded videos"
+
+# The observer for the origin claim. Not a model, so `revision` carries the
+# whole meaning: this is a fact about where the file came from, recorded once,
+# and it must read as evidence with attribution like everything else rather
+# than as a special column only one query knows to look at.
+_ORIGIN_OBSERVER = ("intake", "capture-ledger", "1")
+
+
+def _is_upload_key(key: str) -> bool:
+    """`up_<digits>`, without importing the capture plane at module scope.
+
+    The processing plane runs on hosts where `vios.capture` is present but
+    pyrogram is not, and the import chain there is worth keeping short. The
+    definition lives in `vios/capture/ledger.py`; this mirrors it and the test
+    below asserts the two agree.
+    """
+    key = str(key or "")
+    return key.startswith("up_") and key[3:].isdigit()
+
+
+def _claim_uploads(store, uploads) -> int:
+    """Write the origin of each hand-uploaded video as a claim.
+
+    Being able to *filter* to uploads is not the same as being able to *find*
+    them: the collections list lives in `video.meta`, which no search backend
+    reads. A claim goes through the same FTS index as a transcript line, so
+    "user uploaded videos" answers in the search box, and a caption the person
+    typed when they sent it becomes searchable text about the video instead of
+    a string sitting unused in a ledger column.
+    """
+    oid = store.observer(*_ORIGIN_OBSERVER)
+    n = 0
+    for key, title in uploads:
+        claims = [{"channel": "concept", "kind": "origin",
+                   "value": UPLOAD_COLLECTION, "confidence": 1.0}]
+        if title.strip():
+            claims.append({"channel": "caption", "kind": "upload_note",
+                           "value": title.strip()[:2000], "confidence": 1.0})
+        try:
+            n += store.add_claims(key, oid, claims)
+        except Exception:      # noqa: BLE001
+            # A video whose shots pass has not run yet cannot take a claim that
+            # references one — these do not, but a future edit might, and one
+            # unwritable origin note must not abort the whole sync.
+            continue
+    return n
 
 
 def capture_head(video: dict) -> dict:

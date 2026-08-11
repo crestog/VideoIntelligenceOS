@@ -169,6 +169,40 @@ def canonical(url: str) -> tuple[str, str, str] | None:
     return key, f"https://www.instagram.com/{kind}/{key}/", kind
 
 
+# ── videos that were never on Instagram ──────────────────────────────────
+# Dropping a video straight into the channel from a phone is the fastest way
+# to add something to the archive, and until now it was the one way that did
+# not work: every key in this ledger is an Instagram shortcode, so a video with
+# no permalink had no identity and `canonical()` returned None for it.
+#
+# The message id is the identity instead. It is already unique within the
+# channel, already permanent, and already the thing every downloader here takes
+# — so `up_4471` needs no lookup table and survives a ledger rebuilt from
+# nothing but a channel scan. The `up_` prefix keeps it from ever colliding
+# with a shortcode: Instagram's alphabet includes `_`, but a shortcode is 11
+# characters of base64 and never starts with `up_` followed by digits only.
+UPLOAD_PREFIX = "up_"
+UPLOAD_KIND = "upload"
+UPLOAD_SOURCE = "telegram-upload"
+
+_UPLOAD_KEY = re.compile(r"^up_(\d+)$")
+
+
+def upload_key(msg_id) -> str:
+    """The ledger key for a bare video sitting at `msg_id` in the channel."""
+    return f"{UPLOAD_PREFIX}{int(msg_id)}"
+
+
+def is_upload(key: str) -> bool:
+    return bool(_UPLOAD_KEY.match(str(key or "")))
+
+
+def upload_msg_id(key: str) -> int:
+    """The message id back out of an upload key, or 0."""
+    m = _UPLOAD_KEY.match(str(key or ""))
+    return int(m.group(1)) if m else 0
+
+
 class Ledger:
     """SQLite-backed capture ledger. Cheap to open, safe to keep open."""
 
@@ -611,15 +645,40 @@ class Ledger:
         Used by the seeder for the reels the old Colab script uploaded. The
         row goes straight to `uploaded` without ever being queued, so those
         552 are never fetched again — which is the entire point.
+
+        A bare uploaded video takes the same path. Its key is `up_<msg_id>` and
+        its url is empty, so `canonical()` cannot help — and the old fallback
+        `(key, url, "reel")` would have labelled a phone upload a reel and,
+        worse, kept whatever string was passed as `url`. `is_upload` is checked
+        first so the kind is honest: nothing downstream should be able to look
+        at this row and conclude Instagram has a copy.
         """
-        can = canonical(url) or (key, url, "reel")
+        if is_upload(key):
+            kind, url = UPLOAD_KIND, ""
+        else:
+            can = canonical(url) or (key, url, "reel")
+            key, url, kind = can
         now = time.time()
         self.conn.execute(
             "INSERT OR IGNORE INTO item(key,url,kind,state,added_at,source,"
             "position) VALUES(?,?,?,?,?,?,?)",
-            (can[0], can[1], can[2], UPLOADED, now, "seed",
+            (key, url, kind, UPLOADED, now,
+             UPLOAD_SOURCE if kind == UPLOAD_KIND else "seed",
              self._next_position()))
-        self.mark_uploaded(can[0], msg_id=msg_id, **fields)
+        self.mark_uploaded(key, msg_id=msg_id, **fields)
+
+    def adopt_upload(self, msg_id: int, **fields) -> str:
+        """Record a bare video that was dropped into the channel by hand.
+
+        Returns the key. The bytes are already in Telegram — that is the whole
+        difference from every other row in this table, which describes work
+        still to be done or work whose result was uploaded here. Nothing needs
+        fetching, nothing needs an Instagram request, and the row exists solely
+        so the processing plane can find the video and never look at it twice.
+        """
+        key = upload_key(msg_id)
+        self.adopt(key, "", int(msg_id), **fields)
+        return key
 
 
 def open_ledger(path: str) -> Ledger:

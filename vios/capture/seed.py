@@ -45,7 +45,8 @@ from __future__ import annotations
 import re
 import time
 
-from .ledger import Ledger, canonical
+from .ledger import (Ledger, UPLOAD_KIND, UPLOAD_SOURCE, canonical, is_upload,
+                     upload_key)
 
 BATCH = 200
 
@@ -149,6 +150,77 @@ def _facts(msg) -> dict:
     }
 
 
+# Filenames this system puts into the channel itself. A scan must not mistake
+# its own output for something a person uploaded, and every one of these is or
+# can be an mp4: the Phase J chunk parts are two-second slices of a video that
+# is already in the ledger under its real key.
+_OURS = ("vios-evidence-", "vios-stage-", "vios_capture_ledger",
+         "vios-manifest-")
+_OURS_SUFFIX = ("-chunks", "-frames.tar.zst", "-evidence.jsonl.gz",
+                "-manifest.json")
+# `-chunk-0000.mp4` does not end in "-chunks", so the suffix list above would
+# not catch it. The clip name's shape — `<key>-chunk-%04d.mp4` — is what the
+# segmenter writes and nothing else produces, so matching it exactly is safe
+# and costs nothing.
+_CHUNK_NAME = re.compile(r"^[A-Za-z0-9_]+-chunk-\d{4}\.mp4$")
+
+
+def bare_upload(msg) -> dict:
+    """Facts for a video someone dropped into the channel, or {}.
+
+    The archive gained a second front door the moment the channel became
+    writable by a human: forwarding a video into it is faster than saving it on
+    Instagram and waiting for a sweep, and until now those videos were
+    invisible — no permalink in the caption meant `parse_caption` returned {}
+    and the scanner moved on.
+
+    Four things disqualify a message, and each is a real case rather than
+    defensive noise:
+
+      * no video — a photo, a service message, a status note
+      * a reply — every document this system sends is threaded under the video
+        it belongs to, so a reply is our own metadata, chunk or slide
+      * a `vios:` tag in the caption — a video we uploaded, whose permalink
+        `parse_caption` would already have taken
+      * a filename this module recognises as its own output
+
+    The remaining messages are, by elimination, videos a person put there.
+    """
+    video = getattr(msg, "video", None)
+    if video is None:
+        doc = getattr(msg, "document", None)
+        mime = (getattr(doc, "mime_type", "") or "") if doc else ""
+        name = (getattr(doc, "file_name", "") or "") if doc else ""
+        if not (mime.startswith("video/") or name.lower().endswith(
+                (".mp4", ".mov", ".mkv", ".webm", ".m4v"))):
+            return {}
+    if getattr(msg, "reply_to_message_id", None):
+        return {}
+
+    text = getattr(msg, "caption", None) or getattr(msg, "text", "") or ""
+    if _KEY_TAG.search(text):
+        return {}
+
+    media = video or getattr(msg, "document", None)
+    name = (getattr(media, "file_name", "") or "")
+    low = name.lower()
+    if any(low.startswith(p) for p in _OURS) or any(
+            s in low for s in _OURS_SUFFIX) or _CHUNK_NAME.match(low):
+        return {}
+
+    out = {"key": upload_key(msg.id), "url": "", "kind": UPLOAD_KIND,
+           "collections": ["user uploaded videos"],
+           "uploader": "", "views": None, "likes": None,
+           "comment_count": None,
+           # The caption a person wrote is not metadata we generated, but it is
+           # the only thing they said about the video and it belongs in the
+           # record. `title` is the ledger column the interface already shows.
+           "title": text.strip()[:300] or None,
+           "upload": True}
+    out.update(_facts(msg))
+    return out
+
+
 def scan_channel(tg, api_id: int, api_hash: str, head: int = 0,
                  start: int = 1, on_progress=None, should_stop=None) -> list:
     """Walk the channel and return one dict per reel-bearing message.
@@ -202,6 +274,17 @@ def scan_channel(tg, api_id: int, api_hash: str, head: int = 0,
                         reply = getattr(msg, "reply_to_message_id", None)
                         if reply and getattr(msg, "document", None):
                             reply_index[int(reply)] = int(msg.id)
+                            continue
+                        # Not ours, not a reply, and it has a video in it —
+                        # somebody put this here by hand. It is as much a part
+                        # of the archive as anything Instagram gave us, and
+                        # skipping it is how it stayed invisible.
+                        parsed = bare_upload(msg)
+                        if not parsed:
+                            continue
+                        parsed["msg_id"] = int(msg.id)
+                        parsed["at"] = getattr(msg, "date", None)
+                        found.append(parsed)
                         continue
                     parsed["msg_id"] = int(msg.id)
                     parsed["at"] = getattr(msg, "date", None)
@@ -260,19 +343,28 @@ def adopt_all(ledger: Ledger, found, source: str = "channel-scan") -> dict:
     engine will fetch it again tonight. That correction is the entire value of
     running the scan on every boot instead of once.
     """
-    adopted = refreshed = 0
+    adopted = refreshed = uploads = 0
     for item in found:
         key = item.get("key")
         url = item.get("url")
-        if not (key and url):
+        # A bare upload has no url and never will. The old `if not (key and
+        # url)` guard existed to drop half-parsed captions, and applied here it
+        # would silently discard every hand-uploaded video — the exact failure
+        # this branch was added to end.
+        if not key or not (url or item.get("upload")):
             continue
         existing = ledger.conn.execute(
             "SELECT state FROM item WHERE key=?", (key,)).fetchone()
         fields = {k: item.get(k) for k in
                   ("record_msg_id", "file_id", "file_size", "ext", "duration",
                    "width", "height", "uploader", "views", "likes",
-                   "comment_count")
+                   "comment_count", "title")
                   if item.get(k) is not None}
+        if item.get("upload"):
+            # A bare upload has no Instagram creator to credit. "user" is the
+            # honest value and it is how the library tab tells these apart —
+            # the same word everywhere, never the caption text.
+            fields["uploader"] = "user"
         ledger.adopt(key, url, int(item.get("msg_id") or 0), **fields)
         for col in item.get("collections") or []:
             ledger.conn.execute(
@@ -280,6 +372,8 @@ def adopt_all(ledger: Ledger, found, source: str = "channel-scan") -> dict:
                 (key, col[:120]))
         if existing is None:
             adopted += 1
+            if item.get("upload"):
+                uploads += 1
         elif existing["state"] != "uploaded":
             refreshed += 1
     ledger.conn.commit()
@@ -287,9 +381,11 @@ def adopt_all(ledger: Ledger, found, source: str = "channel-scan") -> dict:
     ledger.set_meta("channel_known", str(len(found)))
     ledger.conn.commit()
     ledger.log("seed", f"{source}: {len(found)} in channel, {adopted} new to "
-                       f"the ledger, {refreshed} corrected")
+                       f"the ledger, {refreshed} corrected"
+                       + (f", {uploads} of them videos uploaded by hand"
+                          if uploads else ""))
     return {"in_channel": len(found), "adopted": adopted,
-            "corrected": refreshed}
+            "corrected": refreshed, "uploads": uploads}
 
 
 def seed_from_channel(ledger: Ledger, tg, api_id: int, api_hash: str,
@@ -304,7 +400,7 @@ def seed_from_channel(ledger: Ledger, tg, api_id: int, api_hash: str,
     high = int(ledger.get_meta("scan_high_water", 0) or 0)
     head = head_message_id(tg)
     if head <= high:
-        return {"in_channel": 0, "adopted": 0, "corrected": 0,
+        return {"in_channel": 0, "adopted": 0, "corrected": 0, "uploads": 0,
                 "scanned_to": high, "skipped": True}
     found = scan_channel(tg, api_id, api_hash, head=head, start=max(1, high + 1),
                          on_progress=on_progress, should_stop=should_stop)
