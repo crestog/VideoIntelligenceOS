@@ -196,7 +196,8 @@ const LIB_LIMIT = 40;
 /* Every section that owns a URL. A tab missing from this list is unreachable
  * by link and silently falls back to the landing page, which is how the Maps
  * tab could be opened by click but never by refresh. */
-const TABS = ['home', 'search', 'library', 'graph', 'maps', 'data', 'sources'];
+const TABS = ['home', 'search', 'library', 'graph', 'maps', 'roadmap', 'data',
+              'sources'];
 
 function readHash() {
   const raw = location.hash.replace(/^#\/?/, '');
@@ -223,6 +224,7 @@ function showTab(tab, { push = true } = {}) {
   if (push) {
     const p = new URLSearchParams();
     if (tab === 'search' && S.query) p.set('q', S.query);
+    if (tab === 'roadmap' && R.goal) p.set('goal', R.goal);
     if (S.video) p.set('v', S.video.video_key);
     writeHash(tab, p);
   }
@@ -231,6 +233,8 @@ function showTab(tab, { push = true } = {}) {
   // measured after the switch — hence the boot call here rather than at start.
   if (tab === 'graph') graphBoot(false);
   if (tab === 'maps') mapsBoot(false);
+  // The diagram is measured the same way and for the same reason.
+  if (tab === 'roadmap') roadmapBoot(false);
   if (tab === 'data' && !$('schema').childElementCount) loadSchema();
   if (tab === 'sources') loadSources();
   if (tab === 'home') homeBoot();
@@ -4667,6 +4671,734 @@ function mapsWire() {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+   ROADMAP — the archive as an order to watch it in
+
+   The Graph tab answers "what is connected". This answers "what first", which
+   is a different question and needs a different picture: the server infers
+   prerequisites from one-sided co-occurrence and returns a layered plan, and
+   this draws it twice over. The diagram on top is the shape — stages left to
+   right, prerequisites as curves. The cards below are the plan itself, in
+   order, each opening into the exact moments to watch with their timecodes.
+
+   Two things make it a curriculum rather than a diagram. Every moment plays in
+   the same persistent player the rest of Atlas uses, so "learn this" is one
+   click from "watch this second". And a tick is stored server-side against the
+   concept rather than the plan, so the plan reopens where it was left and a
+   different goal over the same concepts inherits what is already known.
+
+   The diagram is elements, not pixels — unlike the graph and the maps, which
+   are canvases because their point count is the whole archive. Sixty boxes is
+   a size where real DOM buys hover, focus, wrapped text and the CSS tokens for
+   free, and only the connecting curves need an SVG underneath.
+   ════════════════════════════════════════════════════════════════════════ */
+const R = {
+  loaded: false,
+  goal: '',
+  plan: null,
+  steps: new Map(),        // step id → the step, with its live state
+  at: new Map(),           // step id → position, for stable element ids
+  detail: new Map(),       // step id → /api/roadmap/step payload
+  open: new Set(),         // which cards are expanded
+  sel: '',
+  k: 1, tx: 0, ty: 0,      // the diagram's transform
+  drag: null,
+  dragMoved: 0,            // read by a box's click, so a pan is not a click
+  layout: null,
+  busy: false,
+  armed: false,            // "Clear ticks" asked once, waiting for the second
+};
+
+const RM_NODE_W = 176;
+const RM_NODE_H = 46;
+const RM_COL_W = 214;      // node plus the gap the curves live in
+const RM_GAP_Y = 13;
+const RM_ROWS = 9;         // rows before a stage wraps into a second column
+const RM_HEAD_H = 34;      // room for the stage title above the boxes
+const RM_PAD = 18;
+const RM_BAND_GAP = 26;
+
+/* The only thing in this module the h() builder cannot make: SVG lives in its
+   own namespace, and createElement would produce an unstyled HTML element of
+   the same name that silently draws nothing. */
+function sv(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  if (attrs) for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    el.setAttribute(k, String(v));
+  }
+  return el;
+}
+
+const rmCard = (id) => $('rmcard-' + (R.at.get(id) ?? -1));
+
+async function roadmapBoot(force) {
+  if (R.loaded && !force) { rmFit(); return; }
+  R.loaded = true;
+  rmChips();
+  await rmLoad(R.goal, { push: false });
+}
+
+async function rmLoad(goal, { push = true } = {}) {
+  if (R.busy) return;
+  R.busy = true;
+  R.goal = String(goal || '');
+  if ($('rmGoal').value !== R.goal) $('rmGoal').value = R.goal;
+  $('rmNote').textContent = R.goal
+    ? `working out an order for “${R.goal}”…` : 'working out an order…';
+  $('rmGo').disabled = true;
+  if (push && S.tab === 'roadmap') {
+    const p = new URLSearchParams();
+    if (R.goal) p.set('goal', R.goal);
+    if (S.video) p.set('v', S.video.video_key);
+    writeHash('roadmap', p);
+  }
+  let got;
+  try {
+    got = await api(`/api/roadmap?goal=${encodeURIComponent(R.goal)}`);
+  } catch (e) {
+    R.busy = false;
+    $('rmGo').disabled = false;
+    $('rmNote').textContent = 'the plan could not be built — ' + e.message;
+    rmEmpty('The roadmap could not be built', e.message);
+    return;
+  }
+  R.busy = false;
+  $('rmGo').disabled = false;
+  // A goal changes which videos are in scope, so every drill-down cached
+  // against the previous scope is now about a different set of videos.
+  R.detail.clear();
+  R.plan = got;
+  R.steps = new Map((got.steps || []).map(s => [s.id, s]));
+  R.at = new Map((got.steps || []).map((s, i) => [s.id, i]));
+  R.open.clear();
+  R.sel = '';
+  rmRender();
+  rmFit();
+}
+
+/* Goals worth offering before anything is typed: the concepts that cover the
+   most of the archive, which is also the shortest honest answer to "what is
+   this collection even about". */
+async function rmChips() {
+  const box = $('rmChips');
+  let got;
+  try { got = await api('/api/roadmap/goals?limit=14'); }
+  catch { box.textContent = ''; return; }
+  box.textContent = '';
+  for (const g of got.goals || []) {
+    box.appendChild(h('button', {
+      class: 'rm-chip', type: 'button', 'data-kind': g.kind,
+      title: `${fmtInt(g.videos)} video${g.videos === 1 ? '' : 's'} carry this`,
+      onclick: () => rmLoad(g.label),
+    },
+      h('span', { text: g.kind === 'hashtag' ? '#' + g.label.replace(/^#/, '') : g.label }),
+      h('span', { class: 'n', text: fmtInt(g.videos) })));
+  }
+}
+
+function rmEmpty(title, note) {
+  const box = $('rmEmpty');
+  box.hidden = false;
+  box.textContent = '';
+  box.appendChild(h('h3', { text: title }));
+  if (note) box.appendChild(h('p', { text: note }));
+  $('rmHead').hidden = true;
+  $('rmDag').hidden = true;
+  $('rmStages').textContent = '';
+  R.layout = null;          // nothing to fit, and the wrap is hidden now
+}
+
+function rmRender() {
+  const p = R.plan;
+  if (!p) return;
+  const n = (p.steps || []).length;
+  $('rmNote').textContent = rmScopeLine(p);
+  if (!n) {
+    rmEmpty(p.mode === 'goal'
+      ? 'Nothing in that part of the archive repeats enough to order'
+      : 'No order to draw yet', p.note || '');
+    return;
+  }
+  $('rmEmpty').hidden = true;
+  $('rmHead').hidden = false;
+  $('rmDag').hidden = false;
+  rmRenderStats();
+  rmLayout();
+  rmDraw();
+  rmRenderStages();
+}
+
+/* What this plan is actually about, said plainly. `scope_note` is the server's
+   own sentence about which videos it planned over — including the case where a
+   goal matched too few to mean anything and it fell back to the archive. */
+function rmScopeLine(p) {
+  const bits = [p.scope_note || ''];
+  const st = p.stats || {};
+  if (st.ordered) {
+    bits.push(`${fmtInt(st.ordered)} prerequisite${st.ordered === 1 ? '' : 's'} ` +
+      'inferred from what turns up with what');
+  } else if (st.concepts) {
+    bits.push('nothing in here reliably comes before anything else, so the ' +
+      'order is by how much of the collection each one covers');
+  }
+  if (p.built_ms) bits.push(p.cached ? 'from cache' : `built in ${p.built_ms} ms`);
+  return bits.filter(Boolean).join(' · ');
+}
+
+function rmRenderStats() {
+  if (!R.plan) return;
+  const st = R.plan.stats || {};
+  const box = $('rmStats');
+  box.textContent = '';
+  const cell = (n, label, title) => box.appendChild(
+    h('div', { class: 'rm-stat', title: title || '' },
+      h('b', { text: n }), h('span', { text: label })));
+  cell(fmtInt(st.concepts), st.concepts === 1 ? 'step' : 'steps',
+    'concepts this plan puts in order');
+  cell(fmtInt(st.stages), st.stages === 1 ? 'stage' : 'stages',
+    'how deep the order goes — each stage needs the one before it');
+  cell(fmtInt(st.scope_videos), 'videos in scope',
+    'the videos the order was inferred from');
+  cell(`${st.minutes || 0}m`, 'to watch',
+    'the picked moments end to end, not the whole reels');
+  cell(fmtInt(st.ready), 'ready now',
+    'steps whose prerequisites are all ticked off');
+  cell(`${st.percent || 0}%`, 'marked off',
+    `${fmtInt(st.done)} done, ${fmtInt(st.skipped)} skipped, ` +
+    `${st.remaining_minutes || 0}m left`);
+  const bar = $('rmBar');
+  bar.firstElementChild.style.width = Math.max(0, Math.min(100, st.percent || 0)) + '%';
+  bar.title = `${st.percent || 0}% of this plan marked off`;
+  $('rmClear').hidden = !st.marked;
+  $('rmClear').textContent = R.armed ? 'Really clear them?' : 'Clear ticks';
+  $('rmClear').classList.toggle('is-armed', R.armed);
+}
+
+/* ── the diagram ──────────────────────────────────────────────────────────
+ * One column per stage, wrapping to a second column when a stage is taller
+ * than the viewport can read — a foundations stage with forty concepts in it
+ * is normal, and a single 2,300-pixel column of it is not readable at any
+ * zoom that also keeps the later stages on screen.
+ * ------------------------------------------------------------------------- */
+function rmLayout() {
+  const stages = R.plan.stages || [];
+  const nodes = new Map();
+  const bands = [];
+  let x = RM_PAD, rows = 1;
+  for (const st of stages) {
+    const ids = (st.steps || []).filter(i => R.steps.has(i));
+    const cols = Math.max(1, Math.ceil(ids.length / RM_ROWS));
+    rows = Math.max(rows, Math.min(ids.length, RM_ROWS));
+    ids.forEach((id, i) => {
+      nodes.set(id, {
+        id,
+        x: x + Math.floor(i / RM_ROWS) * RM_COL_W,
+        y: RM_HEAD_H + (i % RM_ROWS) * (RM_NODE_H + RM_GAP_Y),
+        w: RM_NODE_W, h: RM_NODE_H,
+      });
+    });
+    bands.push({
+      level: st.level, title: st.title, why: st.why,
+      count: ids.length, done: st.done, marked: st.marked,
+      seconds: st.seconds, x: x - 9, w: cols * RM_COL_W - RM_COL_W + RM_NODE_W + 18,
+    });
+    x += cols * RM_COL_W - (RM_COL_W - RM_NODE_W) + RM_BAND_GAP;
+  }
+  R.layout = {
+    nodes, bands,
+    w: x + RM_PAD,
+    h: RM_HEAD_H + rows * (RM_NODE_H + RM_GAP_Y) + RM_PAD,
+  };
+}
+
+function rmDraw() {
+  const scene = $('rmScene'), wires = $('rmWires'), L = R.layout;
+  if (!scene || !L) return;
+  const ready = new Set(R.plan.ready || []);
+  // The svg is a child of the scene and is kept; everything else is rebuilt.
+  for (const el of Array.from(scene.children)) {
+    if (el !== wires) el.remove();
+  }
+  scene.style.width = L.w + 'px';
+  scene.style.height = L.h + 'px';
+  scene.style.transform = `translate(${R.tx}px,${R.ty}px) scale(${R.k})`;
+  wires.setAttribute('viewBox', `0 0 ${L.w} ${L.h}`);
+  wires.setAttribute('width', L.w);
+  wires.setAttribute('height', L.h);
+  wires.textContent = '';
+
+  for (const b of L.bands) {
+    scene.appendChild(h('div', {
+      class: 'rm-band', style: `left:${b.x}px;width:${b.w}px;height:${L.h - RM_PAD}px`,
+      title: b.why,
+    },
+      h('span', { class: 'rm-band-t', text: b.title }),
+      h('span', {
+        class: 'rm-band-n',
+        text: `${b.done}/${b.count} · ${Math.max(1, Math.round(b.seconds / 60))}m`,
+      })));
+  }
+
+  // Curves under the boxes: prerequisite on the left, what it unlocks on the
+  // right. A curve touching the selected step is amber, which is the one
+  // meaning amber carries anywhere in Atlas — "this is the thing you asked".
+  for (const e of R.plan.edges || []) {
+    const a = L.nodes.get(e.src), b = L.nodes.get(e.dst);
+    if (!a || !b) continue;
+    const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
+    const bend = Math.max(26, (x2 - x1) * 0.5);
+    const hot = R.sel && (e.src === R.sel || e.dst === R.sel);
+    wires.appendChild(sv('path', {
+      d: `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`,
+      class: 'rm-wire' + (hot ? ' is-hot' : ''),
+      'stroke-width': (0.9 + 2.6 * Math.min(1, e.strength * 4)).toFixed(2),
+    }));
+  }
+
+  for (const [id, n] of L.nodes) {
+    const s = R.steps.get(id);
+    if (!s) continue;
+    scene.appendChild(h('button', {
+      class: 'rm-node' + (s.state ? ' is-' + s.state : '') +
+        (ready.has(id) && !s.state ? ' is-ready' : '') +
+        (R.sel === id ? ' is-sel' : ''),
+      type: 'button',
+      style: `left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px`,
+      title: `${s.label} — ${fmtInt(s.videos)} video${s.videos === 1 ? '' : 's'}` +
+        (s.prereq.length ? `, after ${s.prereq.map(p => p.label).join(', ')}` : ''),
+      onclick: () => { if (R.dragMoved <= 4) rmGoTo(id); },
+    },
+      h('span', { class: 'rm-node-l', text: s.label }),
+      h('span', { class: 'rm-node-n', text: fmtInt(s.videos) }),
+      s.state === 'done' ? h('span', { class: 'rm-node-tick', text: '✓' }) : null));
+  }
+}
+
+/* Click in the diagram, land on the card. The diagram is for seeing the shape;
+   everything you can actually do with a step lives on its card. */
+function rmGoTo(id) {
+  R.sel = id;
+  if (!R.open.has(id)) rmToggle(id);
+  else rmSync();
+  const card = rmCard(id);
+  if (card) card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function rmFit() {
+  const wrap = $('rmDagWrap'), L = R.layout;
+  if (!L || $('rmDag').hidden) return;
+  const box = wrap.getBoundingClientRect();
+  // The view has no size until it is visible, the same reason the graph and
+  // the maps defer their first measurement. Retrying only while this tab is
+  // the open one, because a retry loop against a display:none element would
+  // never terminate and never be seen.
+  if (box.width < 40) {
+    if (S.tab === 'roadmap') requestAnimationFrame(rmFit);
+    return;
+  }
+  R.k = Math.max(0.28, Math.min(1, Math.min(box.width / L.w, box.height / L.h)));
+  R.tx = Math.max(0, (box.width - L.w * R.k) / 2);
+  R.ty = Math.max(0, (box.height - L.h * R.k) / 2);
+  rmApply();
+}
+
+function rmZoom(mul, cx, cy) {
+  const wrap = $('rmDagWrap');
+  if (!wrap) return;
+  const box = wrap.getBoundingClientRect();
+  const px = cx === undefined ? box.width / 2 : cx;
+  const py = cy === undefined ? box.height / 2 : cy;
+  const k2 = Math.max(0.2, Math.min(2.4, R.k * mul));
+  // Keep whatever is under the pointer under the pointer.
+  R.tx = px - (px - R.tx) * (k2 / R.k);
+  R.ty = py - (py - R.ty) * (k2 / R.k);
+  R.k = k2;
+  rmApply();
+}
+
+function rmApply() {
+  const scene = $('rmScene');
+  if (scene) scene.style.transform = `translate(${R.tx}px,${R.ty}px) scale(${R.k})`;
+  const note = $('rmDagNote');
+  if (note && R.plan) {
+    const st = R.plan.stats || {};
+    note.textContent = `${fmtInt(st.concepts)} steps in ${fmtInt(st.stages)} ` +
+      `stage${st.stages === 1 ? '' : 's'} · left to right is what comes first` +
+      (R.k < 0.999 ? ` · ${Math.round(R.k * 100)}%` : '');
+  }
+}
+
+/* ── the plan itself ───────────────────────────────────────────────────── */
+function rmRenderStages() {
+  const box = $('rmStages');
+  box.textContent = '';
+  for (const st of R.plan.stages || []) {
+    const list = h('div', { class: 'rm-steps' });
+    for (const id of st.steps || []) {
+      const s = R.steps.get(id);
+      if (s) list.appendChild(rmStepCard(s));
+    }
+    box.appendChild(h('section', { class: 'rm-stage', 'data-level': st.level },
+      h('div', { class: 'rm-stage-head' },
+        h('span', { class: 'rm-stage-n', text: String(st.level) }),
+        h('h3', { text: st.title }),
+        h('span', { class: 'rm-stage-why', text: st.why }),
+        h('span', {
+          class: 'rm-stage-count', 'data-level': st.level,
+          text: `${st.done}/${st.count} done · ${Math.max(1, Math.round(st.seconds / 60))}m`,
+        })),
+      list));
+  }
+}
+
+function rmStepCard(s) {
+  const ready = (R.plan.ready || []).includes(s.id);
+  const open = R.open.has(s.id);
+  const card = h('article', {
+    class: 'rm-step' + (s.state ? ' is-' + s.state : '') +
+      (ready && !s.state ? ' is-ready' : '') + (R.sel === s.id ? ' is-sel' : ''),
+    id: 'rmcard-' + (R.at.get(s.id) ?? -1), 'data-id': s.id,
+  });
+
+  const tick = h('button', {
+    class: 'rm-tick', type: 'button', 'aria-pressed': String(s.state === 'done'),
+    title: s.state === 'done' ? 'Ticked off — click to un-tick' : 'Mark as watched',
+    onclick: () => rmMark(s.id, s.state === 'done' ? '' : 'done'),
+  }, h('span', { text: '✓' }));
+
+  const head = h('div', { class: 'rm-step-head' },
+    tick,
+    h('button', {
+      class: 'rm-step-title', type: 'button',
+      'aria-expanded': String(open),
+      onclick: () => { R.sel = s.id; rmToggle(s.id); },
+    },
+      h('b', { text: s.label }),
+      h('span', { class: 'rm-step-kind', text: s.kind === 'hashtag' ? 'hashtag' : (s.group || s.kind) })),
+    h('div', { class: 'rm-step-facts' },
+      h('span', { text: `${fmtInt(s.videos)} video${s.videos === 1 ? '' : 's'}` }),
+      h('span', { text: `${Math.round((s.share || 0) * 100)}% of scope` }),
+      s.seconds ? h('span', { text: `${Math.round(s.seconds)}s to watch` }) : null,
+      ready && !s.state ? h('span', { class: 'rm-flag', text: 'ready now' }) : null,
+      s.state === 'skip' ? h('span', { class: 'rm-flag rm-flag-skip', text: 'skipped' }) : null),
+    h('button', {
+      class: 'rm-skip', type: 'button', 'aria-pressed': String(s.state === 'skip'),
+      title: s.state === 'skip' ? 'Put it back in the plan' : 'Skip this — I know it already',
+      onclick: () => rmMark(s.id, s.state === 'skip' ? '' : 'skip'),
+    }, 'Skip'));
+
+  card.appendChild(head);
+  const why = rmWhy(s);
+  if (why) card.appendChild(why);
+  card.appendChild(h('div', { class: 'rm-step-body', hidden: !open }));
+  if (open) rmFillBody(card, s.id);
+  return card;
+}
+
+/* Why this step sits where it does. The numbers are the whole argument: a
+   prerequisite is claimed only because it turns up in most of the videos this
+   concept appears in and not the other way round, so both directions are
+   shown and the reader can disagree with the inference. */
+function rmWhy(s) {
+  if (!s.prereq.length && !s.unlocks.length) return null;
+  const row = h('div', { class: 'rm-why' });
+  if (s.prereq.length) {
+    row.appendChild(h('span', { class: 'rm-why-k', text: 'after' }));
+    for (const p of s.prereq) {
+      row.appendChild(h('button', {
+        class: 'rm-link', type: 'button',
+        title: `${p.label} is in ${Math.round(p.p_forward * 100)}% of the videos ` +
+          `“${s.label}” appears in, but “${s.label}” is in only ` +
+          `${Math.round(p.p_back * 100)}% of ${p.label}'s — ${fmtInt(p.shared)} shared`,
+        onclick: () => rmGoTo(p.id),
+      }, p.label));
+    }
+  }
+  if (s.unlocks.length) {
+    row.appendChild(h('span', { class: 'rm-why-k', text: 'opens up' }));
+    for (const u of s.unlocks.slice(0, 4)) {
+      row.appendChild(h('button', {
+        class: 'rm-link rm-link-fwd', type: 'button',
+        onclick: () => rmGoTo(u.id),
+      }, u.label));
+    }
+    if (s.unlocks.length > 4) {
+      row.appendChild(h('span', {
+        class: 'rm-why-more', text: `+${s.unlocks.length - 4} more`,
+      }));
+    }
+  }
+  return row;
+}
+
+async function rmToggle(id) {
+  if (R.open.has(id)) R.open.delete(id);
+  else R.open.add(id);
+  const card = rmCard(id);
+  if (card) {
+    const body = card.querySelector('.rm-step-body');
+    if (body) body.hidden = !R.open.has(id);
+    const title = card.querySelector('.rm-step-title');
+    if (title) title.setAttribute('aria-expanded', String(R.open.has(id)));
+    if (R.open.has(id)) rmFillBody(card, id);
+  }
+  rmSync();
+  if (!R.open.has(id) || R.detail.has(id)) return;
+  // The plan carries five moments per step; opening one asks for the rest,
+  // over the same scope the plan was built for.
+  let got;
+  try {
+    got = await api(`/api/roadmap/step/${encodeURIComponent(id).replace(/%3A/g, ':')}` +
+      `?goal=${encodeURIComponent(R.goal)}`);
+  } catch (e) {
+    got = { ok: false, note: e.message };
+  }
+  R.detail.set(id, got);
+  const still = rmCard(id);
+  if (R.open.has(id) && still) rmFillBody(still, id);
+}
+
+function rmFillBody(card, id) {
+  const body = card.querySelector('.rm-step-body');
+  if (!body) return;
+  body.textContent = '';
+  if (!R.open.has(id)) return;
+  const s = R.steps.get(id);
+  const got = R.detail.get(id);
+  const full = got && got.ok ? got : null;
+  const moments = full ? full.moments : (s ? s.moments : []);
+  const videos = (full ? full.videos : null) || (R.plan.videos || {});
+
+  if (got && !got.ok) {
+    body.appendChild(h('p', { class: 'rm-body-note', text: got.note || 'that step could not be read' }));
+  } else if (!full) {
+    body.appendChild(h('p', { class: 'rm-body-note', text: 'reading the rest of this step…' }));
+  }
+
+  if (full) {
+    const scoped = full.videos_in_scope < full.videos_total
+      ? `${fmtInt(full.videos_in_scope)} of ${fmtInt(full.videos_total)} videos, ` +
+        'narrowed to the goal'
+      : `${fmtInt(full.videos_total)} video${full.videos_total === 1 ? '' : 's'}`;
+    body.appendChild(h('p', { class: 'rm-body-note', text: scoped }));
+  }
+
+  // Honesty about what the moments are. A concept mined from a tag column may
+  // never be said out loud, and a passage that does not contain the word must
+  // not be presented as if it did.
+  if (moments && moments.length && !(moments[0] || {}).said) {
+    body.appendChild(h('p', { class: 'rm-body-warn' },
+      `nothing in these videos says “${s ? s.label : ''}” in words — these are ` +
+      'the strongest moments of the videos carrying it, not quotes of it'));
+  }
+
+  if (!moments || !moments.length) {
+    body.appendChild(h('p', { class: 'rm-body-note', text: 'no indexed moment to open for this one' }));
+    return;
+  }
+  const list = h('div', { class: 'rm-moms' });
+  for (const m of moments) list.appendChild(rmMoment(m, videos, s));
+  body.appendChild(list);
+}
+
+function rmMoment(m, videos, s) {
+  const v = videos[m.video_key] || {};
+  const shot = posterImg({ video_key: m.video_key }, m.t_start, 'rm-shot');
+  previewOn(shot, m.video_key, m.t_start);
+  const open = () => openVideoKey(m.video_key, m.t_start);
+  const row = h('div', {
+    class: 'rm-mom', role: 'button', tabindex: '0',
+    title: 'Play this moment',
+    onclick: open,
+    onkeydown: (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); }
+    },
+  },
+    shot,
+    h('span', { class: 'rm-mom-rail', style: `background:${color(m.source)}` }),
+    h('div', { class: 'rm-mom-txt' },
+      h('div', { class: 'rm-mom-line' },
+        h('span', { class: 'rm-mom-t', text: timecode(m.t_start) }),
+        h('span', { class: 'rm-mom-src', style: `color:${color(m.source)}`,
+          text: SOURCE_LABEL[m.source] || m.source }),
+        h('span', { class: 'rm-mom-of', text: v.title || v.creator || m.video_key })),
+      h('p', { class: 'rm-mom-p' }, marked(m.text, s ? s.label : ''))));
+  return row;
+}
+
+/* ── progress ──────────────────────────────────────────────────────────────
+ * A tick is a one-row write, so the plan is not rebuilt for it. What changes
+ * locally is exactly what the server would recompute: the counts, which steps
+ * are now ready, and the classes that say so. Re-rendering the whole list
+ * instead would scroll the card out from under the click.
+ * ------------------------------------------------------------------------- */
+async function rmMark(id, state) {
+  const s = R.steps.get(id);
+  if (!s) return;
+  const was = s.state;
+  s.state = state;
+  R.sel = id;
+  rmRecount();
+  try {
+    await api('/api/roadmap/progress' +
+      `?step_id=${encodeURIComponent(id)}&state=${encodeURIComponent(state)}` +
+      `&goal=${encodeURIComponent(R.goal)}`, { method: 'POST' });
+  } catch (e) {
+    s.state = was;                      // it never landed, so nothing changed
+    rmRecount();
+    toast('that tick did not save — ' + e.message);
+  }
+}
+
+async function rmClearTicks() {
+  if (!R.armed) {                       // no undo exists, so ask once
+    R.armed = true;
+    rmRenderStats();
+    setTimeout(() => { if (R.armed) { R.armed = false; rmRenderStats(); } }, 4000);
+    return;
+  }
+  R.armed = false;
+  try { await api('/api/roadmap/progress?clear=true', { method: 'POST' }); }
+  catch (e) { toast('the ticks are still there — ' + e.message); return; }
+  for (const s of R.steps.values()) s.state = '';
+  rmRecount();
+  toast('every tick cleared');
+}
+
+function rmRecount() {
+  const steps = [...R.steps.values()];
+  const state = new Map(steps.map(s => [s.id, s.state || '']));
+  const ready = steps
+    .filter(s => !s.state && (s.prereq || []).every(p => state.get(p.id)))
+    .map(s => s.id);
+  const done = steps.filter(s => s.state === 'done').length;
+  const skipped = steps.filter(s => s.state === 'skip').length;
+  const n = steps.length || 1;
+  R.plan.ready = ready;
+  Object.assign(R.plan.stats, {
+    done, skipped, marked: done + skipped, ready: ready.length,
+    percent: Math.round(1000 * (done + skipped) / n) / 10,
+    remaining_minutes:
+      Math.round(steps.filter(s => !s.state)
+        .reduce((a, s) => a + (s.seconds || 0), 0) / 6) / 10,
+  });
+  for (const st of R.plan.stages || []) {
+    const mine = (st.steps || []).map(i => R.steps.get(i)).filter(Boolean);
+    st.done = mine.filter(s => s.state === 'done').length;
+    st.marked = mine.filter(s => s.state).length;
+  }
+  rmRenderStats();
+  rmSync();
+}
+
+/* Repaint the states without rebuilding the DOM that holds them. */
+function rmSync() {
+  const ready = new Set(R.plan.ready || []);
+  for (const el of $$('#rmStages .rm-step')) {
+    const s = R.steps.get(el.dataset.id);
+    if (!s) continue;
+    el.classList.toggle('is-done', s.state === 'done');
+    el.classList.toggle('is-skip', s.state === 'skip');
+    el.classList.toggle('is-ready', ready.has(s.id) && !s.state);
+    el.classList.toggle('is-sel', R.sel === s.id);
+    const tick = el.querySelector('.rm-tick');
+    if (tick) {
+      tick.setAttribute('aria-pressed', String(s.state === 'done'));
+      tick.title = s.state === 'done'
+        ? 'Ticked off — click to un-tick' : 'Mark as watched';
+    }
+    const skip = el.querySelector('.rm-skip');
+    if (skip) {
+      skip.setAttribute('aria-pressed', String(s.state === 'skip'));
+      skip.title = s.state === 'skip'
+        ? 'Put it back in the plan' : 'Skip this — I know it already';
+    }
+    const facts = el.querySelector('.rm-step-facts');
+    if (facts) {
+      for (const f of $$('.rm-flag', facts)) f.remove();
+      if (ready.has(s.id) && !s.state) {
+        facts.appendChild(h('span', { class: 'rm-flag', text: 'ready now' }));
+      }
+      if (s.state === 'skip') {
+        facts.appendChild(h('span', { class: 'rm-flag rm-flag-skip', text: 'skipped' }));
+      }
+    }
+  }
+  for (const el of $$('#rmStages .rm-stage-count')) {
+    const st = (R.plan.stages || []).find(x => String(x.level) === el.dataset.level);
+    if (st) {
+      el.textContent = `${st.done}/${st.count} done · ` +
+        `${Math.max(1, Math.round(st.seconds / 60))}m`;
+    }
+  }
+  rmDraw();
+}
+
+function rmWire() {
+  $('rmForm').addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    rmLoad($('rmGoal').value.trim());
+  });
+  $('rmWhole').addEventListener('click', () => rmLoad(''));
+  $('rmClear').addEventListener('click', rmClearTicks);
+  $('rmIn').addEventListener('click', () => rmZoom(1.25));
+  $('rmOut').addEventListener('click', () => rmZoom(0.8));
+  $('rmFit').addEventListener('click', rmFit);
+
+  const wrap = $('rmDagWrap');
+  wrap.addEventListener('wheel', (ev) => {
+    if (!R.layout) return;
+    ev.preventDefault();
+    const box = wrap.getBoundingClientRect();
+    rmZoom(ev.deltaY < 0 ? 1.11 : 0.9, ev.clientX - box.left, ev.clientY - box.top);
+  }, { passive: false });
+
+  // Drag to pan. The boxes are buttons, and a pointerup that ends a pan still
+  // produces their click — preventDefault on pointerup does not stop it — so
+  // the distance travelled outlives the drag and the click reads it.
+  wrap.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    R.dragMoved = 0;
+    R.drag = { x: ev.clientX, y: ev.clientY, tx: R.tx, ty: R.ty, moved: 0 };
+    wrap.classList.add('is-dragging');
+  });
+  wrap.addEventListener('pointermove', (ev) => {
+    if (!R.drag) return;
+    const dx = ev.clientX - R.drag.x, dy = ev.clientY - R.drag.y;
+    R.drag.moved = Math.max(R.drag.moved, Math.abs(dx) + Math.abs(dy));
+    R.tx = R.drag.tx + dx;
+    R.ty = R.drag.ty + dy;
+    rmApply();
+  });
+  const release = () => {
+    if (!R.drag) return;
+    R.dragMoved = R.drag.moved;
+    R.drag = null;
+    wrap.classList.remove('is-dragging');
+  };
+  wrap.addEventListener('pointerup', release);
+  wrap.addEventListener('pointercancel', release);
+  wrap.addEventListener('pointerleave', release);
+
+  wrap.addEventListener('keydown', (ev) => {
+    const step = 60;
+    if (ev.key === '+' || ev.key === '=') rmZoom(1.2);
+    else if (ev.key === '-') rmZoom(0.82);
+    else if (ev.key === '0') rmFit();
+    else if (ev.key === 'ArrowLeft') { R.tx += step; rmApply(); }
+    else if (ev.key === 'ArrowRight') { R.tx -= step; rmApply(); }
+    else if (ev.key === 'ArrowUp') { R.ty += step; rmApply(); }
+    else if (ev.key === 'ArrowDown') { R.ty -= step; rmApply(); }
+    else return;
+    ev.preventDefault();
+  });
+
+  window.addEventListener('resize', () => {
+    if (S.tab === 'roadmap') rmApply();
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════
    STATUS
    ════════════════════════════════════════════════════════════════════════ */
 let statusTimer = 0;
@@ -4899,6 +5631,7 @@ function wire() {
 
   gwire();
   mapsWire();
+  rmWire();
 
   $('rescanBtn').addEventListener('click', async () => {
     $('rescanBtn').disabled = true;
@@ -4963,6 +5696,10 @@ function wire() {
     if (tab !== S.tab) showTab(tab, { push: false });
     const q = params.get('q') || '';
     if (tab === 'search' && q && q !== S.query) runSearch(q);
+    // A roadmap link carries its goal, so the plan the sender was looking at is
+    // the plan that opens — not the archive-wide one.
+    const goal = params.get('goal') || '';
+    if (tab === 'roadmap' && goal !== R.goal) rmLoad(goal, { push: false });
   });
 }
 
@@ -4975,6 +5712,8 @@ function start() {
   const q = params.get('q');
   // A link carrying a query is a link to results, whatever tab the hash names —
   // otherwise a shared URL lands on the landing page with the query invisible.
+  const goal = params.get('goal') || '';
+  if (tab === 'roadmap' && goal) R.goal = goal;   // read by roadmapBoot below
   showTab(q ? 'search' : tab, { push: false });
   if (q) { $('q').value = q; runSearch(q); }
   const v = params.get('v');

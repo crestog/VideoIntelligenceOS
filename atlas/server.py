@@ -34,7 +34,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
-from . import config, graph, index, ingest, maps, media, reflect, search
+from . import (config, graph, index, ingest, maps, media, reflect, roadmap,
+               search)
 from .tgchannel import log, recent_log
 
 BOOT_T0 = time.time()
@@ -108,6 +109,7 @@ def _boot() -> None:
     index.ensure_schema(conn)
     graph.ensure_schema(conn)
     maps.ensure_schema(conn)
+    roadmap.ensure_schema(conn)
 
     # Sparse files are only usable while the process that built them remembers
     # which chunks landed, so last run's leftovers are dropped before anything
@@ -875,10 +877,65 @@ def api_graph_from(keys: str = "", limit: int = 24, per_video: int = 5):
 def api_graph_rebuild():
     conn = db()
     try:
-        return graph.rebuild(conn)
+        out = graph.rebuild(conn)
+        # Every plan was derived from the graph that just went away.
+        roadmap.invalidate()
+        return out
     except Exception as e:                                  # noqa: BLE001
         return JSONResponse({"ok": False, "note": f"{type(e).__name__}: {e}"},
                             status_code=500)
+
+
+# ── the roadmap ───────────────────────────────────────────────────────────
+# The same graph, ordered. Building a plan costs a group-by over the edge table
+# plus one FTS lookup per step, so it is cached against the graph's own size and
+# a repeat request is a dictionary hit — which is what makes typing a goal feel
+# like filtering rather than like a job.
+@app.get("/api/roadmap")
+def api_roadmap(goal: str = "", breadth: int = 0, min_support: int = 0):
+    """A watch order for the archive, or for the part of it a goal names."""
+    try:
+        return roadmap.plan(db(), goal,
+                            breadth=breadth or roadmap.BREADTH,
+                            min_support=min_support or roadmap.MIN_SUPPORT)
+    except Exception as e:                                  # noqa: BLE001
+        return JSONResponse({"ok": False, "note": f"{type(e).__name__}: {e}"},
+                            status_code=500)
+
+
+@app.get("/api/roadmap/step/{step_id:path}")
+def api_roadmap_step(step_id: str, goal: str = "", limit: int = 0):
+    """One step in full. `:path` for the same reason the graph routes use it."""
+    found = roadmap.step(db(), step_id, goal=goal,
+                         limit=limit or roadmap.MOMENTS_IN_STEP)
+    if not found.get("ok"):
+        return JSONResponse(found, status_code=404)
+    return found
+
+
+@app.get("/api/roadmap/goals")
+def api_roadmap_goals(limit: int = 14):
+    """Goals worth offering before anything is typed."""
+    return {"ok": True, "goals": roadmap.suggest(db(), limit=max(1, min(limit, 60)))}
+
+
+@app.get("/api/roadmap/progress")
+def api_roadmap_progress():
+    conn = db()
+    return {"ok": True, "progress": roadmap.progress(conn),
+            "counts": roadmap.counts(conn)}
+
+
+@app.post("/api/roadmap/progress")
+def api_roadmap_mark(step_id: str = "", state: str = "", goal: str = "",
+                     clear: bool = False):
+    """Tick a step, skip it, clear one, or clear the lot."""
+    conn = db()
+    out = roadmap.clear(conn) if clear else roadmap.mark(conn, step_id, state,
+                                                        goal=goal)
+    if not out.get("ok"):
+        return JSONResponse(out, status_code=400)
+    return out
 
 
 # ── media ─────────────────────────────────────────────────────────────────

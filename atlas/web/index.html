@@ -42,6 +42,7 @@
     <button role="tab" data-tab="library" aria-selected="false">Library</button>
     <button role="tab" data-tab="graph" aria-selected="false">Graph</button>
     <button role="tab" data-tab="maps" aria-selected="false">Maps</button>
+    <button role="tab" data-tab="roadmap" aria-selected="false">Roadmap</button>
     <button role="tab" data-tab="data" aria-selected="false">Data</button>
     <button role="tab" data-tab="sources" aria-selected="false">Sources</button>
   </nav>
@@ -142,6 +143,11 @@
             <span class="door-k">Maps</span>
             <span class="door-t">See the shape of it</span>
             <span class="door-d">The whole archive laid out by meaning, by cluster, or against any two measures you choose.</span>
+          </button>
+          <button class="door" data-goto="roadmap">
+            <span class="door-k">Roadmap</span>
+            <span class="door-t">Learn it in order</span>
+            <span class="door-d">What has to be understood before what, inferred from the archive itself. Every step opens the seconds to watch.</span>
           </button>
           <button class="door" data-goto="data">
             <span class="door-k">Data</span>
@@ -409,6 +415,63 @@
 
         <div class="maps-empty" id="mapsEmpty" hidden></div>
       </div>
+    </div>
+
+    <!-- ROADMAP ------------------------------------------------------- -->
+    <!-- The Graph tab shows what is connected. This shows what to watch
+         first. The order is inferred from one-sided co-occurrence in the
+         same graph — so it is the archive's own opinion about what has to be
+         understood before what, not a syllabus somebody typed. Every step
+         opens into the exact seconds to watch, in the player on the right. -->
+    <div class="view" id="view-roadmap" data-view="roadmap" hidden>
+      <div class="view-head">
+        <h2>Roadmap</h2>
+        <p class="view-note" id="rmNote"></p>
+      </div>
+
+      <form class="rm-goal" id="rmForm" autocomplete="off">
+        <div class="rm-find">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
+          <input id="rmGoal" type="search" spellcheck="false"
+                 placeholder="What do you want to get good at? Leave it empty for the whole archive"
+                 aria-label="Goal">
+        </div>
+        <button class="btn" id="rmGo" type="submit">Plan it</button>
+        <button class="btn btn-quiet" id="rmWhole" type="button">Whole archive</button>
+      </form>
+      <div class="rm-chips" id="rmChips" aria-label="Goals worth trying"></div>
+
+      <div class="rm-head" id="rmHead" hidden>
+        <div class="rm-stats" id="rmStats"></div>
+        <div class="rm-progress">
+          <div class="rm-bar" id="rmBar"><span></span></div>
+          <button class="btn btn-quiet" id="rmClear" type="button">Clear ticks</button>
+        </div>
+      </div>
+
+      <!-- The shape of the plan, before the plan itself: stages left to
+           right, prerequisites as curves, and a click opens that step's card
+           below. Drawn as elements rather than pixels because sixty boxes
+           should be hoverable, focusable and readable at any zoom. -->
+      <div class="rm-dag" id="rmDag" hidden>
+        <div class="rm-dag-head">
+          <span class="rm-dag-note" id="rmDagNote"></span>
+          <div class="rm-dag-tools">
+            <button class="gtool gtool-icon" id="rmOut" type="button" title="Zoom out (−)">−</button>
+            <button class="gtool gtool-icon" id="rmIn" type="button" title="Zoom in (+)">+</button>
+            <button class="gtool" id="rmFit" type="button" title="Fit the whole plan">Fit</button>
+          </div>
+        </div>
+        <div class="rm-dag-wrap" id="rmDagWrap" tabindex="0"
+             aria-label="The plan as a diagram. Drag to pan, scroll to zoom, click a step to open it.">
+          <div class="rm-scene" id="rmScene">
+            <svg class="rm-wires" id="rmWires" aria-hidden="true"></svg>
+          </div>
+        </div>
+      </div>
+
+      <div class="rm-stages" id="rmStages"></div>
+      <div class="rm-empty" id="rmEmpty" hidden></div>
     </div>
 
     <!-- DATA --------------------------------------------------------- -->
