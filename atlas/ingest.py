@@ -67,6 +67,7 @@ _STATE = {
     "imported": 0,
     "skipped": 0,
     "failed": 0,
+    "assets": 0,              # per-video asset manifests read into `parts`
     "bytes_done": 0,
     "bytes_total": 0,
     "current": "",
@@ -793,6 +794,60 @@ def _manifest_from_message(msg, work_dir: str):
         return None
 
 
+_ASSET_SUFFIX = "-manifest.json"
+
+
+def _looks_like_asset_manifest(info: dict) -> bool:
+    """Cheap name test before spending a download.
+
+    Deliberately narrow. The channel carries three kinds of `.json` — export
+    bundle manifests, per-video records, and these — and a wrong guess costs a
+    download plus a parse per message across a whole-channel walk. The
+    `<key>-manifest.json` name is written by `assets.manifest_name` and nothing
+    else produces it.
+    """
+    name = str(info.get("file_name") or "")
+    return name.endswith(_ASSET_SUFFIX) and len(name) > len(_ASSET_SUFFIX)
+
+
+def _asset_manifest(conn: sqlite3.Connection, info: dict,
+                    work_dir: str) -> bool:
+    """Import a per-video asset manifest into `parts`. True if rows landed.
+
+    Failure is quiet and returns False: a manifest that will not parse costs
+    that video its instant playback, and the byte-range path still plays it.
+    Losing the scan over it would cost every video.
+    """
+    if not _looks_like_asset_manifest(info):
+        return False
+    dest = os.path.join(work_dir, f"asset-{info.get('message_id')}.json")
+    try:
+        if not tgchannel.fetch_document(info, dest):
+            return False
+        with open(dest, "r", encoding="utf-8", errors="replace") as f:
+            man = json.load(f)
+    except Exception as e:
+        log(f"asset manifest {info.get('message_id')} would not read ({e})")
+        return False
+    finally:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+    if not isinstance(man, dict) or not man.get("key"):
+        return False
+    try:
+        from . import index as index_mod
+        index_mod.ensure_schema(conn)
+        n = index_mod.record_parts(conn, man)
+    except Exception as e:
+        log(f"asset manifest for {man.get('key')} would not store ({e})")
+        return False
+    if n:
+        log(f"asset set for {man['key']} — {len(man.get('chunks') or [])} clip(s)")
+    return bool(n)
+
+
 def scan_and_import(full: bool = True, max_messages: int = 0,
                     on_bundle=None) -> dict:
     """Find every bundle in the channel and import the ones not yet held.
@@ -814,7 +869,7 @@ def scan_and_import(full: bool = True, max_messages: int = 0,
 
     _set(phase="probing", running=True, error="", started_at=time.time(),
          finished_at=0.0, scanned=0, found=0, imported=0, skipped=0, failed=0,
-         detail="checking channel access", current="")
+         assets=0, detail="checking channel access", current="")
 
     conn = connect()
     ensure_meta(conn)
@@ -938,6 +993,13 @@ def scan_and_import(full: bool = True, max_messages: int = 0,
 
                 man = _manifest_from_message(msg, work)
                 if not man:
+                    # Not a bundle manifest. It may still be a per-video asset
+                    # manifest — the index that makes clip playback possible —
+                    # which lives in the same channel and is also a .json.
+                    if _asset_manifest(conn, info, work):
+                        found_ids.append(m_id)
+                        with _LOCK:
+                            _STATE["assets"] = _STATE.get("assets", 0) + 1
                     continue
                 found_ids.append(m_id)
                 seq = str(man.get("seq") or m_id)
@@ -965,9 +1027,11 @@ def scan_and_import(full: bool = True, max_messages: int = 0,
         _set(phase="done", running=False, finished_at=time.time(),
              current="", detail=f"{_STATE['found']} bundle(s) and shard(s) "
                                 f"in channel · {_STATE['imported']} imported · "
-                                f"{_STATE['skipped']} already held")
+                                f"{_STATE['skipped']} already held · "
+                                f"{_STATE['assets']} asset set(s)")
         log(f"scan complete — {_STATE['found']} bundle(s)/shard(s), "
-            f"{_STATE['imported']} imported, {_STATE['failed']} failed")
+            f"{_STATE['imported']} imported, {_STATE['failed']} failed, "
+            f"{_STATE['assets']} asset set(s)")
     except Exception as e:
         _set(phase="error", running=False, finished_at=time.time(),
              error=f"{type(e).__name__}: {e}",

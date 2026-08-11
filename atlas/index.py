@@ -102,6 +102,34 @@ _MOMENT_DDL = (
 
     "CREATE INDEX IF NOT EXISTS video_by_created ON video_index(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS video_by_moments ON video_index(moment_count DESC)",
+
+    # One row per channel message that belongs to a video's *asset set*: the
+    # 2-second clips, the metadata json, the manifest itself. Filled by
+    # atlas.ingest while it walks the channel — the same walk that imports
+    # bundles — so a video's clips are discoverable by message id without
+    # opening a single Telegram session.
+    #
+    # `kind` is one of: video | clip | meta | frames | manifest | record.
+    # A clip row carries its time range so playback can pick the exact
+    # segment covering a moment. `file_id` is the cheap HTTP route and
+    # `msg_id` the permanent MTProto one; Atlas tries file_id first and
+    # falls back to msg_id exactly like every other fetch here.
+    "CREATE TABLE IF NOT EXISTS parts ("
+    "  video_key TEXT NOT NULL,"
+    "  kind TEXT NOT NULL,"
+    "  seq INTEGER,"
+    "  msg_id INTEGER,"
+    "  file_id TEXT,"
+    "  name TEXT,"
+    "  bytes INTEGER,"
+    "  sha256 TEXT,"
+    "  t_start REAL,"
+    "  t_end REAL,"
+    "  chunk_seconds REAL,"
+    "  UNIQUE(msg_id))",
+
+    "CREATE INDEX IF NOT EXISTS parts_by_video ON parts(video_key, kind, seq)",
+    "CREATE INDEX IF NOT EXISTS parts_by_time ON parts(video_key, t_start)",
 )
 
 # External-content FTS5: the text lives in `moments` and is not duplicated
@@ -309,6 +337,145 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
             fts = False
     conn.commit()
     return fts
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ASSET PARTS — the clip index behind instant playback
+# ══════════════════════════════════════════════════════════════════════════
+def record_parts(conn: sqlite3.Connection, manifest: dict) -> int:
+    """Store one video's asset manifest as `parts` rows. Returns rows written.
+
+    `INSERT OR REPLACE` keyed on `msg_id`: a message is one asset, forever, so
+    re-importing the same manifest is a no-op and a manifest that was rebuilt
+    after a partial upload replaces the stale rows rather than doubling them.
+    """
+    key = str(manifest.get("key") or "")
+    if not key:
+        return 0
+    span = manifest.get("chunk_seconds")
+    rows = []
+
+    video = manifest.get("video") or {}
+    if video.get("msg_id"):
+        rows.append((key, "video", 0, int(video["msg_id"]),
+                     video.get("file_id", ""), video.get("name", ""),
+                     int(video.get("bytes") or 0), video.get("sha256", ""),
+                     0.0, manifest.get("duration"), span))
+
+    for c in (manifest.get("chunks") or []):
+        if not c.get("msg_id"):
+            continue
+        rows.append((key, "clip", int(c.get("i") or 0), int(c["msg_id"]),
+                     c.get("file_id", ""), c.get("name", ""),
+                     int(c.get("bytes") or 0), c.get("sha256", ""),
+                     float(c.get("t0") or 0.0), float(c.get("t1") or 0.0),
+                     span))
+
+    for a in (manifest.get("assets") or []):
+        if not a.get("msg_id"):
+            continue
+        rows.append((key, str(a.get("kind") or "asset"), 0, int(a["msg_id"]),
+                     a.get("file_id", ""), a.get("name", ""),
+                     int(a.get("bytes") or 0), a.get("sha256", ""),
+                     None, None, span))
+
+    if not rows:
+        return 0
+    conn.executemany(
+        "INSERT OR REPLACE INTO parts (video_key, kind, seq, msg_id, file_id, "
+        "name, bytes, sha256, t_start, t_end, chunk_seconds) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.commit()
+    return len(rows)
+
+
+def clip_at(conn: sqlite3.Connection, video_key: str, t: float) -> dict:
+    """The clip covering timestamp `t`, or {}.
+
+    Clip boundaries come from the muxer, not from `t // seconds`, because
+    segmenting cuts on keyframes and a reel's GOP is rarely exactly the
+    requested length. So this is a range query, and the `<=`/`>` asymmetry is
+    what stops a `t` that lands exactly on a boundary matching two clips.
+    """
+    try:
+        row = conn.execute(
+            "SELECT video_key, kind, seq, msg_id, file_id, name, bytes, "
+            "t_start, t_end FROM parts "
+            "WHERE video_key=? AND kind='clip' AND t_start<=? AND t_end>? "
+            "ORDER BY seq LIMIT 1", (str(video_key), float(t), float(t))
+        ).fetchone()
+    except sqlite3.Error:
+        return {}
+    if not row:
+        # Past the last clip — a `t` at or beyond the end should still play the
+        # final clip rather than nothing, which is what a search hit on the last
+        # second of a video asks for.
+        try:
+            row = conn.execute(
+                "SELECT video_key, kind, seq, msg_id, file_id, name, bytes, "
+                "t_start, t_end FROM parts WHERE video_key=? AND kind='clip' "
+                "ORDER BY seq DESC LIMIT 1", (str(video_key),)).fetchone()
+        except sqlite3.Error:
+            return {}
+    if not row:
+        return {}
+    cols = ("video_key", "kind", "seq", "msg_id", "file_id", "name", "bytes",
+            "t_start", "t_end")
+    return dict(zip(cols, row))
+
+
+def clips_for(conn: sqlite3.Connection, video_key: str,
+              t0: float = None, t1: float = None) -> list:
+    """Every clip for a video, optionally limited to a time window."""
+    sql = ("SELECT seq, msg_id, file_id, name, bytes, t_start, t_end "
+           "FROM parts WHERE video_key=? AND kind='clip'")
+    args = [str(video_key)]
+    if t0 is not None:
+        sql += " AND t_end > ?"
+        args.append(float(t0))
+    if t1 is not None:
+        sql += " AND t_start < ?"
+        args.append(float(t1))
+    sql += " ORDER BY seq"
+    try:
+        cur = conn.execute(sql, args)
+    except sqlite3.Error:
+        return []
+    cols = ("seq", "msg_id", "file_id", "name", "bytes", "t_start", "t_end")
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def part_of(conn: sqlite3.Connection, video_key: str, kind: str) -> dict:
+    """One non-clip asset for a video (`meta`, `manifest`, `frames`), or {}."""
+    try:
+        row = conn.execute(
+            "SELECT msg_id, file_id, name, bytes FROM parts "
+            "WHERE video_key=? AND kind=? ORDER BY msg_id DESC LIMIT 1",
+            (str(video_key), str(kind))).fetchone()
+    except sqlite3.Error:
+        return {}
+    if not row:
+        return {}
+    return dict(zip(("msg_id", "file_id", "name", "bytes"), row))
+
+
+def has_clips(conn: sqlite3.Connection, video_key: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM parts WHERE video_key=? AND kind='clip' LIMIT 1",
+            (str(video_key),)).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row)
+
+
+def keys_with_clips(conn: sqlite3.Connection) -> set:
+    """Every video that has a clip index, for the UI to badge instant playback."""
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT DISTINCT video_key FROM parts WHERE kind='clip'")}
+    except sqlite3.Error:
+        return set()
 
 
 def _collect(conn: sqlite3.Connection) -> dict:
@@ -664,3 +831,14 @@ def _embed_all(db_path: str) -> None:
 
     from . import search
     search.reload_vectors()
+
+    # The map is a projection of exactly these vectors, so the moment they land
+    # is the moment it can be drawn — and the moment any previously built map
+    # became a picture of an older archive. Building it here rather than on the
+    # first click keeps opening the tab instant, and it runs in its own thread
+    # so the encoder finishing is not held up by a projection.
+    try:
+        from . import maps
+        maps.start_build(db_path)
+    except Exception as e:                                  # noqa: BLE001
+        log(f"map build could not start — {type(e).__name__}: {e}")

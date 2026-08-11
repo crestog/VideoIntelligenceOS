@@ -626,19 +626,161 @@ def api_table(name: str, limit: int = 50, offset: int = 0, q: str = "",
     if order and order in col_names:
         order_sql = f' ORDER BY "{order}" {"DESC" if desc else "ASC"}'
 
+    # rowid comes back alongside the columns so a cell can be pointed at later
+    # without guessing a primary key. A WITHOUT ROWID table has none, and then
+    # the drill-down falls back to explaining the column and the value.
+    has_rowid = True
+    try:
+        conn.execute(f'SELECT rowid FROM "{name}" LIMIT 1').fetchone()
+    except sqlite3.Error:
+        has_rowid = False
+
+    select = f'SELECT {"rowid, " if has_rowid else ""}* FROM "{name}"'
     try:
         total = conn.execute(
             f'SELECT COUNT(*) FROM "{name}"{where}', args).fetchone()[0]
         cur = conn.execute(
-            f'SELECT * FROM "{name}"{where}{order_sql} LIMIT ? OFFSET ?',
+            f'{select}{where}{order_sql} LIMIT ? OFFSET ?',
             args + [min(int(limit), 500), int(offset)])
-        rows = [list(r) for r in cur.fetchall()]
+        raw = [list(r) for r in cur.fetchall()]
     except sqlite3.Error as e:
         return JSONResponse({"ok": False, "note": str(e)}, status_code=400)
 
+    rowids = [r[0] for r in raw] if has_rowid else []
+    rows = [r[1:] for r in raw] if has_rowid else raw
+
     return {"ok": True, "table": name, "columns": col_names,
-            "types": [c["type"] for c in cols], "rows": rows, "total": total,
+            "types": [c["type"] for c in cols], "rows": rows,
+            "rowids": rowids, "total": total,
             "offset": offset, "limit": limit}
+
+
+@app.get("/api/cell")
+def api_cell(table: str, column: str, rowid: int = None, value: str = None):
+    """What one cell actually is: its meaning, its provenance, its neighbours.
+
+    *"Clicking a cell should show the truth, backend, what does it mean or
+    refer to."* So this answers four questions about a single value:
+
+    * **what it is** — the column's inferred role, its declared type, and
+      whether search reads it (and as which kind of evidence);
+    * **what it refers to** — if the column is a foreign key by naming
+      convention, the row it points at, resolved; if it is a video key, the
+      reel;
+    * **how common it is** — how many rows in this table carry the same value,
+      because a value shared by 4,000 rows means something different from one
+      that is unique;
+    * **who else says it** — every other table carrying the same value in a
+      comparably named column.
+
+    Nothing here is configured. It is all read from the live schema, so a
+    bundle carrying a table Atlas has never seen still explains itself.
+    """
+    conn = db()
+    if table not in reflect.tables(conn):
+        return JSONResponse({"ok": False, "note": f"no table named {table}"},
+                            status_code=404)
+    cols = reflect.columns(conn, table)
+    by_name = {c["name"]: c for c in cols}
+    if column not in by_name:
+        return JSONResponse({"ok": False, "note": f"{table} has no column {column}"},
+                            status_code=404)
+
+    col = by_name[column]
+    key = reflect.key_column(cols)
+    start, end = reflect.time_columns(cols)
+    content = set(reflect.content_columns(cols))
+    role = ("key" if column == key else "start" if column == start else
+            "end" if column == end else
+            "content" if column in content else "field")
+
+    row = {}
+    if rowid is not None:
+        try:
+            cur = conn.execute(f'SELECT * FROM "{table}" WHERE rowid = ?', (rowid,))
+            got = cur.fetchone()
+            if got:
+                row = dict(zip([d[0] for d in cur.description], got))
+        except sqlite3.Error:
+            row = {}
+    if value is None:
+        value = row.get(column)
+
+    out = {
+        "ok": True, "table": table, "column": column, "value": value,
+        "role": role, "type": col["type"] or "TEXT", "pk": col["pk"],
+        "indexed": column in content,
+        "source": (reflect.source_label(table, column)
+                   if column in content else None),
+        "row": row, "refers_to": None, "same_value": None, "elsewhere": [],
+        "video_key": None,
+        # Named so the caller can open the reel at the moment this row is
+        # about rather than at its start. A row with no time column has none.
+        "time_column": start, "end_column": end,
+    }
+
+    # The reel this cell belongs to, if the row names one. This is what turns a
+    # row of numbers into something you can watch.
+    if key and row.get(key):
+        vk = reflect.normalize_key(row[key])
+        found = conn.execute(
+            "SELECT video_key, title, duration FROM video_index "
+            "WHERE video_key = ?", (vk,)).fetchone()
+        if found:
+            out["video_key"] = found[0]
+            out["video"] = {"video_key": found[0], "title": found[1],
+                            "duration": found[2]}
+
+    if value in (None, ""):
+        return out
+
+    # What it points at, when the name says it points somewhere.
+    for link in reflect.dimension_links(conn, table, cols):
+        if link["local"] != column:
+            continue
+        try:
+            cur = conn.execute(
+                f'SELECT * FROM "{link["table"]}" WHERE "{link["remote"]}" = ? '
+                f'LIMIT 1', (value,))
+            got = cur.fetchone()
+        except sqlite3.Error:
+            got = None
+        if got:
+            out["refers_to"] = {
+                "table": link["table"], "on": link["remote"],
+                "row": dict(zip([d[0] for d in cur.description], got)),
+            }
+        break
+
+    # How many rows here say the same thing.
+    try:
+        out["same_value"] = conn.execute(
+            f'SELECT COUNT(*) FROM "{table}" WHERE "{column}" = ?',
+            (value,)).fetchone()[0]
+    except sqlite3.Error:
+        out["same_value"] = None
+
+    # And who else says it. Only same-named columns are checked: matching a
+    # value across unrelated columns would pair a like count with a msg id.
+    norm = reflect._norm(column)                                # noqa: SLF001
+    for other in reflect.tables(conn):
+        if other == table:
+            continue
+        for oc in reflect.columns(conn, other):
+            if reflect._norm(oc["name"]) != norm:              # noqa: SLF001
+                continue
+            try:
+                n = conn.execute(
+                    f'SELECT COUNT(*) FROM "{other}" WHERE "{oc["name"]}" = ?',
+                    (value,)).fetchone()[0]
+            except sqlite3.Error:
+                continue
+            if n:
+                out["elsewhere"].append(
+                    {"table": other, "column": oc["name"], "rows": n})
+            break
+    out["elsewhere"].sort(key=lambda x: -x["rows"])
+    return out
 
 
 @app.get("/api/bundles")

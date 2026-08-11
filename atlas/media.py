@@ -62,6 +62,20 @@ def _now() -> float:
     return time.time()
 
 
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe(video_key: str) -> str:
+    """A video key as a filename component.
+
+    Keys are Instagram shortcodes or `up_<msg_id>`, both of which are already
+    safe — but a key that reached here from a restored database written by an
+    older revision is not guaranteed to be, and a `/` in one would silently
+    write outside the cache directory.
+    """
+    return _UNSAFE.sub("_", str(video_key))[:120] or "unknown"
+
+
 def _cache_path(video_key: str) -> str:
     return os.path.join(config.VIDEO_CACHE, f"{video_key}.mp4")
 
@@ -547,13 +561,19 @@ def poster(conn: sqlite3.Connection, video_key: str, at: float = None) -> str:
     turns a grid of near-identical intro shots into a grid of answers. Frames
     are cached per (video, second), so scrubbing a ribbon does not re-run
     ffmpeg for a position already seen.
+
+    A video that is not on disk used to return "" here, which is why a fresh
+    Atlas showed a grid of grey rectangles until something had been watched.
+    The clip index removes that: a two-second segment covering the moment is a
+    small standalone mp4, so the frame can be cut from it without the reel
+    ever being downloaded.
     """
     key = str(video_key)
-    found = resolve(conn, key)
-    if found["where"] not in ("local", "cache"):
-        return ""
     if not _FFMPEG:
         return ""
+    found = resolve(conn, key)
+    if found["where"] not in ("local", "cache"):
+        return clip_poster(conn, key, 0.0 if at is None else float(at))
 
     pos = 0.0 if at is None else max(0.0, float(at))
     stamp = f"{pos:.0f}"
@@ -566,6 +586,134 @@ def poster(conn: sqlite3.Connection, video_key: str, at: float = None) -> str:
     # slightly early, which does not matter for a thumbnail.
     cmd = [_FFMPEG, "-nostdin", "-loglevel", "error", "-ss", f"{pos:.2f}",
            "-i", found["path"], "-frames:v", "1", "-vf", "scale=480:-2",
+           "-q:v", "5", "-y", dest]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=25)
+        if r.returncode == 0 and os.path.exists(dest) \
+                and os.path.getsize(dest) > 0:
+            return dest
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CLIPS — the two-second segments that make playback instant
+# ══════════════════════════════════════════════════════════════════════════
+# A clip is a complete, standalone, keyframe-aligned mp4 of about two seconds,
+# cut at capture time and stored as its own channel message. Two things follow,
+# and both are the point of the whole mechanism:
+#
+#   1. Playing a *moment* costs one small download, not a media session over
+#      a whole reel. A 2 s clip is ~200-600 KB, which is inside the Bot API's
+#      20 MB `getFile` ceiling — so it comes down over plain HTTPS with no
+#      MTProto session, no sparse file, and no window arithmetic.
+#   2. A frame can be extracted from a video the server has never held. The
+#      clip is a real mp4, so `ffmpeg` reads it directly and `poster()` can
+#      answer "the frame at 47 s" for a reel that was never downloaded.
+#
+# The clip is not a substitute for the full file — seeking freely and watching
+# to the end still wants the whole reel, which the sparse path fetches in the
+# background. Clips are what remove the wait *before* the first frame.
+_CLIP_LOCK = threading.RLock()
+_CLIP_INFLIGHT: dict = {}
+
+
+def clip_dir() -> str:
+    d = os.path.join(config.VIDEO_CACHE, "_clips")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def clip_path(video_key: str, seq: int) -> str:
+    return os.path.join(clip_dir(), f"{_safe(video_key)}_{int(seq):04d}.mp4")
+
+
+def clip_fetch(conn: sqlite3.Connection, video_key: str, t: float,
+               wait: float = 20.0) -> dict:
+    """Get the clip covering `t` onto disk. Returns {path, t0, t1, seq} or {}.
+
+    Concurrency matters here in a way it does not for the full file: a grid of
+    twenty search results all hovering fires twenty of these, and several will
+    ask for the same clip. One in-flight download per clip, everyone else waits
+    on it — the same bargain `ensure()` makes for whole videos.
+    """
+    from . import index as index_mod
+    row = index_mod.clip_at(conn, video_key, t)
+    if not row or not row.get("msg_id"):
+        return {}
+
+    seq = int(row.get("seq") or 0)
+    dest = clip_path(video_key, seq)
+    out = {"path": dest, "t0": float(row.get("t_start") or 0.0),
+           "t1": float(row.get("t_end") or 0.0), "seq": seq,
+           "msg_id": row.get("msg_id")}
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return out
+
+    ident = f"{video_key}#{seq}"
+    with _CLIP_LOCK:
+        ev = _CLIP_INFLIGHT.get(ident)
+        mine = ev is None
+        if mine:
+            ev = threading.Event()
+            _CLIP_INFLIGHT[ident] = ev
+
+    if not mine:
+        ev.wait(max(0.5, float(wait)))
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return out
+        return {}
+
+    try:
+        tmp = dest + ".part"
+        info = {"file_id": row.get("file_id") or "",
+                "message_id": row.get("msg_id"),
+                "file_size": int(row.get("bytes") or 0),
+                "file_name": row.get("name") or ""}
+        ok = False
+        try:
+            from . import tgchannel          # noqa: PLC0415 (cycle at import)
+            ok = bool(tgchannel.fetch_document(info, tmp))
+        except Exception as e:
+            log(f"clip {ident} fetch failed — {type(e).__name__}: {e}")
+        if ok and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, dest)
+            return out
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return {}
+    finally:
+        with _CLIP_LOCK:
+            _CLIP_INFLIGHT.pop(ident, None)
+        ev.set()
+
+
+def clip_poster(conn: sqlite3.Connection, video_key: str, at: float) -> str:
+    """A still at `at` taken from the clip covering it. Path or "".
+
+    This is what makes a thumbnail of the *matched moment* available for a reel
+    the server has never downloaded, which is the difference between a search
+    grid of answers and a search grid of intro frames.
+    """
+    if not _FFMPEG:
+        return ""
+    pos = max(0.0, float(at))
+    dest = os.path.join(config.POSTER_CACHE,
+                        f"{_safe(video_key)}_{pos:.0f}.jpg")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    got = clip_fetch(conn, video_key, pos)
+    if not got:
+        return ""
+    # Offset *within* the clip. The clip starts at t0, so asking ffmpeg for
+    # `pos` would seek past the end of a two-second file and produce nothing.
+    inner = max(0.0, pos - float(got.get("t0") or 0.0))
+    cmd = [_FFMPEG, "-nostdin", "-loglevel", "error", "-ss", f"{inner:.2f}",
+           "-i", got["path"], "-frames:v", "1", "-vf", "scale=480:-2",
            "-q:v", "5", "-y", dest]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=25)
@@ -626,18 +774,59 @@ def range_plan(path: str, range_header: str) -> dict:
             "headers": headers}
 
 
+def _is_disconnect(exc: BaseException) -> bool:
+    """Is this exception just the player having gone away?
+
+    A scrub, a tab close, a player deciding it has buffered enough — all of them
+    tear the socket down mid-range, and every layer below reports it with a
+    different type. anyio raises `BrokenResourceError`, starlette raises
+    `ClientDisconnect`, the OS raises `BrokenPipeError`/`ConnectionResetError`.
+    None of them mean anything is wrong, and none of them are worth a traceback
+    in a log that has real errors in it.
+
+    Matched by name rather than by import so this stays true across the
+    starlette/anyio versions Kaggle's image happens to pin, and so a missing
+    package cannot turn the guard itself into the failure.
+    """
+    name = type(exc).__name__
+    if name in ("ClientDisconnect", "BrokenResourceError", "ClosedResourceError",
+                "EndOfStream", "BrokenPipeError", "ConnectionResetError"):
+        return True
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    # anyio wraps concurrent failures in an ExceptionGroup; a disconnect inside
+    # one is still a disconnect.
+    inner = getattr(exc, "exceptions", None)
+    if inner:
+        return all(_is_disconnect(e) for e in inner)
+    return False
+
+
 def stream(path: str, start: int, end: int):
     """Yield one byte range. Closes the handle even if the client disconnects
-    mid-play, which happens constantly — people scrub."""
+    mid-play, which happens constantly — people scrub.
+
+    The disconnect guard is deliberate. A `<video>` element abandons a range on
+    every seek, and with the response half-written that used to surface as a
+    traceback per scrub. The handle is closed by the `with` either way; this
+    only stops a normal event from being reported as a fault.
+    """
     remaining = end - start + 1
     with open(path, "rb") as f:
         f.seek(start)
-        while remaining > 0:
-            block = f.read(min(_CHUNK, remaining))
-            if not block:
-                break
-            remaining -= len(block)
-            yield block
+        try:
+            while remaining > 0:
+                block = f.read(min(_CHUNK, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                yield block
+        except GeneratorExit:
+            return
+        except BaseException as exc:
+            if _is_disconnect(exc):
+                return
+            raise
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -893,6 +1082,18 @@ def stream_remote(video_key: str, message, start: int, end: int,
             yield piece
             sent += len(piece)
             _set(key, got=min(size, start + sent))
+    except GeneratorExit:
+        # The player seeked or closed. Everything already pulled from Telegram
+        # is in the sparse file, so this is progress, not loss — fall through to
+        # the `finally` and record the partial state quietly.
+        pass
+    except BaseException as exc:
+        # Same for the socket-level forms of "gone away". Anything else is a
+        # real failure and still raises: a Telegram error must not be filed as
+        # a disconnect, or a video that can never be fetched would look like one
+        # the user simply stopped watching.
+        if not _is_disconnect(exc):
+            raise
     finally:
         if sent >= want:
             _maybe_promote(key, part, index, size)

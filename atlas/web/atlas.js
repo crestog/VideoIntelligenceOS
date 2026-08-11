@@ -683,6 +683,23 @@ function openVideo(video, at) {
   loadRecord(key);
 }
 
+/* Open a reel when all you have is its key — from a deep link, or from a cell
+   in a table that turned out to be about a video. One fetch, so the player
+   arrives with its moments and its record rather than a bare title. */
+async function openVideoKey(key, at) {
+  try {
+    const data = await api(`/api/video/${encodeURIComponent(key)}`);
+    const m = data.meta || {};
+    openVideo({
+      video_key: data.video_key, title: m.title || m.caption || data.video_key,
+      caption: m.caption, creator: m.creator, category: m.category,
+      duration: m.duration, width: m.width, height: m.height, likes: m.likes,
+      created_at: m.created_at, msg_id: m.msg_id,
+      moment_count: m.moment_count, hit_count: 0, moments: data.moments || [],
+    }, at === undefined ? null : at);
+  } catch (e) { toast('Could not open ' + key + ': ' + e.message); }
+}
+
 function seekTo(t) {
   const vid = $('video');
   const go = () => { try { vid.currentTime = Math.max(0, t); vid.play().catch(() => {}); } catch {} };
@@ -945,7 +962,12 @@ function momNavWire() {
       // takes 'o' rather than stealing 'l'.
       case 'o': momLoopToggle(); break;
       case 'f': playerSize(); break;
-      case 'Escape': if (S.video) closePlayer(); else return; break;
+      // The cell inspector opens over the player and closes first, so Escape
+      // does not dismiss both layers with one press.
+      case 'Escape':
+        if (!$('cellSlab').hidden) return;
+        if (S.video) closePlayer(); else return;
+        break;
       case ' ':
       case 'k': if (vid.paused) vid.play().catch(() => {}); else vid.pause(); break;
       case 'j': vid.currentTime = Math.max(0, vid.currentTime - 5); break;
@@ -1033,7 +1055,10 @@ function renderRecord(data) {
       panel.appendChild(kvTable(rel.rows[0]));
     } else {
       const wrap = h('div', { class: 'table-wrap', style: 'max-height:300px' });
-      wrap.appendChild(rowTable(rel.columns, rel.rows.map(r => rel.columns.map(c => r[c]))));
+      // Passing the table name makes these cells askable too: the same
+      // drill-down the Data tab offers, without leaving the player.
+      wrap.appendChild(rowTable(rel.columns,
+        rel.rows.map(r => rel.columns.map(c => r[c])), null, rel.table));
       panel.appendChild(wrap);
     }
   }
@@ -1056,28 +1081,191 @@ function kvTable(obj) {
   return t;
 }
 
-function rowTable(columns, rows, types) {
+/* `src` names the table these rows came from, and `rowids` their identity in
+   it. Given both, every cell becomes a question you can ask — see openCell. */
+function rowTable(columns, rows, types, src, rowids) {
   const t = h('table', { class: 'grid-table' });
   const head = h('tr', {});
   columns.forEach(c => head.appendChild(h('th', { text: c })));
   t.appendChild(head);
-  for (const row of rows) {
+  rows.forEach((row, ri) => {
     const tr = h('tr', {});
     row.forEach((cell, i) => {
+      const ask = src
+        ? { class: 'cell cell-ask', role: 'button', tabindex: '0',
+            title: `${src}.${columns[i]} — what is this?`,
+            onclick: () => openCell(src, columns[i],
+                                    rowids ? rowids[ri] : null, cell),
+            // role="button" is a promise the keyboard has to be able to keep.
+            onkeydown: (ev) => {
+              if (ev.key !== 'Enter' && ev.key !== ' ') return;
+              ev.preventDefault();
+              openCell(src, columns[i], rowids ? rowids[ri] : null, cell);
+            } }
+        : { class: 'cell' };
       if (cell === null || cell === undefined) {
-        tr.appendChild(h('td', {}, h('span', { class: 'null', text: 'null' })));
+        tr.appendChild(h('td', {}, h('span', {
+          ...ask, class: (src ? 'null cell-ask' : 'null'), text: 'null' })));
         return;
       }
       const numeric = typeof cell === 'number' ||
         (types && /INT|REAL|NUM|FLOAT|DOUBLE/i.test(types[i] || ''));
       const text = typeof cell === 'object' ? JSON.stringify(cell) : String(cell);
       tr.appendChild(h('td', { class: numeric ? 'num' : '' },
-        h('span', { class: 'cell', text })));
+        h('span', { ...ask, text })));
     });
     t.appendChild(tr);
-  }
+  });
   return t;
 }
+
+/* ── the cell inspector ───────────────────────────────────────────────────
+   A number in a grid is not an answer, it is a lookup nobody has done yet.
+   This does the lookup: what the column is for, whether search reads it,
+   what the value points at, how many rows share it, which other tables say
+   the same thing — and the reel it all belongs to, ready to play. */
+let cellSeq = 0;
+
+async function openCell(table, column, rowid, fallback) {
+  const slab = $('cellSlab');
+  const body = $('cellBody');
+  slab.hidden = false;
+  body.textContent = '';
+  body.appendChild(h('p', { class: 'hint', text: 'reading this cell…' }));
+
+  // Clicks come faster than the round trip, and the slowest answer must not
+  // be the one left on screen.
+  const token = ++cellSeq;
+
+  const p = new URLSearchParams({ table, column });
+  if (rowid !== null && rowid !== undefined) p.set('rowid', String(rowid));
+  if (fallback !== null && fallback !== undefined && typeof fallback !== 'object')
+    p.set('value', String(fallback));
+
+  let d;
+  try {
+    d = await api('/api/cell?' + p.toString());
+  } catch (e) {
+    if (token !== cellSeq) return;
+    body.textContent = '';
+    body.appendChild(h('p', { class: 'hint', text: 'Could not read it: ' + e.message }));
+    return;
+  }
+  if (token !== cellSeq) return;
+
+  body.textContent = '';
+  body.appendChild(h('div', { class: 'cs-crumb' },
+    h('span', { text: d.table }), h('i', { text: '·' }),
+    h('b', { text: d.column })));
+
+  // A feed in the Sources tab names a column with no particular row behind it,
+  // so there is no value to print — only what the column is for.
+  const noValue = d.value === null || d.value === undefined;
+  if (noValue && rowid === null)
+    body.appendChild(h('p', { class: 'hint',
+      text: 'The whole column, not one value — open a row in Data to ask about a single cell.' }));
+  else
+    body.appendChild(h('pre', { class: 'cs-value',
+      text: noValue ? 'null'
+        : typeof d.value === 'object' ? JSON.stringify(d.value, null, 2)
+        : String(d.value) }));
+  $('cellTitle').textContent = noValue && rowid === null ? 'What this column is'
+                                                         : 'What this is';
+
+  // What it is. The role is inferred from the schema, and it is the same
+  // inference search itself uses — so this is the truth, not a description.
+  const facts = h('div', { class: 'cs-facts' });
+  const fact = (k, v) => { facts.append(h('span', { text: k }), h('b', { text: v })); };
+  fact('role', ROLE_MEANS[d.role] || d.role);
+  fact('declared type', d.type + (d.pk ? ' · primary key' : ''));
+  fact('read by search', d.indexed
+    ? `yes — weighted as ${SOURCE_LABEL[d.source] || d.source}`
+    : 'no — reference only, never matched');
+  if (d.same_value !== null && d.same_value !== undefined)
+    fact('rows with this value', d.same_value === 1
+      ? 'just this one — unique here'
+      : `${fmtInt(d.same_value)} in ${d.table}`);
+  body.appendChild(facts);
+
+  if (d.refers_to) {
+    body.appendChild(h('h4', { class: 'cs-h',
+      text: `points at ${d.refers_to.table}.${d.refers_to.on}` }));
+    const grid = h('div', { class: 'cs-kv' });
+    for (const [k, v] of Object.entries(d.refers_to.row))
+      grid.append(h('span', { text: k }),
+                  h('b', { text: v === null ? 'null' : String(v) }));
+    body.appendChild(grid);
+  }
+
+  if ((d.elsewhere || []).length) {
+    body.appendChild(h('h4', { class: 'cs-h', text: 'the same value elsewhere' }));
+    const list = h('div', { class: 'cs-else' });
+    for (const e of d.elsewhere)
+      list.appendChild(h('button', {
+        class: 'linky',
+        text: `${e.table}.${e.column} — ${fmtInt(e.rows)} row${e.rows === 1 ? '' : 's'}`,
+        // Land on the rows that actually carry this value, then ask the same
+        // question of the other table's column.
+        onclick: () => {
+          showTab('data');
+          openTable(e.table, 0, String(d.value));
+          openCell(e.table, e.column, null, d.value);
+        },
+      }));
+    body.appendChild(list);
+  }
+
+  if (d.video && d.video.video_key) {
+    body.appendChild(h('h4', { class: 'cs-h', text: 'the reel this row is about' }));
+    const at = cellTime(d);
+    const card = h('div', { class: 'cs-reel' });
+    card.appendChild(posterImg(d.video, at, 'cs-poster'));
+    card.appendChild(h('div', {},
+      h('div', { class: 'cs-reel-title', text: d.video.title || d.video.video_key }),
+      h('button', {
+        class: 'btn btn-tiny',
+        text: at === null ? 'Play it' : `Play from ${timecode(at)}`,
+        // If the row named a time, open at it — a claim row is about a moment,
+        // not about a whole reel.
+        onclick: () => openVideoKey(d.video.video_key, at),
+      })));
+    body.appendChild(card);
+  }
+
+  if (d.row && Object.keys(d.row).length) {
+    const det = h('details', { class: 'cs-row' });
+    det.appendChild(h('summary', { text: 'the whole row, as stored' }));
+    const grid = h('div', { class: 'cs-kv' });
+    for (const [k, v] of Object.entries(d.row))
+      grid.append(
+        h('span', { text: k }),
+        h('b', {
+          class: k === d.column ? 'on' : '',
+          text: v === null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v),
+        }));
+    det.appendChild(grid);
+    body.appendChild(det);
+  }
+}
+
+/* The second this row is about, when it is about one. `time_column` is the
+   column reflect.py inferred as the start; a video-level row has no such
+   column and the reel opens at its beginning. */
+function cellTime(d) {
+  const t = d.time_column ? d.row[d.time_column] : null;
+  const n = Number(t);
+  return t === null || t === undefined || !isFinite(n) ? null : n;
+}
+
+/* Plain words for the roles reflect.py infers, because "start" on its own
+   does not tell you that this is the column search reads a timestamp from. */
+const ROLE_MEANS = {
+  key: 'the key — this is how the row joins to a video',
+  start: 'when it begins — search reads this as the moment',
+  end: 'when it ends',
+  content: 'text search reads and matches',
+  field: 'a field carried along, not matched',
+};
 
 /* ── similar ──────────────────────────────────────────────────────────── */
 async function loadSimilar(key) {
@@ -1310,7 +1498,7 @@ async function loadSchema() {
       `Roles are inferred from the data itself — schema ${data.fingerprint.slice(0, 8)}.`;
 
     for (const t of data.tables.sort((a, b) => b.rows - a.rows)) {
-      const card = h('div', { class: 'tcard', onclick: () => openTable(t.name) },
+      const card = h('div', { class: 'tcard', onclick: () => openTable(t.name, 0, '') },
         h('div', { class: 'tcard-head' },
           h('span', { class: 'tcard-name', text: t.name }),
           h('span', { class: 'tcard-flag', 'data-on': String(t.indexed),
@@ -1331,7 +1519,15 @@ async function loadSchema() {
   }
 }
 
-async function openTable(name, offset) {
+/* `filter` is optional and, when given, replaces the in-table search — a
+   different table almost never wants the previous one's filter, and jumping
+   to a value wants exactly that value. Omitting it keeps whatever is there,
+   which is what paging and the search box itself need. */
+async function openTable(name, offset, filter) {
+  if (filter !== undefined) {
+    S.browse.q = filter;
+    $('browserQ').value = filter;
+  }
   S.browse.table = name;
   S.browse.offset = offset || 0;
   $('browser').hidden = false;
@@ -1341,7 +1537,7 @@ async function openTable(name, offset) {
   });
   try {
     const data = await api(`/api/table/${encodeURIComponent(name)}?` + p.toString());
-    const table = rowTable(data.columns, data.rows, data.types);
+    const table = rowTable(data.columns, data.rows, data.types, name, data.rowids);
     table.id = 'browserTable';
     table.className = 'grid-table';
     $('browserTable').replaceWith(table);
@@ -1434,9 +1630,21 @@ function renderFeeds(sources) {
     return;
   }
   for (const s of sources)
-    box.appendChild(h('div', {
+    box.appendChild(h('button', {
       class: 'feed', style: `border-left-color:${color(s.source)}`,
-      title: s.via ? `joined through ${s.via}` : `keyed on ${s.key}`,
+      title: (s.via ? `joined through ${s.via}` : `keyed on ${s.key}`) +
+             ' — click to see what this column is and browse it',
+      // A feed is a column, so clicking one asks the same question a cell
+      // does, minus a row: what is this, and does search read it?
+      // Browsing means the Data tab, since that is where the table renders —
+      // the slab floats over the stage and follows either way.
+      onclick: () => {
+        openCell(s.table, s.text, null, null);
+        showTab('data');
+        // A filter left over from some other table would silently hide most of
+        // this one, so browsing a feed starts unfiltered.
+        openTable(s.table, 0, '');
+      },
     }, h('b', { text: s.table }), '.' + s.text));
 }
 
@@ -2194,7 +2402,8 @@ async function gselect(node) {
     else {
       const cols = Object.keys(rec.rows[0] || {});
       const wrap = h('div', { class: 'gd-rows' });
-      wrap.appendChild(rowTable(cols, rec.rows.map(r => cols.map(c => r[c]))));
+      wrap.appendChild(rowTable(cols, rec.rows.map(r => cols.map(c => r[c])),
+        null, rec.table));
       body.appendChild(wrap);
     }
   }
@@ -2401,7 +2610,7 @@ async function gvideoDetail(node, body) {
       if (rel.rows.length === 1) { body.appendChild(kvTable(rel.rows[0])); continue; }
       const wrap = h('div', { class: 'gd-rows' });
       wrap.appendChild(rowTable(rel.columns,
-        rel.rows.map(r => rel.columns.map(c => r[c]))));
+        rel.rows.map(r => rel.columns.map(c => r[c])), null, rel.table));
       body.appendChild(wrap);
     }
   } catch (e) {
@@ -2433,7 +2642,8 @@ function gschemaDetail(node, body) {
   }));
   body.appendChild(h('div', { class: 'gd-acts' },
     h('button', {
-      class: 'btn', onclick: () => { showTab('data'); openTable(node.label, 0); },
+      class: 'btn',
+      onclick: () => { showTab('data'); openTable(node.label, 0, ''); },
     }, 'Browse the rows')));
 }
 
@@ -2494,7 +2704,8 @@ async function gedgeSelect(edge) {
     for (const rec of recs) {
       const cols = Object.keys(rec.rows[0] || {});
       const wrap = h('div', { class: 'gd-rows' });
-      wrap.appendChild(rowTable(cols, rec.rows.map(r => cols.map(c => r[c]))));
+      wrap.appendChild(rowTable(cols, rec.rows.map(r => cols.map(c => r[c])),
+        null, rec.table));
       body.appendChild(wrap);
     }
   } catch (e) {
@@ -3910,6 +4121,15 @@ function wire() {
     if (ev.key === '/' && document.activeElement !== $('q')) {
       ev.preventDefault(); $('q').focus(); $('q').select();
     }
+    // The inspector is the most recently opened thing, so it is the thing
+    // Escape means. Only once it is gone does Escape reach the player.
+    if (ev.key === 'Escape' && !$('cellSlab').hidden) {
+      $('cellSlab').hidden = true;
+      // document bubbles to window, where the player's own Escape lives, and
+      // one press should dismiss one layer.
+      ev.stopPropagation();
+      return;
+    }
     if (ev.key === 'Escape' && S.video && document.activeElement !== $('q')) closePlayer();
   });
 
@@ -3952,7 +4172,11 @@ function wire() {
     clearTimeout(browseTimer);
     browseTimer = setTimeout(() => openTable(S.browse.table, 0), 260);
   });
-  $('browserClose').addEventListener('click', () => { $('browser').hidden = true; });
+  $('browserClose').addEventListener('click', () => {
+    $('browser').hidden = true;
+    $('cellSlab').hidden = true;
+  });
+  $('cellClose').addEventListener('click', () => { $('cellSlab').hidden = true; });
 
   gwire();
   mapsWire();
@@ -4033,18 +4257,7 @@ function start() {
   const q = params.get('q');
   if (q) { $('q').value = q; runSearch(q); }
   const v = params.get('v');
-  if (v) {
-    api(`/api/video/${encodeURIComponent(v)}`).then(data => {
-      const m = data.meta || {};
-      openVideo({
-        video_key: data.video_key, title: m.title || m.caption || data.video_key,
-        caption: m.caption, creator: m.creator, category: m.category,
-        duration: m.duration, width: m.width, height: m.height, likes: m.likes,
-        created_at: m.created_at, msg_id: m.msg_id,
-        moment_count: m.moment_count, hit_count: 0, moments: data.moments || [],
-      }, null);
-    }).catch(() => {});
-  }
+  if (v) openVideoKey(v, null);
   loadFacets();
 }
 

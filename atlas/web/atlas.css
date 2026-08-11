@@ -500,6 +500,12 @@ body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .stage{
   vertical-align:top; max-width:380px;
 }
 .grid-table td .cell{ display:block; max-height:4.4em; overflow:hidden; }
+/* Every value in a browsed table is a question you can ask of it. The affordance
+   is deliberately quiet — a whole grid of buttons would be unreadable — so it
+   only announces itself under the pointer. */
+.grid-table td .cell-ask{ cursor:pointer; border-bottom:1px dotted transparent; }
+.grid-table td .cell-ask:hover,
+.grid-table td .cell-ask:focus-visible{ color:var(--signal); border-bottom-color:var(--signal); outline:none; }
 .grid-table tr:hover td{ background:var(--ink-2); }
 .grid-table .null{ color:var(--dim); font-style:italic; }
 .grid-table .num{ font-family:var(--mono); text-align:right; }
@@ -533,6 +539,9 @@ body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .stage{
   color:var(--muted);
 }
 .feed b{ color:var(--text); font-weight:500; }
+/* Now a <button>, so it needs the reset the class never had. */
+.feed{ cursor:pointer; text-align:left; border-top:0; border-right:0; border-bottom:0; }
+.feed:hover{ background:var(--ink-3); color:var(--text); }
 
 .log{
   font-family:var(--mono); font-size:11.5px; line-height:1.7; color:var(--muted);
@@ -669,6 +678,65 @@ body[data-player-size="theatre"] .screen{
   padding:9px 20px; font-size:13px; z-index:120;
   box-shadow:0 16px 40px rgba(0,0,0,.5);
 }
+
+/* ══ CELL INSPECTOR ══════════════════════════════════════════════════════
+   A value in a grid is a lookup nobody has done yet. This slab does it: what
+   the column is for, whether search reads it and as what, what the value
+   points at, how many rows share it, who else says it, and the reel the row
+   is about. It floats above the stage because the same answer is wanted from
+   Data and from Sources, and dropping it inside either view would mean two
+   copies of it. */
+.cell-slab{
+  position:fixed; right:calc(var(--pane-w) + 18px); bottom:22px; width:min(430px, 40vw);
+  max-height:min(74vh, 720px); display:flex; flex-direction:column; z-index:110;
+  background:var(--ink-2); border:1px solid var(--line-2); border-radius:var(--r-lg);
+  box-shadow:0 26px 70px rgba(0,0,0,.6);
+  animation:slabIn .18s var(--ease);
+}
+.cell-slab[hidden]{ display:none; }
+@keyframes slabIn{ from{ opacity:0; transform:translateY(10px) } to{ opacity:1; transform:none } }
+@media (max-width:1180px){ .cell-slab{ right:18px; width:min(430px, calc(100vw - 36px)); } }
+
+.cs-head{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding:12px 14px; border-bottom:1px solid var(--line);
+}
+.cs-title{ font-family:var(--display); font-size:13px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
+.cs-body{ padding:14px; overflow:auto; display:flex; flex-direction:column; gap:14px; }
+
+.cs-crumb{ font-family:var(--mono); font-size:12px; color:var(--muted); display:flex; gap:7px; align-items:baseline; }
+.cs-crumb b{ color:var(--signal); font-weight:600; }
+.cs-crumb i{ color:var(--dim); font-style:normal; }
+
+.cs-value{
+  margin:0; font-family:var(--mono); font-size:12.5px; line-height:1.6; color:var(--text);
+  background:var(--ink); border:1px solid var(--line); border-radius:var(--r);
+  padding:11px 13px; max-height:190px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+}
+
+.cs-facts, .cs-kv{ display:grid; grid-template-columns:auto 1fr; gap:6px 14px; align-items:baseline; }
+.cs-facts > span, .cs-kv > span{
+  font-size:10.5px; text-transform:uppercase; letter-spacing:.09em; color:var(--dim);
+  font-family:var(--display); white-space:nowrap;
+}
+.cs-facts > b, .cs-kv > b{ font-family:var(--mono); font-size:12px; font-weight:400; color:var(--text); word-break:break-word; }
+.cs-kv > b.on{ color:var(--signal); }
+
+.cs-h{
+  font-size:10.5px; text-transform:uppercase; letter-spacing:.11em; color:var(--dim);
+  font-weight:600; margin:0; padding-top:2px; border-top:1px solid var(--line);
+}
+.cs-else{ display:flex; flex-direction:column; gap:6px; align-items:flex-start; }
+
+.cs-reel{ display:grid; grid-template-columns:62px 1fr; gap:12px; align-items:center; }
+.cs-poster{ position:relative; aspect-ratio:9/16; border-radius:var(--r-sm); overflow:hidden; background:var(--ink-3); }
+.cs-poster img{ width:100%; height:100%; object-fit:cover; display:block; }
+.cs-poster .noshot{ position:absolute; inset:0; display:grid; place-content:center; padding:4px; font-family:var(--mono); font-size:8px; color:var(--dim); text-align:center; overflow:hidden; }
+.cs-reel-title{ font-size:13px; line-height:1.4; margin-bottom:8px; }
+
+.cs-row summary{ cursor:pointer; font-family:var(--mono); font-size:11.5px; color:var(--muted); }
+.cs-row summary:hover{ color:var(--text); }
+.cs-row .cs-kv{ margin-top:10px; }
 
 .skeleton{ background:linear-gradient(90deg,var(--ink-2),var(--ink-3),var(--ink-2)); background-size:220% 100%; animation:sweep 1.3s linear infinite; border-radius:var(--r); }
 @keyframes sweep{ from{background-position:120% 0} to{background-position:-120% 0} }

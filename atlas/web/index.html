@@ -301,6 +301,18 @@
   </aside>
 </main>
 
+<!-- ═══ CELL INSPECTOR ══════════════════════════════════════════════════
+     Clicking a value in Data or Sources asks what it actually is. It floats
+     over the stage rather than living inside the Data view, because the same
+     answer is wanted from the Sources tab and from a jump between tables. -->
+<aside class="cell-slab" id="cellSlab" hidden aria-label="What this value is">
+  <div class="cs-head">
+    <span class="cs-title" id="cellTitle">What this is</span>
+    <button class="btn btn-quiet btn-tiny" id="cellClose" aria-label="Close">×</button>
+  </div>
+  <div class="cs-body" id="cellBody"></div>
+</aside>
+
 <div class="toast" id="toast" hidden></div>
 <script src="atlas.js"></script>
 <script src="/sitemap.js" defer></script>
