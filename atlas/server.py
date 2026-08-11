@@ -34,7 +34,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
-from . import config, graph, index, ingest, media, reflect, search
+from . import config, graph, index, ingest, maps, media, reflect, search
 from .tgchannel import log, recent_log
 
 BOOT_T0 = time.time()
@@ -107,6 +107,7 @@ def _boot() -> None:
     ingest.ensure_meta(conn)
     index.ensure_schema(conn)
     graph.ensure_schema(conn)
+    maps.ensure_schema(conn)
 
     # Sparse files are only usable while the process that built them remembers
     # which chunks landed, so last run's leftovers are dropped before anything
@@ -193,12 +194,44 @@ def _boot() -> None:
 app = FastAPI(title="Atlas", docs_url=None, redoc_url=None)
 
 
-@app.middleware("http")
-async def _timing(request: Request, call_next):
-    t0 = time.perf_counter()
-    resp = await call_next(request)
-    resp.headers["X-Atlas-Ms"] = f"{(time.perf_counter() - t0) * 1000:.1f}"
-    return resp
+class _Timing:
+    """Stamp X-Atlas-Ms without ever standing between the body and the socket.
+
+    This was `@app.middleware("http")`, which is `BaseHTTPMiddleware`, which
+    wraps `send` to count what the endpoint emits and compares the total against
+    the `Content-Length` it saw in `http.response.start`. Every video request
+    here is a byte range with an exact Content-Length from `media.range_plan`,
+    and a browser seeking mid-playback closes the connection before the range
+    finishes — a completely normal thing for a player to do. The accounting then
+    raised `RuntimeError: Response content shorter than Content-Length` from
+    inside an anyio ExceptionGroup, several frames deep, naming nothing.
+
+    Pure ASGI has no such accounting. The only thing this needs is one header on
+    the response-start message, so it rewrites that message and passes every
+    other one straight through, untouched and uncounted.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        t0 = time.perf_counter()
+
+        async def _send(message):
+            if message.get("type") == "http.response.start":
+                ms = (time.perf_counter() - t0) * 1000
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-atlas-ms", f"{ms:.1f}".encode("latin-1")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+
+app.add_middleware(_Timing)
 
 
 def start_boot() -> None:
@@ -276,6 +309,7 @@ def api_status():
         "index": index.status(),
         "search": search.stats(conn),
         "graph": graph.counts(conn),
+        "map": maps.status(),
         "bundles": bundles,
         "cache": media.cache_stats(),
         "telegram": {"configured": config.telegram_ready(),
@@ -376,6 +410,30 @@ def _resident_clause(conn: sqlite3.Connection) -> str:
     return "video_key IN (SELECT k FROM resident)"
 
 
+def _keys_matching(conn: sqlite3.Connection, q: str, cap: int = 800) -> list:
+    """Video keys whose indexed moments match `q`.
+
+    The library filter is a browse, not a ranked search, so this asks the FTS
+    index for the *set* of videos that contain the words and throws the scores
+    away. Capped, because the filter is meant to narrow a grid — a query that
+    matches most of the archive has not narrowed anything, and the metadata
+    clauses beside it still apply.
+    """
+    if not q.strip():
+        return []
+    try:
+        hits = search.search(conn, q, limit=cap, offset=0)
+    except Exception:                                       # noqa: BLE001
+        return []
+    keys, seen = [], set()
+    for h in hits.get("results", []):
+        k = h.get("video_key")
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+
 @app.get("/api/library")
 def api_library(limit: int = 40, offset: int = 0, sort: str = "recent",
                 creator: str = "", category: str = "", has: str = "",
@@ -395,12 +453,23 @@ def api_library(limit: int = 40, offset: int = 0, sort: str = "recent",
         where.append("has_narrative = 1")
     elif has == "playable":
         where.append(_resident_clause(conn))
+    inside: list = []
     if q:
-        where.append("(LOWER(COALESCE(title,'')) LIKE ? OR "
-                     "LOWER(COALESCE(caption,'')) LIKE ? OR "
-                     "LOWER(COALESCE(creator,'')) LIKE ?)")
+        # Metadata match, plus every video whose *contents* match. Filtering the
+        # library on title alone hides the video that spends thirty seconds on
+        # the subject but never names it — which is the whole reason this
+        # archive is indexed to the second in the first place.
+        clauses = ["LOWER(COALESCE(title,'')) LIKE ?",
+                   "LOWER(COALESCE(caption,'')) LIKE ?",
+                   "LOWER(COALESCE(creator,'')) LIKE ?"]
         needle = f"%{q.lower()}%"
         args += [needle, needle, needle]
+        inside = _keys_matching(conn, q)
+        if inside:
+            marks = ",".join("?" * len(inside))
+            clauses.append(f"video_key IN ({marks})")
+            args += inside
+        where.append("(" + " OR ".join(clauses) + ")")
 
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     order = _SORTS.get(sort, _SORTS["recent"])
@@ -416,15 +485,25 @@ def api_library(limit: int = 40, offset: int = 0, sort: str = "recent",
         return {"ok": False, "note": str(e), "results": [], "total": 0}
 
     resident = media.resident_keys(conn)
+    inside_set = set(inside)
+    needle_l = q.lower().strip()
     for r in rows:
         try:
             r["sources"] = json.loads(r.get("sources") or "{}")
         except (ValueError, TypeError):
             r["sources"] = {}
         r["has_file"] = r.get("video_key") in resident
+        if needle_l:
+            # Which half of the OR above put this row here. The library says so
+            # out loud, because "why is this video in my results?" is a fair
+            # question when the word appears nowhere on the card.
+            meta_hit = any(needle_l in (r.get(f) or "").lower()
+                           for f in ("title", "caption", "creator"))
+            r["matched"] = ("both" if meta_hit and r.get("video_key") in inside_set
+                            else "meta" if meta_hit else "inside")
         r.pop("local_path", None)
     return {"ok": True, "results": rows, "total": total, "offset": offset,
-            "limit": limit}
+            "limit": limit, "inside": len(inside)}
 
 
 @app.get("/api/facets")
@@ -773,6 +852,144 @@ def api_poster(video_key: str, t: float = None):
 @app.post("/api/cache/clear")
 def api_cache_clear():
     return media.clear_cache()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CLIPS — the preview path
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/clip/{video_key}")
+def api_clip(video_key: str, t: float = 0.0, request: Request = None):
+    """The two-second clip covering `t`, as a playable mp4.
+
+    This is what a hovered search result plays. It is a different thing from
+    `/api/play`, on purpose: `play` streams the *whole reel* and has to solve
+    seeking, buffering and a media session; this hands over one small complete
+    file that a `<video>` can start rendering the instant it lands. No range
+    logic, no sparse index, no MTProto — the clip is small enough for the Bot
+    API's own download endpoint.
+
+    204 when the video has no clip index (captured before assets existed, or
+    an asset upload that failed). The interface treats that as "fall back to
+    the player" rather than as an error, which is why this is not a 404.
+    """
+    key = reflect.normalize_key(video_key)
+    got = media.clip_fetch(db(), key, max(0.0, float(t or 0.0)))
+    if not got:
+        return Response(status_code=204)
+    rng = (request.headers.get("range", "") if request is not None else "")
+    resp = _serve_file(got["path"], rng)
+    # The player needs to know where in the reel this clip sits, so a preview
+    # can show a real timestamp and a click can seek the full player to it.
+    resp.headers["X-Clip-Start"] = f"{got['t0']:.3f}"
+    resp.headers["X-Clip-End"] = f"{got['t1']:.3f}"
+    resp.headers["X-Clip-Seq"] = str(got["seq"])
+    return resp
+
+
+@app.get("/api/clips/{video_key}")
+def api_clips(video_key: str, t0: float = None, t1: float = None):
+    """The clip index for one video — what exists, and for which seconds."""
+    key = reflect.normalize_key(video_key)
+    rows = index.clips_for(db(), key, t0, t1)
+    return {"ok": True, "key": key, "count": len(rows),
+            "chunk_seconds": (rows[0]["t_end"] - rows[0]["t_start"]
+                              if rows else None),
+            "clips": [{"seq": r["seq"], "t0": r["t_start"], "t1": r["t_end"],
+                       "bytes": r["bytes"]} for r in rows]}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# THE MAPS — the archive as one picture
+# ══════════════════════════════════════════════════════════════════════════
+# Three views over one projection: a semantic map, the same points coloured by
+# cluster, and a scatter plot of any two numeric columns. The first two need
+# the dense index; the third never does, so at least one map always works.
+@app.get("/api/map")
+def api_map(level: str = "video"):
+    """Legend, cluster names, method and readiness — everything but the points."""
+    conn = db()
+    out = maps.meta(conn, level)
+    if not out["count"]:
+        # A missing map is a normal state on a fresh archive, not an error: the
+        # encoder may still be running. Say which, so the interface can show a
+        # progress line instead of an empty canvas with no explanation.
+        st = index.status()
+        out["note"] = ("the dense index is still building — the map appears "
+                       "when it finishes" if st.get("phase") == "embedding"
+                       else maps.status().get("detail", ""))
+    return out
+
+
+@app.get("/api/map/points")
+def api_map_points(level: str = "video"):
+    """The point cloud as a packed binary buffer.
+
+    Binary rather than JSON because this is the one response whose size scales
+    with the whole archive. Twelve bytes a point against roughly forty, and the
+    browser gets a typed array it can hand straight to the canvas instead of a
+    parse pass over a megabyte of text.
+    """
+    conn = db()
+    buf = maps.points_binary(conn, level)
+    return Response(buf, media_type="application/octet-stream", headers={
+        "X-Map-Count": str(len(buf) // 12),
+        "X-Map-Stride": "12",
+        "Cache-Control": "no-cache"})
+
+
+@app.get("/api/map/refs")
+def api_map_refs(level: str = "video"):
+    """What each point *is*, in the same order as the binary buffer."""
+    return maps.refs(db(), level)
+
+
+@app.get("/api/map/point")
+def api_map_point(level: str = "video", ref: str = ""):
+    """One dot, fully unpacked — the drill-down that makes a map clickable."""
+    found = maps.point(db(), level, ref)
+    if not found.get("ok"):
+        return JSONResponse(found, status_code=404)
+    return found
+
+
+@app.get("/api/map/region")
+def api_map_region(level: str = "video", x0: float = 0.0, y0: float = 0.0,
+                   x1: float = 1.0, y1: float = 1.0, limit: int = 500):
+    """Everything inside a dragged box — the selection other tabs receive."""
+    return maps.region(db(), level, x0, y0, x1, y1, limit)
+
+
+@app.get("/api/map/cluster/{cluster}")
+def api_map_cluster(cluster: int, level: str = "video", limit: int = 30):
+    """One cluster: its name, the words behind the name, its most typical members."""
+    found = maps.cluster_detail(db(), level, cluster, limit)
+    if not found.get("ok"):
+        return JSONResponse(found, status_code=404)
+    return found
+
+
+@app.get("/api/map/axes")
+def api_map_axes():
+    """Every numeric column worth plotting, read from the live schema."""
+    return maps.axes(db())
+
+
+@app.get("/api/map/scatter")
+def api_map_scatter(x: str = "duration", y: str = "moment_count",
+                    colour: str = "cluster", limit: int = 6000,
+                    log_x: bool = False, log_y: bool = False):
+    out = maps.scatter(db(), x, y, colour, limit, log_x, log_y)
+    if not out.get("ok"):
+        return JSONResponse(out, status_code=400)
+    return out
+
+
+@app.post("/api/map/rebuild")
+def api_map_rebuild(method: str = "auto"):
+    """Refit the projection. `method` forces umap | tsne | pca for comparison."""
+    started = maps.start_build(config.DB_PATH, method)
+    return {"ok": True, "started": started, "status": maps.status(),
+            "note": "" if started else "a map build is already running"}
 
 
 # ══════════════════════════════════════════════════════════════════════════

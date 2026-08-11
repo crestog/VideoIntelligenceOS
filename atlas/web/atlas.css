@@ -170,6 +170,25 @@ button{ background:none; border:0; cursor:pointer; }
   display:grid;
   grid-template-columns:minmax(0,1fr) var(--pane-w);
 }
+/* The player's three sizes are one custom property, so the grid, the canvases
+   that measure their own viewport, and the video box all follow from a single
+   change. Theatre drops the left pane entirely rather than squeezing it into a
+   column too narrow to read. */
+/* Both sizes are gated on a video actually being open — otherwise choosing
+   theatre once would hide the search results for the rest of the session with
+   nothing on screen to explain why. */
+body[data-player-size="wide"]:has(.pane-player[data-open="true"]){
+  --pane-w: min(46vw, 760px);
+}
+body[data-player-size="theatre"]:has(.pane-player[data-open="true"]){
+  --pane-w: 100%;
+}
+body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .pane-left{
+  display:none;
+}
+body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .stage{
+  grid-template-columns:100%;
+}
 .pane{ min-width:0; overflow-y:auto; overflow-x:hidden; }
 .pane-left{ padding:0 var(--gutter) 90px; }
 .pane-player{
@@ -351,11 +370,16 @@ button{ background:none; border:0; cursor:pointer; }
 .facet[aria-pressed="true"]{ background:var(--text); color:var(--ink); border-color:var(--text); font-weight:600; }
 .facet .n{ font-family:var(--mono); font-size:10.5px; opacity:.6; margin-left:6px; }
 
+/* --tile-cols is set by the density slider. Unset, the grid keeps its own
+   auto-fill judgement, which is the right answer on an unknown screen. */
 .grid{
   display:grid; gap:16px;
   grid-template-columns:repeat(auto-fill,minmax(168px,1fr));
 }
-.tile{ cursor:pointer; }
+.grid[style*="--tile-cols"]{
+  grid-template-columns:repeat(var(--tile-cols),minmax(0,1fr));
+}
+.tile{ cursor:pointer; position:relative; }
 .tile-shot{
   position:relative; aspect-ratio:9/14; border-radius:var(--r);
   overflow:hidden; background:var(--ink-3); margin-bottom:9px;
@@ -372,6 +396,50 @@ button{ background:none; border:0; cursor:pointer; }
 .tile-rail i{ flex:1; }
 .tile-title{ font-size:13.5px; line-height:1.35; font-weight:500; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .tile-line{ font-family:var(--mono); font-size:10.5px; color:var(--dim); margin-top:4px; }
+
+/* "Why is this here?" — set when the query matched the video's contents but
+   nothing on its card, which otherwise reads as a wrong result. */
+.tile-why{
+  position:absolute; left:6px; top:6px; z-index:2;
+  padding:2px 6px; border-radius:3px;
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.04em;
+  background:rgba(4,10,11,.84); border:1px solid var(--signal); color:var(--signal);
+}
+
+/* The library's own search: input and button read as one control, so the
+   button is obviously the thing that runs the box next to it. */
+.lib-find{ display:flex; }
+.lib-find .mini-input{
+  min-width:min(340px, 46vw);
+  border-top-right-radius:0; border-bottom-right-radius:0; border-right:none;
+}
+.lib-find .btn{
+  border-top-left-radius:0; border-bottom-left-radius:0;
+  border-color:var(--line-2);
+}
+.lib-find:focus-within .mini-input{ border-color:var(--line-2); }
+
+.mini-range{
+  display:inline-flex; align-items:center; gap:8px; height:32px; padding:0 11px;
+  background:var(--ink-3); border:1px solid var(--line); border-radius:var(--r-sm);
+  font-family:var(--mono); font-size:10.5px; color:var(--dim);
+  letter-spacing:.05em; text-transform:uppercase; cursor:pointer;
+}
+.mini-range input[type="range"]{
+  -webkit-appearance:none; appearance:none;
+  width:78px; height:3px; border-radius:2px; background:var(--line-2);
+  cursor:pointer; outline:none;
+}
+.mini-range input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none;
+  width:12px; height:12px; border-radius:50%;
+  background:var(--text); border:none; cursor:pointer;
+}
+.mini-range input[type="range"]::-moz-range-thumb{
+  width:12px; height:12px; border-radius:50%;
+  background:var(--text); border:none; cursor:pointer;
+}
+.mini-range input[type="range"]:focus-visible::-webkit-slider-thumb{ background:var(--signal); }
 
 /* ══ DATA ════════════════════════════════════════════════════════════════ */
 .schema{ display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); }
@@ -467,19 +535,57 @@ button{ background:none; border:0; cursor:pointer; }
   border-left:12px solid var(--line-2); border-top:9px solid transparent; border-bottom:9px solid transparent;
 }
 
+/* 9:16 is right for a reel and wasteful for a landscape upload, so the box
+   holds the aspect only as a ceiling and lets the video decide inside it.
+   `max-height` grows with the player size — in theatre the video is the page. */
 .screen{ position:relative; background:#000; aspect-ratio:9/16; max-height:62vh; }
 .screen video{ width:100%; height:100%; object-fit:contain; display:block; background:#000; }
-.screen-close{
-  position:absolute; right:8px; top:8px; width:28px; height:28px; border-radius:50%;
-  background:rgba(4,10,11,.72); color:var(--text); font-size:18px; line-height:1;
-  display:grid; place-items:center;
+body[data-player-size="wide"] .screen{ max-height:72vh; }
+body[data-player-size="theatre"] .screen{
+  aspect-ratio:auto; height:calc(100vh - var(--topbar) - 232px); max-height:none;
 }
+.screen-tools{
+  position:absolute; right:8px; top:8px; display:flex; gap:6px;
+  opacity:.5; transition:opacity .18s var(--ease);
+}
+.screen:hover .screen-tools, .screen-tools:focus-within{ opacity:1; }
+.screen-btn, .screen-close{
+  width:28px; height:28px; border-radius:50%;
+  background:rgba(4,10,11,.72); color:var(--text); font-size:16px; line-height:1;
+  display:grid; place-items:center; border:1px solid var(--line);
+}
+.screen-btn:hover, .screen-close:hover{ background:rgba(4,10,11,.92); border-color:var(--line-2); }
+.screen-close{ font-size:18px; }
 .screen-busy{
   position:absolute; inset:0; display:grid; place-content:center; justify-items:center; gap:12px;
   background:rgba(11,20,22,.86); font-family:var(--mono); font-size:11.5px; color:var(--muted);
+  padding:24px; text-align:center; line-height:1.55;
 }
 .screen-busy .bar{ width:180px; height:3px; background:var(--ink-4); border-radius:99px; overflow:hidden; }
 .screen-busy .bar i{ display:block; height:100%; width:0; background:var(--signal); transition:width .3s var(--ease); }
+
+/* ── moment navigation ── */
+.player-nav{
+  display:flex; align-items:center; gap:8px;
+  padding:10px 18px 0;
+}
+.pnav{
+  height:26px; padding:0 11px; border-radius:var(--r-sm);
+  background:var(--ink-3); border:1px solid var(--line);
+  font-family:var(--mono); font-size:11px; color:var(--muted);
+  letter-spacing:.02em; white-space:nowrap;
+}
+.pnav:hover{ background:var(--ink-4); border-color:var(--line-2); color:var(--text); }
+.pnav-quiet{ background:transparent; }
+.pnav[data-pressed="true"]{
+  background:var(--ink-4); border-color:var(--signal); color:var(--signal);
+}
+.pnav-at{
+  font-family:var(--mono); font-size:11px; color:var(--dim);
+  min-width:58px; text-align:center;
+}
+.pnav-gap{ flex:1; }
+.mrow[data-step="current"]{ box-shadow:inset 2px 0 0 var(--signal); }
 
 .ribbon-block{ padding:14px 18px 6px; }
 .player-meta{ padding:6px 18px 16px; border-bottom:1px solid var(--line); }
@@ -776,6 +882,296 @@ button{ background:none; border:0; cursor:pointer; }
   font-family:var(--mono); font-size:11.5px; color:var(--s-visual);
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   MAPS — the whole archive as one picture
+
+   Three maps over one database, and the layout is the same for all three
+   because switching between them must feel like changing the lens, not
+   changing the page: toolbar on top, canvas filling everything, legend
+   floating bottom-left, drill-down slab on the right. Only the furniture
+   inside those slots differs — cluster names, or axis pickers.
+
+   The canvas is the page here, so nothing in this section scrolls. The
+   legend and the panel overlay the plot instead of squeezing it, for the
+   same reason the graph's detail slab does: the dot you clicked must stay
+   exactly where it was while you read about it.
+   ════════════════════════════════════════════════════════════════════════ */
+.maps-stage{
+  position:relative;
+  height:calc(100vh - var(--topbar));
+  overflow:hidden;
+  background:
+    radial-gradient(1000px 580px at 50% 42%, #12232700, #0B141600),
+    var(--ink);
+}
+/* Same faint grid as the graph — a pan over empty space has to move
+   something, or the drag reads as a dead control. */
+.maps-stage::before{
+  content:''; position:absolute; inset:0; pointer-events:none; z-index:0;
+  background-image:
+    linear-gradient(var(--ink-2) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ink-2) 1px, transparent 1px);
+  background-size:46px 46px;
+  opacity:.42;
+  mask-image:radial-gradient(circle at 50% 45%, #000 34%, transparent 80%);
+}
+
+/* ── the toolbar: which map, and what it is showing ── */
+.maps-toolbar{
+  position:absolute; left:var(--gutter); right:var(--gutter); top:16px; z-index:8;
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  pointer-events:none;
+}
+.maps-toolbar > *{ pointer-events:auto; }
+
+.maps-tabs{
+  display:inline-flex; gap:3px; padding:3px; border-radius:99px;
+  background:rgba(17,30,33,.92); backdrop-filter:blur(9px);
+  border:1px solid var(--line);
+  box-shadow:0 10px 28px rgba(0,0,0,.42);
+}
+.maps-tabs button{
+  height:28px; padding:0 15px; border-radius:99px;
+  font-size:12.5px; color:var(--muted); line-height:1;
+  transition:color .14s var(--ease), background .14s var(--ease);
+}
+.maps-tabs button:hover{ color:var(--text); }
+.maps-tabs button.on{
+  background:var(--text); color:var(--ink); font-weight:600;
+}
+
+/* The method line. It always says which projection produced the picture,
+   because "UMAP" and "PCA" are not the same claim about distance and the
+   reader deserves to know which one they are looking at. */
+.maps-legend-note{
+  font-family:var(--mono); font-size:11px; color:var(--dim);
+  letter-spacing:.02em; line-height:1.5;
+  max-width:62ch; pointer-events:none;
+}
+.maps-level{
+  margin-left:auto; font-family:var(--mono); font-size:10.5px;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--dim);
+  pointer-events:none;
+}
+
+/* ── the plot itself ── */
+.maps-viewport{
+  position:absolute; inset:0; z-index:1;
+}
+#mapsCanvas{
+  position:absolute; inset:0; width:100%; height:100%;
+  display:block; cursor:crosshair; touch-action:none; outline:none;
+}
+#mapsCanvas:focus-visible{ box-shadow:inset 0 0 0 1px var(--line-2); }
+#mapsCanvas:active{ cursor:grabbing; }
+
+.maps-crosshair{
+  position:absolute; pointer-events:none; z-index:3;
+  border-left:1px dashed rgba(255,176,32,.35);
+  border-top:1px dashed rgba(255,176,32,.35);
+}
+.maps-selection{
+  position:absolute; pointer-events:none; z-index:3;
+  border:1px dashed var(--s-visual);
+  background:rgba(94,200,216,.07);
+}
+
+/* The tooltip follows the pointer, so it must never intercept it. */
+.maps-tooltip{
+  position:absolute; z-index:6; pointer-events:none;
+  max-width:300px; padding:7px 10px;
+  background:rgba(17,30,33,.97); backdrop-filter:blur(9px);
+  border:1px solid var(--line-2); border-radius:var(--r-sm);
+  box-shadow:0 16px 38px rgba(0,0,0,.55);
+  display:flex; flex-direction:column; gap:3px;
+}
+/* The native [hidden] attribute would lose to the display above, so it is
+   reinstated for the three elements the JS toggles with .hidden. */
+.maps-crosshair[hidden],.maps-selection[hidden],.maps-tooltip[hidden]{ display:none; }
+.maps-tooltip strong{
+  font-size:12.5px; font-weight:600; color:var(--text); line-height:1.3;
+  overflow:hidden; display:-webkit-box; -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+}
+.maps-tooltip span{ font-family:var(--mono); font-size:10px; color:var(--dim); }
+
+/* ── the legend, bottom left ──
+   Groups are the map's only categorical key, so the legend is interactive:
+   it is the filter as well as the key. */
+.maps-legend{
+  position:absolute; left:var(--gutter); bottom:18px; z-index:7;
+  width:min(324px, calc(100% - var(--gutter) * 2));
+  max-height:min(58vh, 460px); overflow-y:auto;
+  padding:12px 13px;
+  background:rgba(17,30,33,.9); backdrop-filter:blur(11px);
+  border:1px solid var(--line); border-radius:var(--r);
+  box-shadow:0 18px 44px rgba(0,0,0,.5);
+}
+.maps-legend:empty{ display:none; }
+
+.mlegend-head{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--dim); margin-bottom:9px;
+}
+.mlegend-note{
+  margin:9px 0 0; font-size:11.5px; line-height:1.6; color:var(--dim);
+}
+.mlegend-list{ display:flex; flex-direction:column; gap:2px; }
+
+.mlegend-item{
+  display:flex; align-items:center; gap:8px; width:100%;
+  padding:5px 7px; border-radius:var(--r-sm);
+  text-align:left; font-size:12.5px; color:var(--text);
+  border:1px solid transparent;
+  transition:background .13s var(--ease), opacity .13s var(--ease);
+}
+.mlegend-item:hover{ background:var(--ink-4); border-color:var(--line); }
+/* Muted, not hidden: a group you switched off keeps its place in the list so
+   switching it back on is where you left it. */
+.mlegend-item.off{ opacity:.34; }
+.mlegend-item.static{ cursor:default; }
+.mlegend-item.static:hover{ background:transparent; border-color:transparent; }
+.mlegend-item i{
+  width:9px; height:9px; border-radius:50%; flex:none;
+}
+.mli-label{
+  flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.mli-n{ font-family:var(--mono); font-size:10px; color:var(--dim); flex:none; }
+
+/* ── scatter controls, in the legend slot ── */
+.mscatter-controls{ display:flex; gap:7px; flex-wrap:wrap; align-items:center; }
+.mctl{
+  display:inline-flex; align-items:center; gap:6px;
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--dim);
+}
+.mctl .mini-select{ height:28px; font-size:12px; max-width:150px; }
+.mscatter-controls .mlegend-list{ width:100%; margin-top:4px; }
+
+/* ── the drill-down slab, right ──
+   Overlays the canvas exactly like the graph's, and for the same reason. */
+.maps-panels{
+  position:absolute; right:0; top:0; bottom:0; z-index:10;
+  width:min(410px, 94%);
+  overflow-y:auto; pointer-events:none;
+}
+.maps-panels:empty{ display:none; }
+.mpanel{
+  position:relative; min-height:100%; pointer-events:auto;
+  padding:20px 20px 60px;
+  background:var(--ink-2); border-left:1px solid var(--line);
+  box-shadow:-24px 0 60px rgba(0,0,0,.55);
+  animation:slabIn .22s var(--ease);
+  color:var(--muted); font-size:13px; line-height:1.6;
+}
+.mpanel-close{
+  position:absolute; right:12px; top:12px; z-index:2;
+  width:28px; height:28px; border-radius:50%;
+  background:var(--ink-4); border:1px solid var(--line);
+  color:var(--muted); font-size:17px; line-height:1;
+}
+.mpanel-close:hover{ color:var(--text); }
+
+.mp-title{
+  display:flex; align-items:center; gap:9px;
+  font-family:var(--display); font-size:21px; font-weight:700;
+  letter-spacing:-.025em; line-height:1.2; color:var(--text);
+  margin:0 34px 12px 0; overflow-wrap:anywhere;
+}
+.mp-swatch{ width:11px; height:11px; border-radius:50%; flex:none; }
+
+/* Facts as a definition list, because that is what they are: a label and the
+   value the database actually holds. */
+.mp-facts{
+  display:grid; grid-template-columns:auto minmax(0,1fr);
+  gap:5px 12px; margin:0 0 16px;
+  padding-bottom:14px; border-bottom:1px solid var(--line);
+}
+.mp-facts dt{
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--dim); padding-top:2px;
+}
+.mp-facts dd{
+  margin:0; font-size:13px; color:var(--text); overflow-wrap:anywhere;
+}
+
+.mp-cluster{ display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+.mp-cluster i{ width:10px; height:10px; border-radius:50%; flex:none; }
+.mp-terms{
+  margin:0 0 16px; font-family:var(--mono); font-size:11px;
+  line-height:1.7; color:var(--dim);
+}
+.mp-text{
+  margin:0 0 16px; padding:11px 13px;
+  background:var(--ink-3); border:1px solid var(--line);
+  border-radius:var(--r-sm);
+  font-size:13px; line-height:1.6; color:var(--text);
+}
+
+.mp-moments{
+  list-style:none; margin:0 0 16px; padding:0;
+  display:flex; flex-direction:column; gap:7px;
+}
+.mp-moments li{
+  display:grid; grid-template-columns:auto auto minmax(0,1fr);
+  gap:8px; align-items:baseline;
+}
+.mp-src{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.1em;
+  text-transform:uppercase;
+}
+.mp-mt{
+  font-size:12.5px; line-height:1.45; color:var(--muted);
+  overflow:hidden; display:-webkit-box; -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+}
+
+.mp-acts{ display:flex; gap:7px; flex-wrap:wrap; margin-top:16px; }
+
+.mp-grid{
+  display:grid; grid-template-columns:repeat(auto-fill, minmax(104px, 1fr));
+  gap:8px; margin:14px 0;
+}
+.mp-tile{
+  display:flex; flex-direction:column; gap:5px; text-align:left;
+  padding:0; border-radius:var(--r-sm); border:1px solid transparent;
+  transition:border-color .13s var(--ease), transform .13s var(--ease);
+}
+.mp-tile:hover{ border-color:var(--line-2); transform:translateY(-1px); }
+.mp-shot{
+  width:100%; aspect-ratio:9/16; object-fit:cover;
+  border-radius:var(--r-sm); background:var(--ink-4); display:block;
+}
+.mp-tile-t{
+  font-size:11px; line-height:1.35; color:var(--muted); padding:0 2px 4px;
+  overflow:hidden; display:-webkit-box; -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+}
+
+.maps-empty{
+  position:absolute; inset:0; z-index:4;
+  display:grid; place-content:center; text-align:center;
+  padding:40px; color:var(--muted); gap:8px;
+}
+.maps-empty h3{ font-size:20px; color:var(--text); }
+.maps-empty p{ margin:0; max-width:48ch; line-height:1.65; }
+.maps-empty[hidden]{ display:none; }
+
+/* Two utilities the maps introduce and the rest of the UI can use: a button
+   sized for a toolbar row, and a button that reads as a link because it acts
+   like one. */
+.btn-tiny{
+  height:24px; padding:0 9px; font-size:11.5px; border-radius:var(--r-sm);
+}
+.btn-tiny.on{ color:var(--signal); border-color:var(--signal); }
+.linky{
+  padding:0; font-size:inherit; color:var(--signal);
+  border-bottom:1px solid transparent; line-height:1.3; text-align:left;
+}
+.linky:hover{ border-bottom-color:var(--signal); }
+
 
 @media (max-width:1180px){
   .stage{ grid-template-columns:minmax(0,1fr); }
@@ -804,6 +1200,17 @@ button{ background:none; border:0; cursor:pointer; }
   .graph-stage{ height:74vh; }
   .graph-rail{ width:calc(100% - var(--gutter) * 2); }
   .graph-legend{ display:none; }
+  /* Same wrapped-topbar problem as the graph, and the same fix. */
+  .maps-stage{ height:74vh; }
+  .maps-toolbar{ position:static; padding:12px var(--gutter) 0; }
+  .maps-level{ display:none; }
+  /* On a phone the legend would cover the plot it explains, so it drops to a
+     single scrolling row of swatches and gives the canvas back its space. */
+  .maps-legend{
+    left:0; right:0; bottom:0; width:100%; max-height:132px;
+    border-radius:0; border-left:0; border-right:0; border-bottom:0;
+  }
+  .maps-panels{ width:100%; }
 }
 
 @media (prefers-reduced-motion:reduce){

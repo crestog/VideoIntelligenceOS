@@ -171,7 +171,7 @@ const S = {
   status: null,
   video: null,                 // the open video's search-result shape
   record: null,                // /api/video payload for the open video
-  lib: { offset: 0, rows: [], total: 0, creator: '', category: '' },
+  lib: { offset: 0, rows: [], total: 0, creator: '', category: '', inside: 0, q: '' },
   browse: { table: '', offset: 0, q: '' },
   prefetched: new Set(),
   suggestIndex: -1,
@@ -184,11 +184,16 @@ const LIB_LIMIT = 40;
 /* ════════════════════════════════════════════════════════════════════════
    ROUTING
    ════════════════════════════════════════════════════════════════════════ */
+/* Every section that owns a URL. A tab missing from this list is unreachable
+ * by link and silently falls back to search, which is how the Maps tab could
+ * be opened by click but never by refresh. */
+const TABS = ['search', 'library', 'graph', 'maps', 'data', 'sources'];
+
 function readHash() {
   const raw = location.hash.replace(/^#\/?/, '');
   const [tab, qs] = raw.split('?');
   return {
-    tab: ['search', 'library', 'graph', 'data', 'sources'].includes(tab) ? tab : 'search',
+    tab: TABS.includes(tab) ? tab : 'search',
     params: new URLSearchParams(qs || ''),
   };
 }
@@ -215,6 +220,7 @@ function showTab(tab, { push = true } = {}) {
   // The canvas has no size while its view is hidden, so the graph can only be
   // measured after the switch — hence the boot call here rather than at start.
   if (tab === 'graph') graphBoot(false);
+  if (tab === 'maps') mapsBoot(false);
   if (tab === 'data' && !$('schema').childElementCount) loadSchema();
   if (tab === 'sources') loadSources();
 }
@@ -559,6 +565,13 @@ function prefetch(keys) {
 
 let statePoll = 0;
 let retryTimer = 0;
+let busyGuard = 0;
+/* The ordered timestamps of the open video's passages, and where the player
+ * currently sits in that list. Navigation is by moment, not by scrubbing —
+ * the whole point of the index is that the interesting instants are known. */
+let momTimes = [];
+let momAt = -1;
+let momLoop = null;
 
 function openVideo(video, at) {
   const key = video.video_key;
@@ -606,10 +619,49 @@ function seekTo(t) {
   else vid.addEventListener('loadedmetadata', go, { once: true });
 }
 
-function busy(on, text, pct) {
-  $('screenBusy').hidden = !on;
+/* The overlay used to be cleared only by `loadeddata` or `playing`. When
+ * neither ever fires — a codec the browser will not decode, a range request
+ * the channel never answers — the word "opening" stayed on screen forever and
+ * looked like the whole application had hung. So every busy state now carries
+ * its own deadline and, when it expires, says what it is actually waiting for
+ * and offers the two things a person can do about it. */
+function busy(on, text, pct, opts) {
+  const box = $('screenBusy');
+  box.hidden = !on;
   if (text) $('busyText').textContent = text;
   $('busyBar').style.width = (pct === undefined ? (on ? 8 : 100) : pct) + '%';
+
+  const act = $('busyAct');
+  act.hidden = true;
+  act.onclick = null;
+  clearTimeout(busyGuard);
+  if (!on) return;
+
+  if (opts && opts.action) {
+    act.hidden = false;
+    act.textContent = opts.action.label;
+    act.onclick = opts.action.run;
+    return;
+  }
+  busyGuard = setTimeout(() => {
+    if ($('screenBusy').hidden || !S.video) return;
+    const vid = $('video');
+    // Bytes are decoding: the overlay is simply stale, so drop it.
+    if (vid.readyState >= 2 || (!vid.paused && vid.currentTime > 0)) {
+      busy(false);
+      return;
+    }
+    busy(true, 'still waiting on this file — it may be large, or the channel ' +
+      'may not have answered', 0, { action: {
+        label: 'Try again',
+        run: () => {
+          busy(true, 'opening');
+          vid.load();
+          vid.play().catch(() => {});
+          if (S.video) pollMediaState(S.video.video_key);
+        },
+      } });
+  }, (opts && opts.after) || 12000);
 }
 
 function pollMediaState(key) {
@@ -628,7 +680,13 @@ function pollMediaState(key) {
       if (st.status === 'streaming') return;
       if (st.status === 'error') {
         clearInterval(statePoll);
-        busy(true, st.note || 'could not fetch this video from the channel', 0);
+        busy(true, st.note || 'could not fetch this video from the channel', 0,
+          { action: { label: 'Try again', run: () => {
+              const vid = $('video');
+              busy(true, 'opening');
+              vid.load(); vid.play().catch(() => {});
+              pollMediaState(key);
+            } } });
         return;
       }
       const pct = st.percent || (st.total ? (st.got / st.total) * 100 : 0);
@@ -689,6 +747,12 @@ function renderMoments(video, at) {
   panel.textContent = '';
   const list = (video.moments || []).slice().sort((a, b) =>
     (a.t_start === null ? -1 : a.t_start) - (b.t_start === null ? -1 : b.t_start));
+  // Keep the ordered timestamps for moment navigation. The loop needs a live
+  // video to know when to stop, so it is an interval, not a one-shot seek.
+  momTimes = list.map(m => m.t_start).filter(t => t !== null && t !== undefined);
+  momAt = -1;
+  stopMomLoop();
+  momStepTo(at !== null && at !== undefined ? at : (momTimes[0] ?? -1));
   if (!list.length) {
     panel.appendChild(h('p', { class: 'hint',
       text: 'No indexed passages for this video yet.' }));
@@ -697,13 +761,129 @@ function renderMoments(video, at) {
   for (const m of list) {
     panel.appendChild(h('div', {
       class: 'mrow', 'data-t': m.t_start === null ? '' : m.t_start,
-      onclick: () => { if (m.t_start !== null && m.t_start !== undefined) seekTo(m.t_start); },
+      onclick: () => { if (m.t_start !== null && m.t_start !== undefined) { momStepTo(m.t_start); seekTo(m.t_start); } },
     },
       h('span', { class: 't', text: m.t_start === null || m.t_start === undefined
         ? '—' : timecode(m.t_start) }),
       h('span', { class: 'rail', style: `background:${color(m.source)}` }),
       h('span', { class: 'txt' }, marked(m.text, S.query))));
   }
+}
+
+/* ── moment navigation ────────────────────────────────────────────────── */
+function momIndex(t) {
+  const dur = (S.video && S.video.duration) || 0;
+  return momTimes.findIndex(x => Math.abs(x - t) < Math.max(0.6, dur * 0.005));
+}
+
+function momStepTo(t) {
+  momAt = momIndex(t);
+  $('momAt').textContent = momAt < 0 ? timecode(t || 0)
+    : `${momAt + 1} / ${momTimes.length}`;
+  const pos = momAt < 0 ? '' : 'current';
+  $$('#panel-moments .mrow').forEach(row => {
+    row.dataset.step = (momAt >= 0 && Number(row.dataset.t) === momTimes[momAt])
+      ? pos : '';
+  });
+  return momAt;
+}
+
+function momGo(delta) {
+  if (!momTimes.length) return;
+  const now = $('video').currentTime;
+  let i = momIndex(now);
+  if (i < 0) i = now <= (momTimes[0] || 0) ? 0 : momTimes.length;
+  i += delta;
+  i = Math.max(0, Math.min(momTimes.length - 1, i));
+  if (momStepTo(momTimes[i]) >= 0) seekTo(momTimes[i]);
+}
+
+/* Loop the passage the player is sitting on, so a moment can be watched twice
+ * without touching the scrubber. The window runs to the next indexed moment,
+ * capped — a 40-second gap between passages is not a loop anyone wants. */
+function momLoopToggle() {
+  if (momLoop) { stopMomLoop(); return; }
+  const i = momIndex($('video').currentTime);
+  const t = momTimes[i];
+  if (t === undefined) return;
+  const next = momTimes[i + 1];
+  const span = Math.min(6, Math.max(1.5, (next === undefined ? 3 : next - t)));
+  $('momLoop').dataset.pressed = 'true';
+  $('momLoop').setAttribute('aria-pressed', 'true');
+  momLoop = setInterval(() => {
+    const vid = $('video');
+    if (vid.currentTime < t - 0.4 || vid.currentTime > t + span) {
+      vid.currentTime = t;
+      vid.play().catch(() => {});
+    }
+  }, 150);
+}
+
+function stopMomLoop() {
+  clearInterval(momLoop);
+  momLoop = null;
+  const b = $('momLoop');
+  if (b) { delete b.dataset.pressed; b.setAttribute('aria-pressed', 'false'); }
+}
+
+/* ── how big the player is ──
+   The rail is 452 px wide, which is right for glancing at a result while you
+   keep reading the list and wrong for actually watching a reel. Three sizes,
+   because the two extremes both have a real use: rail to browse, wide to
+   watch, theatre to study one video with everything else out of the way. */
+const PLAYER_SIZES = ['rail', 'wide', 'theatre'];
+
+function playerSize(next) {
+  const el = $('player');
+  const now = el.dataset.size || 'rail';
+  const size = next || PLAYER_SIZES[(PLAYER_SIZES.indexOf(now) + 1) % 3];
+  el.dataset.size = size;
+  document.body.dataset.playerSize = size;
+  try { localStorage.setItem('atlas.playerSize', size); } catch {}
+  const b = $('screenSize');
+  if (b) b.title = `Player size: ${size} — press f to change`;
+  // The maps and graph canvases size themselves off their viewport, so a
+  // change to the player's width has to be followed by a re-measure or they
+  // draw at the old size until the next window resize.
+  if (S.tab === 'maps') { mapsResize(); mapsDraw(); }
+  if (S.tab === 'graph' && typeof gresize === 'function') gresize();
+}
+
+function momNavWire() {
+  $('momPrev').addEventListener('click', () => momGo(-1));
+  $('momNext').addEventListener('click', () => momGo(1));
+  $('momLoop').addEventListener('click', momLoopToggle);
+  $('screenSize').addEventListener('click', () => playerSize());
+  let saved = '';
+  try { saved = localStorage.getItem('atlas.playerSize') || ''; } catch {}
+  playerSize(PLAYER_SIZES.includes(saved) ? saved : 'rail');
+
+  // Keyboard, but only when the person is not typing into something. Every
+  // key here is a single letter for the same reason a video editor's are.
+  window.addEventListener('keydown', (ev) => {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    const el = document.activeElement;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'SELECT' ||
+               el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+    if (!S.video && ev.key !== 'Escape') return;
+    const vid = $('video');
+    switch (ev.key) {
+      case 'n': momGo(1); break;
+      case 'p': momGo(-1); break;
+      // j / k / l are the scrub triple every editor already knows, so loop
+      // takes 'o' rather than stealing 'l'.
+      case 'o': momLoopToggle(); break;
+      case 'f': playerSize(); break;
+      case 'Escape': if (S.video) closePlayer(); else return; break;
+      case ' ':
+      case 'k': if (vid.paused) vid.play().catch(() => {}); else vid.pause(); break;
+      case 'j': vid.currentTime = Math.max(0, vid.currentTime - 5); break;
+      case 'l': vid.currentTime = vid.currentTime + 5; break;
+      case 'm': vid.muted = !vid.muted; break;
+      default: return;
+    }
+    ev.preventDefault();
+  });
 }
 
 function markActiveCard() {
@@ -715,6 +895,10 @@ function markActiveCard() {
 function closePlayer() {
   clearInterval(statePoll);
   clearTimeout(retryTimer);
+  clearTimeout(busyGuard);
+  stopMomLoop();
+  momTimes = [];
+  momAt = -1;
   S.video = null;
   const vid = $('video');
   vid.pause();
@@ -872,22 +1056,56 @@ function showPanel(name) {
    ════════════════════════════════════════════════════════════════════════ */
 async function loadLibrary(reset) {
   if (reset) { S.lib.offset = 0; S.lib.rows = []; }
+  S.lib.q = $('libQ').value.trim();
   const p = new URLSearchParams({
     limit: String(LIB_LIMIT), offset: String(S.lib.offset),
-    sort: $('libSort').value, has: $('libHas').value, q: $('libQ').value.trim(),
+    sort: $('libSort').value, has: $('libHas').value, q: S.lib.q,
   });
   if (S.lib.creator) p.set('creator', S.lib.creator);
   if (S.lib.category) p.set('category', S.lib.category);
 
+  if (reset) libNote('searching…');
   try {
     const data = await api('/api/library?' + p.toString());
     S.lib.rows = S.lib.rows.concat(data.results || []);
     S.lib.total = data.total || 0;
+    S.lib.inside = data.inside || 0;
     S.lib.offset = S.lib.rows.length;
     renderLibrary(reset);
-  } catch (e) { toast('Library failed: ' + e.message); }
+    libNote();
+  } catch (e) { libNote(''); toast('Library failed: ' + e.message); }
 
   if (!S.facets) loadFacets();
+}
+
+/* What the library is currently showing, and — when a query is running — how
+ * many of those videos were found by what is *inside* them rather than by
+ * their title. Without that line, a result whose title says nothing about the
+ * query looks like a bug instead of the feature it is. */
+function libNote(override) {
+  const el = $('libNote');
+  if (override !== undefined) { el.textContent = override; return; }
+  const bits = [`${fmtInt(S.lib.total)} video${S.lib.total === 1 ? '' : 's'}`];
+  if (S.lib.q) {
+    bits.push(`matching “${S.lib.q}”`);
+    if (S.lib.inside)
+      bits.push(`· ${fmtInt(S.lib.inside)} found by what is spoken, seen or written inside them`);
+  }
+  const filters = [S.lib.creator, S.lib.category].filter(Boolean);
+  if (filters.length) bits.push(`· ${filters.join(' · ')}`);
+  el.textContent = bits.join(' ');
+}
+
+/* How many tiles fit on a row. Kept in a custom property so the grid rule
+ * stays one line of CSS, and remembered, because a density is a preference
+ * rather than a per-visit decision. */
+const LIB_DENSITY = { 1: 1, 2: 2, 3: 0, 4: 5, 5: 7 };   // 0 = the CSS default
+function libDensity(step) {
+  const n = LIB_DENSITY[step] || 0;
+  const grid = $('libGrid');
+  if (n) grid.style.setProperty('--tile-cols', String(n));
+  else grid.style.removeProperty('--tile-cols');
+  try { localStorage.setItem('atlas.libDensity', String(step)); } catch { /* private mode */ }
 }
 
 function renderLibrary(reset) {
@@ -915,6 +1133,10 @@ function renderLibrary(reset) {
         rail.appendChild(h('i', { style: `flex:${n};background:${color(src)}` }));
       shot.appendChild(rail);
     }
+
+    if (r.matched === 'inside')
+      tile.appendChild(h('span', { class: 'tile-why', text: 'found inside',
+        title: 'The words are spoken, seen or written in this video, not in its title.' }));
 
     tile.append(shot,
       h('div', { class: 'tile-title', text: r.title || r.caption || r.video_key }),
@@ -2518,6 +2740,963 @@ async function graphFromResults() {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+   MAPS — the archive as one picture
+
+   Three views over one dataset. Two of them (semantic, cluster) share a
+   projection computed on the server; the third (scatter) plots two numeric
+   columns and needs no embedding at all, which is why there is always a map
+   to look at even on a fresh archive.
+
+   Everything is drawn to one canvas because the point count is the whole
+   archive — 180k DOM nodes is not a thing a browser will do, and 180k canvas
+   arcs is about eight milliseconds. The cost of canvas is that nothing is
+   clickable for free, so hit-testing is a uniform grid built once per data
+   load: a lookup is O(points in one cell) rather than O(all points), which is
+   what keeps the hover readout live while the pointer moves.
+   ════════════════════════════════════════════════════════════════════════ */
+const M = {
+  map: 'semantic',        // semantic | cluster | scatter
+  level: 'video',         // video | moment
+  loaded: false,
+  // Which dataset is currently in M.xy. Semantic and cluster share one, the
+  // scatter plot has its own, and both fill the same arrays — so the map name
+  // alone cannot say whether a repaint is safe or a refetch is needed.
+  dataset: '',            // '' | projection | scatter
+  xy: null,               // Float32Array, 2 per point
+  cluster: null,          // Int32Array
+  refs: null, keys: null, times: null,
+  clusters: [],           // legend, from /api/map
+  method: '',
+  // scatter
+  axes: [], sx: '', sy: '', slogx: false, slogy: false,
+  scatter: null,          // the /api/map/scatter payload
+  // view transform
+  k: 1, tx: 0, ty: 0,
+  hover: -1, picked: -1,
+  muted: new Set(),       // cluster ids toggled off in the legend
+  grid: null, gridN: 0,
+  drag: null, box: null,
+  raf: 0,
+};
+
+/* The cluster palette. Built from the seven channel hues the rest of Atlas
+ * already uses, then rotated through lightness so that a large archive with
+ * forty clusters still reads as distinct without inventing colours that mean
+ * something else somewhere else. */
+const MAP_HUES = [199, 48, 142, 258, 325, 0, 172, 220, 30, 100, 280, 350];
+function clusterColor(c, alpha) {
+  if (c === null || c === undefined || c < 0) return `rgba(139,147,158,${alpha})`;
+  const hue = MAP_HUES[c % MAP_HUES.length];
+  const light = 62 + ((Math.floor(c / MAP_HUES.length) % 3) * 11);
+  return `hsla(${hue},72%,${light}%,${alpha})`;
+}
+
+const mcanvas = () => $('mapsCanvas');
+
+function mapsShowEmpty(title, note) {
+  const box = $('mapsEmpty');
+  box.hidden = false;
+  box.textContent = '';
+  box.appendChild(h('h3', { text: title }));
+  if (note) box.appendChild(h('p', { text: note }));
+  $('mapsViewport').style.visibility = 'hidden';
+}
+
+function mapsHideEmpty() {
+  $('mapsEmpty').hidden = true;
+  $('mapsViewport').style.visibility = '';
+}
+
+/* ── loading ───────────────────────────────────────────────────────────── */
+async function mapsBoot(force) {
+  // The canvas has no size until its view is visible, so measurement and the
+  // first fit can only happen after the tab switch — same reason as the graph.
+  if (M.loaded && !force) { mapsResize(); mapsDraw(); return; }
+  M.loaded = true;
+  if (M.map === 'scatter') { await mapsLoadScatter(); return; }
+  await mapsLoadProjection();
+}
+
+async function mapsLoadProjection() {
+  try {
+    const meta = await api(`/api/map?level=${M.level}`);
+    M.clusters = meta.clusters || [];
+    M.method = meta.method || '';
+    if (!meta.count) {
+      mapsShowEmpty('No map yet',
+        meta.note || 'The semantic and cluster maps are drawn from the dense ' +
+        'index. Once the encoder has run they appear here. The scatter plot ' +
+        'works without it.');
+      mapsRenderLegend();
+      return;
+    }
+
+    // The points come back as a packed buffer and the labels as JSON, in the
+    // same row order. Fetched together because neither is useful alone.
+    const [buf, refs] = await Promise.all([
+      fetch(U(`/api/map/points?level=${M.level}`)).then(r => r.arrayBuffer()),
+      api(`/api/map/refs?level=${M.level}`),
+    ]);
+    const view = new DataView(buf);
+    const n = Math.floor(buf.byteLength / 12);
+    M.xy = new Float32Array(n * 2);
+    M.cluster = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      M.xy[i * 2] = view.getFloat32(i * 12, true);
+      M.xy[i * 2 + 1] = view.getFloat32(i * 12 + 4, true);
+      M.cluster[i] = view.getInt32(i * 12 + 8, true);
+    }
+    M.refs = refs.refs || [];
+    M.keys = refs.keys || [];
+    M.times = refs.t || [];
+    M.dataset = 'projection';
+
+    mapsHideEmpty();
+    mapsBuildGrid();
+    mapsRenderLegend();
+    mapsRenderNote(meta);
+    mapsResize();
+    mapsFit();
+  } catch (e) {
+    mapsShowEmpty('The map could not load', String(e.message || e));
+  }
+}
+
+function mapsRenderNote(meta) {
+  const how = {
+    umap: 'UMAP — neighbourhoods and global structure preserved',
+    tsne: 't-SNE — local structure preserved, distances between far groups ' +
+          'are not meaningful',
+    pca: 'PCA — a linear projection: it shows the big splits and blurs the ' +
+         'fine ones',
+  }[M.method] || M.method;
+  const n = M.refs ? M.refs.length : 0;
+  $('mapsNote').textContent = n
+    ? `${fmtInt(n)} ${M.level === 'video' ? 'videos' : 'passages'} · ${how}`
+    : '';
+}
+
+async function mapsLoadScatter() {
+  try {
+    if (!M.axes.length) {
+      const got = await api('/api/map/axes');
+      M.axes = got.axes || [];
+      if (!M.axes.length) {
+        mapsShowEmpty('Nothing numeric to plot',
+          'The scatter plot needs at least two numeric columns in ' +
+          'video_index. Import a bundle and it will fill in.');
+        return;
+      }
+      // Default to the pair that says the most about a video archive, but
+      // only if the columns actually arrived in this bundle.
+      const have = new Set(M.axes.map(a => a.name));
+      M.sx = have.has('duration') ? 'duration' : M.axes[0].name;
+      M.sy = have.has('moment_count') ? 'moment_count'
+           : (M.axes[1] || M.axes[0]).name;
+    }
+    const p = new URLSearchParams({
+      x: M.sx, y: M.sy, colour: 'cluster',
+      log_x: String(M.slogx), log_y: String(M.slogy),
+    });
+    M.scatter = await api('/api/map/scatter?' + p.toString());
+    if (!M.scatter.count) {
+      mapsShowEmpty('No points to plot',
+        M.scatter.note || 'Every video is missing one of the two columns.');
+      mapsRenderLegend();
+      return;
+    }
+    mapsHideEmpty();
+    mapsProjectScatter();
+    mapsRenderLegend();
+    $('mapsNote').textContent =
+      `${fmtInt(M.scatter.count)} videos · ${M.scatter.x_label} against ` +
+      `${M.scatter.y_label}` + (M.scatter.note ? ` · ${M.scatter.note}` : '');
+    mapsResize();
+    mapsFit();
+  } catch (e) {
+    mapsShowEmpty('The scatter plot could not load', String(e.message || e));
+  }
+}
+
+/* The scatter payload arrives in data units — seconds, megabytes, counts — so
+ * it is normalised into the same [0,1] space the projection uses. That way one
+ * draw path, one hit-test and one zoom implementation serve all three maps,
+ * and only the axis furniture differs. */
+function mapsProjectScatter() {
+  const pts = M.scatter.points;
+  let lo0 = Infinity, hi0 = -Infinity, lo1 = Infinity, hi1 = -Infinity;
+  for (const p of pts) {
+    if (p.x < lo0) lo0 = p.x; if (p.x > hi0) hi0 = p.x;
+    if (p.y < lo1) lo1 = p.y; if (p.y > hi1) hi1 = p.y;
+  }
+  const sp0 = (hi0 - lo0) || 1, sp1 = (hi1 - lo1) || 1;
+  M.scatter.domain = { lo0, hi0, lo1, hi1 };
+  M.xy = new Float32Array(pts.length * 2);
+  M.cluster = new Int32Array(pts.length);
+  M.refs = []; M.keys = []; M.times = [];
+  pts.forEach((p, i) => {
+    M.xy[i * 2] = (p.x - lo0) / sp0;
+    // Screen y grows downward and a chart's y grows upward, so this is
+    // flipped here rather than in the draw, where it would have to be undone
+    // again for hit-testing.
+    M.xy[i * 2 + 1] = 1 - (p.y - lo1) / sp1;
+    M.cluster[i] = p.g;
+    M.refs.push(p.key); M.keys.push(p.key); M.times.push(null);
+  });
+  M.dataset = 'scatter';
+  mapsBuildGrid();
+}
+
+/* ── hit testing ───────────────────────────────────────────────────────── */
+/* A uniform grid over the unit square. Rebuilt only when the data changes,
+ * never on zoom: zoom is a transform applied at draw time, so the grid stays
+ * valid and a pan costs nothing. */
+function mapsBuildGrid() {
+  const n = M.xy ? M.xy.length / 2 : 0;
+  const cells = Math.max(8, Math.min(160, Math.ceil(Math.sqrt(n / 3))));
+  M.gridN = cells;
+  M.grid = new Map();
+  for (let i = 0; i < n; i++) {
+    const cx = Math.min(cells - 1, Math.max(0, Math.floor(M.xy[i * 2] * cells)));
+    const cy = Math.min(cells - 1, Math.max(0, Math.floor(M.xy[i * 2 + 1] * cells)));
+    const id = cy * cells + cx;
+    let bucket = M.grid.get(id);
+    if (!bucket) { bucket = []; M.grid.set(id, bucket); }
+    bucket.push(i);
+  }
+}
+
+function mapsPick(px, py) {
+  if (!M.grid || !M.xy) return -1;
+  const cells = M.gridN;
+  const u = (px - M.tx) / M.k, v = (py - M.ty) / M.k;
+  const reach = 10 / M.k;                     // 10 screen px, in data units
+  const c0 = Math.max(0, Math.floor((u - reach) * cells));
+  const c1 = Math.min(cells - 1, Math.floor((u + reach) * cells));
+  const r0 = Math.max(0, Math.floor((v - reach) * cells));
+  const r1 = Math.min(cells - 1, Math.floor((v + reach) * cells));
+  let best = -1, bestD = reach * reach;
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const bucket = M.grid.get(r * cells + c);
+      if (!bucket) continue;
+      for (const i of bucket) {
+        if (M.muted.has(M.cluster[i])) continue;
+        const dx = M.xy[i * 2] - u, dy = M.xy[i * 2 + 1] - v;
+        const d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = i; }
+      }
+    }
+  }
+  return best;
+}
+
+/* ── drawing ───────────────────────────────────────────────────────────── */
+function mapsResize() {
+  const cv = mcanvas();
+  const box = $('mapsViewport').getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(box.width * dpr);
+  cv.height = Math.round(box.height * dpr);
+  cv.style.width = box.width + 'px';
+  cv.style.height = box.height + 'px';
+  M.dpr = dpr;
+}
+
+function mapsFit() {
+  const cv = mcanvas();
+  const w = cv.width, hgt = cv.height;
+  if (!w || !hgt) return;
+  const pad = M.map === 'scatter' ? 64 * (M.dpr || 1) : 28 * (M.dpr || 1);
+  M.k = Math.min(w - pad * 2, hgt - pad * 2);
+  M.tx = (w - M.k) / 2;
+  M.ty = (hgt - M.k) / 2;
+  mapsDraw();
+}
+
+function mapsSchedule() {
+  if (M.raf) return;
+  M.raf = requestAnimationFrame(() => { M.raf = 0; mapsDraw(); });
+}
+
+function mapsDraw() {
+  const cv = mcanvas();
+  const ctx = cv.getContext('2d');
+  const w = cv.width, hgt = cv.height;
+  if (!w || !hgt || !M.xy) return;
+  const dpr = M.dpr || 1;
+
+  ctx.clearRect(0, 0, w, hgt);
+  if (M.map === 'scatter') mapsDrawAxes(ctx, w, hgt, dpr);
+
+  const n = M.xy.length / 2;
+  // Dots shrink as the archive grows so a dense region reads as a shape
+  // rather than a solid block, and grow with zoom so a magnified cluster
+  // becomes individually clickable.
+  const base = n > 60000 ? 1.1 : n > 12000 ? 1.7 : n > 2000 ? 2.4 : 3.4;
+  const r = Math.max(0.7, base * dpr * Math.min(2.4, Math.pow(M.k / 700, 0.4)));
+  const flat = M.map === 'semantic';
+  const alpha = n > 40000 ? 0.5 : n > 8000 ? 0.65 : 0.85;
+
+  // Batched by colour: a fillStyle change is the expensive part of a canvas
+  // scatter, so all points of one cluster are drawn in a single path.
+  const byColour = new Map();
+  for (let i = 0; i < n; i++) {
+    const c = M.cluster[i];
+    if (M.muted.has(c)) continue;
+    const key = flat ? -1 : c;
+    let list = byColour.get(key);
+    if (!list) { list = []; byColour.set(key, list); }
+    list.push(i);
+  }
+
+  for (const [c, list] of byColour) {
+    ctx.fillStyle = flat
+      ? `rgba(198,214,212,${alpha})` : clusterColor(c, alpha);
+    ctx.beginPath();
+    for (const i of list) {
+      const x = M.xy[i * 2] * M.k + M.tx;
+      const y = M.xy[i * 2 + 1] * M.k + M.ty;
+      if (x < -8 || y < -8 || x > w + 8 || y > hgt + 8) continue;
+      ctx.moveTo(x + r, y);
+      ctx.arc(x, y, r, 0, 6.283185);
+    }
+    ctx.fill();
+  }
+
+  if (M.map === 'cluster') mapsDrawClusterLabels(ctx, w, hgt, dpr);
+  for (const i of [M.hover, M.picked]) {
+    if (i < 0 || i >= n || M.muted.has(M.cluster[i])) continue;
+    const x = M.xy[i * 2] * M.k + M.tx, y = M.xy[i * 2 + 1] * M.k + M.ty;
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(5 * dpr, r + 3.5 * dpr), 0, 6.283185);
+    ctx.lineWidth = 2 * dpr;
+    // Amber means "this is the selection" everywhere else in Atlas, and the
+    // hover ring borrows the visual-evidence teal rather than inventing a
+    // colour, so the map reads as the same application as the ribbons.
+    ctx.strokeStyle = i === M.picked ? '#FFB020' : '#5EC8D8';
+    ctx.stroke();
+  }
+
+  if (M.box) {
+    const b = M.box;
+    ctx.setLineDash([5 * dpr, 4 * dpr]);
+    ctx.strokeStyle = 'rgba(94,200,216,0.9)';
+    ctx.lineWidth = 1.4 * dpr;
+    ctx.strokeRect(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1),
+                   Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(94,200,216,0.07)';
+    ctx.fillRect(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1),
+                 Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+  }
+}
+
+/* Cluster names, drawn at the centre of each group and hidden when two would
+ * overlap. A legend nobody can read is worse than no legend, so this drops
+ * labels rather than stacking them. */
+function mapsDrawClusterLabels(ctx, w, hgt, dpr) {
+  if (!M.clusters.length) return;
+  ctx.font = `${12 * dpr}px "Public Sans", system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const taken = [];
+  for (const c of M.clusters) {
+    if (M.muted.has(c.cluster)) continue;
+    const x = c.cx * M.k + M.tx, y = c.cy * M.k + M.ty;
+    if (x < 0 || y < 0 || x > w || y > hgt) continue;
+    const label = c.label || `group ${c.cluster + 1}`;
+    const wide = ctx.measureText(label).width;
+    if (taken.some(t => Math.abs(t.x - x) < (t.w + wide) / 2 + 8 * dpr &&
+                        Math.abs(t.y - y) < 20 * dpr)) continue;
+    taken.push({ x, y, w: wide });
+    ctx.lineWidth = 3.5 * dpr;
+    ctx.strokeStyle = 'rgba(11,20,22,0.92)';
+    ctx.strokeText(label, x, y);
+    ctx.fillStyle = clusterColor(c.cluster, 1);
+    ctx.fillText(label, x, y);
+  }
+}
+
+function mapsDrawAxes(ctx, w, hgt, dpr) {
+  const d = M.scatter && M.scatter.domain;
+  if (!d) return;
+  ctx.strokeStyle = 'rgba(36,64,63,0.9)';
+  ctx.lineWidth = 1 * dpr;
+  ctx.fillStyle = '#5B7876';
+  ctx.font = `${11 * dpr}px "IBM Plex Mono", monospace`;
+  const fmt = (v, isLog) => {
+    const n = isLog ? Math.pow(10, v) : v;
+    if (Math.abs(n) >= 1000) return fmtInt(Math.round(n));
+    return (Math.abs(n) < 10 ? n.toFixed(1) : String(Math.round(n)));
+  };
+  for (let i = 0; i <= 4; i++) {
+    const f = i / 4;
+    const x = f * M.k + M.tx, y = f * M.k + M.ty;
+    ctx.beginPath(); ctx.moveTo(x, M.ty); ctx.lineTo(x, M.ty + M.k); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(M.tx, y); ctx.lineTo(M.tx + M.k, y); ctx.stroke();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText(fmt(d.lo0 + f * (d.hi0 - d.lo0), M.slogx), x, M.ty + M.k + 6 * dpr);
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(fmt(d.hi1 - f * (d.hi1 - d.lo1), M.slogy), M.tx - 8 * dpr, y);
+  }
+  ctx.fillStyle = '#E8EAED';
+  ctx.font = `${12 * dpr}px "Public Sans", system-ui, sans-serif`;  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(M.scatter.x_label + (M.slogx ? ' (log)' : ''),
+               M.tx + M.k / 2, M.ty + M.k + 24 * dpr);
+  ctx.save();
+  ctx.translate(M.tx - 46 * dpr, M.ty + M.k / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText(M.scatter.y_label + (M.slogy ? ' (log)' : ''), 0, 0);
+  ctx.restore();
+}
+
+/* ── legend and controls ───────────────────────────────────────────────── */
+function mapsRenderLegend() {
+  const box = $('mapsLegend');
+  box.textContent = '';
+
+  if (M.map === 'scatter') {
+    box.appendChild(mapsAxisPicker());
+    return;
+  }
+
+  const head = h('div', { class: 'mlegend-head' },
+    h('span', { text: M.map === 'cluster' ? 'Groups of meaning' : 'Colour off' }),
+    M.clusters.length ? h('button', {
+      class: 'btn btn-quiet btn-tiny',
+      onclick: () => { M.muted.clear(); mapsRenderLegend(); mapsDraw(); },
+      text: 'Show all',
+    }) : null);
+  box.appendChild(head);
+
+  if (M.map === 'semantic') {
+    box.appendChild(h('p', { class: 'mlegend-note', text:
+      'Distance is meaning: two dots near each other are two passages the ' +
+      'models described in similar terms. Drag a box to select, click a dot ' +
+      'to open it, scroll to zoom.' }));
+  }
+
+  const list = h('div', { class: 'mlegend-list' });
+  for (const c of M.clusters) {
+    const off = M.muted.has(c.cluster);
+    list.appendChild(h('button', {
+      class: 'mlegend-item' + (off ? ' off' : ''),
+      title: (c.terms || []).join(', '),
+      onclick: (ev) => {
+        // Plain click isolates, which is what people actually want from a
+        // legend; modifier-click toggles one off, for building a comparison.
+        if (ev.shiftKey || ev.metaKey || ev.ctrlKey) {
+          if (off) M.muted.delete(c.cluster); else M.muted.add(c.cluster);
+        } else if (M.muted.size === M.clusters.length - 1 && !off) {
+          M.muted.clear();
+        } else {
+          M.muted = new Set(M.clusters.map(x => x.cluster)
+            .filter(x => x !== c.cluster));
+        }
+        mapsRenderLegend();
+        mapsDraw();
+      },
+      ondblclick: () => mapsOpenCluster(c.cluster),
+    },
+      h('i', { style: `background:${clusterColor(c.cluster, 1)}` }),
+      h('span', { class: 'mli-label', text: c.label || `group ${c.cluster + 1}` }),
+      h('span', { class: 'mli-n', text: fmtInt(c.size) })));
+  }
+  box.appendChild(list);
+  if (M.clusters.length) {
+    box.appendChild(h('p', { class: 'mlegend-note', text:
+      'Click a group to isolate it · shift-click to toggle · double-click for ' +
+      'its videos' }));
+  }
+}
+
+function mapsAxisPicker() {
+  const wrap = h('div', { class: 'mscatter-controls' });
+  const pick = (which) => {
+    const sel = h('select', { class: 'mini-select', onchange: (ev) => {
+      if (which === 'x') M.sx = ev.target.value; else M.sy = ev.target.value;
+      mapsLoadScatter();
+    } });
+    for (const a of M.axes) {
+      sel.appendChild(h('option', {
+        value: a.name, selected: (which === 'x' ? M.sx : M.sy) === a.name,
+      }, a.label));
+    }
+    return sel;
+  };
+  wrap.appendChild(h('label', { class: 'mctl' }, h('span', { text: 'X' }), pick('x')));
+  wrap.appendChild(h('label', { class: 'mctl' }, h('span', { text: 'Y' }), pick('y')));
+  wrap.appendChild(h('button', {
+    class: 'btn btn-quiet btn-tiny' + (M.slogx ? ' on' : ''),
+    onclick: () => { M.slogx = !M.slogx; mapsLoadScatter(); },
+    text: 'log X',
+  }));
+  wrap.appendChild(h('button', {
+    class: 'btn btn-quiet btn-tiny' + (M.slogy ? ' on' : ''),
+    onclick: () => { M.slogy = !M.slogy; mapsLoadScatter(); },
+    text: 'log Y',
+  }));
+  wrap.appendChild(h('button', {
+    class: 'btn btn-quiet btn-tiny',
+    onclick: () => { M.sx = [M.sy, M.sy = M.sx][0]; mapsLoadScatter(); },
+    text: 'Swap',
+  }));
+  if (M.scatter && M.scatter.groups && M.scatter.groups.length > 1) {
+    const list = h('div', { class: 'mlegend-list' });
+    M.scatter.groups.forEach((g, i) => {
+      list.appendChild(h('span', { class: 'mlegend-item static' },
+        h('i', { style: `background:${clusterColor(i, 1)}` }),
+        h('span', { class: 'mli-label', text: g })));
+    });
+    wrap.appendChild(list);
+  }
+  return wrap;
+}
+
+/* ── the drill-down: what a dot actually is ────────────────────────────── */
+async function mapsOpenPoint(i) {
+  if (i < 0 || !M.refs) return;
+  M.picked = i;
+  mapsDraw();
+  const panels = $('mapsPanels');
+  panels.textContent = '';
+  panels.appendChild(h('div', { class: 'mpanel', text: 'Loading…' }));
+
+  // A scatter point is a video and needs no projection lookup — it already
+  // carries everything the panel shows, so it skips the round trip.
+  if (M.map === 'scatter') {
+    const p = M.scatter.points[i];
+    mapsRenderPoint({
+      ok: true, level: 'video', ref: p.key, video_key: p.key,
+      video: { title: p.title, creator: p.creator, moment_count: p.n },
+      scatter: { x: p.x, y: p.y },
+    });
+    return;
+  }
+  try {
+    const got = await api(`/api/map/point?level=${M.level}&ref=` +
+                          encodeURIComponent(M.refs[i]));
+    mapsRenderPoint(got);
+  } catch (e) {
+    panels.textContent = '';
+    panels.appendChild(h('div', { class: 'mpanel', text: String(e.message || e) }));
+  }
+}
+
+function mapsRenderPoint(got) {
+  const panels = $('mapsPanels');
+  panels.textContent = '';
+  const v = got.video || {};
+  const key = got.video_key;
+  const at = got.t_start;
+
+  const card = h('div', { class: 'mpanel mpanel-point' });
+  card.appendChild(h('button', {
+    class: 'mpanel-close', 'aria-label': 'Close',
+    onclick: () => { panels.textContent = ''; M.picked = -1; mapsDraw(); },
+  }, '×'));
+
+  card.appendChild(h('h3', { class: 'mp-title',
+    text: v.title || key || got.ref }));
+
+  const facts = h('dl', { class: 'mp-facts' });
+  const fact = (k, val) => {
+    if (val === null || val === undefined || val === '') return;
+    facts.appendChild(h('dt', { text: k }));
+    facts.appendChild(h('dd', { text: String(val) }));
+  };
+  fact('video', key);
+  if (v.creator) fact('creator', v.creator);
+  if (v.category) fact('collection', v.category);
+  if (v.duration) fact('duration', timecode(v.duration));
+  if (v.moment_count !== undefined) fact('indexed passages', fmtInt(v.moment_count));
+  if (at !== null && at !== undefined) fact('at', timecode(at));
+  if (got.source) fact('found by', SOURCE_LABEL[got.source] || got.source);
+  if (got.scatter) {
+    fact(M.scatter.x_label, got.scatter.x.toFixed(2));
+    fact(M.scatter.y_label, got.scatter.y.toFixed(2));
+  }
+  card.appendChild(facts);
+
+  if (got.cluster_info) {
+    const ci = got.cluster_info;
+    card.appendChild(h('div', { class: 'mp-cluster' },
+      h('i', { style: `background:${clusterColor(got.cluster, 1)}` }),
+      h('button', {
+        class: 'linky', onclick: () => mapsOpenCluster(got.cluster),
+        text: `${ci.label} · ${fmtInt(ci.size)} points`,
+      })));
+    if (ci.terms && ci.terms.length) {
+      card.appendChild(h('p', { class: 'mp-terms',
+        text: 'what names this group: ' + ci.terms.join(' · ') }));
+    }
+  }
+
+  if (got.moment && got.moment.text) {
+    card.appendChild(h('p', { class: 'mp-text', text: got.moment.text }));
+  } else if (got.moments && got.moments.length) {
+    const list = h('ul', { class: 'mp-moments' });
+    for (const m of got.moments.slice(0, 12)) {
+      list.appendChild(h('li', {},
+        h('button', {
+          class: 'linky',
+          onclick: () => openVideo({ video_key: key, title: v.title,
+                                     creator: v.creator }, m.t_start),
+          text: timecode(m.t_start),
+        }),
+        h('span', { class: 'mp-src', text: SOURCE_LABEL[m.source] || m.source,
+                    style: `color:${color(m.source)}` }),
+        h('span', { class: 'mp-mt', text: (m.text || '').slice(0, 160) })));
+    }
+    card.appendChild(list);
+  }
+
+  // The cross-tab links. A map is only worth having if a dot leads somewhere.
+  const acts = h('div', { class: 'mp-acts' });
+  if (key) {
+    acts.appendChild(h('button', {
+      class: 'btn',
+      onclick: () => openVideo({ video_key: key, title: v.title,
+                                 creator: v.creator },
+                               at === null || at === undefined ? 0 : at),
+      text: at ? `Play at ${timecode(at)}` : 'Play',
+    }));
+    acts.appendChild(h('button', {
+      class: 'btn btn-quiet',
+      onclick: () => { showTab('graph'); graphFocusKey(key); },
+      text: 'In the graph',
+    }));
+    acts.appendChild(h('button', {
+      class: 'btn btn-quiet',
+      onclick: () => { showTab('search'); $('q').value = v.title || key;
+                       runSearch(v.title || key); },
+      text: 'Find similar',
+    }));
+  }
+  if (got.sql) {
+    acts.appendChild(h('button', {
+      class: 'btn btn-quiet',
+      onclick: () => {
+        navigator.clipboard.writeText(got.sql)
+          .then(() => toast('query copied'))
+          .catch(() => toast(got.sql));
+      },
+      title: got.sql,
+      text: 'Copy the query',
+    }));
+  }
+  card.appendChild(acts);
+  panels.appendChild(card);
+}
+
+async function mapsOpenCluster(cluster) {
+  const panels = $('mapsPanels');
+  panels.textContent = '';
+  panels.appendChild(h('div', { class: 'mpanel', text: 'Loading…' }));
+  try {
+    const got = await api(`/api/map/cluster/${cluster}?level=${M.level}&limit=40`);
+    panels.textContent = '';
+    const card = h('div', { class: 'mpanel' });
+    card.appendChild(h('button', {
+      class: 'mpanel-close', 'aria-label': 'Close',
+      onclick: () => { panels.textContent = ''; },
+    }, '×'));
+    card.appendChild(h('h3', { class: 'mp-title' },
+      h('i', { class: 'mp-swatch',
+               style: `background:${clusterColor(cluster, 1)}` }),
+      got.label || `group ${cluster + 1}`));
+    card.appendChild(h('p', { class: 'mp-terms',
+      text: `${fmtInt(got.size)} points across ${fmtInt(got.videos)} videos · ` +
+            (got.terms || []).join(' · ') }));
+
+    const grid = h('div', { class: 'mp-grid' });
+    const seen = new Set();
+    for (const it of got.items) {
+      if (seen.has(it.video_key)) continue;
+      seen.add(it.video_key);
+      const video = { video_key: it.video_key, title: it.title,
+                      creator: it.creator };
+      const tile = h('button', {
+        class: 'mp-tile',
+        onclick: () => openVideo(video, it.t_start || 0),
+      },
+        posterImg(video, it.t_start, 'mp-shot'),
+        h('span', { class: 'mp-tile-t',
+                    text: it.title || it.video_key }));
+      grid.appendChild(tile);
+    }
+    card.appendChild(grid);
+    card.appendChild(h('div', { class: 'mp-acts' },
+      h('button', {
+        class: 'btn',
+        onclick: () => mapsSendToGraph(Array.from(seen)),
+        text: 'Graph this group',
+      }),
+      h('button', {
+        class: 'btn btn-quiet',
+        onclick: () => { M.muted = new Set(M.clusters.map(x => x.cluster)
+                           .filter(x => x !== cluster));
+                         mapsRenderLegend(); mapsDraw(); },
+        text: 'Isolate on the map',
+      })));
+    panels.appendChild(card);
+  } catch (e) {
+    panels.textContent = '';
+    panels.appendChild(h('div', { class: 'mpanel', text: String(e.message || e) }));
+  }
+}
+
+/* A dragged box becomes a set of videos, and a set of videos is exactly what
+ * the graph's `from_keys` view already takes. That is the whole point of the
+ * selection: the map answers "what is over here", the graph answers "how is
+ * it connected", and neither has to reimplement the other. */
+async function mapsSelectRegion(x0, y0, x1, y1) {
+  const u0 = (Math.min(x0, x1) - M.tx) / M.k, u1 = (Math.max(x0, x1) - M.tx) / M.k;
+  const v0 = (Math.min(y0, y1) - M.ty) / M.k, v1 = (Math.max(y0, y1) - M.ty) / M.k;
+
+  if (M.map === 'scatter') {
+    // Local: the scatter payload is already in memory, so there is nothing to
+    // ask the server for.
+    const keys = [];
+    for (let i = 0; i < M.xy.length / 2; i++) {
+      if (M.muted.has(M.cluster[i])) continue;
+      const x = M.xy[i * 2], y = M.xy[i * 2 + 1];
+      if (x >= u0 && x <= u1 && y >= v0 && y <= v1) keys.push(M.keys[i]);
+    }
+    mapsRenderRegion({ ok: true, count: keys.length, videos: keys.length,
+                       keys, items: [] });
+    return;
+  }
+  try {
+    const p = new URLSearchParams({ level: M.level, x0: u0, y0: v0,
+                                    x1: u1, y1: v1, limit: '600' });
+    mapsRenderRegion(await api('/api/map/region?' + p.toString()));
+  } catch (e) { toast(String(e.message || e)); }
+}
+
+function mapsRenderRegion(got) {
+  const panels = $('mapsPanels');
+  panels.textContent = '';
+  if (!got.count) {
+    panels.appendChild(h('div', { class: 'mpanel',
+      text: 'Nothing in that box. Drag over a denser area.' }));
+    return;
+  }
+  const card = h('div', { class: 'mpanel' });
+  card.appendChild(h('button', {
+    class: 'mpanel-close', 'aria-label': 'Close',
+    onclick: () => { panels.textContent = ''; },
+  }, '×'));
+  card.appendChild(h('h3', { class: 'mp-title',
+    text: `${fmtInt(got.count)} points · ${fmtInt(got.videos)} videos` }));
+
+  const grid = h('div', { class: 'mp-grid' });
+  const shown = got.items && got.items.length
+    ? got.items : got.keys.map(k => ({ video_key: k }));
+  const seen = new Set();
+  for (const it of shown) {
+    if (seen.has(it.video_key) || seen.size >= 60) continue;
+    seen.add(it.video_key);
+    const video = { video_key: it.video_key, title: it.title,
+                    creator: it.creator };
+    grid.appendChild(h('button', {
+      class: 'mp-tile', onclick: () => openVideo(video, it.t_start || 0),
+    },
+      posterImg(video, it.t_start, 'mp-shot'),
+      h('span', { class: 'mp-tile-t', text: it.title || it.video_key })));
+  }
+  card.appendChild(grid);
+  card.appendChild(h('div', { class: 'mp-acts' },
+    h('button', { class: 'btn',
+      onclick: () => mapsSendToGraph(got.keys.slice(0, 24)),
+      text: 'Graph this selection' }),
+    h('button', { class: 'btn btn-quiet',
+      onclick: () => { showTab('library'); },
+      text: 'Open the library' })));
+  panels.appendChild(card);
+}
+
+async function mapsSendToGraph(keys) {
+  if (!keys || !keys.length) return;
+  G.loaded = true;
+  G.mode = 'data';
+  showTab('graph');
+  try {
+    const data = await api('/api/graph/from?keys=' +
+                           encodeURIComponent(keys.slice(0, 24).join(',')));
+    G.nodes.clear(); G.edges.clear();
+    gabsorb(data);
+    gresize(); G.alpha = 1;
+    for (let i = 0; i < 160; i++) gtick();
+    gfit();
+  } catch (e) { toast(String(e.message || e)); }
+}
+
+/* Focus the graph on one video, for the "in the graph" link on a point. */
+async function graphFocusKey(key) {
+  G.loaded = true;
+  try {
+    const data = await api('/api/graph/from?keys=' + encodeURIComponent(key));
+    G.nodes.clear(); G.edges.clear();
+    gabsorb(data);
+    gresize(); G.alpha = 1;
+    for (let i = 0; i < 160; i++) gtick();
+    gfit();
+  } catch (e) { toast(String(e.message || e)); }
+}
+
+/* ── pointer, keyboard and wiring ──────────────────────────────────────── */
+function mapsTooltip(i, px, py) {
+  const tip = $('mapsTooltip');
+  if (i < 0) { tip.hidden = true; return; }
+  const cluster = M.clusters.find(c => c.cluster === M.cluster[i]);
+  let label = M.keys ? M.keys[i] : '';
+  let sub = '';
+  if (M.map === 'scatter' && M.scatter) {
+    const p = M.scatter.points[i];
+    label = p.title || p.key;
+    sub = `${M.scatter.x_label} ${p.x.toFixed(1)} · ` +
+          `${M.scatter.y_label} ${p.y.toFixed(1)}`;
+  } else {
+    const t = M.times ? M.times[i] : null;
+    sub = [cluster ? cluster.label : '',
+           (t !== null && t !== undefined) ? timecode(t) : '']
+      .filter(Boolean).join(' · ');
+  }
+  tip.textContent = '';
+  tip.appendChild(h('strong', { text: String(label) }));
+  if (sub) tip.appendChild(h('span', { text: sub }));
+  tip.hidden = false;
+  const box = $('mapsViewport').getBoundingClientRect();
+  const w = tip.offsetWidth || 180, hh = tip.offsetHeight || 40;
+  tip.style.left = Math.min(box.width - w - 8, Math.max(8, px + 14)) + 'px';
+  tip.style.top = Math.min(box.height - hh - 8, Math.max(8, py + 14)) + 'px';
+}
+
+function mapsWire() {
+  const cv = mcanvas();
+  const dpr = () => M.dpr || 1;
+
+  $$('.maps-tabs button').forEach(b => b.addEventListener('click', () => {
+    if (M.map === b.dataset.map) return;
+    M.map = b.dataset.map;
+    $$('.maps-tabs button').forEach(x =>
+      x.classList.toggle('on', x.dataset.map === M.map));
+    M.picked = -1; M.hover = -1; M.muted.clear();
+    $('mapsPanels').textContent = '';
+    // Semantic and cluster are the same fetch, so switching between them is
+    // a repaint; scatter is a different dataset entirely.
+    if (M.map === 'scatter') {
+      if (M.dataset === 'scatter') {
+        mapsRenderLegend(); mapsResize(); mapsFit();
+      } else mapsLoadScatter();
+    } else if (M.dataset === 'projection') {
+      mapsRenderLegend(); mapsRenderNote({}); mapsResize(); mapsFit();
+    } else mapsLoadProjection();
+  }));
+
+  cv.addEventListener('mousemove', (ev) => {
+    const box = cv.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * dpr(), py = (ev.clientY - box.top) * dpr();
+    if (M.drag) {
+      if (M.drag.mode === 'pan') {
+        M.tx = M.drag.tx0 + (px - M.drag.px0);
+        M.ty = M.drag.ty0 + (py - M.drag.py0);
+      } else {
+        M.box = { x0: M.drag.px0, y0: M.drag.py0, x1: px, y1: py };
+      }
+      mapsSchedule();
+      return;
+    }
+    const i = mapsPick(px, py);
+    if (i !== M.hover) { M.hover = i; mapsSchedule(); }
+    mapsTooltip(i, ev.clientX - box.left, ev.clientY - box.top);
+    cv.style.cursor = i >= 0 ? 'pointer' : 'crosshair';
+  });
+
+  cv.addEventListener('mouseleave', () => {
+    M.hover = -1; $('mapsTooltip').hidden = true; mapsSchedule();
+  });
+
+  cv.addEventListener('mousedown', (ev) => {
+    const box = cv.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * dpr(), py = (ev.clientY - box.top) * dpr();
+    // Shift or middle drags a selection box; a plain drag pans, which is what
+    // a pointer over a map is expected to do.
+    const boxing = ev.shiftKey || ev.button === 1;
+    M.drag = { mode: boxing ? 'box' : 'pan', px0: px, py0: py,
+               tx0: M.tx, ty0: M.ty, moved: false };
+    $('mapsTooltip').hidden = true;
+    ev.preventDefault();
+  });
+
+  window.addEventListener('mouseup', (ev) => {
+    if (!M.drag) return;
+    const cvv = mcanvas();
+    const box = cvv.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * dpr(), py = (ev.clientY - box.top) * dpr();
+    const far = Math.hypot(px - M.drag.px0, py - M.drag.py0) > 5 * dpr();
+    if (M.drag.mode === 'box' && far) {
+      mapsSelectRegion(M.drag.px0, M.drag.py0, px, py);
+    } else if (!far) {
+      const i = mapsPick(px, py);
+      if (i >= 0) mapsOpenPoint(i);
+    }
+    M.drag = null; M.box = null;
+    mapsDraw();
+  });
+
+  cv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const box = cv.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * dpr(), py = (ev.clientY - box.top) * dpr();
+    const factor = Math.exp(-ev.deltaY * 0.0016);
+    const next = Math.max(60, Math.min(90000, M.k * factor));
+    // Zoom about the pointer, so the thing under the cursor stays under it.
+    M.tx = px - (px - M.tx) * (next / M.k);
+    M.ty = py - (py - M.ty) * (next / M.k);
+    M.k = next;
+    mapsSchedule();
+  }, { passive: false });
+
+  cv.addEventListener('dblclick', () => mapsFit());
+
+  // Keyboard operation, because a canvas that only answers to a mouse is a
+  // canvas half the people who open it cannot use.
+  cv.addEventListener('keydown', (ev) => {
+    const step = 60;
+    if (ev.key === 'ArrowLeft') M.tx += step;
+    else if (ev.key === 'ArrowRight') M.tx -= step;
+    else if (ev.key === 'ArrowUp') M.ty += step;
+    else if (ev.key === 'ArrowDown') M.ty -= step;
+    else if (ev.key === '+' || ev.key === '=') M.k *= 1.25;
+    else if (ev.key === '-') M.k /= 1.25;
+    else if (ev.key === '0') { mapsFit(); return; }
+    else if (ev.key === 'Tab' && M.refs && M.refs.length) {
+      // Walk the points in order, so every dot is reachable without a mouse.
+      ev.preventDefault();
+      let n = M.refs.length, i = M.picked;
+      for (let step2 = 0; step2 < n; step2++) {
+        i = ((ev.shiftKey ? i - 1 : i + 1) + n) % n;
+        if (!M.muted.has(M.cluster[i])) break;
+      }
+      mapsOpenPoint(i);
+      return;
+    } else return;
+    ev.preventDefault();
+    mapsSchedule();
+  });
+
+  window.addEventListener('resize', () => {
+    if (S.tab !== 'maps') return;
+    mapsResize();
+    mapsDraw();
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════
    STATUS
    ════════════════════════════════════════════════════════════════════════ */
 let statusTimer = 0;
@@ -2630,10 +3809,25 @@ function wire() {
   $('libHas').addEventListener('change', () => loadLibrary(true));
 
   let libTimer = 0;
+  const libRun = () => { clearTimeout(libTimer); loadLibrary(true); };
   $('libQ').addEventListener('input', () => {
     clearTimeout(libTimer);
     libTimer = setTimeout(() => loadLibrary(true), 220);
   });
+  // The debounce is a convenience, not the contract: pressing Enter or the
+  // button searches now, because a search box that only reacts to typing
+  // pauses feels broken the moment you expect it to obey.
+  $('libQ').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); libRun(); }
+  });
+  $('libGo').addEventListener('click', libRun);
+
+  const density = $('libDensity');
+  let savedDensity = '';
+  try { savedDensity = localStorage.getItem('atlas.libDensity') || ''; } catch { /* private mode */ }
+  if (savedDensity) density.value = savedDensity;
+  libDensity(Number(density.value));
+  density.addEventListener('input', () => libDensity(Number(density.value)));
 
   let browseTimer = 0;
   $('browserQ').addEventListener('input', (ev) => {
@@ -2644,6 +3838,7 @@ function wire() {
   $('browserClose').addEventListener('click', () => { $('browser').hidden = true; });
 
   gwire();
+  mapsWire();
 
   $('rescanBtn').addEventListener('click', async () => {
     $('rescanBtn').disabled = true;
@@ -2671,6 +3866,7 @@ function wire() {
   $$('.strip button').forEach(b =>
     b.addEventListener('click', () => showPanel(b.dataset.panel)));
   $('screenClose').addEventListener('click', closePlayer);
+  momNavWire();
 
   const vid = $('video');
   vid.addEventListener('loadeddata', () => { busy(false); clearInterval(statePoll); });
@@ -2696,6 +3892,10 @@ function wire() {
       const t = row.dataset.t === '' ? null : Number(row.dataset.t);
       row.dataset.now = String(t !== null && now >= t && now < t + 6);
     });
+    // Keep the "3 / 17" counter honest while the video plays past passages
+    // the person did not step to.
+    const i = momIndex(now);
+    if (i !== momAt) momStepTo(now);
   });
 
   window.addEventListener('hashchange', () => {

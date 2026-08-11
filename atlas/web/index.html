@@ -40,6 +40,7 @@
     <button role="tab" data-tab="search" aria-selected="true">Search</button>
     <button role="tab" data-tab="library" aria-selected="false">Library</button>
     <button role="tab" data-tab="graph" aria-selected="false">Graph</button>
+    <button role="tab" data-tab="maps" aria-selected="false">Maps</button>
     <button role="tab" data-tab="data" aria-selected="false">Data</button>
     <button role="tab" data-tab="sources" aria-selected="false">Sources</button>
   </nav>
@@ -89,7 +90,11 @@
       <div class="view-head">
         <h2>Library</h2>
         <div class="view-tools">
-          <input class="mini-input" id="libQ" type="search" placeholder="Filter by title, caption or creator">
+          <div class="lib-find">
+            <input class="mini-input" id="libQ" type="search"
+                   placeholder="Search titles, captions and everything spoken or seen">
+            <button class="btn" id="libGo" type="button">Search</button>
+          </div>
           <select class="mini-select" id="libSort" aria-label="Sort">
             <option value="recent">Newest first</option>
             <option value="richest">Most indexed</option>
@@ -104,8 +109,13 @@
             <option value="speech">Has speech</option>
             <option value="playable">Playable now</option>
           </select>
+          <label class="mini-range" title="How many videos per row">
+            <span>density</span>
+            <input id="libDensity" type="range" min="1" max="5" step="1" value="3">
+          </label>
         </div>
       </div>
+      <p class="view-note" id="libNote"></p>
       <div class="facets" id="libFacets"></div>
       <div class="grid" id="libGrid"></div>
       <div class="more" id="libMore" hidden>
@@ -156,6 +166,39 @@
       </div>
     </div>
 
+    <!-- MAPS ---------------------------------------------------------- -->
+    <!-- The archive in one picture: three maps over the same database, each
+         with its own canvas and controls. Semantic and cluster are two ways
+         of reading one projection; the scatter plot is pure SQL over numeric
+         columns and works even before the encoder has run. -->
+    <div class="view view-flush" id="view-maps" data-view="maps" hidden>
+      <div class="maps-stage" id="mapsStage">
+
+        <div class="maps-toolbar">
+          <div class="maps-tabs" role="tablist" aria-label="Map">
+            <button role="tab" class="on" data-map="semantic">Semantic</button>
+            <button role="tab" data-map="cluster">Clusters</button>
+            <button role="tab" data-map="scatter">Scatter</button>
+          </div>
+          <span class="maps-legend-note" id="mapsNote"></span>
+          <span class="maps-level" id="mapsLevel"></span>
+        </div>
+
+        <div class="maps-viewport" id="mapsViewport">
+          <canvas id="mapsCanvas" tabindex="0"
+                  aria-label="Map of the archive. Click or drag a dot to explore."></canvas>
+          <div class="maps-crosshair" id="mapsCrosshair" hidden></div>
+          <div class="maps-tooltip" id="mapsTooltip" hidden></div>
+          <div class="maps-selection" id="mapsSelection" hidden></div>
+        </div>
+
+        <div class="maps-legend" id="mapsLegend"></div>
+        <div class="maps-panels" id="mapsPanels"></div>
+
+        <div class="maps-empty" id="mapsEmpty" hidden></div>
+      </div>
+    </div>
+
     <!-- DATA --------------------------------------------------------- -->
     <div class="view" id="view-data" data-view="data" hidden>
       <div class="view-head">
@@ -194,7 +237,7 @@
   </section>
 
   <!-- ── right: the persistent player ── -->
-  <aside class="pane pane-player" id="player" data-open="false">
+  <aside class="pane pane-player" id="player" data-open="false" data-size="rail">
     <div class="player-idle" id="playerIdle">
       <div class="player-idle-mark" aria-hidden="true"></div>
       <p>Pick a result to play it here.<br>Nothing reloads — the video stays put
@@ -202,13 +245,31 @@
     </div>
 
     <div class="player-live" id="playerLive" hidden>
-      <div class="screen">
-        <video id="video" playsinline preload="auto"></video>
+      <div class="screen" id="screen">
+        <video id="video" playsinline preload="auto" controls></video>
         <div class="screen-busy" id="screenBusy" hidden>
           <div class="bar"><i id="busyBar"></i></div>
           <span id="busyText">fetching from the channel</span>
+          <button class="btn btn-tiny" id="busyAct" hidden></button>
         </div>
-        <button class="screen-close" id="screenClose" aria-label="Close player">×</button>
+        <div class="screen-tools">
+          <button class="screen-btn" id="screenSize" aria-label="Bigger player"
+                  title="Bigger (f) — rail, wide, then theatre">⤢</button>
+          <button class="screen-btn" id="screenClose" aria-label="Close player"
+                  title="Close (esc)">×</button>
+        </div>
+      </div>
+
+      <!-- Moment-to-moment navigation. Seeking by hand on a 9:16 reel to find
+           the next match is the slow way; these step through the very passages
+           that made this video a result. -->
+      <div class="player-nav">
+        <button class="pnav" id="momPrev" title="Previous moment (p)">‹ moment</button>
+        <span class="pnav-at" id="momAt">—</span>
+        <button class="pnav" id="momNext" title="Next moment (n)">moment ›</button>
+        <span class="pnav-gap"></span>
+        <button class="pnav pnav-quiet" id="momLoop" aria-pressed="false"
+                title="Loop the moment you are on (o)">loop</button>
       </div>
 
       <div class="ribbon-block">
