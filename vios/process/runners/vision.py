@@ -506,15 +506,48 @@ def ocr(job: Job) -> Emission:
 
     def loader():
         from paddleocr import PaddleOCR  # noqa: PLC0415
-        use_gpu = bool(job.resources.get("gpu_count"))
-        engines = {}
+        gpu = bool(job.resources.get("gpu_count"))
+
+        # PaddleOCR has had three constructor generations and Kaggle's image
+        # pins whichever one it pins this month. 2.x takes use_gpu/show_log;
+        # 3.x removed both and raises ValueError("Unknown argument: use_gpu")
+        # rather than TypeError, which is why the original fallback — an
+        # `except TypeError` — never fired and every OCR pass in the run
+        # declined. So the kwargs are tried in order, newest first, and the
+        # guard catches both exception types plus the RuntimeError some builds
+        # raise from their own argument checker.
+        #
+        # Newest first matters: on 2.x the 3.x kwargs are rejected immediately
+        # and cost nothing, whereas the reverse order would silently accept
+        # `use_gpu` on a 3.x build that has quietly started ignoring it.
+        attempts = [
+            ({"lang": None, "use_textline_orientation": True,
+              "device": "gpu:0" if gpu else "cpu"}, "3.x"),
+            ({"lang": None, "device": "gpu:0" if gpu else "cpu"}, "3.x minimal"),
+            ({"lang": None, "use_angle_cls": True, "show_log": False,
+              "use_gpu": gpu}, "2.x"),
+            ({"lang": None}, "bare"),
+        ]
+
+        engines, why = {}, {}
         for lang in langs:
-            try:
-                engines[lang] = PaddleOCR(lang=lang, use_angle_cls=True,
-                                          show_log=False, use_gpu=use_gpu)
-            except TypeError:
-                # 3.x dropped show_log/use_gpu and picks the device itself.
-                engines[lang] = PaddleOCR(lang=lang)
+            for kwargs, label in attempts:
+                try:
+                    engines[lang] = PaddleOCR(**{**kwargs, "lang": lang})
+                    break
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    why[lang] = f"{label}: {type(exc).__name__}: {exc}"
+                except ImportError:
+                    raise
+                except Exception as exc:      # noqa: BLE001
+                    # A download failure or a missing model file is not an
+                    # argument problem and retrying with fewer kwargs will not
+                    # help — stop on this language and keep the others.
+                    why[lang] = f"{label}: {type(exc).__name__}: {exc}"
+                    break
+        for lang in langs:
+            if lang not in engines and lang in why:
+                job.note(f"PP-OCR could not initialise '{lang}' — {why[lang]}")
         return engines
 
     try:
@@ -965,15 +998,37 @@ def depth(job: Job) -> Emission:
     device, dtype = device_and_dtype(job.resources)
 
     def loader():
-        model = AutoModelForDepthEstimation.from_pretrained(
-            job.component.model,
-            torch_dtype=torch_dtype(dtype) if device == "cuda"
-            else torch.float32)
-        proc = AutoImageProcessor.from_pretrained(job.component.model)
-        model.eval()
-        if device == "cuda":
-            model = model.to("cuda")
-        return {"model": model, "processor": proc}
+        # The registry ships the transformers-layout mirror. The alternates
+        # exist because the original checkpoint has no `model_type` in its
+        # config.json and `AutoModelForDepthEstimation` cannot dispatch without
+        # one — a whole run's worth of depth was lost to that. Trying the `-hf`
+        # form of whatever is configured means a future registry edit that drops
+        # the suffix degrades to a warning instead of a dead pass.
+        want = job.component.model
+        candidates = [want]
+        if not want.endswith("-hf"):
+            candidates.append(want + "-hf")
+        last = None
+        for repo in candidates:
+            try:
+                model = AutoModelForDepthEstimation.from_pretrained(
+                    repo,
+                    torch_dtype=torch_dtype(dtype) if device == "cuda"
+                    else torch.float32)
+                proc = AutoImageProcessor.from_pretrained(repo)
+            except Exception as exc:          # noqa: BLE001
+                last = exc
+                continue
+            if repo != want:
+                job.note(f"depth loaded from {repo} — {want} is not in "
+                         f"transformers layout")
+            model.eval()
+            if device == "cuda":
+                model = model.to("cuda")
+            return {"model": model, "processor": proc}
+        raise RuntimeError(
+            f"no loadable depth checkpoint among {', '.join(candidates)}: "
+            f"{type(last).__name__}: {last}")
 
     bundle = job.cache.get(job.component.load_key, loader)
     model, proc = bundle["model"], bundle["processor"]

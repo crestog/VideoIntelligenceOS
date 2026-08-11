@@ -94,6 +94,28 @@ ALIASES = {
 # read by config.py and gates GraphRAG entity extraction.
 PASSTHROUGH = ("VIOS_NIM_API_KEY",)
 
+# Names a credential must also appear under because third-party code reads
+# them and will never learn ours.
+#
+# ALIASES is the inbound direction — where a value may already be sitting. This
+# is the outbound one, and the two are not symmetric: normalising to a canonical
+# name is the right rule for code we own, and useless for code we do not.
+# `huggingface_hub` reads HF_TOKEN out of the environment by itself, deep inside
+# `from_pretrained`, and nothing in this repository is in a position to hand it
+# one. So a session with VIOS_HF_TOKEN stored correctly still declined the
+# diarisation pass with "no Hugging Face token in the environment" — the secret
+# was present under the only name pyannote could not see. The engine did mirror
+# it, but only when the token arrived through the settings form, which is the
+# path a Kaggle session never takes.
+#
+# Mirrors are written only into names that are empty, so an explicit export of
+# HF_TOKEN still wins, and mirroring happens even when the canonical name was
+# already set — otherwise a hand-exported VIOS_HF_TOKEN would skip the bridge it
+# most needs.
+MIRROR = {
+    "hf_token": ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGING_FACE_HUB_TOKEN"),
+}
+
 SECRET = "kaggle-secrets"
 ENV = "environment"
 FILE = "local file"
@@ -226,24 +248,39 @@ def export_to_env() -> dict:
     well as left where it was, so a credential stored as TELEGRAM_BOT_TOKEN
     reaches code that only ever looks up VIOS_BOT_TOKEN. Normalising here means
     no other file needs an alias list.
+
+    The reverse also happens, for the few names third-party code insists on:
+    see MIRROR. Those entries come back keyed `field:ENV_NAME` so a launcher can
+    show that HF_TOKEN was set without implying a second secret was found.
     """
     from_kaggle = _from_kaggle()
     exported = {}
 
     for name in FIELDS:
         canonical = FIELDS[name][0]
-        if os.environ.get(canonical, "").strip():
-            continue                       # an explicit export outranks a store
-        val = ""
-        for label in labels(name)[1:]:     # an alias already in the environment
-            if os.environ.get(label, "").strip():
-                val = os.environ[label].strip()
-                break
-        val = val or from_kaggle.get(name, "")
+        val = os.environ.get(canonical, "").strip()
+        if not val:                        # an explicit export outranks a store
+            for label in labels(name)[1:]:  # an alias already in the environment
+                if os.environ.get(label, "").strip():
+                    val = os.environ[label].strip()
+                    break
+            val = (val or str(from_kaggle.get(name, "") or "")).strip()
+            if val:
+                os.environ[canonical] = val
+                exported[name] = canonical
         if not val:
             continue
-        os.environ[canonical] = str(val)
-        exported[name] = canonical
+        # Outbound mirrors, for libraries that read their own name and cannot be
+        # told ours. Deliberately outside the `if not val` above: a token
+        # exported by hand under the canonical name needs the mirror just as
+        # much as one that came from Kaggle Secrets, and the early `continue`
+        # this replaced is exactly why diarisation declined on a session that
+        # had the secret stored.
+        for label in MIRROR.get(name, ()):
+            if os.environ.get(label, "").strip():
+                continue
+            os.environ[label] = val
+            exported[f"{name}:{label}"] = label
 
     for label in PASSTHROUGH:              # bridged under their own name
         if os.environ.get(label, "").strip():

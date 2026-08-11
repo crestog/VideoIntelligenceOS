@@ -52,6 +52,7 @@ import traceback
 from collections import deque
 
 from . import intake, media, registry, resources
+from .. import creds as _creds
 from .coverage import Coverage, worker_id
 from .runners import get as get_runner
 from .runners import missing as missing_runners
@@ -64,10 +65,25 @@ from ..capture.upload import Telegram, UploadError
 IDLE, RUNNING, PAUSED, STOPPING, ERROR = (
     "idle", "running", "paused", "stopping", "error")
 
-# Videos between shard uploads. Fifty is about four minutes of work on a T4 and
-# a few hundred kilobytes gzipped — small enough that a killed session loses
-# almost nothing, large enough that the channel does not fill with noise.
-PUBLISH_EVERY = 50
+# Videos between shard uploads. One, because the honest unit of "already done"
+# is a video: every pass in this rotation has run on it, and until that reaches
+# the channel a session that dies has to earn it again. Fifty was a guess sized
+# against a four-minute video; the passes now read every frame, so fifty videos
+# is hours of GPU work to lose in one stroke.
+#
+# The floor below is what stops that becoming a chat full of two-kilobyte files
+# when a cohort of cheap signal passes flies through thirty reels a minute.
+PUBLISH_EVERY = 1
+
+# Never upload two shards closer together than this. A shard costs a Telegram
+# round trip and a channel message; below about a minute apart they stop being
+# checkpoints and start being noise.
+PUBLISH_MIN_SECONDS = 90.0
+
+# …and never let unpublished work get older than this, however few videos it
+# came from. This is the number that bounds what a killed Kaggle session
+# actually costs, so it is the one to change if that cost feels wrong.
+PUBLISH_MAX_SECONDS = 600.0
 
 # One stage bundle part. The Bot API refuses a document over 50 MB and this
 # engine's uploader has no MTProto document path, so a bundle that would exceed
@@ -261,6 +277,16 @@ class ProcessEngine:
         if not v:
             return
         self.cred_sources = got.get("sources") or {}
+        # Before configure(), not inside it. `configure` takes the credentials
+        # in one call, so a bad channel id raises in the Telegram branch and the
+        # HF token two branches below is never reached — and the `except` here
+        # then hides that from the log. The environment bridge has no such
+        # coupling and is idempotent, so running it first means one broken
+        # credential can no longer silently disable an unrelated pass.
+        try:
+            _creds.export_to_env()
+        except Exception as exc:            # noqa: BLE001
+            self._log(f"credential bridge failed: {type(exc).__name__}", "warn")
         try:
             self.configure(
                 bot_token=v.get("bot_token", ""),
@@ -271,8 +297,13 @@ class ProcessEngine:
             if self.cred_sources:
                 where = sorted(set(self.cred_sources.values()))
                 self._log(f"credentials loaded from {', '.join(where)}")
-        except Exception:
+        except Exception as exc:            # noqa: BLE001
+            # Named, not swallowed. This ran silently for a whole session and
+            # the only symptom was a pass declining for a reason that was not
+            # true.
             self.cred_sources = {}
+            self._log(f"stored credentials rejected: "
+                      f"{type(exc).__name__}: {exc}", "warn")
 
     # ══════════════════════════════════════════════════════════════════════
     # Resources this engine owns
@@ -346,9 +377,13 @@ class ProcessEngine:
                 self._hf_token = hf_token.strip()
                 # huggingface_hub reads the environment directly when it
                 # resolves a gated repo, so passing it through job.params
-                # alone would not be enough for pyannote.
-                os.environ["HF_TOKEN"] = self._hf_token
-                os.environ.setdefault("HUGGINGFACE_TOKEN", self._hf_token)
+                # alone would not be enough for pyannote. The list of names it
+                # might read lives in creds.MIRROR, next to the boot bridge that
+                # writes the same names, because two copies of it is how the
+                # newest one (HUGGING_FACE_HUB_TOKEN) came to be missing here.
+                os.environ["VIOS_HF_TOKEN"] = self._hf_token
+                for _label in _creds.MIRROR.get("hf_token", ()):
+                    os.environ.setdefault(_label, self._hf_token)
 
             if components is not None:
                 known = set(registry.all_ids())
@@ -372,7 +407,7 @@ class ProcessEngine:
             if restore_on_start is not None:
                 self.restore_on_start = bool(restore_on_start)
             if publish_every:
-                self.publish_every = max(5, int(publish_every))
+                self.publish_every = max(1, int(publish_every))
             if vram_headroom_mb is not None:
                 self.vram_headroom_mb = max(256, int(vram_headroom_mb))
             if cache_budget_mb is not None:
@@ -989,7 +1024,7 @@ class ProcessEngine:
         self.session["videos"] += 1
         self.session["seconds"] += time.time() - started
         self.since_publish += 1
-        if self.since_publish >= self.publish_every:
+        if self._publish_due():
             self._publish(f"cohort-{cohort.index}")
 
         freed = intake.evict(self.cache_dir, self.cache_budget_mb,
@@ -1355,6 +1390,36 @@ class ProcessEngine:
                       f"{why or 'unload'} — the next cohort has that much "
                       f"less than the packer assumed", "warn")
 
+    def _publish_due(self) -> bool:
+        """Is it time to push a shard?
+
+        Three conditions, and the answer is yes when the count is met *and* the
+        rate limit has passed, or when the age limit has been exceeded whatever
+        the count.
+
+        The user's question was "will this export work automatically, and
+        perfectly, after each video is processed?" — and the honest answer for
+        the previous build was no: `PUBLISH_EVERY = 50` meant a session could
+        run for hours and be killed with everything still local. Publishing on
+        every video is the right default because a video is the unit of work
+        that is either wholly done or not done at all. The two clocks are what
+        keep that from degenerating: the floor stops a fast cohort from filling
+        the channel with tiny files, and the ceiling makes sure a slow one still
+        checkpoints, so the maximum loss is bounded by time rather than by how
+        many reels happened to fit in a cohort.
+        """
+        with self._lock:
+            n = self.since_publish
+            last = self.last_publish or 0.0
+        if n <= 0:
+            return False
+        age = time.time() - last if last else float("inf")
+        if age >= PUBLISH_MAX_SECONDS:
+            return True
+        if n < max(1, int(self.publish_every)):
+            return False
+        return age >= PUBLISH_MIN_SECONDS
+
     def _publish(self, note: str) -> str:
         """Export everything written since the last shard and send it up.
 
@@ -1382,6 +1447,11 @@ class ProcessEngine:
                     and hi_fvec <= lo_fvec and hi_fmet <= lo_fmet):
                 self.since_publish = 0
                 return ""
+
+            # The quick early return is the common case for a cohort that
+            # wrote nothing. Anything past it is a real export, and the
+            # age gate that decided it deserves a real watermark.
+            self.last_publish = time.time()
 
             seq = int(store.get_meta("shard_seq", "0") or 0) + 1
             sid = f"{intake.site_id(store)}-{seq:04d}"

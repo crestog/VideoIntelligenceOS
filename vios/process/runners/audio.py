@@ -209,8 +209,9 @@ def diarize(job: Job) -> Emission:
     wav_path = job.artifact("audio.wav")
     token = _hf_token(job)
     if not token:
-        raise SkipPass("no Hugging Face token in the environment — pyannote's "
-                       "weights are gated (set HF_TOKEN)")
+        raise SkipPass("no Hugging Face token — store it in Kaggle Secrets as "
+                       "VIOS_HF_TOKEN (pyannote's weights are gated), then "
+                       "restart so the launcher bridges it into HF_TOKEN")
 
     def loader():
         import torch  # noqa: PLC0415

@@ -9,6 +9,7 @@ Phases:
   4. Ignition: Launch all worker processes with auto-healing watchdog threads
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -59,9 +60,57 @@ def stream_logs(pipe, prefix, is_engine=False):
         print(f"{prefix} {line}", end="", flush=True)
 
 
+WATCHDOG_STATE = {}
+
+# The watchdog lives in this process; /api/status is served by ui_server.py in
+# another one. So the state is also written to a file both can see — a worker
+# that is flapping has to be visible on the page, not only in a log nobody is
+# reading at hour nine. One small JSON write per crash and per launch; nothing
+# polls it here.
+#
+# The path is resolved on first use, not at import: `config` reads the
+# environment once and keeps it, so nothing above may import it before Phase 0
+# has bridged the Kaggle Secrets in.
+_WATCHDOG_FILE = ""
+
+
+def _watchdog_file() -> str:
+    global _WATCHDOG_FILE
+    if not _WATCHDOG_FILE:
+        from config import LAKE_DIR
+        _WATCHDOG_FILE = os.path.join(LAKE_DIR, "watchdog.json")
+    return _WATCHDOG_FILE
+
+
+def _publish_watchdog():
+    """Best-effort: a failed write must never take a worker down with it."""
+    try:
+        path = _watchdog_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "workers": WATCHDOG_STATE}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def run_with_watchdog(command, prefix, is_engine):
-    """Ensures the process stays alive forever. Restarts it if it crashes."""
+    """Keep a worker alive, with a backoff so a broken one cannot drown the log.
+
+    The three-second restart was fine for a worker that crashes once. For one
+    that cannot start at all — a missing weight, a syntax error, a port already
+    bound — it produced twenty tracebacks a minute forever, and the errors worth
+    reading scrolled past between them. So the delay grows, capped, and resets
+    once the process has stayed up long enough to have actually run.
+
+    The counters are published in WATCHDOG_STATE, and through it to
+    watchdog.json, so /api/status can show that a worker is flapping rather than
+    working.
+    """
+    delay, crashes = 3, 0
     while True:
+        started = time.time()
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -69,11 +118,29 @@ def run_with_watchdog(command, prefix, is_engine):
             text=True,
             bufsize=1
         )
+        WATCHDOG_STATE[prefix] = {"pid": process.pid, "crashes": crashes,
+                                  "since": started, "delay": delay}
+        _publish_watchdog()
         stream_logs(process.stdout, prefix, is_engine)
         process.wait()
+        lived = time.time() - started
 
-        print(f"\n⚠️ [WATCHDOG] {prefix} crashed (exit={process.returncode}). Rebooting in 3s...", flush=True)
-        time.sleep(3)
+        if lived >= 120:
+            # It ran long enough to have done work. Whatever killed it is not
+            # a startup failure, so do not punish the next attempt.
+            delay, crashes = 3, 0
+        else:
+            crashes += 1
+            delay = min(delay * 2, 120)
+        WATCHDOG_STATE[prefix] = {"pid": 0, "crashes": crashes,
+                                  "since": started, "delay": delay,
+                                  "exit": process.returncode,
+                                  "lived": round(lived, 1)}
+        _publish_watchdog()
+        note = f" — {crashes} in a row" if crashes > 1 else ""
+        print(f"\n⚠️ [WATCHDOG] {prefix} crashed (exit={process.returncode}, "
+              f"up {lived:.0f}s{note}). Rebooting in {delay}s...", flush=True)
+        time.sleep(delay)
 
 
 # ══════════════════════════════════════════════════════════
@@ -221,6 +288,36 @@ try:
 except Exception:
     OMNI_ENABLED = False
 
+# ── Who owns the GPU ──────────────────────────────────────────────────────
+# Two planes in this repository load models, and until now both did, onto the
+# same card, with nothing between them. `model_manager.py` and the omniscient
+# vision worker keep SigLIP, CLIP, DINOv2, Whisper large-v3, RAFT, YOLO and
+# EasyOCR warm on cuda:0 — about 5.5 GiB that is never released — while the v2
+# processing engine bin-packs its cohorts against whatever `resources.probe()`
+# saw free at the moment it looked. The result on a real run was neither plane
+# working: v2 filled the card, then v1 could not allocate 34 MiB and its vision
+# jobs went RETRIED → DEAD in a loop.
+#
+# This is not a Kaggle problem to fight. It is two copies of the same models
+# competing, because the v1 plane's seven models are a strict subset of what the
+# v2 registry already runs at higher coverage. So one plane owns the card, and
+# it is the one whose output the product is built on.
+#
+#   VIOS_GPU_OWNER=v2  (default) — the processing engine gets the whole card.
+#                                  model_manager and omni_engine do not start.
+#                                  The Postgres/Neo4j/Redis services and every
+#                                  CPU worker are untouched.
+#   VIOS_GPU_OWNER=v1            — the old behaviour, both planes, for when the
+#                                  omniscient dashboard is what you are working
+#                                  on and the v2 sweep is stopped.
+#   VIOS_GPU_OWNER=both          — explicitly opt back into the contention.
+GPU_OWNER = (os.environ.get("VIOS_GPU_OWNER", "") or "v2").strip().lower()
+if GPU_OWNER not in ("v1", "v2", "both"):
+    GPU_OWNER = "v2"
+V1_GPU = GPU_OWNER in ("v1", "both")
+V2_GPU = GPU_OWNER in ("v2", "both")
+os.environ["VIOS_GPU_OWNER"] = GPU_OWNER
+
 # ── Credential preflight ──────────────────────────────────────────────────
 # Reported here, once, before the workers start. Telegram credentials are
 # env-only (they used to be committed literals, which put a live bot token in
@@ -290,12 +387,13 @@ print("", flush=True)
 print("=" * 60, flush=True)
 print("🚀 IGNITING VIDEO INTELLIGENCE OS", flush=True)
 print("=" * 60, flush=True)
-print("   🤖 [ENGINE]    → model_manager.py  (7 SOTA GPU models)", flush=True)
+if V1_GPU:
+    print("   🤖 [ENGINE]    → model_manager.py  (7 SOTA GPU models)", flush=True)
 print("   🖥️ [UI]        → ui_server.py      (FastAPI + Ghost Worker)", flush=True)
 print("   🎞️ [CV-ENGINE] → frame_worker.py   (OpenCV frame extraction)", flush=True)
-if OMNI_ENABLED:
+if OMNI_ENABLED and V1_GPU:
     print("   🔮 [OMNI]      → omni_engine.py    (Tri-partite DB + GraphRAG + Bot)", flush=True)
-else:
+elif not OMNI_ENABLED:
     # Said out loud, because the silent version cost a session. VIOS_OMNI=0
     # switches off Neo4j, Postgres, GraphRAG, the narrative passes and /omni,
     # and with no line here the boot log of a crippled stack was identical to a
@@ -306,14 +404,26 @@ else:
           flush=True)
     print("                    Unset VIOS_OMNI in the launch cell to restore it.",
           flush=True)
+print("-" * 60, flush=True)
+print(f"   🎛️ GPU owner   → {GPU_OWNER}", flush=True)
+if not V1_GPU:
+    # Named, with the reason and the way back. A worker that silently does not
+    # start is indistinguishable from one that started and did nothing.
+    print("      model_manager.py and omni_engine.py are held back so the",
+          flush=True)
+    print("      processing engine has the whole card — the two planes were",
+          flush=True)
+    print("      OOM-ing each other over the same seven models.", flush=True)
+    print("      VIOS_GPU_OWNER=both restores the old behaviour.", flush=True)
 print("=" * 60, flush=True)
 print("", flush=True)
 
 # Launch workers via Watchdog Threads
-threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
+if V1_GPU:
+    threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"], "🖥️ [UI]", False), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"], "🎞️ [CV-ENGINE]", False), daemon=True).start()
-if OMNI_ENABLED:
+if OMNI_ENABLED and V1_GPU:
     threading.Thread(target=run_with_watchdog, args=(["python", "-u", "omni_engine.py"], "🔮 [OMNI]", True), daemon=True).start()
 
 try:

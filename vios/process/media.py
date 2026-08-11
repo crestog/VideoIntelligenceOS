@@ -377,8 +377,17 @@ def loudness(path: str) -> dict:
     broadcasters actually certify against. Reimplementing it in numpy would be
     a week of work to produce numbers slightly different from everyone else's.
     ffmpeg ships it; this parses its summary.
+
+    The log level is raised for this one call, deliberately. The ebur128 filter
+    writes its summary with `AV_LOG_INFO`, so the module-wide `-loglevel error`
+    that keeps every other call quiet also throws away the entire result — the
+    filter runs, the numbers are computed, and the block that would print them
+    is discarded before it reaches stderr. That produced "ebur128 produced no
+    summary — is there an audio stream?" on files that had perfectly good audio,
+    which is a wrong answer rather than a missing one.
     """
-    cmd = ["ffmpeg", *_FF, "-i", path, "-af", "ebur128=peak=true",
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info",
+           "-nostats", "-i", path, "-af", "ebur128=peak=true",
            "-f", "null", "-"]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -386,7 +395,18 @@ def loudness(path: str) -> dict:
         raise MediaError(f"ebur128 failed: {exc}") from None
     text = res.stderr or ""
     if "Summary:" not in text:
-        raise MediaError("ebur128 produced no summary — is there an audio stream?")
+        # Two very different failures used to share one message. Which one it is
+        # decides whether the pass should be re-run after a fix or marked as
+        # correctly declined forever, so they are separated here.
+        low = text.lower()
+        if ("does not contain any stream" in low
+                or "audio stream" in low and "not" in low
+                or "invalid data found" in low):
+            raise MediaError("no audio stream to measure")
+        tail = " ".join(text.strip().splitlines()[-3:])[:300]
+        raise MediaError(
+            "ebur128 ran but printed no summary"
+            + (f" — ffmpeg said: {tail}" if tail else ""))
     tail = text.rsplit("Summary:", 1)[1]
 
     def grab(label, unit):

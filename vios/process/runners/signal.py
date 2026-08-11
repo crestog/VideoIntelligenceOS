@@ -635,10 +635,20 @@ def loudness(job: Job) -> Emission:
     wav_path = job.artifact("audio.wav")
     np = _np()
 
+    # R128 and the RMS curve are independent measurements of the same file, and
+    # only one of them needs ffmpeg's filter graph to have printed what it was
+    # asked for. Coupling them cost a whole pass — every claim, including the
+    # curve the hook pass reads — to a summary-parse failure. So a missing R128
+    # is now a note, and the pass declines only when there is genuinely no audio.
+    r128: dict = {}
+    r128_error = ""
     try:
         r128 = media.loudness(wav_path)
     except media.MediaError as exc:
-        raise SkipPass(str(exc)) from None
+        if "no audio stream" in str(exc):
+            raise SkipPass(str(exc)) from None
+        r128_error = str(exc)
+        job.note(f"R128 unavailable, curve still measured — {r128_error}")
 
     em = Emission()
     for key, kind, label in (
@@ -709,7 +719,8 @@ def loudness(job: Job) -> Emission:
                      shot_idx=int(s["idx"]))
 
     em.notes = {**r128, "silence_ratio": round(silent, 4),
-                "windows": int(len(db))}
+                "windows": int(len(db)),
+                **({"r128_error": r128_error} if r128_error else {})}
     return em
 
 

@@ -540,10 +540,17 @@ _PERCEPTION = [
             "faces in it, where the face-size proxy has nothing to measure. The "
             "per-frame spread is stored as a packed metric array rather than as "
             "claims, because it is a curve to be read as a curve — a push-in is "
-            "a slope in it, and that is invisible in one number per shot."),
-        model="depth-anything/Depth-Anything-V2-Small", weights="depth-anything-v2-s",
+            "a slope in it, and that is invisible in one number per shot.\n\n"
+            "The repo id carries the `-hf` suffix on purpose. "
+            "`depth-anything/Depth-Anything-V2-Small` is the authors' original "
+            "checkpoint: its config.json has no `model_type`, so "
+            "`AutoModelForDepthEstimation` cannot dispatch and every load raised "
+            "'Unrecognized model'. The `-hf` mirror is the same weights in "
+            "transformers layout."),
+        model="depth-anything/Depth-Anything-V2-Small-hf",
+        weights="depth-anything-v2-s",
         quant="fp16", device="gpu", vram_mb=500, disk_mb=100, seconds=45.0,
-        revision="2",
+        revision="3",
         needs=("allframes",), requires=("transformers", "torch"),
         produces=("claims", "metrics"),
         kinds=("shot_scale", "depth_spread"),
@@ -815,9 +822,14 @@ _LANGUAGE = [
                "why_it_works", "assertion", "answers", "audience", "subject",
                "critique"),
         params={"temperature": 0.2, "max_tokens": 2048},
-        tier="deep", default_on=False,
+        tier="deep", default_on=True,
         notes=("Needs VIOS_NIM_API_KEY in Kaggle Secrets. VIOS_NIM_MODEL "
-               "picks the model; VIOS_NIM_RPM caps the request rate."),
+               "picks the model; VIOS_NIM_RPM caps the request rate. "
+               "On by default: it is the only pass that costs no VRAM, so "
+               "leaving it off meant the key sat idle through an entire run "
+               "while the GPU passes queued behind each other. With no key it "
+               "declines on the first video and says so, which is a cheaper "
+               "way to find out than a run that never used it."),
     ),
 ]
 
