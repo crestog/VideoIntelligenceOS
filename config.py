@@ -319,9 +319,17 @@ HF_TOKEN = os.environ.get('HF_TOKEN', '')
 # NVIDIA NIM API (GraphRAG extraction + query rewrite + synthesis).
 #   Supplied by the launcher from Kaggle Secrets -> os.environ["VIOS_NIM_API_KEY"].
 #   Empty disables GraphRAG/synthesis only; vision + oracle pipelines still run.
+#
+#   The base URL and model live here for reference, but the value that is
+#   actually called is resolved by vios.process.runners.cloud.NimClient, which
+#   both planes share so one account-wide rate limit has one owner. The default
+#   there is a mid-size model deliberately: the free tier is ~40 requests a
+#   minute metered in credits that deplete with model size, and this pass runs on
+#   every video. The 550B is available for a curated subset by setting
+#   VIOS_NIM_MODEL, which is the one place model choice belongs.
 NIM_API_KEY  = os.environ.get('VIOS_NIM_API_KEY', '')
 NIM_BASE_URL = os.environ.get('VIOS_NIM_BASE_URL', 'https://integrate.api.nvidia.com/v1')
-NIM_MODEL    = os.environ.get('VIOS_NIM_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
+NIM_MODEL    = os.environ.get('VIOS_NIM_MODEL', 'nvidia/llama-3.1-nemotron-70b-instruct')
 
 # PostgreSQL (Omniscient relational store)
 OMNI_PG_DB       = os.environ.get('VIOS_PG_DB', 'omnidb')

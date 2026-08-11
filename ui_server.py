@@ -870,26 +870,73 @@ except Exception as _atlas_exc:         # pragma: no cover - import guard
 if _ATLAS_READY:
     _atlas_booted = threading.Event()
 
-    @app.middleware("http")
-    async def _atlas_lazy_boot(request: Request, call_next):
-        """Start Atlas's scan/index the first time somebody opens it."""
-        if (request.url.path.startswith("/atlas")
-                and not _atlas_booted.is_set()):
-            _atlas_booted.set()
-            try:
-                _atlas_server.start_boot()
-                custom_print("🗺️ Atlas: boot started (scanning the channel for "
-                             "database bundles)")
-            except Exception as exc:
-                custom_print(f"⚠️ Atlas boot failed to start: "
-                             f"{type(exc).__name__}: {exc}")
-        return await call_next(request)
+    class _AtlasLazyBoot:
+        """Start Atlas's scan/index the first time somebody opens it.
+
+        Pure ASGI, not `@app.middleware("http")`. The decorator installs a
+        `BaseHTTPMiddleware`, which wraps `send` and counts the bytes the
+        endpoint emits against the `Content-Length` it saw — regardless of what
+        the middleware body actually does. Atlas serves video as byte ranges
+        with an exact Content-Length, and a player seeking mid-clip drops the
+        connection before the range completes, which is ordinary playback. The
+        accounting turned that into `RuntimeError: Response content shorter
+        than Content-Length` inside an anyio ExceptionGroup, for every seek.
+
+        All this needs is to notice a path and start a thread, so it never
+        touches send at all and the range stream reaches the socket untouched.
+        """
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if (scope.get("type") == "http"
+                    and str(scope.get("path", "")).startswith("/atlas")
+                    and not _atlas_booted.is_set()):
+                _atlas_booted.set()
+                try:
+                    _atlas_server.start_boot()
+                    custom_print("🗺️ Atlas: boot started (scanning the channel "
+                                 "for database bundles)")
+                except Exception as exc:
+                    custom_print(f"⚠️ Atlas boot failed to start: "
+                                 f"{type(exc).__name__}: {exc}")
+            await self.app(scope, receive, send)
+
+    app.add_middleware(_AtlasLazyBoot)
 else:
     @app.get("/atlas", response_class=HTMLResponse)
     def _atlas_missing():                          # pragma: no cover
         return HTMLResponse(
             f"<h1>Atlas</h1><p>Atlas could not load on this machine.</p>"
             f"<pre>{_ATLAS_WHY}</pre>", status_code=503)
+
+def _worker_health() -> dict:
+    """What boot.py's watchdog knows, read from the file it writes.
+
+    A worker that cannot start restarts forever with a growing backoff, which
+    keeps the log readable but leaves the page saying nothing is wrong. The
+    watchdog publishes its counters to watchdog.json; this reads them and reports
+    only what is actually worth acting on — anything with two or more crashes in
+    a row, plus whether the file itself has gone stale, which would mean boot.py
+    is no longer the thing supervising these processes.
+    """
+    path = os.path.join(LAKE_DIR, "watchdog.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"known": False}
+    workers = data.get("workers") or {}
+    flapping = {name: st for name, st in workers.items()
+                if isinstance(st, dict) and int(st.get("crashes") or 0) >= 2}
+    down = [name for name, st in workers.items()
+            if isinstance(st, dict) and not st.get("pid")]
+    return {"known": True, "at": data.get("at", 0), "workers": workers,
+            "flapping": flapping, "down": down,
+            "note": (", ".join(f"{n} crashed {st['crashes']}× in a row"
+                               for n, st in flapping.items()) or "")}
+
 
 @app.get("/api/status")
 def get_status():
@@ -912,7 +959,8 @@ def get_status():
             free_gb = f"{disk.free / (1024**3):.1f} GB"
         except Exception:
             free_gb = "N/A"
-        cached = cache_put("status:payload", {"queue": metrics, "disk_free": free_gb}, 1.0)
+        cached = cache_put("status:payload", {"queue": metrics, "disk_free": free_gb,
+                                              "workers": _worker_health()}, 1.0)
     return {"status": GLOBAL_STATUS, **cached}
 
 # ── OMNISCIENT DASHBOARD PROXY ──

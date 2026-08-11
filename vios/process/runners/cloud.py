@@ -154,6 +154,117 @@ class _Bucket:
                        self._tokens + (now - self._at) * self.rate)
 
 
+# ── the same ceiling, across processes ────────────────────────────────────
+# The quota is per account, but VIOS runs the v1 Oracle and the v2 engine as two
+# separate processes, so an in-memory bucket in each one lets the pair spend
+# twice the limit while both individually believe they are under it. That is the
+# `ResourceExhausted (33/32)` failure with an extra step, and it is exactly the
+# starvation this module exists to prevent.
+#
+# Redis is already running in the container for the v1 queues, so it is the
+# natural place for the one counter both processes read. The window is a sorted
+# set of request timestamps trimmed to the last sixty seconds, and the trim,
+# count and insert happen inside one EVAL so two processes cannot both see room
+# for the last token. If Redis is not reachable — a v2-only run, or a local
+# import — the local bucket is the whole answer and nothing here is missed.
+_SHARED_KEY = "vios:nim:window"
+_SHARED_LUA = """
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+local used = redis.call('ZCARD', KEYS[1])
+if used < limit then
+  redis.call('ZADD', KEYS[1], now, ARGV[4])
+  redis.call('PEXPIRE', KEYS[1], math.floor(window * 2000))
+  return -1
+end
+local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+return tostring(oldest[2] + window - now)
+"""
+
+
+class _SharedWindow:
+    """A sixty-second sliding window in Redis, or nothing at all.
+
+    Deliberately fail-open: a NIM call must never be blocked because Redis
+    hiccuped. On the first failure this stops trying for the rest of the
+    session and the local bucket carries the whole limit — under-spending the
+    quota is a cost, being unable to call the model is an outage.
+    """
+
+    def __init__(self, rpm: float):
+        self.limit = max(1, int(rpm))
+        self.window = 60.0
+        self._redis = None
+        self._sha = ""
+        self._off = False
+        self._lock = threading.Lock()
+        self.shared = False
+
+    def _connect(self):
+        if self._off or self._redis is not None:
+            return self._redis
+        with self._lock:
+            if self._off or self._redis is not None:
+                return self._redis
+            url = os.environ.get("VIOS_REDIS_URL", "").strip()
+            host = os.environ.get("VIOS_REDIS_HOST", "").strip() or "localhost"
+            try:
+                import redis as _redis            # noqa: PLC0415
+                conn = (_redis.Redis.from_url(url, socket_timeout=2,
+                                              socket_connect_timeout=2)
+                        if url else
+                        _redis.Redis(host=host, port=6379, socket_timeout=2,
+                                     socket_connect_timeout=2))
+                conn.ping()
+                self._sha = conn.script_load(_SHARED_LUA)
+                self._redis = conn
+                self.shared = True
+            except Exception:                     # noqa: BLE001
+                self._off = True
+            return self._redis
+
+    def reserve(self) -> float:
+        """0.0 when a slot was taken, seconds to wait when it was not, -1 when
+        there is no shared window to consult."""
+        conn = self._connect()
+        if conn is None:
+            return -1.0
+        try:
+            out = conn.evalsha(self._sha, 1, _SHARED_KEY, repr(time.time()),
+                               repr(self.window), str(self.limit),
+                               f"{os.getpid()}:{time.time():.4f}")
+        except Exception:                         # noqa: BLE001
+            # A restarted Redis loses the script; one reload, then give up on
+            # coordination rather than retrying forever inside a hot path.
+            try:
+                self._sha = conn.script_load(_SHARED_LUA)
+                out = conn.evalsha(self._sha, 1, _SHARED_KEY, repr(time.time()),
+                                   repr(self.window), str(self.limit),
+                                   f"{os.getpid()}:{time.time():.4f}")
+            except Exception:                     # noqa: BLE001
+                self._off = True
+                self._redis = None
+                self.shared = False
+                return -1.0
+        try:
+            wait = float(out if not isinstance(out, bytes) else out.decode())
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.0 if wait < 0 else max(0.05, min(wait, self.window))
+
+    def used(self) -> int:
+        conn = self._connect()
+        if conn is None:
+            return -1
+        try:
+            conn.zremrangebyscore(_SHARED_KEY, 0, time.time() - self.window)
+            return int(conn.zcard(_SHARED_KEY))
+        except Exception:                          # noqa: BLE001
+            return -1
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Classifying a refusal
 # ══════════════════════════════════════════════════════════════════════════
@@ -248,6 +359,7 @@ class NimClient:
         self._lock = threading.Lock()
         self._client = None
         self._bucket = _Bucket(RPM)
+        self._window = _SharedWindow(RPM)
         self._gate = threading.Semaphore(max(1, CONCURRENCY))
         self._models: list = []
         self._preflighted = False
@@ -368,6 +480,24 @@ class NimClient:
                 f"{RPM:.0f} req/min", retry_after=90.0)
         self.stats["waited"] = round(self.stats["waited"] + waited, 1)
 
+        # Then the account-wide window, if there is one. The local bucket has
+        # already smoothed this process's own rate; this is only about the other
+        # process spending the same quota, so it waits inside the same budget
+        # rather than being given a second one.
+        deadline = time.monotonic() + max(0.0, MAX_WAIT - waited)
+        while True:
+            pause = self._window.reserve()
+            if pause <= 0.0:
+                break
+            if time.monotonic() + pause > deadline:
+                self.stats["deferred"] += 1
+                self.stats["last_limit_at"] = time.time()
+                raise RateLimited(
+                    f"the account-wide window is full ({self._window.limit}"
+                    f"/min shared with the v1 plane)", retry_after=90.0)
+            time.sleep(min(pause, 2.0))
+            self.stats["waited"] = round(self.stats["waited"] + min(pause, 2.0), 1)
+
         last: Exception | None = None
         for attempt in range(max(1, RETRIES)):
             with self._gate:
@@ -430,6 +560,11 @@ class NimClient:
             "budget_now": round(self._bucket.available(), 1),
             "models_seen": len(self._models),
             "permanent_error": self._permanent,
+            # Whether the two planes are actually sharing one ceiling, and how
+            # much of it is spent. -1 means there is no shared window to read.
+            "window_shared": self._window.shared,
+            "window_used": self._window.used(),
+            "window_limit": self._window.limit,
         }
         out.update(self.stats)
         return out

@@ -35,7 +35,7 @@ import uuid as uuid_lib
 # the 20 GB output quota, which is what caused "No space left on device".
 from config import (ARCHIVE_DIR, LAKE_DIR, API_ID, API_HASH, BOT_TOKEN,
                     QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE, OMNI_DEDUP_SET,
-                    NIM_API_KEY, NIM_BASE_URL, NIM_MODEL, OMNI_DASHBOARD_PORT,
+                    OMNI_DASHBOARD_PORT,
                     OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS,
                     missing_telegram_secrets)
 
@@ -71,73 +71,199 @@ REDIS = redis_lib.Redis(host="localhost", port=6379, decode_responses=True,
 # ═══════════════════════════════════════════════════════════
 # NVIDIA NIM CLIENT (lazy, optional — everything has a fallback)
 # ═══════════════════════════════════════════════════════════
-_nim_client = None
+# One client for the whole account, not one per call site. The account-wide
+# quota is roughly forty requests a minute across every model, and this process
+# used to spend it with no bucket, no backoff and no idea what the v2 engine was
+# spending beside it — which is what produced `ResourceExhausted (33/32)`. The
+# shared client in vios.process.runners.cloud holds the token bucket, the
+# concurrency bound, the retry policy and the sliding window both planes read
+# through Redis, so the two cannot starve each other.
+_nim_shared = None
+_nim_import_error = ""
 
 
 def nim():
-    global _nim_client
-    if _nim_client is None and NIM_API_KEY:
+    """The shared NIM client, or None when it cannot be reached.
+
+    Returns the `NimClient`, not an OpenAI handle: every caller in this file
+    goes through `nim_chat`, and anything that wants the raw SDK would be
+    bypassing the rate limit that exists to keep the key usable.
+    """
+    global _nim_shared, _nim_import_error
+    if _nim_shared is None and not _nim_import_error:
         try:
-            from openai import OpenAI
-            _nim_client = OpenAI(base_url=NIM_BASE_URL, api_key=NIM_API_KEY)
+            from vios.process.runners import cloud
+            _nim_shared = cloud.client()
         except Exception as e:
-            log(f"NIM client init failed: {e}", "WARN")
-    return _nim_client
+            _nim_import_error = f"{type(e).__name__}: {e}"[:200]
+            log(f"shared NIM client unavailable ({_nim_import_error}) — NIM "
+                f"calls in this process are disabled", "WARN")
+    return _nim_shared
 
 
 def nim_chat(messages, temperature=0.2, max_tokens=1024):
-    """One NIM completion; returns text or raises."""
+    """One NIM completion, rate-limited and retried; returns text or raises.
+
+    Raises `cloud.RateLimited` when the quota is the obstacle and
+    `cloud.NotConfigured` when retrying can never help. Callers that only want
+    "did it work" can keep catching Exception; callers that need to tell
+    "come back later" from "this will never work" catch the two by name.
+    """
     client = nim()
     if not client:
-        raise RuntimeError("NIM API not configured")
-    resp = client.chat.completions.create(model=NIM_MODEL, messages=messages,
-                                          temperature=temperature, max_tokens=max_tokens)
-    return resp.choices[0].message.content
+        raise RuntimeError(f"NIM API unavailable: {_nim_import_error or 'not configured'}")
+    return client.chat(messages, temperature=temperature, max_tokens=max_tokens,
+                       log=lambda m, lvl="info": log(m, lvl.upper()))
 
 
 # ═══════════════════════════════════════════════════════════
 # GRAPHRAG — narrative → entities/relationships → Neo4j
 # ═══════════════════════════════════════════════════════════
-_graphrag_warned = False
+# How many chunk narratives ride in one extraction call. One call per chunk on a
+# forty-per-minute account cannot finish an archive; six per call cuts the
+# request count by six at no quality cost, because each segment is still
+# extracted separately inside the prompt and each record still carries the
+# segment it came from.
+GRAPHRAG_BATCH = max(1, int(os.environ.get("VIOS_GRAPHRAG_BATCH", "6") or 6))
+
+# Why the graph is thin, reported by /api/graph/health rather than inferred from
+# an empty canvas. `disabled_reason` is set only for a permanent failure — a
+# missing key, a rejected key, a model this key cannot reach. A transient
+# refusal increments `rate_limited` and is retried; it never disables anything,
+# which is the bug this replaces.
+GRAPHRAG = {"calls": 0, "batches": 0, "chunks": 0, "entities": 0,
+            "relationships": 0, "rate_limited": 0, "store_failed": 0,
+            "disabled_reason": "", "last_error": "", "last_error_at": 0.0}
+_graphrag_lock = threading.Lock()
 
 
-def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_id,
-                               start_t=None, end_t=None):
-    global _graphrag_warned
+def _graphrag_permanent(exc) -> bool:
+    """True when no amount of waiting will make this call work."""
+    try:
+        from vios.process.runners.cloud import NotConfigured
+    except Exception:
+        return False
+    return isinstance(exc, NotConfigured)
+
+
+def _graphrag_batch_text(batch):
+    """The segments, labelled, so every record can name where it came from."""
+    parts = []
+    for i, (cid, text, start_t, end_t) in enumerate(batch):
+        span = ("" if start_t is None else
+                f" ({float(start_t):.1f}s–{float(end_t or start_t):.1f}s)")
+        parts.append(f"=== SEGMENT {i}{span} ===\n{text.strip()}")
+    return "\n\n".join(parts)
+
+
+def _graphrag_attribute(name, batch, current):
+    """Which chunk an extracted record belongs to.
+
+    The model is asked to announce each segment before the records taken from
+    it, and usually does. When it does not, the name is looked for in the
+    segment texts — extraction quotes what it read, so a substring match is
+    right far more often than guessing — and only if that fails does the record
+    fall back to the first segment of the batch.
+    """
+    if current is not None and 0 <= current < len(batch):
+        return batch[current]
+    needle = (name or "").strip().lower()
+    if needle:
+        for entry in batch:
+            if needle in (entry[1] or "").lower():
+                return entry
+    return batch[0]
+
+
+def extract_and_store_graphrag(neo4j_driver, video_uuid, batch):
+    """One extraction call for several chunk narratives → Entity/RELATED_TO.
+
+    `batch` is a list of `(chunk_id, narrative, start_t, end_t)`, all from the
+    one video named by `video_uuid`. Batching is the difference between an
+    archive that finishes and one that spends its whole quota on the first fifty
+    videos.
+    """
+    batch = [b for b in batch if b and (b[1] or "").strip()]
+    if not batch:
+        return
+    with _graphrag_lock:
+        if GRAPHRAG["disabled_reason"]:
+            return
+
     extraction_prompt = PROMPTS["entity_extraction"].format(
         entity_types=", ".join(PROMPTS["DEFAULT_ENTITY_TYPES"]),
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        input_text=narrative_text)
-    try:
-        graph_output = nim_chat([{"role": "user", "content": extraction_prompt}],
-                                temperature=0.1, max_tokens=2048)
-    except Exception as e:
-        # Once, not once per chunk. With no NIM key this fires for every chunk
-        # of every video — thousands of identical WARN lines that buried the
-        # real errors. The UI reports the degraded state via /api/graph/health.
-        if not _graphrag_warned:
-            log(f"GraphRAG entity extraction unavailable ({e}) — the graph keeps "
-                f"Video→Chunk→Narrative structure but gains no Entity nodes. "
-                f"Set VIOS_NIM_API_KEY to enable it.", "WARN")
-            _graphrag_warned = True
-        return
+        input_text=_graphrag_batch_text(batch))
+    if len(batch) > 1:
+        # Appended rather than woven into the prompt template: the template is
+        # the upstream GraphRAG wording and is worth leaving recognisable.
+        tup = PROMPTS["DEFAULT_TUPLE_DELIMITER"]
+        rec = PROMPTS["DEFAULT_RECORD_DELIMITER"]
+        extraction_prompt += (
+            f"\n\nThe text above is {len(batch)} separate segments, each "
+            f"introduced by a line reading `=== SEGMENT n ===`. Extract each "
+            f"segment on its own — do not merge them. Immediately before the "
+            f"records taken from a segment, emit one record of the form "
+            f'("segment"{tup}n){rec} naming that segment number, so each entity '
+            f"stays attached to the moment it appeared in.")
 
     try:
+        graph_output = nim_chat([{"role": "user", "content": extraction_prompt}],
+                                temperature=0.1,
+                                max_tokens=min(4096, 900 + 500 * len(batch)))
+    except Exception as e:
+        permanent = _graphrag_permanent(e)
+        with _graphrag_lock:
+            GRAPHRAG["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            GRAPHRAG["last_error_at"] = time.time()
+            if permanent:
+                # Latched *only* here. The old code latched on the first
+                # failure of any kind, so one transient burst silently disabled
+                # entity extraction for the rest of the session on a valid key.
+                GRAPHRAG["disabled_reason"] = str(e)[:200]
+                log(f"GraphRAG entity extraction disabled for this session: "
+                    f"{str(e)[:200]}. The graph keeps Video→Chunk→Narrative "
+                    f"structure but gains no Entity nodes.", "WARN")
+            else:
+                GRAPHRAG["rate_limited"] += 1
+                log(f"GraphRAG extraction deferred for {len(batch)} chunk(s) "
+                    f"({str(e)[:160]}) — the narratives are stored and the "
+                    f"entities can be re-extracted later", "WARN")
+        return
+
+    with _graphrag_lock:
+        GRAPHRAG["calls"] += 1
+        GRAPHRAG["batches"] += 1
+        GRAPHRAG["chunks"] += len(batch)
+
+    entities = relationships = 0
+    try:
         lines = graph_output.split(PROMPTS["DEFAULT_RECORD_DELIMITER"])
+        current = 0 if len(batch) == 1 else None
         with neo4j_driver.session() as session:
             for line in lines:
                 line = line.strip().strip("()")
                 if not line or PROMPTS["DEFAULT_COMPLETION_DELIMITER"] in line:
                     continue
                 parts = line.split(PROMPTS["DEFAULT_TUPLE_DELIMITER"])
+                record_type = parts[0].strip().strip('"').lower()
+
+                if record_type == "segment" and len(parts) >= 2:
+                    try:
+                        current = int(re.sub(r"[^\d]", "", parts[1]) or 0)
+                    except ValueError:
+                        current = None
+                    continue
                 if len(parts) < 4:
                     continue
-                record_type = parts[0].strip('"').lower()
 
                 if record_type == "entity":
                     name, e_type, desc = parts[1].strip('"'), parts[2].strip('"'), parts[3].strip('"')
+                    if not name.strip():
+                        continue
+                    chunk_id, _, start_t, end_t = _graphrag_attribute(name, batch, current)
                     # Entity nodes stay GLOBAL on purpose — one "skateboard"
                     # shared across every reel that shows one is the whole
                     # point of a knowledge graph. What was missing is the
@@ -152,6 +278,7 @@ def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_i
                         SET r.video_uuid = $vid, r.start = $start, r.end = $end
                     """, name=name, type=e_type, desc=desc, cid=chunk_id,
                          vid=video_uuid, start=start_t, end=end_t)
+                    entities += 1
 
                 elif record_type == "relationship" and len(parts) >= 5:
                     src, tgt, desc, weight = (parts[1].strip('"'), parts[2].strip('"'),
@@ -166,8 +293,29 @@ def extract_and_store_graphrag(neo4j_driver, narrative_text, video_uuid, chunk_i
                         MERGE (s)-[r:RELATED_TO]->(t)
                         SET r.description = $desc, r.weight = $weight
                     """, src=src, tgt=tgt, desc=desc, weight=weight_int)
+                    relationships += 1
     except Exception as e:
-        log(f"GraphRAG store failed for {chunk_id}: {e}", "WARN")
+        with _graphrag_lock:
+            GRAPHRAG["store_failed"] += 1
+            GRAPHRAG["last_error"] = f"store: {type(e).__name__}: {e}"[:300]
+            GRAPHRAG["last_error_at"] = time.time()
+        log(f"GraphRAG store failed for {len(batch)} chunk(s): {e}", "WARN")
+        return
+
+    with _graphrag_lock:
+        GRAPHRAG["entities"] += entities
+        GRAPHRAG["relationships"] += relationships
+
+
+def graphrag_health():
+    """Everything /api/graph/health needs about extraction, in one dict."""
+    with _graphrag_lock:
+        out = dict(GRAPHRAG)
+    out["batch_size"] = GRAPHRAG_BATCH
+    client = nim()
+    out["nim"] = client.status() if client else {
+        "configured": False, "reason": _nim_import_error or "client unavailable"}
+    return out
 
 
 # ═══════════════════════════════════════════════════════════
@@ -521,6 +669,8 @@ def process_oracle_job(payload):
     pg_conn = get_pg_conn_optional()
     reused = 0
     skipped_dup = 0
+    # Chunk narratives waiting on one entity-extraction call. See GRAPHRAG_BATCH.
+    graph_batch: list = []
     # Per-video, per-job comparison pool. Scoped here rather than module-global
     # so one video's narratives can never suppress another's, and so a long
     # video keeps every earlier chunk in view instead of ageing them out.
@@ -688,10 +838,27 @@ def process_oracle_job(payload):
                                 MERGE (c)-[:DESCRIBED_BY]->(n)
                             """, vid=v_uuid, cid=c_id_str, start=start_t, end=end_t,
                                 desc=narrative)
-                        extract_and_store_graphrag(driver, narrative, v_uuid, c_id_str,
-                                                   start_t=start_t, end_t=end_t)
+                        # Entity extraction is deferred to a batch: the chunk
+                        # node it attaches to has just been written, and one API
+                        # call per chunk is what exhausted the quota. Collected
+                        # here, flushed below in groups of GRAPHRAG_BATCH.
+                        graph_batch.append((c_id_str, narrative, start_t, end_t))
+                        if len(graph_batch) >= GRAPHRAG_BATCH:
+                            extract_and_store_graphrag(driver, v_uuid, graph_batch)
+                            graph_batch = []
                     except Exception as e:
                         log(f"Neo4j insert failed for {c_id_str}: {e}", "WARN")
+
+        # The tail of the video: fewer than a full batch, and it still has to be
+        # extracted — a video of five chunks would otherwise contribute nothing.
+        if graph_batch:
+            driver = get_neo4j()
+            if driver:
+                try:
+                    extract_and_store_graphrag(driver, v_uuid, graph_batch)
+                except Exception as e:
+                    log(f"GraphRAG tail batch failed for {v_uuid}: {e}", "WARN")
+            graph_batch = []
         pg_conn.commit()
     finally:
         pg_conn.close()
@@ -1023,17 +1190,49 @@ def build_dashboard():
 
     @app_dashboard.route("/api/graph/health")
     def get_graph_health():
-        """Why the graph looks thin. Entity extraction needs a NIM key; without
-        one the structural half still writes and this says so out loud instead
-        of leaving an empty canvas to interpret."""
+        """Why the graph looks thin, and whether it is temporary.
+
+        Three states, not two. Extraction is *off* when there is no key, *paused*
+        when the account-wide rate limit is the obstacle — which passes, and the
+        narratives are already stored so nothing is lost — and *broken* when the
+        key is rejected or the model is unreachable, which will not pass. The old
+        version could only say "no key", and a transient burst that latched the
+        warn-once flag looked identical to a missing one.
+        """
         driver = get_neo4j()
+        rag = graphrag_health()
+        nim_state = rag.get("nim") or {}
+        configured = bool(nim_state.get("configured"))
+        disabled = rag.get("disabled_reason") or nim_state.get("permanent_error") or ""
+
+        if not configured:
+            mode, note = "off", (
+                "VIOS_NIM_API_KEY is unset — Video/Chunk/Narrative nodes are "
+                "written, Entity nodes are not.")
+        elif disabled:
+            mode, note = "broken", (
+                f"Entity extraction stopped for this session: {disabled}. The "
+                f"narratives are stored, so re-running the Oracle after fixing "
+                f"the key backfills the entities.")
+        elif rag.get("rate_limited"):
+            mode, note = "paused", (
+                f"{rag['rate_limited']} extraction batch(es) hit the account-wide "
+                f"rate limit and were deferred, not failed. "
+                f"{rag.get('entities', 0)} entities stored so far; "
+                f"{GRAPHRAG_BATCH} chunks ride each call.")
+        else:
+            mode, note = "on", (
+                f"{rag.get('entities', 0)} entities and "
+                f"{rag.get('relationships', 0)} relationships from "
+                f"{rag.get('calls', 0)} call(s) over {rag.get('chunks', 0)} chunks.")
+
         health = {"neo4j": bool(driver),
-                  "entity_extraction": bool(NIM_API_KEY),
-                  "extraction_backend": "nvidia-nim" if NIM_API_KEY else None,
+                  "entity_extraction": configured and not disabled,
+                  "extraction_mode": mode,
+                  "extraction_backend": nim_state.get("model") if configured else None,
+                  "note": note,
+                  "graphrag": rag,
                   "counts": {}}
-        if not NIM_API_KEY:
-            health["note"] = ("VIOS_NIM_API_KEY is unset — Video/Chunk/Narrative "
-                              "nodes are written, Entity nodes are not.")
         if driver:
             try:
                 with driver.session() as session:
