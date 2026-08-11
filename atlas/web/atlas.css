@@ -269,6 +269,20 @@ body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .stage{
   overflow:hidden; background:var(--ink-4);
 }
 .card-shot img{ width:100%; height:100%; object-fit:cover; display:block; }
+
+/* The hover preview. One element for the page, moved into whichever thumbnail
+   is hovered; it sits over the poster so a clip that never arrives leaves the
+   still image on screen instead of a black hole. */
+.hover-clip{
+  position:absolute; inset:0; z-index:1;
+  width:100%; height:100%; object-fit:cover; display:block;
+  background:#000; animation:clipIn .2s var(--ease);
+}
+@keyframes clipIn{ from{ opacity:0 } to{ opacity:1 } }
+.previewing .dur, .previewing .cached, .previewing .tile-rail, .previewing .tile-why{ z-index:2; }
+/* Amber again means "this is the one you are pointed at". */
+.previewing{ box-shadow:0 0 0 1px var(--signal); }
+@media (prefers-reduced-motion:reduce){ .hover-clip{ animation:none } }
 .card-shot .noshot{
   position:absolute; inset:0; display:grid; place-items:center;
   font-family:var(--mono); font-size:10px; color:var(--dim); letter-spacing:.1em;

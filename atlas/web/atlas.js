@@ -206,6 +206,7 @@ function writeHash(tab, params) {
 
 function showTab(tab, { push = true } = {}) {
   S.tab = tab;
+  previewStop();   // a preview left running under a hidden tab keeps streaming
   $$('.tabs button').forEach(b =>
     b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
   $$('.view').forEach(v => { v.hidden = v.dataset.view !== tab; });
@@ -410,9 +411,76 @@ const posterWatcher = new IntersectionObserver((entries) => {
   }
 }, { rootMargin: '400px 0px' });
 
+/* ── hover preview ─────────────────────────────────────────────────────────
+ * Hovering a result plays the found moment, not the start of the reel: two
+ * seconds from `/api/clip`, looped, silent. There is exactly one <video> for
+ * the whole page and it is moved into whichever thumbnail is under the
+ * pointer — a grid of forty tiles must not become forty media downloads.
+ * ------------------------------------------------------------------------- */
+const PV = {
+  el: null,
+  host: null,        // the .card-shot / .tile-shot currently holding it
+  timer: 0,
+  key: '',
+  none: new Set(),   // keys the server has already answered 204 for
+};
+
+function previewEl() {
+  if (PV.el) return PV.el;
+  const v = document.createElement('video');
+  v.className = 'hover-clip';
+  v.muted = true; v.loop = true; v.playsInline = true;
+  v.preload = 'auto';
+  v.setAttribute('aria-hidden', 'true');
+  // A 204 or an undecodable clip must leave the poster exactly as it was,
+  // so a video with no clip index simply behaves like one without a preview.
+  v.addEventListener('error', () => { PV.none.add(PV.key); previewStop(); });
+  PV.el = v;
+  return v;
+}
+
+function previewStop() {
+  clearTimeout(PV.timer);
+  PV.timer = 0;
+  const v = PV.el;
+  if (!v) return;
+  v.pause();
+  v.removeAttribute('src');
+  v.load();                       // releases the connection, not just the frame
+  if (v.parentNode) v.parentNode.removeChild(v);
+  if (PV.host) PV.host.classList.remove('previewing');
+  PV.host = null;
+  PV.key = '';
+}
+
+function previewStart(host, key, t) {
+  if (PV.none.has(key)) return;
+  const v = previewEl();
+  PV.host = host;
+  PV.key = key;
+  host.classList.add('previewing');
+  host.appendChild(v);
+  v.src = U(`/api/clip/${key}?t=${Math.max(0, t || 0).toFixed(1)}`);
+  v.play().catch(() => { /* autoplay refused, or the clip never arrived */ });
+}
+
+/* Attach to a thumbnail. The delay is what keeps a pointer travelling across
+ * a grid from firing a request per tile it crosses. */
+function previewOn(host, key, t, delay = 320) {
+  if (!window.matchMedia || !window.matchMedia('(hover: hover)').matches) return host;
+  host.addEventListener('pointerenter', () => {
+    clearTimeout(PV.timer);
+    PV.timer = setTimeout(() => previewStart(host, key, t), delay);
+  });
+  host.addEventListener('pointerleave', () => {
+    if (PV.host === host) previewStop(); else clearTimeout(PV.timer);
+  });
+  return host;
+}
+
 function renderCards(results, append) {
   const list = $('cards');
-  if (!append) list.textContent = '';
+  if (!append) { previewStop(); list.textContent = ''; }
   const frag = document.createDocumentFragment();
 
   for (const r of results.slice(append ? list.childElementCount : 0)) {
@@ -423,6 +491,9 @@ function renderCards(results, append) {
     const shot = posterImg(r, at, 'card-shot');
     if (r.duration) shot.appendChild(h('span', { class: 'dur', text: timecode(r.duration) }));
     if (r.has_file) shot.appendChild(h('i', { class: 'cached', title: 'already on this machine' }));
+    // Hovering plays the moment that made this a result — not the reel's
+    // opening frame, which is the one part of a video nothing ever matched on.
+    if (at !== null) previewOn(shot, r.video_key, at);
 
     const line = h('div', { class: 'card-line' });
     if (r.creator) line.appendChild(h('span', { class: 'who', text: r.creator }));
@@ -1110,7 +1181,7 @@ function libDensity(step) {
 
 function renderLibrary(reset) {
   const grid = $('libGrid');
-  if (reset) grid.textContent = '';
+  if (reset) { previewStop(); grid.textContent = ''; }
   const frag = document.createDocumentFragment();
 
   for (const r of S.lib.rows.slice(grid.childElementCount)) {
@@ -1122,6 +1193,9 @@ function renderLibrary(reset) {
     });
     const shot = posterImg(r, null, 'tile-shot');
     if (r.duration) shot.appendChild(h('span', { class: 'dur', text: timecode(r.duration) }));
+    // No query means no found moment to show, so the browse grid previews just
+    // past the opening — far enough in to be the video rather than its title card.
+    previewOn(shot, r.video_key, r.duration ? Math.min(r.duration * 0.1, 6) : 0);
 
     // A miniature of the ribbon: the mix of evidence this video carries,
     // without needing a query to have been run.
