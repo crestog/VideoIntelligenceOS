@@ -109,6 +109,15 @@ DISK_FLOOR_MB = 4_000
 
 IDLE_POLL_SECONDS = 90
 
+# How long a pass that cannot run on this kind of machine waits before it is
+# offered again. It is not a backoff — nothing failed and nothing will change in
+# five minutes — it is the interval at which the engine re-asks the question,
+# because the answer depends on where the coverage database is being read. Six
+# hours is long enough that a session never churns on it and short enough that a
+# database restored onto a machine that *can* run the pass starts it the same
+# working day rather than a month later.
+ELSEWHERE_SECONDS = 6 * 3600
+
 # How recently the channel must have been scanned for the sweep to trust the
 # scan and not repeat it. The boot restore and `restore_on_start` do the same
 # walk over thousands of messages, seconds apart, and the second one downloads
@@ -243,9 +252,16 @@ class ProcessEngine:
         self.current: dict = {}
         self.session = {"videos": 0, "passes": 0, "claims": 0, "vectors": 0,
                         "skipped": 0, "failed": 0, "deferred": 0,
+                        "elsewhere": 0,
                         "seconds": 0.0, "downloaded": 0, "shards": 0}
         self.last_publish: float | None = None
         self.since_publish = 0
+
+        # Components deferred because this machine cannot run them, so their
+        # dependents can be told the same thing instead of being retried every
+        # five minutes, and so the log says it once rather than once per video.
+        self._elsewhere: set = set()
+        self._elsewhere_logged: set = set()
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -668,8 +684,9 @@ class ProcessEngine:
             self.started_at = time.time()
             self.session = {"videos": 0, "passes": 0, "claims": 0,
                             "vectors": 0, "skipped": 0, "failed": 0,
-                            "deferred": 0, "seconds": 0.0,
+                            "deferred": 0, "elsewhere": 0, "seconds": 0.0,
                             "downloaded": 0, "shards": 0}
+            self._elsewhere_logged = set()
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="vios-process")
             self._thread.start()
@@ -1042,6 +1059,35 @@ class ProcessEngine:
         cov, store = self.coverage, self.store
         comp = registry.get(cid)
 
+        # Can this machine run it at all?
+        #
+        # `kaggle_ok=False` means the pass is known not to work on Kaggle's
+        # 2×T4 — a 38B that will not shard across PCIe inside nine hours, a
+        # kernel that needs Ampere. The point of recording that as data is that
+        # the pass is neither deleted from the registry nor hacked into fitting:
+        # the coverage row says `deferred` with the reason, so the matrix
+        # distinguishes "cannot run here" from "broke", and a machine that can
+        # run it finds the work waiting rather than marked done.
+        #
+        # Every component ships `kaggle_ok=True`, so today this never fires. It
+        # is the door, not the room: when a pass proves unrunnable on a T4 the
+        # honest fix is one field, not a code change.
+        if not comp.kaggle_ok and self.resources.get("host") == "kaggle":
+            try:
+                where = resources.describe(self.resources)
+            except Exception:               # noqa: BLE001
+                where = "this host"
+            why = (f"not runnable on {where} — flagged kaggle_ok=False in the "
+                   f"registry, held for a machine that can run it")
+            cov.defer(key, cid, why, ELSEWHERE_SECONDS)
+            self.session["elsewhere"] = self.session.get("elsewhere", 0) + 1
+            self._elsewhere.add(cid)
+            if cid not in self._elsewhere_logged:
+                self._elsewhere_logged.add(cid)
+                self._log(f"{cid}: deferred for another machine — "
+                          f"{comp.title} is flagged as not runnable here", "warn")
+            return "deferred"
+
         # Dependency gate. A pass whose input was never produced should not
         # spend a GPU second discovering that for itself.
         broken = [n for n in comp.needs
@@ -1058,8 +1104,17 @@ class ProcessEngine:
         # so it waits with it.
         waiting = [n for n in comp.needs if states.get(n) == "deferred"]
         if waiting:
+            # …and if what it is waiting on cannot run here at all, it waits on
+            # the same clock. Five minutes is the right interval for a rate
+            # limit and pure churn for a machine that will never be able to run
+            # the dependency, which would otherwise re-ask every sweep forever.
+            elsewhere = [n for n in waiting if n in self._elsewhere]
             why = f"waiting on {', '.join(waiting)}, which is deferred"
-            cov.defer(key, cid, why, 300.0)
+            if elsewhere:
+                why = (f"waiting on {', '.join(elsewhere)}, which needs a "
+                       f"different machine")
+            cov.defer(key, cid, why,
+                      ELSEWHERE_SECONDS if elsewhere else 300.0)
             self.session["deferred"] = self.session.get("deferred", 0) + 1
             return "deferred"
 

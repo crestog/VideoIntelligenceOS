@@ -138,6 +138,25 @@ def capabilities(gpus: list) -> dict:
     }
 
 
+def host() -> str:
+    """Which kind of machine this is: "kaggle" or "local".
+
+    The only consumer is the `kaggle_ok` flag in the registry, and it needs this
+    rather than a GPU name because the constraint is the whole environment — two
+    T4s, a nine-hour ceiling, no persistent disk — not the card alone. A T4 in a
+    workstation with no session limit is not the same host.
+
+    Kaggle sets KAGGLE_KERNEL_RUN_TYPE in every kernel, interactive or batch;
+    /kaggle/working is checked too so a shell that lost the environment still
+    identifies itself correctly.
+    """
+    if os.environ.get("VIOS_HOST"):
+        return os.environ["VIOS_HOST"].strip().lower()
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE"):
+        return "kaggle"
+    return "kaggle" if os.path.isdir("/kaggle/working") else "local"
+
+
 def probe(scratch: str = ".") -> dict:
     """Everything the planner needs, in one dict.
 
@@ -156,6 +175,7 @@ def probe(scratch: str = ".") -> dict:
     return {
         "gpus": gpus,
         "gpu_count": len(gpus),
+        "host": host(),
         "vram_total_mb": sum(g["total_mb"] for g in gpus),
         "vram_free_mb": sum(g["free_mb"] for g in gpus),
         "usable_vram_mb": min(per_card) if per_card else 0,

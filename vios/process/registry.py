@@ -1071,14 +1071,25 @@ def unrunnable(ids, res: dict) -> dict:
     Shown in the tab beside the plan rather than raised, because "this session
     got one GPU instead of two" is a normal Kaggle Tuesday and the answer is to
     run the other twenty-six passes, not to stop.
+
+    `kaggle_ok=False` is reported here too, and before the GPU filter, because
+    that flag is a statement about the whole machine rather than about VRAM — a
+    CPU pass can be flagged as well. It is the plan's way of saying the same
+    thing the coverage row will say per video: not broken, not here.
     """
     out = {}
     per_card = res.get("usable_vram_mb", 0)
     total = res.get("usable_vram_total_mb", 0)
     gpus = res.get("gpu_count", 0)
+    kaggle = res.get("host") == "kaggle"
     for cid in ids:
         c = BY_ID.get(cid)
-        if c is None or c.device != "gpu":
+        if c is None:
+            continue
+        if kaggle and not c.kaggle_ok:
+            out[cid] = "flagged as not runnable on Kaggle — held for another machine"
+            continue
+        if c.device != "gpu":
             continue
         if not gpus:
             out[cid] = "no GPU in this session"
