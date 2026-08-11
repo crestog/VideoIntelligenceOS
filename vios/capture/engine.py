@@ -46,6 +46,7 @@ import traceback
 # `fetchmod.cleanup(...)` — an hour into a run, not at import time.
 from .fetch import (fetch as fetch_one, cleanup as fetch_cleanup,
                     FetchError, tool_versions)
+from .assets import publish_assets
 from .ledger import Ledger, open_ledger
 from .pacing import Pacer
 from .upload import Telegram, UploadError, publish, upload_snapshot
@@ -122,6 +123,15 @@ class CaptureEngine:
         self.max_attempts = 5
         self.allow_gallery_dl = True
         self.snapshot_every = SNAPSHOT_EVERY
+        # Clips are what make Atlas play a searched moment instantly, so they
+        # are on by default — that is the whole point of building them. The
+        # cost is real and worth stating: a 30 s reel becomes ~16 extra channel
+        # messages, which is the binding constraint on capture rate once
+        # Instagram's own pacing is satisfied. Turn off in the admin tab when
+        # the priority is raw ingest speed rather than playback.
+        self.upload_assets = os.environ.get("VIOS_UPLOAD_ASSETS", "1") != "0"
+        # Instagram export slice source, if one was provided via the admin tab.
+        self._ig_export_slices: dict | None = None
 
         self._ledger: Ledger | None = None
         self._adopt_stored_credentials()
@@ -539,6 +549,29 @@ class CaptureEngine:
             for miss in (sent.get("slides_failed") or []):
                 led.log("slide-missing", miss, key)
 
+            # ── the asset set ────────────────────────────────────────────
+            # Runs after the ledger row is durable and before the workdir is
+            # deleted, which is the only window where both the bytes and the
+            # anchor message id exist. Everything here is an optimisation over
+            # data that is already safe in the channel, so it never raises and
+            # never marks the capture failed — a note in the ledger is the
+            # whole consequence of an asset that could not be built.
+            if self.upload_assets and result.get("video"):
+                self.current["phase"] = "assets"
+                try:
+                    got = publish_assets(
+                        self._tg, result, sent, key, work,
+                        ig_slice=self._ig_slice(key))
+                    if got["clips"] or got["uploaded"]:
+                        led.log("assets",
+                                f"{got['clips']} clip(s), "
+                                f"{got['uploaded']} message(s)", key)
+                    for note in got["notes"]:
+                        led.log("asset-note", note[:400], key)
+                except Exception as exc:
+                    led.log("asset-note",
+                            f"{type(exc).__name__}: {str(exc)[:300]}", key)
+
             self.session_done += 1
             self.since_snapshot += 1
             self.hostile_streak = 0
@@ -598,6 +631,32 @@ class CaptureEngine:
         rows = led.conn.execute(
             "SELECT collection FROM membership WHERE key=?", (key,)).fetchall()
         return [r["collection"] for r in rows]
+
+    def _ig_slice(self, key: str) -> dict:
+        """What the Instagram export said about this reel, or {}.
+
+        The export is parsed once and held, because it is a single zip that is
+        read start to finish and re-reading it per capture would add seconds to
+        every item. `VIOS_IG_EXPORT` names the zip; absent, this is a no-op and
+        the merge simply contributes nothing.
+        """
+        if self._ig_export_slices is None:
+            path = os.environ.get("VIOS_IG_EXPORT", "")
+            if path and os.path.isfile(path):
+                try:
+                    from .igexport import slices_from_export
+                    self._ig_export_slices = slices_from_export(path)
+                except Exception:
+                    self._ig_export_slices = {}
+            else:
+                self._ig_export_slices = {}
+        if not self._ig_export_slices:
+            return {}
+        try:
+            from .igexport import slice_for
+            return slice_for(self._ig_export_slices, key)
+        except Exception:
+            return {}
 
     def _progress(self, sent: int, total: int):
         if self.current:
