@@ -1,5 +1,6 @@
 import os, sqlite3, aiosqlite, redis, re, time, asyncio, urllib.request, json, uvicorn, threading, subprocess
 from collections import deque
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 import logging
@@ -682,10 +683,55 @@ async def background_downloader():
             await asyncio.sleep(15)
 
 # --- FASTAPI APP ---
+# Every route in this process, plus all fifty in the mounted Atlas app, is a
+# sync `def`. FastAPI runs those in anyio's default worker thread pool, and that
+# pool holds **40 tokens for the entire process** — one shared budget for the
+# main UI, v17, admin, the process routes and Atlas together. A route that waits
+# on SQLite holds its token for the whole wait (`store.py` opens with
+# `timeout=30.0`), and the pages poll on blind intervals that do not wait for
+# the previous answer, so a busy hour queues requests faster than they retire.
+#
+# A drained pool does not fail. It queues, silently, in arrival order — which is
+# why the site "worked for a few tabs and nothing else" after an hour, and why
+# `/atlas/atlas.js` never arrived while the cached HTML rendered instantly. The
+# fault looked like broken JavaScript and was actually a full waiting room.
+#
+# The ceiling is a number, not a design: raise it. Threads that are parked on a
+# database lock cost a stack and nothing else, and 192 of them is a few hundred
+# MB of address space against a machine that is holding model weights. This is
+# the floor of the fix, not the whole of it — the poll loops that fill the room
+# are throttled separately, and the interface files Atlas needs to be a page at
+# all are now served on the event loop so they never queue behind anything.
+#
+# It must run inside the loop: anyio keeps the limiter in a RunVar bound to the
+# running event loop, so setting it at import time would configure a loop that
+# no longer exists by the time uvicorn starts. Hence a lifespan, which is also
+# the only non-deprecated place to do it.
+def _raise_thread_ceiling() -> None:
+    try:
+        import anyio.to_thread
+        want = max(40, int(os.environ.get("VIOS_THREADPOOL", "192")))
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        had = limiter.total_tokens
+        if want > had:
+            limiter.total_tokens = want
+            custom_print(f"🧵 worker threads {had} → {want} "
+                         f"(sync routes share one pool; 40 drains in an hour)")
+    except Exception as exc:                       # pragma: no cover
+        custom_print(f"⚠️ could not raise the thread ceiling: "
+                     f"{type(exc).__name__}: {exc}")
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    _raise_thread_ceiling()
+    yield
+
+
 # `docs_url=None` disables FastAPI's built-in Swagger route so the one below can
 # take /docs and give it the same footer every other page has. /openapi.json is
 # untouched — the page still reads its schema from there.
-app = FastAPI(title="Insta-Vault Modular OS", docs_url=None)
+app = FastAPI(title="Insta-Vault Modular OS", docs_url=None, lifespan=_lifespan)
 
 
 # When the disk fills, SQLite raises "database or disk is full" from deep inside

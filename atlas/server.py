@@ -24,6 +24,7 @@ channel is fully imported — means a blank browser tab for several minutes.
 without touching this file.
 """
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -193,7 +194,36 @@ def _boot() -> None:
 # ══════════════════════════════════════════════════════════════════════════
 # APP
 # ══════════════════════════════════════════════════════════════════════════
-app = FastAPI(title="Atlas", docs_url=None, redoc_url=None)
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """Raise anyio's worker-thread ceiling for the standalone entry point.
+
+    Fifty routes in this file are sync `def`, and FastAPI runs those in anyio's
+    default thread pool, which holds 40 tokens for the whole process. A route
+    waiting on a SQLite lock (`busy_timeout=60000`) holds its token for the
+    whole wait, so a saturated pool queues silently in arrival order and the
+    page cannot even fetch its own script. Threads parked on a lock cost a
+    stack, so raise it.
+
+    It has to happen inside the loop: anyio stores the limiter in a RunVar
+    bound to the running event loop. When this app is *mounted* (ui_server),
+    Starlette does not run a sub-app's lifespan and the parent already does
+    the same thing — so this is the laptop path, and it never doubles up.
+    """
+    try:
+        import anyio.to_thread
+        want = max(40, int(os.environ.get("VIOS_THREADPOOL", "192")))
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        if want > limiter.total_tokens:
+            log(f"worker threads {limiter.total_tokens} → {want}")
+            limiter.total_tokens = want
+    except Exception as exc:                                # pragma: no cover
+        log(f"could not raise the thread ceiling — "
+            f"{type(exc).__name__}: {exc}", "WARN")
+    yield
+
+
+app = FastAPI(title="Atlas", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 
 class _Timing:
@@ -241,31 +271,94 @@ def start_boot() -> None:
 
 
 # ── the page ──────────────────────────────────────────────────────────────
-@app.get("/", response_class=HTMLResponse)
-def home():
-    path = os.path.join(config.WEB_DIR, "index.html")
+# The interface is three files, and they are the three files that must never
+# fail to arrive: a page that cannot fetch its own script is indistinguishable
+# from a page whose script crashed, and both look like "Atlas is broken".
+#
+# Every other route here is a sync `def`, which FastAPI runs in anyio's thread
+# pool — 40 threads for the whole process, shared with the main VIOS server this
+# is mounted inside, its polling UIs, and any sqlite call that decides to wait
+# 30 seconds on a lock. When that pool is drained, a `def` route does not fail;
+# it queues, silently, for as long as it takes. That is what "the Atlas tab just
+# says starting and nothing clicks" was: the HTML came from the browser cache
+# and atlas.js never arrived.
+#
+# So these four are `async def` and answer from memory. They need no thread and
+# no lock, and they are correct even while the rest of the process is wedged —
+# which is exactly when somebody needs the page to load and tell them so.
+_WEB_CACHE: dict = {}          # filename → (mtime, size, text/bytes, etag)
+
+
+def _web_asset(name: str):
+    """Read a web file once; re-read only when it changes on disk."""
+    path = os.path.join(config.WEB_DIR, name)
+    st = os.stat(path)
+    sig = (st.st_mtime_ns, st.st_size)
+    hit = _WEB_CACHE.get(name)
+    if hit and hit[0] == sig:
+        return hit[1], hit[2]
+    with open(path, "rb") as f:
+        raw = f.read()
+    etag = '"%s-%x-%x"' % (name, st.st_size, st.st_mtime_ns & 0xFFFFFFFF)
+    _WEB_CACHE[name] = (sig, raw, etag)
+    return raw, etag
+
+
+def _asset_response(request: Request, name: str, media_type: str):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+        raw, etag = _web_asset(name)
+    except OSError as e:
+        return Response(f"/* {name} is missing: {e} */", status_code=500,
+                        media_type=media_type)
+    # no-store would re-send 250 KB on every tab switch; no-cache with an ETag
+    # asks once and gets a 304, so an edited file is picked up on reload without
+    # the browser ever serving a stale copy.
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return Response(raw, media_type=media_type, headers=headers)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    """The page, told where it is mounted.
+
+    `root_path` is '' standalone and '/atlas' mounted. The interface used to
+    infer that from its own script URL, which is right until the page is opened
+    at `/atlas` with no trailing slash: relative refs then resolve against the
+    root, the script's URL says `/atlas.js`, and every API call goes to the
+    parent server — which answers `/api/status` with a completely different
+    shape and 404s everything else. The page rendered, polled, and did nothing.
+
+    The server is the only participant that knows the answer, so it says it, and
+    the asset refs are made absolute for the same reason.
+    """
+    try:
+        raw, _ = _web_asset("index.html")
+        html = raw.decode("utf-8")
     except OSError as e:
         return HTMLResponse(f"<h1>Atlas</h1><p>Interface missing: {e}</p>",
                             status_code=500)
+    root = str(request.scope.get("root_path") or "").rstrip("/")
+    html = html.replace('href="atlas.css"', f'href="{root}/atlas.css"')
+    html = html.replace('src="atlas.js"', f'src="{root}/atlas.js"')
+    html = html.replace(
+        "<head>", f'<head>\n<meta name="atlas-base" content="{root}">', 1)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/atlas.css")
-def css():
-    return FileResponse(os.path.join(config.WEB_DIR, "atlas.css"),
-                        media_type="text/css")
+async def css(request: Request):
+    return _asset_response(request, "atlas.css", "text/css")
 
 
 @app.get("/atlas.js")
-def js():
-    return FileResponse(os.path.join(config.WEB_DIR, "atlas.js"),
-                        media_type="application/javascript")
+async def js(request: Request):
+    return _asset_response(request, "atlas.js", "application/javascript")
 
 
 @app.get("/favicon.ico")
-def favicon():
+async def favicon():
     return Response(status_code=204)
 
 

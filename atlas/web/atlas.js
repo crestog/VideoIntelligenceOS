@@ -119,6 +119,46 @@ function toast(msg) {
   toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
 }
 
+/* ── faults are shown, never swallowed ──
+ * A page whose script died looks exactly like a page whose server is slow:
+ * the status pill keeps its initial "starting", the buttons do nothing, and
+ * there is nothing on screen to act on. That happened, and the diagnosis cost
+ * a session. So anything that breaks says so in the pill and in the console,
+ * and the first line of it is kept for the Sources tab.
+ *
+ * Recorded even before the pill exists — this runs at parse time, and an early
+ * throw would otherwise have nowhere to go. */
+let FAULT = '';
+function fault(msg) {
+  FAULT = String(msg || '').slice(0, 300);
+  try {
+    const dot = document.querySelector('.pulse-dot');
+    const text = document.querySelector('.pulse-text');
+    if (dot) dot.dataset.state = 'error';
+    if (text) text.textContent = 'interface fault — see console';
+    const pill = document.getElementById('pulse');
+    if (pill) pill.title = FAULT;
+  } catch { /* the document is not there yet; the console line still is */ }
+  console.error('[atlas]', FAULT);
+}
+
+window.addEventListener('error', (ev) => {
+  fault(`${ev.message || 'script error'} (${(ev.filename || '').split('/').pop()}:${ev.lineno})`);
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  const r = ev.reason;
+  fault('unhandled: ' + ((r && (r.message || r.note)) || String(r)));
+});
+
+/* Run one wiring section so a failure in it cannot disable the others. The
+ * whole interface used to be one `wire()` call: a single missing element threw,
+ * and every button on the page — including the tabs, which need no server —
+ * stayed dead. */
+function part(name, fn) {
+  try { fn(); }
+  catch (e) { fault(`${name} did not wire: ${e.message}`); }
+}
+
 /* ── transport ─────────────────────────────────────────────────────────── */
 
 /* Where this Atlas is mounted.
@@ -127,17 +167,22 @@ function toast(msg) {
  * own port (`atlas_boot.py`, everything at `/`), or mounted inside the main
  * VIOS server at `/atlas` so the whole system is one tunnel and one URL.
  *
- * Derived from this script's own resolved URL rather than from
- * `location.pathname`, because the pathname is not reliable here — the tab
- * router writes to `location.hash`, deep links carry a hash, and a trailing
- * slash may or may not be present. The script tag's `src` is resolved to an
- * absolute URL by the browser and is exactly one of `/atlas.js` or
- * `/atlas/atlas.js`, which makes this a fact rather than an inference.
+ * The server states it, in a meta tag it writes into the page from its own
+ * `root_path`. That is the only participant that *knows* — everything else is
+ * inference, and one of those inferences failed in a way that looked like the
+ * whole interface was broken: opened at `/atlas` without the trailing slash,
+ * the browser resolves `src="atlas.js"` against the root, so the script's own
+ * URL says `/atlas.js` and this yielded ''. Every API call then went to the
+ * parent server, which answers `/api/status` with a different shape and 404s
+ * the rest — a page that renders, polls, and does nothing, with no error to
+ * read.
  *
- * Yields '' standalone and '/atlas' mounted, so `BASE + '/api/…'` is right in
- * both and no caller has to know.
+ * The script-URL derivation stays as the fallback for a hand-copied page or a
+ * cached older HTML, so a stale index.html still works.
  */
 const BASE = (() => {
+  const said = document.querySelector('meta[name="atlas-base"]');
+  if (said) return (said.getAttribute('content') || '').replace(/\/$/, '');
   const tag = document.currentScript
     || [...document.querySelectorAll('script')].find(s => /atlas\.js(\?|$)/.test(s.src));
   try { return new URL(tag.src).pathname.replace(/\/atlas\.js.*$/, ''); }
@@ -800,6 +845,15 @@ function prefetch(keys) {
 }
 
 let statePoll = 0;
+/* The media-state poll is a chain of timeouts rather than an interval, so
+ * cancelling it takes two steps: clear the pending timer *and* invalidate the
+ * one that may already be mid-await. A generation counter does both. */
+let statePollGen = 0;
+function stopMediaPoll() {
+  statePollGen += 1;
+  clearTimeout(statePoll);
+  statePoll = 0;
+}
 let retryTimer = 0;
 let busyGuard = 0;
 /* The ordered timestamps of the open video's passages, and where the player
@@ -918,21 +972,28 @@ function busy(on, text, pct, opts) {
 }
 
 function pollMediaState(key) {
-  clearInterval(statePoll);
-  statePoll = setInterval(async () => {
-    if (!S.video || S.video.video_key !== key) { clearInterval(statePoll); return; }
+  stopMediaPoll();
+  const gen = statePollGen;
+  // This was a 900 ms setInterval with an await in its body, so a slow
+  // /api/media/state answer did not delay the next request — it queued it, on
+  // the same worker-thread pool every other route in the process draws from.
+  // The one moment the server is busiest fetching from the channel was the
+  // moment the page shouted at it hardest. Ask again 900 ms after each answer.
+  const again = async () => {
+    if (gen !== statePollGen) return;
+    if (!S.video || S.video.video_key !== key) { statePoll = 0; return; }
     try {
       const st = await api(`/api/media/${encodeURIComponent(key)}/state`);
+      if (gen !== statePollGen) return;
       if (st.where === 'local' || st.where === 'cache' || st.status === 'ready') {
-        clearInterval(statePoll);
+        statePoll = 0;
         return;
       }
       // Streaming means bytes are already reaching the player. The video's own
       // events clear the overlay; showing a progress bar over a playing video
       // would be a lie about what it is waiting for.
-      if (st.status === 'streaming') return;
       if (st.status === 'error') {
-        clearInterval(statePoll);
+        statePoll = 0;
         busy(true, st.note || 'could not fetch this video from the channel', 0,
           { action: { label: 'Try again', run: () => {
               const vid = $('video');
@@ -942,12 +1003,17 @@ function pollMediaState(key) {
             } } });
         return;
       }
-      const pct = st.percent || (st.total ? (st.got / st.total) * 100 : 0);
-      busy(true, st.status === 'downloading'
-        ? `fetching from the channel — ${fmtBytes(st.got)}${st.total ? ' of ' + fmtBytes(st.total) : ''}`
-        : 'queued behind another download', Math.max(4, pct));
+      if (st.status !== 'streaming') {
+        const pct = st.percent || (st.total ? (st.got / st.total) * 100 : 0);
+        busy(true, st.status === 'downloading'
+          ? `fetching from the channel — ${fmtBytes(st.got)}${st.total ? ' of ' + fmtBytes(st.total) : ''}`
+          : 'queued behind another download', Math.max(4, pct));
+      }
     } catch { /* keep polling; a 503 here is expected while it downloads */ }
-  }, 900);
+    if (gen !== statePollGen) return;
+    statePoll = setTimeout(again, 900);
+  };
+  statePoll = setTimeout(again, 900);
 }
 
 function renderPlayerMeta(video) {
@@ -1151,7 +1217,7 @@ function markActiveCard() {
 }
 
 function closePlayer() {
-  clearInterval(statePoll);
+  stopMediaPoll();
   clearTimeout(retryTimer);
   clearTimeout(busyGuard);
   stopMomLoop();
@@ -5403,11 +5469,13 @@ function rmWire() {
    ════════════════════════════════════════════════════════════════════════ */
 let statusTimer = 0;
 let lastPhase = '';
+let statusMisses = 0;
 
 async function pollStatus() {
   try {
     const st = await api('/api/status');
     S.status = st;
+    statusMisses = 0;
     paintPulse(st);
     // The landing page is a live report, so it repaints on the same tick as the
     // pulse rather than only when the tab is opened.
@@ -5425,12 +5493,30 @@ async function pollStatus() {
       }
     }
     if (!S.facets && st.search && st.search.videos) loadFacets();
-  } catch { /* the server is still coming up */ }
+  } catch (e) {
+    // Not "the server is still coming up" any more. One miss during boot is
+    // ordinary; three in a row is a fact worth showing, because the alternative
+    // is a pill that says "starting" for an hour while the server is wedged,
+    // the shape of the reply is wrong, or this page is asking the wrong origin.
+    statusMisses += 1;
+    if (statusMisses >= 3) {
+      const dot = $$('.pulse-dot')[0], text = $$('.pulse-text')[0];
+      if (dot) dot.dataset.state = 'error';
+      if (text) text.textContent = `no answer from ${BASE || '/'}/api/status`;
+      $('pulse').title = `${statusMisses} failed polls · ${e.message}`;
+      console.warn('[atlas] status poll failed:', e.message);
+    }
+  }
 
   const busyNow = S.status && (S.status.boot.phase !== 'ready' ||
     S.status.ingest.running || S.status.index.running);
+  // A failing poll backs off rather than hammering a server that is already in
+  // trouble — every sync endpoint here shares one thread pool, and a browser
+  // tab left open on a stalled server is how that pool got drained.
+  const wait = statusMisses ? Math.min(3000 * statusMisses, 20000)
+                            : (busyNow ? 1500 : 12000);
   clearTimeout(statusTimer);
-  statusTimer = setTimeout(pollStatus, busyNow ? 1500 : 12000);
+  statusTimer = setTimeout(pollStatus, wait);
 }
 
 function paintPulse(st) {
@@ -5465,6 +5551,15 @@ function paintPulse(st) {
   dot.dataset.state = state;
   text.textContent = label;
   $('pulse').title = st.boot.detail || label;
+
+  // A healthy server does not make a broken page work. If something on this
+  // side threw, that stays the headline — a green pill over a dead interface is
+  // the exact lie this is here to prevent.
+  if (FAULT) {
+    dot.dataset.state = 'error';
+    text.textContent = 'interface fault — see console';
+    $('pulse').title = FAULT;
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -5629,9 +5724,9 @@ function wire() {
   });
   $('cellClose').addEventListener('click', () => { $('cellSlab').hidden = true; });
 
-  gwire();
-  mapsWire();
-  rmWire();
+  part('graph', gwire);
+  part('maps', mapsWire);
+  part('roadmap', rmWire);
 
   $('rescanBtn').addEventListener('click', async () => {
     $('rescanBtn').disabled = true;
@@ -5662,7 +5757,7 @@ function wire() {
   momNavWire();
 
   const vid = $('video');
-  vid.addEventListener('loadeddata', () => { busy(false); clearInterval(statePoll); });
+  vid.addEventListener('loadeddata', () => { busy(false); stopMediaPoll(); });
   vid.addEventListener('playing', () => busy(false));
   vid.addEventListener('error', () => {
     if (!S.video) return;
@@ -5705,8 +5800,12 @@ function wire() {
 
 /* ── boot ─────────────────────────────────────────────────────────────── */
 function start() {
-  wire();
-  pollStatus();
+  // The pill goes live *before* anything else, and independently of it. It used
+  // to be started after wire(), so a throw anywhere in wiring left the page
+  // showing its initial "starting" for as long as it was open — the server was
+  // fine and there was no way to tell from the screen.
+  part('status', pollStatus);
+  part('wiring', wire);
 
   const { tab, params } = readHash();
   const q = params.get('q');
@@ -5714,11 +5813,11 @@ function start() {
   // otherwise a shared URL lands on the landing page with the query invisible.
   const goal = params.get('goal') || '';
   if (tab === 'roadmap' && goal) R.goal = goal;   // read by roadmapBoot below
-  showTab(q ? 'search' : tab, { push: false });
-  if (q) { $('q').value = q; runSearch(q); }
+  part('opening tab', () => showTab(q ? 'search' : tab, { push: false }));
+  if (q) part('opening query', () => { $('q').value = q; runSearch(q); });
   const v = params.get('v');
-  if (v) openVideoKey(v, null);
-  loadFacets();
+  if (v) part('opening video', () => openVideoKey(v, null));
+  part('facets', loadFacets);
 }
 
 if (document.readyState === 'loading')

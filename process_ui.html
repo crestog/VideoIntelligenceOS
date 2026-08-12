@@ -1255,14 +1255,14 @@ function renderErrors(s){
 
 async function tick(){
   const s = await get('/api/process/status');
-  if(s.ok === false) return;
+  if(s.ok === false) return false;
   render(s);
   const t = s.task || {};
   if(t.running) say('#setupResult', t.message || 'Working…', 'busy');
 }
 async function tickLog(){
   const r = await get('/api/process/activity?limit=90');
-  if(!r.ok) return;
+  if(!r.ok) return false;
   const el = $('#log');
   if(!r.events.length){ el.innerHTML = '<div class="skel">Nothing yet.</div>'; return; }
   el.innerHTML = r.events.map(e => {
@@ -1578,11 +1578,22 @@ $('#bAdopt').onclick = async () => {
 };
 
 async function pollTask(target, done){
-  const t = setInterval(async () => {
+  let misses = 0;
+  for(;;){
+    await sleep(1200);
     const s = await get('/api/process/task');
+    // An unreachable server is not a finished task. This used to be a
+    // setInterval whose body awaited a fetch, so a slow answer meant two
+    // requests in flight and then three; and a single dropped answer read as
+    // `running: undefined` and declared the job done.
+    if(s.ok === false){
+      if(++misses < 5) continue;
+      return say(target, s.error || 'lost contact with the server', 'no');
+    }
+    misses = 0;
     say(target, s.message || 'Working…', s.error ? 'no' : s.running ? 'busy' : 'ok');
-    if(!s.running){ clearInterval(t); if(done) done(); }
-  }, 1200);
+    if(!s.running){ if(done) done(); return; }
+  }
 }
 
 /* ══ SETUP ═════════════════════════════════════════════════════════ */
@@ -1663,11 +1674,42 @@ async function loadPlan(){
   $('#eDl').textContent = num(e.download_mb);
 }
 
+/* ── polling that cannot flood ─────────────────────────────────────
+   These were `setInterval(tick, 1200)` and `setInterval(tickLog, 3000)`, which
+   fire whether or not the previous answer ever arrived. Every route in this
+   server is a sync `def` sharing one worker-thread pool, so a slow reply does
+   not delay the next request — it queues it, and the queue is the same one the
+   rest of the site is waiting in. An hour of that is a pool full of this page's
+   own backlog, which is what "only a few tabs work and nothing loads" was.
+
+   So: wait for the answer, then wait the interval. Do nothing while the tab is
+   hidden, because nobody is reading it. Back off when it fails, so a wedged
+   server is asked every half minute instead of every 1.2 seconds — the one
+   moment it can least afford a cannon is the moment the old code fired one. */
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function loop(name, fn, ms){
+  let delay = ms;
+  const again = async () => {
+    if(!document.hidden){
+      try{
+        const ok = await fn();
+        delay = ok === false ? Math.min(delay * 2, 30000) : ms;
+      }catch(e){
+        delay = Math.min(delay * 2, 30000);
+        console.warn('[' + name + '] ' + (e.message || e));
+      }
+    }
+    setTimeout(again, delay);
+  };
+  setTimeout(again, ms);          // first fire when setInterval's would have
+}
+
 /* ── boot ─────────────────────────────────────────────────────────── */
 loadCatalog().then(() => { tick(); loadPlan(); });
 tickLog();
-setInterval(tick, 1200);
-setInterval(tickLog, 3000);
+loop('status', tick, 1200);
+loop('activity', tickLog, 3000);
 </script>
 <script src="/sitemap.js" defer></script>
 </body>

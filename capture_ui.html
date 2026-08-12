@@ -929,9 +929,10 @@ let lastState = '';
 async function tick(){
   try{
     const s = await (await fetch('/api/capture/status')).json();
-    if(s.ok === false) return;
+    if(s.ok === false) return false;
     render(s);
-  }catch(e){ /* a dropped poll is not worth a message */ }
+  }catch(e){ return false; }   // a dropped poll is not worth a message, but it
+                               // is worth asking less often — see loop()
 }
 
 function render(s){
@@ -1002,7 +1003,7 @@ function render(s){
 async function loadLog(){
   try{
     const j = await (await fetch('/api/capture/activity?limit=45')).json();
-    if(!j.ok) return;
+    if(!j.ok) return false;
     const rows = j.events || [];
     $('#log').innerHTML = rows.length ? rows.map(e => {
       const t = new Date((e.at || 0) * 1000).toTimeString().slice(0, 8);
@@ -1010,7 +1011,7 @@ async function loadLog(){
         + `<span class="k ${esc(e.kind)}">${esc(e.kind)}</span>`
         + `<span class="m">${esc(e.key ? e.key + ' · ' : '')}${esc(e.text || '')}</span></div>`;
     }).join('') : '<div class="skel">no activity yet</div>';
-  }catch(e){}
+  }catch(e){ return false; }
 }
 
 /* ── setup actions ────────────────────────────────────────────────── */
@@ -1145,13 +1146,18 @@ $('#bImport').onclick = async () => {
   if(!j.ok){ say('#rImport', j.error, 'no'); return; }
 
   // Parsing runs on the task thread now, so the answer arrives by polling.
-  const poll = setInterval(async () => {
-    let t;
+  // A `setInterval` whose body awaits a fetch does not poll every 900 ms — it
+  // starts a request every 900 ms and lets them pile up. Wait for the answer.
+  let t;
+  for(;;){
+    await sleep(900);
     try { t = await (await fetch('/api/capture/task')).json(); }
-    catch { return; }                       // a dropped poll is not a failure
-    if(t.running){ say('#rImport', t.message || 'Parsing…', 'busy'); return; }
-    clearInterval(poll);
-    if(t.error){ say('#rImport', t.error, 'no'); return; }
+    catch { continue; }                     // a dropped poll is not a failure
+    if(!t.running) break;
+    say('#rImport', t.message || 'Parsing…', 'busy');
+  }
+  if(t.error){ say('#rImport', t.error, 'no'); return; }
+  {
     const r = t.result || {};
     const cols = Object.entries(r.collections || {})
       .sort((a, b) => b[1] - a[1]).slice(0, 8)
@@ -1168,25 +1174,28 @@ $('#bImport').onclick = async () => {
       + `${r.format || 'the file'}.\n` + bits.join(', ') + '.'
       + (cols ? `\nCollections: ${cols}` : ''), 'ok');
     $('#paste').value = ''; tick();
-  }, 900);
+  }
 };
 
 async function runScan(target){
   say(target, 'Starting the scan…', 'busy');
   const j = await post('/api/capture/seed/channel');
   if(!j.ok){ say(target, j.error, 'no'); return; }
-  const poll = setInterval(async () => {
-    const t = await (await fetch('/api/capture/task')).json();
-    if(t.running){ say(target, t.message, 'busy'); return; }
-    clearInterval(poll);
-    if(t.error){ say(target, t.error, 'no'); return; }
-    const r = t.result || {};
-    say(target, r.skipped
-      ? 'Channel unchanged since the last scan.'
-      : `${num(r.in_channel)} reels in the channel · ${num(r.adopted)} new to `
-        + `the ledger · ${num(r.corrected)} corrected.`, 'ok');
-    tick();
-  }, 1200);
+  let t;
+  for(;;){
+    await sleep(1200);
+    try { t = await (await fetch('/api/capture/task')).json(); }
+    catch { continue; }
+    if(!t.running) break;
+    say(target, t.message, 'busy');
+  }
+  if(t.error){ say(target, t.error, 'no'); return; }
+  const r = t.result || {};
+  say(target, r.skipped
+    ? 'Channel unchanged since the last scan.'
+    : `${num(r.in_channel)} reels in the channel · ${num(r.adopted)} new to `
+      + `the ledger · ${num(r.corrected)} corrected.`, 'ok');
+  tick();
 }
 $('#bScan').onclick = () => runScan('#rCheck');
 $('#bScan2').onclick = () => runScan('#rSeed');
@@ -1294,10 +1303,35 @@ $('#qState').onchange = () => { qOffset = 0; loadQueue(); };
 $('#bPrev').onclick = () => { qOffset = Math.max(0, qOffset - 50); loadQueue(); };
 $('#bNext').onclick = () => { qOffset += 50; loadQueue(); };
 
+/* ── polling that waits for its own answer ─────────────────────────
+   `setInterval(tick, 2000)` fires whether or not the last answer arrived.
+   Every route here is a sync `def` sharing one worker-thread pool with the
+   rest of the site, so a slow reply queues the next request rather than
+   delaying it, and a page left open compounds its own backlog. Wait, sleep
+   while the tab is hidden, and ask less often when the answers stop. */
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function loop(name, fn, ms){
+  let delay = ms;
+  const again = async () => {
+    if(!document.hidden){
+      try{
+        const ok = await fn();
+        delay = ok === false ? Math.min(delay * 2, 30000) : ms;
+      }catch(e){
+        delay = Math.min(delay * 2, 30000);
+        console.warn('[' + name + '] ' + (e.message || e));
+      }
+    }
+    setTimeout(again, delay);
+  };
+  setTimeout(again, ms);
+}
+
 /* ── boot ─────────────────────────────────────────────────────────── */
 tick(); loadLog();
-setInterval(tick, 2000);
-setInterval(loadLog, 6000);
+loop('status', tick, 2000);
+loop('activity', loadLog, 6000);
 </script>
 <script src="/sitemap.js" defer></script>
 </body>

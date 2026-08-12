@@ -1733,6 +1733,25 @@ async function loadLogs() {
 }
 
 /* ═══════ BOOT + POLLING ═══════ */
+/* These were blind `setInterval`s. They already skipped a hidden tab, but they
+   fired whether or not the previous answer arrived — and every route in this
+   server is a sync `def` drawing on one worker-thread pool that the whole site
+   shares. When answers slow, a blind interval stops measuring time and starts
+   filling a queue; loadDbHealth alone runs three aggregate queries. So wait for
+   the answer, then wait the interval, and ask less often when the server has
+   stopped answering rather than more. */
+function loop(name, fn, ms) {
+  let delay = ms;
+  const again = async () => {
+    if (!document.hidden) {
+      try { await fn(); delay = ms; }
+      catch (e) { delay = Math.min(delay * 2, 60000); console.warn('[' + name + '] ' + (e.message || e)); }
+    }
+    setTimeout(again, delay);
+  };
+  setTimeout(again, ms);
+}
+
 (function boot() {
   loadDisk(); loadCategories(); loadSystem(); loadLogs(); loadDbHealth();
   loadPause();
@@ -1744,15 +1763,15 @@ async function loadLogs() {
   // a panel that did not know about it would report a healthy system mid-wipe.
   pollReset();
   loadResetPreview();
-  setInterval(() => { if (!document.hidden) { loadSystem(); } }, 6000);
+  loop('system', loadSystem, 6000);
   // Pause state leads the page: it is the one reading that decides whether
   // "no progress" means idle or stopped, so it beats faster than the rest.
-  setInterval(() => { if (!document.hidden) { loadPause(); } }, 4000);
-  setInterval(() => { if (!document.hidden) { loadLogs(); } }, 4000);
-  setInterval(() => { if (!document.hidden) { loadDisk(); } }, 30000);
+  loop('pause', loadPause, 4000);
+  loop('logs', loadLogs, 4000);
+  loop('disk', loadDisk, 30000);
   // Counts move only as the pipeline writes, and each poll runs three
   // aggregate queries — a slow beat is the right one here.
-  setInterval(() => { if (!document.hidden) { loadDbHealth(); } }, 45000);
+  loop('db-health', loadDbHealth, 45000);
 })();
 </script>
 <script src="/sitemap.js" defer></script>

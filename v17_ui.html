@@ -1038,7 +1038,7 @@ function teardownWorkspace() {
   playing = false;
   $('btnPlay').textContent = 'Play';
   if (networkAborter) { networkAborter.abort(); networkAborter = null; }
-  if (extractionTimer) { clearInterval(extractionTimer); extractionTimer = null; }
+  if (extractionTimer) { clearTimeout(extractionTimer); extractionTimer = null; }
   if (pipelineTimer) { clearTimeout(pipelineTimer); pipelineTimer = null; }
   for (const entry of bitmapCache.values()) entry.bm.close && entry.bm.close();
   bitmapCache.clear();
@@ -1139,21 +1139,32 @@ async function paintFirstFrame(folder, mySession) {
 function startExtractionPoll(folderId, expected) {
   $('extractChip').classList.add('on');
   const mySession = session;
-  extractionTimer = setInterval(async () => {
-    if (mySession !== session) { clearInterval(extractionTimer); return; }
+  // A setInterval whose body awaits a fetch does not poll every 2.5s — it
+  // *starts* a request every 2.5s, and when extraction is loading the server
+  // the requests stack up in a thread pool the whole site shares. Ask again
+  // 2.5s after each answer instead.
+  const again = async () => {
+    if (mySession !== session) { return; }
     try {
       const st = await (await apiFetch(`/api/workspace/${folderId}/status`)).json();
+      if (mySession !== session) return;
       $('extractTxt').textContent = `Extracting ${st.frames_ready}/${st.total_expected}`;
       if (st.is_complete) {
-        clearInterval(extractionTimer); extractionTimer = null;
+        extractionTimer = null;
         $('extractChip').classList.remove('on');
         showToast('Extraction complete — reloading frames', 'ok');
         openWorkspace(folderId, false);
-      } else if (st.frames_ready > frameNames.length && frameNames.length === 0) {
+        return;
+      }
+      if (st.frames_ready > frameNames.length && frameNames.length === 0) {
         openWorkspace(folderId, false);
       }
     } catch (e) { /* transient */ }
-  }, 2500);
+    if (mySession !== session) return;   // torn down while we waited; the new
+                                         // workspace owns the timer slot now
+    extractionTimer = setTimeout(again, 2500);
+  };
+  extractionTimer = setTimeout(again, 2500);
 }
 
 /* ═══════════ PROGRESSIVE BUFFER ═══════════ */
@@ -2201,16 +2212,40 @@ async function pollLogs() {
     const box = $('consoleBox');
     box.innerHTML = (data.logs || []).slice(-40).map(l => `<div>${l.replace(/</g, '&lt;')}</div>`).join('');
     box.scrollTop = box.scrollHeight;
-  } catch (e) { /* transient */ }
+  } catch (e) { return false; }   /* transient — but ask less often */
 }
-setInterval(pollLogs, 5000);
+
+/* Polling that waits for its own answer. Every route in this server is a sync
+   `def` sharing one worker-thread pool with the rest of the site, so a blind
+   interval does not slow down when the server does — it queues, and the queue
+   is what the other tabs are waiting in. Sleep while the tab is hidden, and
+   back off when the answers stop coming. */
+function loop(name, fn, ms) {
+  let delay = ms;
+  const again = async () => {
+    if (!document.hidden) {
+      try {
+        const ok = await fn();
+        delay = ok === false ? Math.min(delay * 2, 30000) : ms;
+      } catch (e) {
+        delay = Math.min(delay * 2, 30000);
+        console.warn('[' + name + '] ' + (e.message || e));
+      }
+    }
+    setTimeout(again, delay);
+  };
+  setTimeout(again, ms);
+}
+
+loop('logs', pollLogs, 5000);
 
 /* ═══════════ BOOT ═══════════ */
 (async function boot() {
   history.replaceState({ view: 'library' }, '', '#library');
   await Promise.all([refreshLibrary(false), loadCategories()]);
-  setInterval(() => {
-    if ($('view-library').classList.contains('active') && !document.hidden) refreshLibrary(false);
+  loop('library', () => {
+    if (!$('view-library').classList.contains('active')) return;
+    return refreshLibrary(false);
   }, 30000);
 })();
 </script>
