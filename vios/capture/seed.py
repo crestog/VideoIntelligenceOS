@@ -164,6 +164,10 @@ _OURS_SUFFIX = ("-chunks", "-frames.tar.zst", "-evidence.jsonl.gz",
 # and costs nothing.
 _CHUNK_NAME = re.compile(r"^[A-Za-z0-9_]+-chunk-\d{4}\.mp4$")
 
+# The one filename whose presence answers a question no other message can: does
+# this video already have an asset set? Written by `assets.manifest_name`.
+_ASSET_MANIFEST_SUFFIX = "-manifest.json"
+
 
 def bare_upload(msg) -> dict:
     """Facts for a video someone dropped into the channel, or {}.
@@ -257,7 +261,7 @@ def scan_channel(tg, api_id: int, api_hash: str, head: int = 0,
                      in_memory=True, no_updates=True,
                      max_concurrent_transmissions=2)
         await app.start()
-        found, reply_index = [], {}
+        found, reply_index, asset_index = [], {}, {}
         try:
             for lo in range(start, head + 1, BATCH):
                 if should_stop and should_stop():
@@ -272,8 +276,18 @@ def scan_channel(tg, api_id: int, api_hash: str, head: int = 0,
                         # metadata record. Remember the link so the ledger row
                         # can point at it.
                         reply = getattr(msg, "reply_to_message_id", None)
-                        if reply and getattr(msg, "document", None):
-                            reply_index[int(reply)] = int(msg.id)
+                        doc = getattr(msg, "document", None)
+                        if reply and doc:
+                            name = (getattr(doc, "file_name", "") or "").lower()
+                            if name.endswith(_ASSET_MANIFEST_SUFFIX):
+                                # An asset set's index. Its presence is the only
+                                # durable proof that this video's clips are
+                                # already in the channel, and recording it here
+                                # is what stops a ledger rebuilt from nothing
+                                # from re-uploading every clip in the archive.
+                                asset_index[int(reply)] = int(msg.id)
+                            else:
+                                reply_index[int(reply)] = int(msg.id)
                             continue
                         # Not ours, not a reply, and it has a video in it —
                         # somebody put this here by hand. It is as much a part
@@ -301,6 +315,9 @@ def scan_channel(tg, api_id: int, api_hash: str, head: int = 0,
             rec = reply_index.get(item["msg_id"])
             if rec:
                 item["record_msg_id"] = rec
+            man = asset_index.get(item["msg_id"])
+            if man:
+                item["assets_msg_id"] = man
         return found
 
     return asyncio.run(_go())
@@ -358,7 +375,7 @@ def adopt_all(ledger: Ledger, found, source: str = "channel-scan") -> dict:
         fields = {k: item.get(k) for k in
                   ("record_msg_id", "file_id", "file_size", "ext", "duration",
                    "width", "height", "uploader", "views", "likes",
-                   "comment_count", "title")
+                   "comment_count", "title", "assets_msg_id")
                   if item.get(k) is not None}
         if item.get("upload"):
             # A bare upload has no Instagram creator to credit. "user" is the

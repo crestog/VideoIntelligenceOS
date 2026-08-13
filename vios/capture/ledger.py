@@ -107,7 +107,17 @@ CREATE TABLE IF NOT EXISTS item (
     comment_count INTEGER,
     comments_got  INTEGER,
     taken_at      REAL,
-    lang          TEXT
+    lang          TEXT,
+
+    -- The asset set (clips + manifest) this video has in the channel, if any.
+    -- `assets_msg_id` is the manifest message, and the manifest is the commit
+    -- point: it exists only once every clip it names has been uploaded. So a
+    -- NULL here means "this video has no asset set", which is the question the
+    -- backfill asks 62 times on a ledger captured before the asset set existed.
+    assets_msg_id INTEGER,
+    assets_clips  INTEGER,
+    assets_at     REAL,
+    assets_note   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS item_state ON item(state, next_try_at, position);
@@ -231,7 +241,11 @@ class Ledger:
         and losing it means re-uploading thousands of files.
         """
         have = {r["name"] for r in self.conn.execute("PRAGMA table_info(item)")}
-        for name, spec in (("revivals", "INTEGER NOT NULL DEFAULT 0"),):
+        for name, spec in (("revivals", "INTEGER NOT NULL DEFAULT 0"),
+                           ("assets_msg_id", "INTEGER"),
+                           ("assets_clips", "INTEGER"),
+                           ("assets_at", "REAL"),
+                           ("assets_note", "TEXT")):
             if name not in have:
                 self.conn.execute(f"ALTER TABLE item ADD COLUMN {name} {spec}")
 
@@ -493,7 +507,7 @@ class Ledger:
         cols = ("msg_id", "record_msg_id", "file_id", "file_size", "sha256",
                 "ext", "duration", "width", "height", "uploader", "title",
                 "views", "likes", "comment_count", "comments_got", "taken_at",
-                "lang")
+                "lang", "assets_msg_id")
         sets = ["state=?", "done_at=?", "last_error=NULL"]
         vals: list = [UPLOADED, time.time()]
         for c in cols:
@@ -503,6 +517,70 @@ class Ledger:
         vals.append(key)
         self.conn.execute(f"UPDATE item SET {', '.join(sets)} WHERE key=?", vals)
         self.conn.commit()
+
+    # ── the asset set ────────────────────────────────────────────────────
+    def mark_assets(self, key: str, manifest_msg_id: int, clips: int = 0,
+                    note: str = "") -> None:
+        """Record that this video's clips and manifest are in the channel.
+
+        Written by the capture loop the moment it publishes an asset set, and by
+        the backfill for the videos that were captured before asset sets existed.
+        A row with `assets_msg_id` set is never offered to the backfill again,
+        which is what makes a run that dies at video 40 resume at 41 rather than
+        re-uploading 40 videos' worth of clips.
+
+        A manifest id of 0 is not recorded. `publish_assets` returns 0 when the
+        manifest upload itself failed, and treating that as done would leave a
+        video whose clips are in the channel but whose index is not — unreachable
+        for Atlas and invisible to the retry.
+        """
+        if not manifest_msg_id:
+            if note:
+                self.conn.execute(
+                    "UPDATE item SET assets_note=? WHERE key=?",
+                    (str(note)[:900], key))
+                self.conn.commit()
+            return
+        self.conn.execute(
+            "UPDATE item SET assets_msg_id=?, assets_clips=?, assets_at=?, "
+            "assets_note=? WHERE key=?",
+            (int(manifest_msg_id), int(clips or 0), time.time(),
+             str(note)[:900] or None, key))
+        self.conn.commit()
+
+    def needs_assets(self, limit: int = 500) -> list:
+        """Uploaded videos with no asset set, oldest first.
+
+        Photos are excluded — there is nothing to segment — and so is any row
+        whose message id is unknown, because the clips have to be threaded under
+        the video's own message and there is nothing to thread them under.
+        Oldest first so the backfill's progress matches the archive's order and
+        an interrupted run is easy to reason about.
+        """
+        rows = self.conn.execute(
+            "SELECT key,url,kind,msg_id,record_msg_id,file_id,file_size,"
+            "       duration,width,height,uploader,title,sha256,ext,taken_at,"
+            "       assets_note "
+            "FROM item WHERE state=? AND COALESCE(assets_msg_id,0)=0 "
+            "  AND COALESCE(msg_id,0)>0 AND COALESCE(ext,'')<>'photo' "
+            "ORDER BY COALESCE(done_at, added_at) ASC LIMIT ?",
+            (UPLOADED, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    def asset_counts(self) -> dict:
+        """How much of the archive is playable the fast way."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS videos, "
+            "  SUM(CASE WHEN COALESCE(assets_msg_id,0)>0 THEN 1 ELSE 0 END) "
+            "    AS with_assets, "
+            "  SUM(COALESCE(assets_clips,0)) AS clips "
+            "FROM item WHERE state=? AND COALESCE(msg_id,0)>0 "
+            "  AND COALESCE(ext,'')<>'photo'", (UPLOADED,)).fetchone()
+        videos = int(row["videos"] or 0)
+        have = int(row["with_assets"] or 0)
+        return {"videos": videos, "with_assets": have,
+                "without_assets": max(videos - have, 0),
+                "clips": int(row["clips"] or 0)}
 
     def mark_failed(self, key: str, error: str, retry_in: float = 900,
                     max_attempts: int = 5):

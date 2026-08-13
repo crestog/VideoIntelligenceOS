@@ -1383,6 +1383,23 @@ if __name__ == "__main__":
         except Exception as e:
             custom_print(f"⚠️ [PROCESS] autostart could not be armed: {e}")
 
+    # The asset sets Atlas plays from. Every video captured before Phase J has a
+    # message in the channel and nothing beside it, so Atlas can only reach those
+    # through a media session and a byte-range seek — which is why a
+    # never-watched reel takes half a minute to start. The backfill cuts the
+    # clips those videos are missing, out of bytes that are already in Telegram.
+    # Armed later than the processing sweep because it begins by restoring the
+    # pinned ledger, and a no-op the moment every video has a manifest.
+    if _CAPTURE_READY:
+        try:
+            from vios.capture.backfill import autostart as _backfill_autostart
+            _backfill_autostart(delay=90.0)
+            custom_print("🎞️ [CAPTURE] asset-set backfill armed — clips for the "
+                         "videos captured before they existed "
+                         "(VIOS_BACKFILL_AUTOSTART=0 to disable)")
+        except Exception as e:
+            custom_print(f"⚠️ [CAPTURE] backfill could not be armed: {e}")
+
     def run_server():
         uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error")
 

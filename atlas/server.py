@@ -424,17 +424,44 @@ def api_log(limit: int = 120):
     return {"lines": recent_log(limit)}
 
 
-@app.post("/api/scan")
-def api_scan(full: bool = True, max_messages: int = 0):
-    """Re-scan the channel. Safe to call repeatedly — imports are merges."""
+def rescan(full: bool = True, max_messages: int = 0) -> bool:
+    """Re-scan the channel in the background. False if one is already running.
+
+    A function rather than only a route because the other planes in this process
+    have reason to call it. The capture plane's asset backfill, in particular,
+    writes a `-manifest.json` per video into the channel, and until Atlas reads
+    those manifests into `parts` it keeps resolving media the slow way — so the
+    thing that just created the fast path is the thing that should say so, rather
+    than the clips waiting for the next session's boot scan to be noticed.
+
+    Imports are merges and bundles already held are skipped without being
+    downloaded, so calling this repeatedly is cheap and safe.
+
+    Refuses before Atlas has booted. `ingest` allows one scan at a time, so a
+    scan started here while Atlas is still unopened would make its own boot scan
+    return "already running" and skip — leaving the site to index whatever this
+    pass happened to import, with none of the per-bundle re-indexing boot does.
+    Nothing is lost by waiting: a boot that has not run yet is a boot that will
+    read these manifests anyway.
+    """
+    if _BOOT["phase"] == "starting":
+        log("rescan asked for before boot — the boot scan will read it instead")
+        return False
+
     def after(conn, result):
         try:
             _index_if_stale(conn, force=True)
         except Exception as e:
             log(f"post-bundle index failed — {e}")
 
-    started = ingest.scan_in_background(full=full, max_messages=max_messages,
-                                        on_bundle=after)
+    return ingest.scan_in_background(full=full, max_messages=max_messages,
+                                     on_bundle=after)
+
+
+@app.post("/api/scan")
+def api_scan(full: bool = True, max_messages: int = 0):
+    """Re-scan the channel. Safe to call repeatedly — imports are merges."""
+    started = rescan(full=full, max_messages=max_messages)
     return {"ok": started,
             "note": "" if started else "a scan is already running"}
 

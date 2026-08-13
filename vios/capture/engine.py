@@ -562,6 +562,15 @@ class CaptureEngine:
                     got = publish_assets(
                         self._tg, result, sent, key, work,
                         ig_slice=self._ig_slice(key))
+                    # The manifest id is the watermark the backfill reads. Without
+                    # this line a freshly captured video looks identical to one
+                    # captured before asset sets existed, so `needs_assets()`
+                    # would hand it to the backfill and every clip would be cut
+                    # and uploaded a second time. Recording it here is what makes
+                    # the two paths converge on the same answer.
+                    led.mark_assets(key, got.get("manifest_msg_id") or 0,
+                                    clips=got.get("clips") or 0,
+                                    note="; ".join(got.get("notes") or [])[:400])
                     if got["clips"] or got["uploaded"]:
                         led.log("assets",
                                 f"{got['clips']} clip(s), "

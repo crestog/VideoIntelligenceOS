@@ -568,6 +568,32 @@ details.step .in{padding:15px 16px 18px}
           <div class="result" id="rLedger"></div>
         </div>
       </div>
+
+      <div class="sec">
+        <h3>Asset sets — what makes Atlas play instantly</h3>
+        <div class="card">
+          <div class="band" style="background:var(--visual)"></div>
+          <p class="hint">Every reel captured from now on gets cut into two-second
+            clips and uploaded under its own message, with a manifest listing
+            them. Atlas plays a clip instead of seeking into a 20 MB file, which
+            is the difference between a second and half a minute. Reels captured
+            before this existed have no clips — this builds them, one video at a
+            time, without touching Instagram: the bytes come back out of the
+            channel. It is safe to leave running and safe to stop; the ledger
+            remembers exactly which videos are done. A session arms this by
+            itself about a minute after boot, so the button is there for a
+            second pass rather than for the first one.</p>
+          <div class="stats" id="bfStats" style="margin-bottom:12px">
+            <div class="stat"><div class="n">—</div><div class="k">loading</div></div>
+          </div>
+          <div class="btns">
+            <button class="btn primary" id="bBackfill">Build the missing asset sets</button>
+            <button class="btn danger" id="bBackfillStop">Stop after this video</button>
+          </div>
+          <div class="result" id="rBackfill"></div>
+          <div class="log" id="bfLog" style="margin-top:12px;max-height:190px" hidden></div>
+        </div>
+      </div>
     </section>
 
     <!-- ══ QUEUE ═════════════════════════════════════════════════════ -->
@@ -915,6 +941,7 @@ function goto(page){
   ['run','setup','queue','help'].forEach(p => $('#p-' + p).hidden = (p !== page));
   window.scrollTo(0, 0);
   if(page === 'queue') loadQueue();
+  if(page === 'setup') loadBackfill();
 }
 $('#nav').addEventListener('click', e => {
   const b = e.target.closest('button'); if(b) goto(b.dataset.p);
@@ -1303,6 +1330,85 @@ $('#qState').onchange = () => { qOffset = 0; loadQueue(); };
 $('#bPrev').onclick = () => { qOffset = Math.max(0, qOffset - 50); loadQueue(); };
 $('#bNext').onclick = () => { qOffset += 50; loadQueue(); };
 
+/* ── asset sets ───────────────────────────────────────────────────── */
+/* A backfill runs for the better part of an hour, so this card is the only
+   window into it. It polls on its own slow cadence rather than joining the
+   status tick: the number it shows changes once every few seconds at most, and
+   every route here is a sync `def` sharing one thread pool. */
+let bfRunning = false;
+async function loadBackfill(){
+  // Nothing to show while the setup page is hidden, and the poll is not worth a
+  // thread — except while a run is in flight, where the operator may well be
+  // watching the run page and expects the numbers to keep moving.
+  if($('#p-setup').hidden && !bfRunning) return;
+  let j;
+  try { j = await (await fetch('/api/capture/backfill')).json(); }
+  catch(e){ return false; }
+  if(j.ok === false) return false;
+  bfRunning = (j.state === 'running' || j.state === 'stopping');
+
+  const c = j.counts || {};
+  $('#bfStats').innerHTML = c.error
+    ? `<div class="stat"><div class="n">—</div><div class="k">${esc(c.error).slice(0, 60)}</div></div>`
+    : [[c.with_assets, 'have clips'], [c.without_assets, 'still to build'],
+       [c.clips, 'clips in the channel'], [c.videos, 'videos captured']]
+      .map(([n, k]) => `<div class="stat"><div class="n">${num(n)}</div>`
+        + `<div class="k">${k}</div></div>`).join('');
+
+  $('#bBackfill').disabled = bfRunning;
+  $('#bBackfillStop').disabled = !bfRunning;
+
+  const cur = j.current || {};
+  if(bfRunning){
+    say('#rBackfill', (cur.key
+      ? `${cur.key} — ${cur.phase || 'working'} (${cur.n} of ${cur.of})`
+      : j.message || 'working…')
+      + `\n${num(j.done)} built · ${num(j.clips)} clips uploaded`
+      + (j.failed ? ` · ${num(j.failed)} failed` : '')
+      + (j.skipped ? ` · ${num(j.skipped)} had no reachable bytes` : ''),
+      'busy');
+  }else if(j.state === 'error'){
+    say('#rBackfill', j.error || j.message, 'no');
+  }else if(j.started_at){
+    say('#rBackfill', j.message, 'ok');
+  }else{
+    // Nothing has run yet this session. The session arms a backfill by itself,
+    // so say what that armed run is waiting for rather than leaving the card
+    // looking like it needs a click it does not need.
+    const a = j.autostart || {};
+    if(a.state && a.state !== 'off')
+      say('#rBackfill', `Armed automatically — ${a.state}`
+        + (a.message ? `: ${a.message}` : '.'), 'busy');
+    else if(a.message)
+      say('#rBackfill', a.message, '');
+  }
+
+  const notes = j.notes || [];
+  const box = $('#bfLog');
+  box.hidden = !notes.length;
+  if(notes.length){
+    box.innerHTML = notes.slice().reverse().map(n =>
+      `<div class="ln"><span class="t">`
+      + `${new Date((n.at || 0) * 1000).toTimeString().slice(0, 8)}</span>`
+      + `<span class="k">${esc((n.key || '·').slice(0, 12))}</span>`
+      + `<span class="m">${esc(n.text)}</span></div>`).join('');
+  }
+}
+
+$('#bBackfill').onclick = async () => {
+  say('#rBackfill', 'Starting…', 'busy');
+  const j = await post('/api/capture/backfill/start');
+  if(!j.ok){ say('#rBackfill', j.error || j.message, 'no'); return; }
+  bfRunning = true;
+  toast('Building asset sets — leave this running', 'ok');
+  loadBackfill();
+};
+$('#bBackfillStop').onclick = async () => {
+  say('#rBackfill', 'Stopping after the current video…', 'busy');
+  await post('/api/capture/backfill/stop');
+  loadBackfill();
+};
+
 /* ── polling that waits for its own answer ─────────────────────────
    `setInterval(tick, 2000)` fires whether or not the last answer arrived.
    Every route here is a sync `def` sharing one worker-thread pool with the
@@ -1332,6 +1438,7 @@ function loop(name, fn, ms){
 tick(); loadLog();
 loop('status', tick, 2000);
 loop('activity', loadLog, 6000);
+loop('assets', loadBackfill, 5000);
 </script>
 <script src="/sitemap.js" defer></script>
 </body>

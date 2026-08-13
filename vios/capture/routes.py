@@ -391,3 +391,53 @@ def export():
                      'attachment; filename="vios_capture_ledger.json"'})
     except Exception as exc:
         return _err(exc, 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Asset sets for the videos that were captured before they existed
+# ═══════════════════════════════════════════════════════════════════════
+# Deliberately outside `_run_task`. A backfill runs for the better part of an
+# hour, and the single task slot exists so a scan and an import cannot interleave
+# their writes to the same rows — a rule that does not apply here, because a
+# backfill only ever UPDATEs the four asset columns of a row that is already
+# `uploaded`. Putting it in the slot would mean an operator could not scan the
+# channel or paste a link for the whole hour, which is the wrong trade.
+@capture_router.post("/api/capture/backfill/start")
+def backfill_start(limit: str = Form("")):
+    try:
+        from .backfill import get_backfill
+        try:
+            n = int(str(limit).strip())
+        except (TypeError, ValueError):
+            n = 0
+        res = get_backfill().start(get_engine(), limit=max(n, 0))
+        return JSONResponse(res, status_code=200 if res["ok"] else 400)
+    except Exception as exc:
+        return _err(exc, 500)
+
+
+@capture_router.post("/api/capture/backfill/stop")
+def backfill_stop():
+    try:
+        from .backfill import get_backfill
+        return JSONResponse(get_backfill().stop())
+    except Exception as exc:
+        return _err(exc, 500)
+
+
+@capture_router.get("/api/capture/backfill")
+def backfill_status():
+    """State plus the archive-wide count, so the card can be read on its own."""
+    try:
+        from .backfill import autostart_state, get_backfill
+        out = get_backfill().status()
+        out["autostart"] = autostart_state()
+        try:
+            out["counts"] = get_engine().ledger.asset_counts()
+        except Exception as exc:
+            # The state of the worker is worth reporting even when the ledger
+            # cannot be counted; collapsing the two would blank the whole card.
+            out["counts"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return _ok(**out)
+    except Exception as exc:
+        return _err(exc, 500)
