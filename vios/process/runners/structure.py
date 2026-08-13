@@ -272,6 +272,7 @@ def keyframes(job: Job) -> Emission:
     os.makedirs(outdir, exist_ok=True)
 
     index, em = [], Emission()
+    unreadable = 0
     for n, s in enumerate(rows):
         if n % 20 == 0:
             job.heartbeat(f"shot {n}/{len(rows)}")
@@ -281,9 +282,26 @@ def keyframes(job: Job) -> Emission:
                  else [float(s["t0"]) + span * 0.5])
         cands = media.frames_at(job.media, times, outdir, width=640,
                                 prefix=f"s{int(s['idx']):04d}_")
-        if not cands:
+        # Sharpness is measured by reading the file, so a candidate that scores
+        # zero either is a black frame or was never written. Both are unusable
+        # as the shot's representative, and a shot whose every candidate scores
+        # zero must not appear in the index at all: `index.json` is the contract
+        # every keyframe consumer trusts without checking, and a row pointing at
+        # a file that does not exist is what put
+        # `imread_('.../frames/s0010_0003.jpg'): can't open/read file` in the log
+        # and then averaged an empty list into a NaN claim.
+        scored = [(c, _sharpness(c["path"])) for c in cands]
+        usable = [(c, sc) for c, sc in scored if sc > 0.0]
+        if not usable:
+            unreadable += 1
+            for c in cands:
+                if os.path.exists(c["path"]):
+                    try:
+                        os.remove(c["path"])
+                    except OSError:
+                        pass
             continue
-        best = max(cands, key=lambda c: _sharpness(c["path"]))
+        best = max(usable, key=lambda pair: pair[1])[0]
         final = os.path.join(outdir, f"shot{int(s['idx']):04d}.jpg")
         try:
             if os.path.exists(final):
@@ -302,13 +320,17 @@ def keyframes(job: Job) -> Emission:
 
     if not index:
         raise SkipPass("could not extract a frame from any shot")
+    if unreadable:
+        job.note(f"{unreadable} of {len(rows)} shots yielded no readable frame "
+                 f"and were left out of the index")
 
     with open(os.path.join(outdir, "index.json"), "w", encoding="utf-8") as fh:
         json.dump(index, fh)
     job._frames = index
 
     em.artifact("frames", outdir, {"count": len(index)})
-    em.notes = {"frames": len(index), "shots": len(rows)}
+    em.notes = {"frames": len(index), "shots": len(rows),
+                "shots_without_a_frame": unreadable}
     return em
 
 

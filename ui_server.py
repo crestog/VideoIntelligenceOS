@@ -1060,7 +1060,15 @@ async def omni_root_redirect():
     return RedirectResponse(url="/omni/")   # trailing slash → relative URLs resolve
 
 
-@app.api_route("/omni/{path:path}", methods=["GET", "POST"])
+# One route per method, not one route with two methods. FastAPI computes a
+# route's `unique_id` once — `name + path + list(methods)[0]` — and then emits it
+# for *every* method that route serves, so a single `api_route(methods=["GET",
+# "POST"])` produces the same operation id twice and openapi() warns `Duplicate
+# Operation ID omni_proxy_omni__path__post` on every schema build. Registering
+# the two verbs separately gives each its own id, and the proxy body stays one
+# function.
+@app.get("/omni/{path:path}")
+@app.post("/omni/{path:path}")
 async def omni_proxy(request: Request, path: str = ""):
     if not OMNI_ENABLED:
         return await omni_root_redirect()

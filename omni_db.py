@@ -77,6 +77,34 @@ def stable_id64(s: str) -> int:
 # ═══════════════════════════════════════════════════════════
 # SERVICE MANAGEMENT (idempotent — safe to call on every engine boot)
 # ═══════════════════════════════════════════════════════════
+def _pg_socket_dirs():
+    """Directories that actually hold a Postgres unix socket, best first.
+
+    The Debian package puts it in `/var/run/postgresql`, which is why that path
+    was hard-coded here — but `/run/postgresql` is the same directory on a
+    systemd image only when the compat symlink exists, a source build defaults
+    to `/tmp`, and a cluster started with an explicit
+    `unix_socket_directories` can be anywhere. Naming one path meant that on an
+    image which chose another, the socket transport silently did not exist and
+    the whole layer's fate rested on TCP and a password — which is the other
+    half of this fault. Look for the socket instead of assuming where it is.
+    """
+    import glob
+    found, seen = [], set()
+    for base in (os.environ.get("PGHOST") or "", "/var/run/postgresql",
+                 "/run/postgresql", "/tmp", "/var/run/postgres"):
+        # PGHOST may name a TCP host rather than a directory; only a path can
+        # hold a socket.
+        if not base.startswith("/") or base in seen:
+            continue
+        seen.add(base)
+        if glob.glob(os.path.join(base, ".s.PGSQL.*")):
+            found.append(base)
+    # Nothing listening yet — the caller may be racing a starting cluster, so
+    # still offer the packaged default rather than no socket transport at all.
+    return found or ["/var/run/postgresql"]
+
+
 def _psql(sql: str, timeout=30):
     """Run one statement as the Postgres superuser, whatever this box allows.
 
@@ -88,11 +116,12 @@ def _psql(sql: str, timeout=30):
     role reads exactly like a dead server: "unreachable".
     """
     quoted = sql.replace("'", "'\\''")
-    for cmd in (["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=0",
-                 "-c", sql],
-                ["su", "postgres", "-c", f"psql -c '{quoted}'"],
-                ["psql", "-U", "postgres", "-h", "/var/run/postgresql",
-                 "-c", sql]):
+    cmds = [["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=0",
+             "-c", sql],
+            ["su", "postgres", "-c", f"psql -c '{quoted}'"]]
+    cmds += [["psql", "-U", "postgres", "-h", d, "-c", sql]
+             for d in _pg_socket_dirs()]
+    for cmd in cmds:
         rc, out = _run(cmd, timeout=timeout)
         if rc == -1:
             continue                      # this transport does not exist here
@@ -160,6 +189,16 @@ def _start_postgres():
 
     # Idempotent role/db creation. "already exists" is the expected answer on
     # every run after the first, so its exit code is not a failure.
+    #
+    # But "already exists" is not the end of it. A cluster that survived from an
+    # earlier session — a restored data directory, a second boot inside the same
+    # container — already has the role, with whatever password it was created
+    # with. CREATE fails, the failure is swallowed as expected, and every TCP
+    # connection for the rest of the session answers `FATAL: password
+    # authentication failed for user "omni"` while the log says the layer came
+    # up fine. The password we are going to authenticate with is the one we must
+    # set, so set it unconditionally: ALTER is idempotent, cheap, and the only
+    # statement here whose success means the connection will work.
     rc, out = _psql(f"CREATE USER {OMNI_PG_USER} WITH PASSWORD "
                     f"'{OMNI_PG_PASSWORD}' SUPERUSER;")
     if rc == -1:
@@ -167,6 +206,13 @@ def _start_postgres():
                           "omni role cannot be created")
     elif rc != 0 and "already exists" not in out:
         _diag("postgres", f"could not create the {OMNI_PG_USER} role: {out[:200]}")
+
+    rc, out = _psql(f"ALTER USER {OMNI_PG_USER} WITH PASSWORD "
+                    f"'{OMNI_PG_PASSWORD}' SUPERUSER;")
+    if rc not in (0, -1):
+        _diag("postgres", f"the {OMNI_PG_USER} role exists but its password "
+                          f"could not be reconciled, so TCP connections will "
+                          f"fail authentication: {out[:200]}")
 
     rc, out = _psql(f"CREATE DATABASE {OMNI_PG_DB} OWNER {OMNI_PG_USER};")
     if rc not in (0, -1) and "already exists" not in out:
@@ -382,7 +428,11 @@ def ensure_services():
         "SUCCESS" if AVAILABLE["postgres"] else "WARN")
     if not AVAILABLE["postgres"]:
         if last_pg:
-            _diag("postgres", f"last connection error: {str(last_pg)[:200]}")
+            # Not truncated to a couple of lines: `get_pg_conn` now reports what
+            # every transport answered, and which of them failed how is the
+            # whole diagnosis. "password authentication failed" and "no such
+            # file or directory" call for opposite fixes.
+            _diag("postgres", f"last connection error: {str(last_pg)[:600]}")
         log("   └─ VIOS continues without it: narratives and frame rows are "
             "skipped, vectors still index, and the Explorer table will look "
             "empty. Everything else is unaffected.", "WARN")
@@ -448,7 +498,8 @@ def service_report() -> dict:
         "available": dict(AVAILABLE),
         "diagnostics": {k: list(v) for k, v in DIAGNOSTICS.items()},
         "postgres": {"database": OMNI_PG_DB, "user": OMNI_PG_USER,
-                     "host": OMNI_PG_HOST},
+                     "host": OMNI_PG_HOST, "sockets": _pg_socket_dirs(),
+                     "cluster": "/".join(_pg_cluster_state() or ()) or "none"},
         "neo4j": {"home": NEO4J_HOME, "bolt": NEO4J_BOLT,
                   "installed": os.path.exists(
                       os.path.join(NEO4J_HOME, "bin", "neo4j")),
@@ -468,18 +519,28 @@ def get_pg_conn():
     never set a password for the role rejects them while the socket — peer or
     trust — lets the same role straight in. Falling back means one less thing
     that has to be configured correctly for the layer to come up.
+
+    The exception raised on total failure carries every attempt, not just the
+    last one. Before, the last rung was TCP, so a session whose role password
+    was stale reported `password authentication failed` and nothing about the
+    socket having been tried at all — and the operator had no way to tell a
+    dead cluster from a wrong password from a socket in an unexpected place.
     """
     import psycopg2
-    last = None
-    for kw in ({"host": OMNI_PG_HOST, "password": OMNI_PG_PASSWORD},
-               {"host": "/var/run/postgresql"},
-               {"host": "127.0.0.1", "password": OMNI_PG_PASSWORD}):
+    attempts, tried = [], []
+    for kw in ([{"host": OMNI_PG_HOST, "password": OMNI_PG_PASSWORD}]
+               + [{"host": d} for d in _pg_socket_dirs()]
+               + [{"host": "127.0.0.1", "password": OMNI_PG_PASSWORD}]):
         try:
             return psycopg2.connect(dbname=OMNI_PG_DB, user=OMNI_PG_USER,
                                     connect_timeout=10, **kw)
         except Exception as e:
-            last = e
-    raise last
+            tried.append(kw["host"])
+            attempts.append(f"{kw['host']}: "
+                            f"{str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
+    raise RuntimeError(
+        f"no route to Postgres as {OMNI_PG_USER}@{OMNI_PG_DB} — tried "
+        f"{len(tried)}: " + " | ".join(attempts))
 
 
 # ── Graceful degradation: no-op stand-ins used when Postgres is unavailable ──

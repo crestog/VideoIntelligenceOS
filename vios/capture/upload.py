@@ -203,23 +203,38 @@ class Telegram:
                     last = UploadError(f"{method}: rate limited")
                     continue
 
+                body = None
                 try:
                     body = r.json()
                 except Exception:
-                    raise UploadError(
-                        f"{method}: HTTP {r.status_code}, non-JSON reply")
+                    # Telegram's edge answers a gateway failure with an HTML
+                    # error page, not JSON. Raising here put the error inside
+                    # the try, where `except UploadError: raise` sent it
+                    # straight out of the retry ladder — so
+                    # `Shard f23747a8-0007 not uploaded: sendDocument: Bad
+                    # Gateway` got zero retries for the one class of failure
+                    # the ladder exists to absorb. A 5xx is the server's
+                    # problem and worth trying again; a 4xx that cannot even
+                    # produce JSON is ours and is not.
+                    if r.status_code < 500:
+                        raise UploadError(
+                            f"{method}: HTTP {r.status_code}, non-JSON reply")
+                    last = UploadError(
+                        f"{method}: HTTP {r.status_code} "
+                        f"({r.reason_phrase or 'server error'}), non-JSON reply")
 
-                if body.get("ok"):
-                    return body.get("result", {})
+                if body is not None:
+                    if body.get("ok"):
+                        return body.get("result", {})
 
-                desc = body.get("description", "no description")
-                if r.status_code >= 500:
-                    last = UploadError(f"{method}: {desc}")
-                else:
-                    # 4xx is us being wrong — a missing admin right, a bad
-                    # channel id, a malformed caption. Retrying cannot fix it
-                    # and the description is the actionable part.
-                    raise UploadError(f"{method}: {desc}")
+                    desc = body.get("description", "no description")
+                    if r.status_code >= 500:
+                        last = UploadError(f"{method}: {desc}")
+                    else:
+                        # 4xx is us being wrong — a missing admin right, a bad
+                        # channel id, a malformed caption. Retrying cannot fix it
+                        # and the description is the actionable part.
+                        raise UploadError(f"{method}: {desc}")
             except UploadError:
                 raise
             except (httpx.HTTPError, OSError) as e:

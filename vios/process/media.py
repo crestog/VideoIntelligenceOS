@@ -287,6 +287,13 @@ def frames_at(src: str, times, outdir: str, width: int = 640,
     index rather than decoding from zero. On a 60-second reel that is the
     difference between 40 ms and 3 s per frame, and the keyframes pass asks for
     a hundred of them.
+
+    A zero exit code is not proof of a file. `-ss` past the last decodable frame
+    of a container whose declared duration is optimistic makes ffmpeg exit 0
+    having written nothing, and the caller then holds a path to a file that does
+    not exist — which is how `imread_('.../frames/s0010_0003.jpg'): can't
+    open/read file` reached the log from a workdir nothing had evicted. Existence
+    and a non-trivial size are what count as extracted.
     """
     os.makedirs(outdir, exist_ok=True)
     out = []
@@ -297,11 +304,17 @@ def frames_at(src: str, times, outdir: str, width: int = 640,
                   "-i", src, "-frames:v", "1",
                   "-vf", f"scale={int(width)}:-2", "-q:v", "3", dst],
                  timeout=120)
-            out.append({"index": i, "t": round(float(t), 3), "path": dst})
         except MediaError:
             # A seek past the end of a file whose declared duration was
             # optimistic. One missing frame is not a failed pass.
             continue
+        try:
+            if os.path.getsize(dst) < 512:      # a JPEG header and nothing else
+                os.remove(dst)
+                continue
+        except OSError:
+            continue                            # ffmpeg said fine, wrote nothing
+        out.append({"index": i, "t": round(float(t), 3), "path": dst})
     return out
 
 

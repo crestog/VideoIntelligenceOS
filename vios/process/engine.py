@@ -1330,9 +1330,9 @@ class ProcessEngine:
             if gone:
                 self._rebuild(job, "artifacts",
                               f"{', '.join(gone)} evicted or made elsewhere")
-        if "keyframes" in needs and not os.path.exists(
-                job.path("frames/index.json")):
-            self._rebuild(job, "keyframes", "frame index absent")
+        if "keyframes" in needs and not self._keyframes_present(job):
+            self._rebuild(job, "keyframes",
+                          "shot frames evicted or made elsewhere")
 
         # The complete frame set is the expensive one, and the one every
         # perception pass now depends on. Without this branch a cohort that
@@ -1348,6 +1348,36 @@ class ProcessEngine:
         if "allframes" in needs and not self._allframes_present(job, comp):
             self._rebuild(job, "allframes",
                           "complete frame set evicted or made elsewhere")
+
+    @staticmethod
+    def _keyframes_present(job: Job) -> bool:
+        """Is the shot-frame set on disk, or only the index that names it?
+
+        `frames/index.json` is a few hundred bytes and the JPEGs beside it are
+        tens of megabytes, so an eviction — or a partial arrival from another
+        worker — can leave the index describing frames that are gone. Every
+        keyframe consumer reads the index and hands the paths straight to
+        `cv2.imread`, which answers `None` and logs
+        `imread_('.../frames/s0010_0003.jpg'): can't open/read file` once per
+        frame before the pass averages an empty list. Checking the first and
+        last frame the index names costs two `os.path.exists` calls; the same
+        spot check `allframes` already gets.
+        """
+        ipath = job.path("frames/index.json")
+        if not os.path.exists(ipath):
+            return False
+        try:
+            with open(ipath, "r", encoding="utf-8") as fh:
+                index = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(index, list) or not index:
+            return False
+        for probe in (index[0], index[-1]):
+            path = str((probe or {}).get("path") or "")
+            if not path or not os.path.exists(path):
+                return False
+        return True
 
     @staticmethod
     def _allframes_present(job: Job, comp) -> bool:

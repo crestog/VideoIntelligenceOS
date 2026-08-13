@@ -377,6 +377,27 @@ def audio_tag(job: Job) -> Emission:
 
     batch_size = max(1, int(job.params.get("batch", 16)))
     floor = float(job.params.get("min_similarity", 0.05))
+
+    # `audios=` is deprecated and warns once per call — which on a 60-second reel
+    # at a 0.48 s hop is 125 identical FutureWarnings per video, drowning the log
+    # the real errors have to be legible in. `audio=` is the current name, but
+    # the older ClapProcessor a pinned image may ship only knows `audios=`, so
+    # settle which one this build accepts on the first batch and use it for the
+    # rest of the pass.
+    audio_kw = "audio"
+
+    def encode(chunks):
+        nonlocal audio_kw
+        try:
+            return proc(**{audio_kw: chunks}, sampling_rate=rate,
+                        return_tensors="pt", padding=True)
+        except TypeError:
+            if audio_kw != "audio":
+                raise
+            audio_kw = "audios"
+            return proc(audios=chunks, sampling_rate=rate,
+                        return_tensors="pt", padding=True)
+
     em = Emission()
     idxs: list = []                       # window index per scored window
     times: list = []                      # (t0, t1) per scored window
@@ -397,8 +418,7 @@ def audio_tag(job: Job) -> Emission:
         if not chunks:
             continue
         with torch.no_grad():
-            audio_in = proc(audios=chunks, sampling_rate=rate,
-                            return_tensors="pt", padding=True)
+            audio_in = encode(chunks)
             if device == "cuda":
                 audio_in = {k: v.to("cuda") for k, v in audio_in.items()}
             avec = model.get_audio_features(**audio_in)
