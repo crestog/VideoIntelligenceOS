@@ -950,6 +950,26 @@ if _ATLAS_READY:
             await self.app(scope, receive, send)
 
     app.add_middleware(_AtlasLazyBoot)
+
+    # `/atlas` — the URL every nav link uses — matches no route: Starlette's
+    # Mount compiles to `^/atlas/(?P<path>.*)$`, so the bare path only ever
+    # arrived as a 307 to `/atlas/` from `redirect_slashes`. That redirect is one
+    # extra round trip through the tunnel for the first thing the operator
+    # clicks, and its Location is built from the scheme uvicorn believes it is
+    # serving — correct only while the proxy headers are trusted, and an https
+    # page redirected to http is a dead link with no error anywhere near the
+    # cause. Answering the bare path directly removes both. It is `async` and
+    # returns a cached string, so it cannot queue behind a drained thread pool
+    # either, which is the state the tab is most often opened in.
+    @app.get("/atlas", response_class=HTMLResponse)
+    async def _atlas_page():
+        try:
+            return HTMLResponse(_atlas_server.page_html("/atlas"),
+                                headers={"Cache-Control": "no-cache"})
+        except Exception as exc:
+            return HTMLResponse(
+                f"<h1>Atlas</h1><p>The interface files could not be read:</p>"
+                f"<pre>{type(exc).__name__}: {exc}</pre>", status_code=500)
 else:
     @app.get("/atlas", response_class=HTMLResponse)
     def _atlas_missing():                          # pragma: no cover

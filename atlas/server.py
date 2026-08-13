@@ -270,6 +270,18 @@ def start_boot() -> None:
     threading.Thread(target=_boot, name="atlas-boot", daemon=True).start()
 
 
+def boot_phase() -> str:
+    """`starting` until something opens Atlas, then scanning → indexing → ready.
+
+    Public because the other planes in this process have to know whether Atlas is
+    mid-boot. Its boot is the slowest thing here and the only one the operator is
+    watching, so work that competes with it for the channel — the asset backfill
+    — waits for `ready` rather than racing it.
+    """
+    with _BOOT_LOCK:
+        return str(_BOOT.get("phase") or "")
+
+
 # ── the page ──────────────────────────────────────────────────────────────
 # The interface is three files, and they are the three files that must never
 # fail to arrive: a page that cannot fetch its own script is indistinguishable
@@ -319,6 +331,24 @@ def _asset_response(request: Request, name: str, media_type: str):
     return Response(raw, media_type=media_type, headers=headers)
 
 
+def page_html(root: str = "") -> str:
+    """The interface, told where it is mounted. Raises OSError if it is missing.
+
+    A function rather than only a route body because the parent server serves
+    `/atlas` itself — see the note on `home` — and both paths must hand the
+    browser byte-identical HTML, or the tab that answers without a redirect and
+    the tab that answers after one behave differently for no reason a reader
+    could find.
+    """
+    raw, _ = _web_asset("index.html")
+    html = raw.decode("utf-8")
+    root = str(root or "").rstrip("/")
+    html = html.replace('href="atlas.css"', f'href="{root}/atlas.css"')
+    html = html.replace('src="atlas.js"', f'src="{root}/atlas.js"')
+    return html.replace(
+        "<head>", f'<head>\n<meta name="atlas-base" content="{root}">', 1)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     """The page, told where it is mounted.
@@ -334,16 +364,10 @@ async def home(request: Request):
     the asset refs are made absolute for the same reason.
     """
     try:
-        raw, _ = _web_asset("index.html")
-        html = raw.decode("utf-8")
+        html = page_html(request.scope.get("root_path") or "")
     except OSError as e:
         return HTMLResponse(f"<h1>Atlas</h1><p>Interface missing: {e}</p>",
                             status_code=500)
-    root = str(request.scope.get("root_path") or "").rstrip("/")
-    html = html.replace('href="atlas.css"', f'href="{root}/atlas.css"')
-    html = html.replace('src="atlas.js"', f'src="{root}/atlas.js"')
-    html = html.replace(
-        "<head>", f'<head>\n<meta name="atlas-base" content="{root}">', 1)
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
@@ -444,7 +468,7 @@ def rescan(full: bool = True, max_messages: int = 0) -> bool:
     Nothing is lost by waiting: a boot that has not run yet is a boot that will
     read these manifests anyway.
     """
-    if _BOOT["phase"] == "starting":
+    if boot_phase() == "starting":
         log("rescan asked for before boot — the boot scan will read it instead")
         return False
 

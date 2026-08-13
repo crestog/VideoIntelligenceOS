@@ -425,6 +425,45 @@ def get_backfill() -> Backfill:
 # an empty list and the thread exits without sending a single message.
 _AUTO = {"state": "off", "message": "", "at": 0.0, "armed": False}
 
+ATLAS_WAIT = float(os.environ.get("VIOS_BACKFILL_ATLAS_WAIT", "900"))
+
+
+def _wait_for_atlas() -> None:
+    """Hold until Atlas has finished booting, if it is booting at all.
+
+    Atlas's boot reads the whole channel and imports every database bundle it
+    finds, and it is the slowest thing in a session as well as the only one the
+    operator is sitting in front of. A backfill starting underneath it competes
+    for the same Bot API — the same rate limit, on the same chat — so the work
+    whose entire purpose is to make Atlas fast would first make Atlas slow to
+    open, which is exactly backwards.
+
+    Three states, three answers. `starting` means nobody has opened Atlas, so
+    there is nothing to wait for and waiting would postpone the backfill for the
+    whole session. `ready` or `error` means the boot is over. Anything between is
+    a boot in progress: wait, but on a clock, because a scan that never finishes
+    must not silently cost the archive its clips.
+    """
+    try:
+        from atlas.server import boot_phase  # noqa: PLC0415
+    except Exception:
+        return                              # no Atlas here; nothing to yield to
+    try:
+        if boot_phase() in ("starting", "ready", "error", ""):
+            return
+        _AUTO.update({"state": "waiting", "message": (
+            "Atlas is reading the channel — starting once it is ready, so the "
+            "two are not competing for the same rate limit")})
+        end = time.time() + max(0.0, ATLAS_WAIT)
+        while time.time() < end:
+            time.sleep(2.0)
+            if boot_phase() in ("ready", "error", ""):
+                return
+        _AUTO.update({"message": f"Atlas still booting after "
+                                 f"{int(ATLAS_WAIT)}s — starting anyway"})
+    except Exception:
+        return
+
 
 def autostart_state() -> dict:
     return dict(_AUTO)
@@ -483,6 +522,7 @@ def autostart(delay: float = 0.0) -> dict:
                     f"asset set — {counts['clips']} clip(s) in the channel")})
                 return
 
+            _wait_for_atlas()
             res = get_backfill().start(eng)
             _AUTO.update({"state": "running" if res.get("ok") else "off",
                           "message": (f"{counts['without_assets']} video(s) "
