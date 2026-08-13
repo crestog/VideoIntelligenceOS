@@ -20,6 +20,13 @@
 
 'use strict';
 
+// Proof of life for the watchdog in index.html. A classic script that fails to
+// compile executes nothing at all — not even its own error handler — so the
+// page cannot report the one failure that silences it. This flag is the page's
+// evidence that the file was parsed *and* reached its first statement; the
+// watchdog paints an interface fault if it is still missing a few seconds in.
+window.__atlasLive = true;
+
 /* ── small helpers ─────────────────────────────────────────────────────── */
 const $  = (id) => document.getElementById(id);
 const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
@@ -2523,12 +2530,9 @@ function gtick() {
   if (G.alpha < GRAPH_TICK.floor) G.alpha = 0;
 }
 
-const REDUCED = window.matchMedia &&
-  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
 function gheat(to) {
   if (G.frozen) { gdraw(); return; }
-  if (REDUCED) {
+  if (REDUCED()) {
     // No animation wanted. Dragging still has to feel direct, so a drag just
     // repaints; anything else settles the layout in one go and shows the
     // finished arrangement rather than the journey to it.
@@ -5566,6 +5570,26 @@ function paintPulse(st) {
    WIRING
    ════════════════════════════════════════════════════════════════════════ */
 function wire() {
+  /* ── navigation, first and on its own ──
+   * The tabs, the brand and the doors need no server and no panel, so nothing
+   * further down this function should be able to take them with it. They used to
+   * be wired after the finder and the keydown handlers; a throw up there left a
+   * page that looked alive and answered no clicks, which is indistinguishable
+   * from a page whose script never ran at all. */
+  part('navigation', () => {
+    $$('.tabs button').forEach(b =>
+      b.addEventListener('click', () => showTab(b.dataset.tab)));
+    // Every "go here" button on the page, in one place: the doors, and the link
+    // out to the library.
+    $$('[data-goto]').forEach(b =>
+      b.addEventListener('click', () => showTab(b.dataset.goto)));
+    const brand = document.querySelector('.brand');
+    if (brand) brand.addEventListener('click', (ev) => {
+      ev.preventDefault(); showTab('home');
+    });
+    if ($('pulse')) $('pulse').addEventListener('click', () => showTab('sources'));
+  });
+
   $('finder').addEventListener('submit', (ev) => {
     ev.preventDefault();
     closeSuggest();
@@ -5611,13 +5635,6 @@ function wire() {
     if (ev.key === 'Escape' && S.video && document.activeElement !== $('q')) closePlayer();
   });
 
-  $$('.tabs button').forEach(b =>
-    b.addEventListener('click', () => showTab(b.dataset.tab)));
-  document.querySelector('.brand').addEventListener('click', (ev) => {
-    ev.preventDefault(); showTab('home');
-  });
-  $('pulse').addEventListener('click', () => showTab('sources'));
-
   /* ── the landing page ──
    * Its search field is the top bar's, at the size the page is about; handing
    * the query to the same code path means the two can never disagree about what
@@ -5630,10 +5647,6 @@ function wire() {
     showTab('search');
     runSearch(q);
   });
-  // Every "go here" button on the page, in one place: the doors, and the link
-  // out to the library.
-  $$('[data-goto]').forEach(b =>
-    b.addEventListener('click', () => showTab(b.dataset.goto)));
 
   $('moreBtn').addEventListener('click', () => runSearch(S.query, { append: true }));
 

@@ -291,9 +291,10 @@ def seed_channel():
         return _err("Save the bot token and channel id first.")
 
     def _job(say):
-        from .seed import seed_from_channel
-        return seed_from_channel(
-            eng.ledger, eng.telegram, eng.telegram.api_id, eng.telegram.api_hash,
+        # The engine owns this now, so the route, the capture loop and the asset
+        # backfill all seed the same way — one place that knows the credentials
+        # and what to do when the scan fails.
+        return eng.seed_ledger(
             on_progress=lambda at, head, n:
                 say(f"Scanning message {at:,} of {head:,} — {n} reels found"))
 

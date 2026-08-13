@@ -1408,8 +1408,8 @@ if __name__ == "__main__":
     # through a media session and a byte-range seek — which is why a
     # never-watched reel takes half a minute to start. The backfill cuts the
     # clips those videos are missing, out of bytes that are already in Telegram.
-    # Armed later than the processing sweep because it begins by restoring the
-    # pinned ledger, and a no-op the moment every video has a manifest.
+    # Armed later than the processing sweep because it begins by reading the
+    # channel, and a no-op the moment every video has a manifest.
     if _CAPTURE_READY:
         try:
             from vios.capture.backfill import autostart as _backfill_autostart

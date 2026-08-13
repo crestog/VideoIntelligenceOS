@@ -126,7 +126,7 @@ def _boot() -> None:
         held = 0
     if held:
         log(f"resuming with {held} passage(s) already indexed")
-        search.reload_vectors()
+        search.reload_vectors(expect=ingest.meta_get(conn, "index_build_id", ""))
         _boot_set(phase="ready", detail=f"{held} passage(s) from a previous run",
                   ready_at=time.time())
 
@@ -148,8 +148,17 @@ def _boot() -> None:
         def after_bundle(bundle_conn, result):
             # Re-index after each bundle rather than only at the end, so the
             # first bundle is searchable while the rest are still downloading.
+            #
+            # Only when the import actually carried rows, though. A forced
+            # rebuild is a DELETE of every moment, a full re-INSERT, an FTS5
+            # rebuild, a graph derivation and a dense re-embed of every passage;
+            # doing that for a shard whose tables were all already held is
+            # minutes of work that cannot change a single row. `force=False`
+            # still rebuilds when the schema fingerprint moved, so a bundle
+            # carrying a new column is picked up either way.
+            added = sum(int(v or 0) for v in (result.get("rows") or {}).values())
             try:
-                _index_if_stale(bundle_conn, force=True)
+                _index_if_stale(bundle_conn, force=bool(added))
             except Exception as e:
                 log(f"index after bundle {result.get('seq')} failed — {e}")
 
@@ -170,7 +179,7 @@ def _boot() -> None:
     except Exception as e:                                  # noqa: BLE001
         log(f"graph check failed — {type(e).__name__}: {e}", "WARN")
 
-    search.reload_vectors()
+    search.reload_vectors(expect=ingest.meta_get(conn, "index_build_id", ""))
     try:
         moments = conn.execute("SELECT COUNT(*) FROM moments").fetchone()[0]
         videos = conn.execute("SELECT COUNT(*) FROM video_index").fetchone()[0]
@@ -473,8 +482,10 @@ def rescan(full: bool = True, max_messages: int = 0) -> bool:
         return False
 
     def after(conn, result):
+        # Forced only when rows actually landed — see `after_bundle` in _boot().
+        added = sum(int(v or 0) for v in (result.get("rows") or {}).values())
         try:
-            _index_if_stale(conn, force=True)
+            _index_if_stale(conn, force=bool(added))
         except Exception as e:
             log(f"post-bundle index failed — {e}")
 

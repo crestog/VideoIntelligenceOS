@@ -135,7 +135,17 @@ def http_download(file_id: str, dest: str) -> bool:
     try:
         info = _call("getFile", {"file_id": file_id})
     except Exception as exc:
-        log(f"getFile failed: {exc}", "WARN")
+        # Not a fault, and it must not read like one. Every caller treats False
+        # as "use MTProto next", and for a video over the 20 MB ceiling that is
+        # the expected path — it succeeded on every occurrence of the last run,
+        # while the log said "getFile failed" 60 times and sent the reader
+        # looking for a download problem that did not exist.
+        cap = config.HTTP_DOWNLOAD_LIMIT // 1048576
+        if "too big" in str(exc).lower():
+            log(f"over the Bot API's {cap} MB cap — fetching it over MTProto "
+                f"instead")
+        else:
+            log(f"getFile unavailable ({exc}) — falling back to MTProto", "WARN")
         return False
     size = info.get("file_size") or 0
     if size > config.HTTP_DOWNLOAD_LIMIT:

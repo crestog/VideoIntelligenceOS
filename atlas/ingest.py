@@ -844,7 +844,10 @@ def _asset_manifest(conn: sqlite3.Connection, info: dict,
         log(f"asset manifest for {man.get('key')} would not store ({e})")
         return False
     if n:
-        log(f"asset set for {man['key']} — {len(man.get('chunks') or [])} clip(s)")
+        # The canonical key, not the manifest's own spelling — this line is how
+        # the operator checks that clips landed where `/api/clip` looks for them.
+        log(f"asset set for {reflect.normalize_key(man['key'])} — "
+            f"{len(man.get('chunks') or [])} clip(s)")
     return bool(n)
 
 

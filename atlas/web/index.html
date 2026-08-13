@@ -13,6 +13,62 @@
      correctly under both. atlas.js reads its own resolved src to find the same
      prefix for API calls. -->
 <link rel="stylesheet" href="atlas.css">
+
+<!-- ═══ THE WATCHDOG ══════════════════════════════════════════════════════
+     Three failures used to look identical from the outside: the script did not
+     compile, the script never arrived, and the server is still booting. All
+     three left the pill below reading "starting" forever, with no console line
+     and nothing to act on — a duplicate top-level `const` in atlas.js cost a
+     whole session that way, because a classic script that fails to compile
+     never runs, not even its own error handler.
+
+     So the reporting lives *here*, in the one place that is already parsed
+     before atlas.js is. It uses the same DOM contract `fault()` uses in
+     atlas.js, and hands over the moment atlas.js proves it is alive. -->
+<script>
+(function () {
+  'use strict';
+  var said = false;
+  function paint(msg) {
+    if (said) return;                       // the first cause is the useful one
+    said = true;
+    try {
+      var dot = document.querySelector('.pulse-dot');
+      var text = document.querySelector('.pulse-text');
+      var pill = document.getElementById('pulse');
+      if (dot) dot.dataset.state = 'error';
+      if (text) text.textContent = 'interface fault — see console';
+      if (pill) pill.title = String(msg || '').slice(0, 300);
+    } catch (e) { /* the body is not parsed yet; the console line still lands */ }
+    try { console.error('[atlas:boot]', msg); } catch (e) {}
+  }
+  window.__atlasFault = paint;
+
+  // Capture phase, so a compile error in a <script> below this one is seen. A
+  // parse failure arrives as an error event on window with no useful message in
+  // some engines, hence the fallback wording.
+  window.addEventListener('error', function (ev) {
+    if (window.__atlasLive) return;         // atlas.js owns its own errors now
+    var where = ((ev && ev.filename) || '').split('/').pop();
+    if (ev && ev.target && ev.target.tagName === 'SCRIPT' && !ev.message) {
+      paint('atlas.js did not load — ' + (ev.target.src || 'no src'));
+      return;
+    }
+    paint(((ev && ev.message) || 'script error') +
+          (where ? ' (' + where + ':' + ((ev && ev.lineno) || '?') + ')' : ''));
+  }, true);
+
+  // And the silent case: no error event at all, just a file that never became
+  // live. Long enough that a slow tunnel is not accused of being a fault.
+  window.addEventListener('load', function () {
+    setTimeout(function () {
+      if (!window.__atlasLive)
+        paint('atlas.js loaded but did not run — check the console for a ' +
+              'SyntaxError above this line');
+    }, 6000);
+  });
+})();
+</script>
 </head>
 <body>
 
@@ -583,7 +639,7 @@
 </aside>
 
 <div class="toast" id="toast" hidden></div>
-<script src="atlas.js"></script>
+<script src="atlas.js" onerror="window.__atlasFault &amp;&amp; window.__atlasFault('atlas.js could not be fetched — the interface has no code to run')"></script>
 <script src="/sitemap.js" defer></script>
 </body>
 </html>

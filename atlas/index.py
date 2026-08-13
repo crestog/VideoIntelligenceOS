@@ -42,6 +42,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 
 from . import config, reflect
 from .tgchannel import log
@@ -348,8 +349,16 @@ def record_parts(conn: sqlite3.Connection, manifest: dict) -> int:
     `INSERT OR REPLACE` keyed on `msg_id`: a message is one asset, forever, so
     re-importing the same manifest is a no-op and a manifest that was rebuilt
     after a partial upload replaces the stale rows rather than doubling them.
+
+    The key is normalised, because the producer and the reader do not spell it
+    the same way. The manifest carries the capture *ledger's* key — `up_1234`
+    for a hand-uploaded video — while `/api/clip` and `/api/clips` normalise
+    whatever the page sends, and `video_index` is keyed off `posts.video_id`,
+    the bare message id. Stored raw, every clip lands under a key nothing ever
+    asks for and the routes keep answering 204 with a full `parts` table.
+    `UNIQUE(msg_id)` means there can only be one spelling, so it is this one.
     """
-    key = str(manifest.get("key") or "")
+    key = reflect.normalize_key(manifest.get("key") or "")
     if not key:
         return 0
     span = manifest.get("chunk_seconds")
@@ -580,6 +589,23 @@ def _video_metadata(conn: sqlite3.Connection) -> dict:
             absorb(f'SELECT {", ".join(pieces)} FROM posts p',
                    {"key": "video_id", "fields": fields})
 
+    # The new capture/process plane's own row per video. It is the only writer
+    # that measures a video with ffprobe, and for anything it captured it is the
+    # only source of a `msg_id` at all — a video keyed by shortcode has no digits
+    # to fall back on, so without this it has no metadata row, no duration and no
+    # way to be fetched. Absorbed after `videos`/`posts` so the legacy harvest
+    # index still wins where both know a field.
+    if "video" in tables:
+        cols = {c["name"] for c in reflect.columns(conn, "video")}
+        want = {"msg_id": "msg_id", "duration": "duration", "width": "width",
+                "height": "height", "fps": "fps", "creator": "uploader",
+                "created_at": "taken_at"}
+        sel = {d: s for d, s in want.items() if s in cols}
+        if "video_key" in cols and sel:
+            picked = sorted(set(sel.values()) | {"video_key"})
+            absorb(f'SELECT {", ".join(picked)} FROM video',
+                   {"key": "video_key", "fields": sel})
+
     # The Omniscient side knows a path for videos the harvest index may not.
     for t in ("omni_chunks", "omni_frames"):
         if t not in tables:
@@ -660,13 +686,23 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
         meta_set(conn, "index_moments", total)
         meta_set(conn, "index_has_fts", int(has_fts))
 
+        # The generation this table belongs to. `moments.id` is reassigned by
+        # every rebuild — the DELETE above frees the rowids and the INSERT hands
+        # them out again in a different order — so a vector file built for an
+        # earlier generation still has the right *shape* while pointing every hit
+        # at the wrong passage. Nothing in the file itself says which table it
+        # was made from, so this id is what says it, and both the writer and the
+        # reader check it.
+        build_id = uuid.uuid4().hex[:12]
+        meta_set(conn, "index_build_id", build_id)
+
         log(f"index built — {total} passage(s) across {_STATE['videos']} video(s)"
             + ("" if has_fts else " (no fts5)"))
 
         _set(phase="done", running=False, finished_at=time.time(),
              detail=f"{total} passage(s) · {_STATE['videos']} video(s)")
         result = {"ok": True, "moments": total, "videos": _STATE["videos"],
-                  "fts": has_fts}
+                  "fts": has_fts, "build_id": build_id}
     except Exception as e:
         _set(phase="error", running=False, finished_at=time.time(),
              error=f"{type(e).__name__}: {e}", detail="index build failed")
@@ -674,7 +710,7 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
         return {"ok": False, "note": f"{type(e).__name__}: {e}"}
 
     if embed:
-        start_embedding(conn_path=config.DB_PATH)
+        start_embedding(conn_path=config.DB_PATH, build_id=build_id)
     return result
 
 
@@ -741,24 +777,28 @@ def vector_state() -> dict:
         return {}
 
 
-def start_embedding(conn_path: str = None) -> bool:
+def start_embedding(conn_path: str = None, build_id: str = "") -> bool:
     """Kick off the dense index in the background.
 
     Deliberately not blocking. Lexical search is already live at this point, so
     the site is usable while this runs; when it finishes, the ranker starts
     fusing dense results in and nobody has to reload anything.
+
+    `build_id` is the index generation these vectors will describe. It travels
+    with the thread so the thread can check, at the last possible moment, that
+    the table it read is still the table on disk.
     """
     global _EMBED_THREAD
     if _EMBED_THREAD is not None and _EMBED_THREAD.is_alive():
         return False
     _EMBED_THREAD = threading.Thread(
-        target=_embed_all, args=(conn_path or config.DB_PATH,),
+        target=_embed_all, args=(conn_path or config.DB_PATH, build_id),
         name="atlas-embed", daemon=True)
     _EMBED_THREAD.start()
     return True
 
 
-def _embed_all(db_path: str) -> None:
+def _embed_all(db_path: str, build_id: str = "") -> None:
     import sqlite3 as _sq
     try:
         from .encoder import get_encoder
@@ -814,6 +854,30 @@ def _embed_all(db_path: str) -> None:
 
     if len(ids) == 0:
         return
+
+    # Encoding takes minutes; a rebuild that started while it ran has already
+    # reassigned every `moments.id` these vectors are keyed by. Writing them now
+    # would leave a well-formed dense index that maps hits to the wrong
+    # passages — search's worst failure mode, because it looks like it works.
+    # The next build's own embed pass replaces them, so dropping these costs a
+    # cycle of dense search and nothing else.
+    if build_id:
+        try:
+            check = _sq.connect(db_path, timeout=60.0, check_same_thread=False)
+            try:
+                from .ingest import meta_get
+                now_id = meta_get(check, "index_build_id", "")
+            finally:
+                check.close()
+        except Exception:                                   # noqa: BLE001
+            now_id = build_id       # cannot tell; the reader checks again
+        if now_id and now_id != build_id:
+            log("dense vectors discarded — a newer index build superseded "
+                "this one")
+            _set(dense_ready=False, phase="done", finished_at=time.time(),
+                 detail="dense index superseded mid-build")
+            return
+
     tmp_v = config.VECTOR_PATH + ".tmp"
     tmp_i = config.VECTOR_PATH + ".ids.tmp"
     vecs.tofile(tmp_v)
@@ -822,7 +886,8 @@ def _embed_all(db_path: str) -> None:
     os.replace(tmp_i, config.VECTOR_PATH + ".ids")
     with open(config.VECTOR_META, "w", encoding="utf-8") as f:
         json.dump({"dim": dim, "count": int(len(ids)),
-                   "model": config.EMBED_MODEL, "built_at": time.time()}, f)
+                   "model": config.EMBED_MODEL, "built_at": time.time(),
+                   "build_id": build_id}, f)
 
     _set(dense_ready=True, phase="done", finished_at=time.time(),
          detail=f"dense index ready — {len(ids)} vector(s) in "
@@ -830,7 +895,7 @@ def _embed_all(db_path: str) -> None:
     log(f"dense index ready — {len(ids)} vectors, {time.time() - t0:.0f}s")
 
     from . import search
-    search.reload_vectors()
+    search.reload_vectors(expect=build_id)
 
     # The map is a projection of exactly these vectors, so the moment they land
     # is the moment it can be drawn — and the moment any previously built map

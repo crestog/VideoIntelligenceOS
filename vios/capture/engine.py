@@ -723,6 +723,52 @@ class CaptureEngine:
         self._snapshot(self.ledger, force=True)
         return {"message": "Ledger uploaded and pinned in the channel."}
 
+    def seed_ledger(self, on_progress=None) -> dict:
+        """Teach the ledger what the channel already holds, outside a run.
+
+        `_seed` does this at the head of a capture, which is the only place it
+        used to be reachable from — so a session that never captures anything
+        (the common one on this archive: everything is already uploaded) never
+        learns the channel's contents at all. The asset backfill needs exactly
+        that knowledge and nothing else, and `restore_ledger` is not a substitute:
+        a pinned snapshot may not exist, and it cannot know about a video someone
+        uploaded to the channel by hand.
+
+        Report-and-survive, like `_seed`: the scan is an optimisation, and a
+        caller that cannot read history should still work from whatever the
+        ledger holds. Returns the seed's own counts, or `{"error": …}`.
+        """
+        from .seed import seed_from_channel
+        if not self._tg:
+            return {"error": "no bot token"}
+        led = self.ledger
+        # The client is the authority on the MTProto pair: `configure` can be
+        # handed api credentials in a later call than the token, and the route
+        # this replaced read them off the client for exactly that reason.
+        api_id = int(getattr(self._tg, "api_id", 0) or self._api_id or 0)
+        api_hash = str(getattr(self._tg, "api_hash", "") or self._api_hash or "")
+
+        # `_stop` stays set from a stop() until the next start(), so a seed asked
+        # for by the backfill or the tab hours later would inherit it and abort on
+        # its first message — silently, and without recording a watermark. It only
+        # means "stop" while there is a capture loop to stop.
+        def _halt() -> bool:
+            return self.state in (RUNNING, PAUSED, STOPPING) and \
+                self._stop.is_set()
+
+        try:
+            res = seed_from_channel(
+                led, self._tg, api_id, api_hash,
+                on_progress=on_progress, should_stop=_halt)
+        except Exception as exc:
+            led.log("seed-failed", str(exc)[:400])
+            return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        led.log("seed", f"channel holds {res.get('in_channel', 0)} video(s); "
+                        f"{res.get('adopted', 0)} were new to the ledger"
+                        + (" (unchanged since the last scan)"
+                           if res.get("skipped") else ""))
+        return res
+
     def restore_ledger(self) -> dict:
         """Pull the pinned ledger out of the channel and put it in place.
 

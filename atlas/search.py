@@ -72,12 +72,20 @@ _CACHE_LOCK = threading.Lock()
 # ══════════════════════════════════════════════════════════════════════════
 # VECTOR RESIDENCY
 # ══════════════════════════════════════════════════════════════════════════
-def reload_vectors() -> bool:
+def reload_vectors(expect: str = "") -> bool:
     """Load the flat vector file into RAM. Called after the indexer writes it.
 
     np.fromfile rather than np.load: the file is a bare float32 dump with its
     shape recorded in a sidecar, which avoids pickle and lets the indexer write
     it with `.tofile()` in one call.
+
+    `expect` is the index generation the caller believes `moments` is on. The
+    vectors are keyed by `moments.id`, which every rebuild reassigns, so a file
+    from an older generation would load cleanly and then point each hit at the
+    wrong passage. A definite disagreement — both sides naming a generation, and
+    naming different ones — is refused. Either side being silent is accepted:
+    an archive built before this stamp existed should not lose dense search on
+    upgrade, and its next rebuild stamps both.
     """
     global _VECTORS, _VEC_IDS, _VEC_POS
     try:
@@ -87,6 +95,11 @@ def reload_vectors() -> bool:
 
     meta = index.vector_state()
     if not meta or not meta.get("count"):
+        return False
+    have_id = str(meta.get("build_id") or "")
+    if expect and have_id and have_id != expect:
+        log(f"dense index ignored — built for index {have_id}, this one is "
+            f"{expect}; it reloads after the next build")
         return False
     try:
         dim = int(meta.get("dim") or config.EMBED_DIM)

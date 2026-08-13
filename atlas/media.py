@@ -234,6 +234,18 @@ def resolve(conn: sqlite3.Connection, video_key: str) -> dict:
             msg_id = int(key)
         except (TypeError, ValueError):
             msg_id = None
+    if not msg_id:
+        # A video keyed by shortcode, known only to the new capture plane, has
+        # no digits to fall back on — but if it has an asset set, its manifest
+        # recorded the video's own message id when the clips were published.
+        # Refusing to play a video whose clips are already in hand would be a
+        # strange way to fail.
+        try:
+            from . import index as _index
+            msg_id = int((_index.part_of(conn, key, "video") or {})
+                         .get("msg_id") or 0) or None
+        except Exception:                                   # noqa: BLE001
+            msg_id = None
     if msg_id:
         return {"key": key, "where": "remote", "path": None, "size": 0,
                 "duration": info.get("duration"), "msg_id": int(msg_id)}

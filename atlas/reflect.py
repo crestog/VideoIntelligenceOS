@@ -115,9 +115,12 @@ _SOURCE_HINTS = (
 )
 
 # Atlas's own tables. They are derived from the others, so indexing them would
-# feed search its own output back to it.
+# feed search its own output back to it. `parts` belongs here for the same reason
+# `video_index` does — it is written by `index.ensure_schema`, and its `name`
+# column is a clip filename, timestamped and keyed by video, so left in it puts
+# one `1234-c0007.mp4` passage into search per clip of every video.
 _ATLAS_OWN = {"moments", "moments_fts", "bundles", "atlas_meta", "ingest_log",
-              "video_index", "graph_nodes", "graph_edges"}
+              "video_index", "graph_nodes", "graph_edges", "parts"}
 
 _FTS_SHADOW = re.compile(r"_(data|idx|content|docsize|config)$")
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
@@ -379,6 +382,50 @@ def _q(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+# A run of letters long enough to be a word rather than an exponent, a unit or
+# an axis label. Three is the shortest that excludes "e+05", "id" and "0.5".
+_LEXICAL = re.compile(r"[A-Za-z]{3,}")
+
+
+def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
+    """`content_columns` narrowed to the ones whose *data* reads like language.
+
+    A name is a good guide and not proof. `frame_metric.values_`,
+    `frame_metric.frames` and `frame_vector.frames` are TEXT columns holding
+    JSON arrays of floats: every name test calls them content, and no human
+    query can ever match one. Left in, they cost encoder time on every build and
+    dilute ranking with passages that are numbers.
+
+    So the values decide. A column stays if a sample of them contains actual
+    words. Deliberately generous — a quarter of the sample is enough, a column
+    with nothing in it is kept (there is nothing to judge, and it contributes no
+    passages either way), and a short enum like `"float32"` reads as lexical. It
+    drops number dumps, not anything a person wrote.
+
+    Additive: `content_columns` and its other callers are untouched, and the
+    rule is about the data, so no table is named here either.
+    """
+    keep = []
+    for name in content_columns(cols):
+        try:
+            sample = [r[0] for r in conn.execute(
+                f"SELECT t.{_q(name)} FROM {_q(table)} t "
+                f"WHERE t.{_q(name)} IS NOT NULL "
+                f"AND TRIM(t.{_q(name)}) <> '' LIMIT 24")]
+        except sqlite3.Error:
+            keep.append(name)           # unreadable — judge it by its name
+            continue
+        vals = [str(v) for v in sample]
+        if not vals:
+            keep.append(name)
+            continue
+        lexical = sum(1 for v in vals if _LEXICAL.search(v))
+        need = 1 if len(vals) <= 4 else max(2, int(0.25 * len(vals)))
+        if lexical >= need:
+            keep.append(name)
+    return keep
+
+
 def text_sources(conn: sqlite3.Connection) -> list:
     """Every (table, key, time, text) the indexer should read, as ready SQL.
 
@@ -399,7 +446,7 @@ def text_sources(conn: sqlite3.Connection) -> list:
         s_expr = f"t.{_q(start)}" if start else "NULL"
         e_expr = f"t.{_q(end)}" if end else "NULL"
 
-        for text_col in content_columns(cols):
+        for text_col in prose_columns(conn, table, cols):
             base = (f"SELECT t.{_q(key)}, {s_expr}, {e_expr}, "
                     f"t.{_q(text_col)} FROM {_q(table)} t "
                     f"WHERE t.{_q(text_col)} IS NOT NULL "
@@ -431,7 +478,14 @@ def text_sources(conn: sqlite3.Connection) -> list:
         # Dimension text, pulled onto the parent's key so a creator's name is
         # searchable against the videos they made rather than against nothing.
         for link in dimension_links(conn, table, cols):
+            # The linked table's columns get the same data test as the parent's:
+            # a lookup table can hold a number dump too, and `dimension_links`
+            # is shared with the graph, which judges by name on purpose.
+            prose = set(prose_columns(conn, link["table"],
+                                      columns(conn, link["table"])))
             for text_col in link["texts"]:
+                if text_col not in prose:
+                    continue
                 specs.append({
                     "table": link["table"], "key": key, "start": "", "end": "",
                     "text": text_col,
@@ -501,7 +555,13 @@ _KEY_NAMESPACE = re.compile(r"^vios[:=]", re.I)
 # explicit short list on purpose — a generic "letters then digits" rule would
 # also match Instagram shortcodes like `Cx1234` and throw away the letters that
 # make them unique.
-_PREFIXED_NUMBER = re.compile(r"^(?:tg|msg|id)[_:-]?(\d+)$", re.I)
+#
+# `up_` is the capture ledger's key for a video a person uploaded to the channel
+# by hand (`ledger.upload_key`), and the number in it *is* the message id. Left
+# unfolded, one such video is two videos in Atlas — `1234` carrying the legacy
+# captions and frame notes, `up_1234` carrying the new plane's claims and shots —
+# and the asset manifests land under the spelling the reader never asks for.
+_PREFIXED_NUMBER = re.compile(r"^(?:tg|msg|id|up)[_:-]?(\d+)$", re.I)
 
 
 def normalize_key(value) -> str:
