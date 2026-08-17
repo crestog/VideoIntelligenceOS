@@ -234,6 +234,10 @@ const S = {
   lib: { offset: 0, rows: [], total: 0, creator: '', category: '', inside: 0, q: '' },
   home: { latest: null, counted: {} },   // the landing page's own fetch + count-up
   browse: { table: '', offset: 0, q: '' },
+  // Image search is its own lane, so it keeps its own results rather than
+  // pretending to be a moment search. `origin` is what produced them — a frame,
+  // an upload or a phrase — and it is what a space switch re-runs.
+  vsearch: { on: false, space: '', hits: [], meta: null, origin: null },
   prefetched: new Set(),
   suggestIndex: -1,
   suggestItems: [],
@@ -327,6 +331,16 @@ function narrowActive() {
 async function runSearch(query, { append = false } = {}) {
   query = (query || '').trim();
   if (!query) { showOpening(); return; }
+  // A typed query is a return to text search. Image search hid the layout and
+  // sort controls because they mean nothing for a frame list; they come back
+  // here rather than only on the explicit "leave" chip, because typing is the
+  // way most people will leave the mode.
+  if (S.vsearch.on) {
+    S.vsearch.on = false;
+    S.vsearch.hits = [];
+    S.vsearch.origin = null;
+    if ($('resultsControls')) $('resultsControls').hidden = false;
+  }
   S.query = query;
   $('q').value = query;
   const offset = append ? S.results.length : 0;
@@ -384,6 +398,11 @@ function applySearch(data, append) {
       data.dense
         ? 'Try fewer words, or describe what is happening rather than naming it. Search covers narratives, speech, objects and on-screen text.'
         : 'The meaning index is still building — right now search only matches words that literally appear. Semantic matches will start working on their own.');
+    // Words failing is exactly when the pixels are worth asking. This searches
+    // the same phrase against what the frames look like rather than against
+    // anything written about them, so "red car at night" can answer even when
+    // no model ever wrote those words down.
+    offerPixelSearch(S.query);
     return;
   }
 
@@ -787,6 +806,10 @@ function showEmpty(title, body) {
 function showOpening() {
   S.query = '';
   S.results = [];
+  S.vsearch.on = false;
+  S.vsearch.hits = [];
+  S.vsearch.origin = null;
+  if ($('resultsControls')) $('resultsControls').hidden = false;
   $('results').hidden = true;
   $('emptySearch').hidden = true;
   // The narrowing panel belongs to a result set. With no results it is a set of
@@ -794,6 +817,282 @@ function showOpening() {
   setNarrowOpen(false);
   $('opening').hidden = false;
   writeHash('search', new URLSearchParams(S.video ? { v: S.video.video_key } : {}));
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   IMAGE SEARCH — what the models saw, not what they wrote about it
+   ════════════════════════════════════════════════════════════════════════
+ * Three ways in, and the first needs no model at all: a frame's embedding is
+ * already in the database, so "looks like this" is a matrix multiply against
+ * memory. Text and uploaded images go through CLIP's two towers on the server's
+ * CPU, which is why they can be slow the first time and are instant after.
+ *
+ * These results are frames, not videos, so they get their own rendering rather
+ * than being forced into a card that expects moments and matched text. What they
+ * share with a normal result is the click: a frame carries a timestamp, and the
+ * player opens there.
+ * ------------------------------------------------------------------------- */
+const VSPACE_LABEL = { siglip2: 'SigLIP 2', clip: 'CLIP' };
+
+async function runVSearch(origin, { space = '' } = {}) {
+  S.vsearch.origin = origin;
+  S.vsearch.on = true;
+  if (S.tab !== 'search') showTab('search');
+  paintSearchSkeleton();
+  $('resultsCount').innerHTML = '<span class="lat">looking…</span>';
+
+  try {
+    let data;
+    if (origin.kind === 'image') {
+      const body = new FormData();
+      body.append('file', origin.file, origin.file.name || 'drop.png');
+      data = await api('/api/vsearch/image?limit=48', { method: 'POST', body });
+    } else if (origin.kind === 'text') {
+      data = await api('/api/vsearch?limit=48&q=' + encodeURIComponent(origin.text));
+    } else {
+      const p = new URLSearchParams({ limit: '48', frame: origin.key });
+      if (origin.idx !== undefined && origin.idx !== null) {
+        p.set('frame', `${origin.key}:${origin.idx}`);
+      } else {
+        p.set('t', String(Math.max(0, origin.t || 0)));
+      }
+      // Only frame search has a space to choose: a CLIP query vector can only
+      // be compared against CLIP frames, so text and uploads are `clip` by
+      // construction and offering a switch would be offering a wrong answer.
+      if (space || S.vsearch.space) p.set('space', space || S.vsearch.space);
+      if (origin.sameVideo) p.set('same_video', 'true');
+      data = await api('/api/vsearch?' + p.toString());
+    }
+    applyVSearch(data);
+  } catch (e) {
+    $('results').hidden = true;
+    showEmpty('Image search failed', String(e.message || e));
+  }
+}
+
+function applyVSearch(data) {
+  const hits = data.hits || [];
+  S.vsearch.hits = hits;
+  S.vsearch.meta = data;
+  S.vsearch.space = data.space || S.vsearch.space || '';
+  S.results = [];
+  S.resultTotal = hits.length;
+
+  $('opening').hidden = true;
+  $('emptySearch').hidden = true;
+  setNarrowOpen(false);
+  // Sort order, layout and density all describe a list of videos ranked by text
+  // relevance. These are frames ranked by cosine distance, so the controls come
+  // back when normal search does.
+  if ($('resultsControls')) $('resultsControls').hidden = true;
+
+  if (!hits.length) {
+    $('results').hidden = true;
+    // The server always says why, because four different causes look identical
+    // from here: no vectors imported yet, no numpy, no query encoder, or an
+    // archive that genuinely holds nothing like this.
+    showEmpty('No frames like that',
+      data.reason || 'Nothing in the archive resembles it closely enough.');
+    return;
+  }
+
+  $('results').hidden = false;
+  renderVCount(data);
+  $('sourceFilters').textContent = '';
+  renderVHits(hits);
+  $('more').hidden = true;
+}
+
+function vOriginLabel() {
+  const o = S.vsearch.origin || {};
+  if (o.kind === 'image') return `an image you dropped`;
+  if (o.kind === 'text') return `“${o.text}”, in pixels`;
+  const at = (o.t !== undefined && o.t !== null) ? ` at ${timecode(o.t)}` : '';
+  return `a frame of ${o.key}${at}`;
+}
+
+function renderVCount(data) {
+  const sp = data.space || S.vsearch.space;
+  const bits = [
+    `<b>${fmtInt(data.count)}</b> frame${data.count === 1 ? '' : 's'} like ` +
+      vOriginLabel(),
+    `<span class="lat">${data.took_ms} ms</span>`,
+  ];
+  if (data.searched_videos)
+    bits.push(`<span class="of">${fmtInt(data.searched_videos)} video` +
+              `${data.searched_videos === 1 ? '' : 's'} re-ranked frame by frame</span>`);
+  if (sp) bits.push(`<span class="by">${VSPACE_LABEL[sp] || sp}</span>`);
+  $('resultsCount').innerHTML = bits.join(' <span class="sep">·</span> ');
+
+  // The space switch, only where it means something. A frame exists in both
+  // spaces, so the same question can be asked of either geometry and they
+  // disagree in interesting ways — SigLIP on scene and composition, CLIP on
+  // names and logos. A text or uploaded query has no such choice: it was
+  // encoded by CLIP, so `clip` is the only space it can honestly be compared in.
+  const box = $('sourceFilters');
+  box.textContent = '';
+  const o = S.vsearch.origin || {};
+  if (o.kind === 'frame') {
+    for (const s of ['siglip2', 'clip']) {
+      box.appendChild(h('button', {
+        class: 'chip-filter', 'aria-pressed': String(s === sp),
+        title: `Compare in the ${VSPACE_LABEL[s]} space`,
+        onclick: () => runVSearch(S.vsearch.origin, { space: s }),
+      }, VSPACE_LABEL[s]));
+    }
+    box.appendChild(h('button', {
+      class: 'chip-filter', 'aria-pressed': String(!!o.sameVideo),
+      title: 'Include frames from the same video — near-duplicate detection ' +
+             'inside one reel',
+      onclick: () => runVSearch({ ...o, sameVideo: !o.sameVideo }, { space: sp }),
+    }, 'same video'));
+  }
+  box.appendChild(h('button', {
+    class: 'chip-filter', 'aria-pressed': 'false',
+    title: 'Back to searching what the models wrote',
+    onclick: leaveVSearch,
+  }, 'leave'));
+}
+
+/* Image search is a mode, not a query, so leaving it is explicit. Restoring the
+ * last text search rather than clearing everything: the phrase in the box is
+ * still what the user was looking for. */
+function leaveVSearch() {
+  S.vsearch.on = false;
+  S.vsearch.hits = [];
+  S.vsearch.origin = null;
+  if ($('resultsControls')) $('resultsControls').hidden = false;
+  $('cards').dataset.view = S.view;
+  if (S.query) runSearch(S.query); else showOpening();
+}
+
+function renderVHits(hits) {
+  const list = $('cards');
+  previewStop();
+  list.textContent = '';
+  list.dataset.view = 'frames';
+  const frag = document.createDocumentFragment();
+
+  hits.forEach((hit, i) => {
+    const at = (hit.t === null || hit.t === undefined) ? null : Number(hit.t);
+    const shot = h('div', { class: 'vhit-shot' },
+      h('span', { class: 'noshot', text: hit.video_key }));
+    const img = h('img', {
+      alt: '', loading: 'lazy',
+      'data-src': U(`/api/frame/${encodeURIComponent(hit.video_key)}?i=${hit.frame_idx}` +
+                    (at === null ? '' : `&t=${at.toFixed(2)}`)),
+    });
+    img.addEventListener('error', () => { img.remove(); });
+    shot.appendChild(img);
+    posterWatcher.observe(img);
+    if (at !== null) previewOn(shot, hit.video_key, at);
+
+    frag.appendChild(h('li', {
+      class: 'vhit', 'data-key': hit.video_key, tabindex: '0',
+      onclick: () => openVideoKey(hit.video_key, at),
+      onkeydown: (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault(); openVideoKey(hit.video_key, at);
+        }
+      },
+      onpointerenter: () => prefetch([hit.video_key]),
+    },
+      h('div', { class: 'vhit-rank', text: String(i + 1).padStart(2, '0') }),
+      shot,
+      h('div', { class: 'vhit-line' },
+        h('span', { class: 't', text: at === null ? `frame ${hit.frame_idx}` : timecode(at) }),
+        h('span', { class: 'score', text: hit.score.toFixed(3) })),
+      // A frame is a way into a video, so the key stays visible: two hits from
+      // one reel is a meaningful thing to notice and a thumbnail alone hides it.
+      h('div', { class: 'vhit-key', text: hit.video_key }),
+      h('button', {
+        class: 'vhit-more', title: 'Frames like this one',
+        onclick: (ev) => {
+          ev.stopPropagation();
+          runVSearch({ kind: 'frame', key: hit.video_key, idx: hit.frame_idx,
+                       t: at, sameVideo: false },
+                     { space: S.vsearch.space });
+        },
+      }, 'more like this')));
+  });
+  list.appendChild(frag);
+}
+
+/* The playhead's frame, in whichever space was last used. `t` rather than a
+ * frame number on purpose: the browser has a playhead and the server has `fps`,
+ * so the conversion happens where the data for it lives. */
+function looksLikeThis() {
+  if (!S.video) { toast('Open a video first'); return; }
+  const vid = $('video');
+  const t = (vid && isFinite(vid.currentTime)) ? vid.currentTime : 0;
+  runVSearch({ kind: 'frame', key: S.video.video_key, t, sameVideo: false },
+             { space: S.vsearch.space });
+}
+
+async function imageSearchFile(file) {
+  if (!file) return;
+  if (!/^image\//.test(file.type || '')) {
+    toast('That is not an image'); return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    toast('That image is larger than 8 MB'); return;
+  }
+  runVSearch({ kind: 'image', file });
+}
+
+/* Mode 3's way in, offered where it is most useful: under a text search that
+ * found nothing. It is a button rather than a permanent control because it
+ * costs a model load on the server the first time, and because most queries
+ * are better answered by what the models wrote than by raw pixels. */
+function offerPixelSearch(query) {
+  const q = (query || '').trim();
+  if (!q) return;
+  const box = $('emptySearch');
+  box.appendChild(h('button', { class: 'btn', onclick: () => runVSearch({ kind: 'text', text: q }) },
+    'Search the frames themselves'));
+  box.appendChild(h('p', { class: 'hint', style: 'margin-top:8px',
+    text: 'CLIP compares the words to what every frame looks like. ' +
+          'The first one of these is slow while the model loads.' }));
+}
+
+/* The whole window is the drop target. `dragenter`/`dragleave` fire for every
+ * child element the pointer crosses, so the veil is counted in and out rather
+ * than toggled — otherwise it flickers off the moment the cursor enters a card. */
+let dragDepth = 0;
+function wireImageDrop() {
+  const veil = $('dropVeil');
+  const hasFiles = (ev) => Array.from(ev.dataTransfer?.types || []).includes('Files');
+
+  window.addEventListener('dragenter', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth++;
+    if (veil) veil.hidden = false;
+  });
+  window.addEventListener('dragover', (ev) => { if (hasFiles(ev)) ev.preventDefault(); });
+  window.addEventListener('dragleave', (ev) => {
+    if (!hasFiles(ev)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth && veil) veil.hidden = true;
+  });
+  window.addEventListener('drop', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth = 0;
+    if (veil) veil.hidden = true;
+    const file = ev.dataTransfer?.files?.[0];
+    if (file) imageSearchFile(file);
+  });
+
+  // Pasting a screenshot is the same gesture without a file manager, and it is
+  // how most screenshots actually arrive.
+  window.addEventListener('paste', (ev) => {
+    const item = Array.from(ev.clipboardData?.items || [])
+      .find(it => it.kind === 'file' && /^image\//.test(it.type));
+    if (!item) return;
+    const file = item.getAsFile();
+    if (file) { ev.preventDefault(); imageSearchFile(file); }
+  });
 }
 
 /* ── type-ahead ───────────────────────────────────────────────────────── */
@@ -1179,6 +1478,7 @@ function momNavWire() {
   $('momPrev').addEventListener('click', () => momGo(-1));
   $('momNext').addEventListener('click', () => momGo(1));
   $('momLoop').addEventListener('click', momLoopToggle);
+  if ($('momLike')) $('momLike').addEventListener('click', looksLikeThis);
   $('screenSize').addEventListener('click', () => playerSize());
   let saved = '';
   try { saved = localStorage.getItem('atlas.playerSize') || ''; } catch {}
@@ -5607,6 +5907,23 @@ function wire() {
   $('q').addEventListener('input', (ev) => {
     if (!ev.target.value.trim()) { closeSuggest(); showOpening(); return; }
     scheduleSuggest(ev.target.value);
+  });
+
+  /* ── image search ──
+   * Its own `part` because it is the newest surface here and a throw in it must
+   * not take the finder's submit handler with it. The file input is reset after
+   * every pick so choosing the same screenshot twice still fires a change.
+   */
+  part('image search', () => {
+    const picker = $('qImage');
+    if ($('qImageBtn') && picker)
+      $('qImageBtn').addEventListener('click', () => picker.click());
+    if (picker) picker.addEventListener('change', () => {
+      const file = picker.files && picker.files[0];
+      picker.value = '';
+      imageSearchFile(file);
+    });
+    wireImageDrop();
   });
 
   $('q').addEventListener('keydown', (ev) => {

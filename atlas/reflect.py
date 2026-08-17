@@ -119,8 +119,15 @@ _SOURCE_HINTS = (
 # `video_index` does — it is written by `index.ensure_schema`, and its `name`
 # column is a clip filename, timestamped and keyed by video, so left in it puts
 # one `1234-c0007.mp4` passage into search per clip of every video.
+#
+# `vec_payload` is here for a different reason: it holds raw float buffers as
+# BLOBs, which no reflection can describe and no reader would want to browse. It
+# is written by `ingest`'s payload lane and read only by the image search that
+# builds its index from it. `coverage` is here because it is the processing
+# plane's work table — it says what ran, which means nothing to a search index.
 _ATLAS_OWN = {"moments", "moments_fts", "bundles", "atlas_meta", "ingest_log",
-              "video_index", "graph_nodes", "graph_edges", "parts"}
+              "video_index", "graph_nodes", "graph_edges", "parts",
+              "vec_payload", "coverage"}
 
 _FTS_SHADOW = re.compile(r"_(data|idx|content|docsize|config)$")
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")

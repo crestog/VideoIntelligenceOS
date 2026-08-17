@@ -40,12 +40,18 @@ DB_PATH      = os.path.join(ATLAS_HOME, "atlas.db")
 BUNDLE_DIR   = os.path.join(ATLAS_HOME, "bundles")     # downloaded parts
 VECTOR_PATH  = os.path.join(ATLAS_HOME, "moments.vec")  # flat float32 matrix
 VECTOR_META  = os.path.join(ATLAS_HOME, "moments.vec.json")
+# One flat matrix per frame-vector space, written the same way and read the same
+# way. Unlike `moments.vec` these survive a reindex untouched: they are keyed by
+# `(video_key, frame_idx)`, which no rebuild reassigns, where moment vectors are
+# keyed by `moments.id`, which every rebuild does.
+FRAME_VEC_DIR = os.path.join(ATLAS_HOME, "frames")
 SESSION_DIR  = os.path.join(ATLAS_HOME, "session")
 VIDEO_CACHE  = os.path.join(CACHE_DIR, "video")
 POSTER_CACHE = os.path.join(CACHE_DIR, "poster")
 WEB_DIR      = os.path.join(_HERE, "web")
 
-for _d in (ATLAS_HOME, BUNDLE_DIR, SESSION_DIR, VIDEO_CACHE, POSTER_CACHE):
+for _d in (ATLAS_HOME, BUNDLE_DIR, SESSION_DIR, VIDEO_CACHE, POSTER_CACHE,
+           FRAME_VEC_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
@@ -131,6 +137,34 @@ CANDIDATES   = int(os.environ.get("ATLAS_CANDIDATES", "200"))
 RRF_K        = 60      # the constant from the original RRF paper
 MOMENT_GAP_S = 6.0     # hits closer than this in one video are one moment
 QUERY_CACHE  = 256     # LRU entries
+
+# ── Image search ──────────────────────────────────────────────────────────
+# The frame vectors the processing plane writes, searched in their own spaces.
+# `siglip2` and `clip` are two different geometries; a query is only ever
+# compared against the space it was produced in.
+#
+# The resident matrix is bounded by construction rather than by hope: 62 videos
+# at ~900 frames x 1152 dims x 4 B is 257 MB, and an archive four times that size
+# would quietly exhaust a Kaggle kernel. `VSEARCH_MAX_MB` picks a frame stride so
+# the matrix fits and records it in the meta — so growth costs *resolution*,
+# never memory, and the number is visible rather than inferred.
+#
+# The stride is only the coarse pass: the top videos are re-ranked against their
+# full-rate rows read straight from `vec_payload`, so the answer is frame-exact.
+VSEARCH_MAX_MB     = int(os.environ.get("ATLAS_VSEARCH_MAX_MB", "256"))
+VSEARCH_SPACES     = ("siglip2", "clip")
+
+# CLIP ViT-L/14 for the query side: 1.7 GB against SigLIP2-so400m's ~4 GB, both
+# towers in one checkpoint, and stronger on proper nouns and logos — which is
+# what a search box actually receives. It is loaded only on the first image or
+# text-into-image query, so a session that never runs one never pays for it.
+VSEARCH_MODEL      = os.environ.get("ATLAS_VSEARCH_MODEL",
+                                    "openai/clip-vit-large-patch14")
+# CPU, and not "auto". The processing plane owns both cards for the whole
+# session; a query encoder that takes VRAM is how a GPU worker dies mid-pass.
+VSEARCH_DEVICE     = os.environ.get("ATLAS_VSEARCH_DEVICE", "cpu").lower()
+# How many videos the coarse pass promotes to the frame-exact re-rank.
+VSEARCH_CANDIDATES = int(os.environ.get("ATLAS_VSEARCH_CANDIDATES", "24"))
 
 # Relative trust in each kind of evidence. Qwen's narrative is a model looking
 # at the video and describing it, so it outranks an object list; OCR is exact

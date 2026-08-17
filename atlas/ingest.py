@@ -106,6 +106,33 @@ _META_DDL = (
     "(seq TEXT PRIMARY KEY, manifest_id INTEGER, schema INTEGER, "
     "created_at TEXT, code_commit TEXT, parts INTEGER, bytes INTEGER, "
     "counts TEXT, imported_at REAL, status TEXT, note TEXT)",
+
+    # Embeddings, as the bytes they are. Every column here mirrors a column the
+    # processing plane wrote, because a vector without its `dim`, its `dtype` and
+    # its `space` is an anonymous buffer — you cannot reshape it and you must not
+    # compare it against another space.
+    #
+    # `data` and `frames` are real BLOBs, decoded from hex at the door. The shard
+    # carries them hex-encoded because JSONL has no byte type, and stored as they
+    # arrive they would cost double the disk for a string that no query can use.
+    #
+    # `uid` is the processing plane's own uid, and it is the primary key: the
+    # whole shard design rests on a replay being a no-op, so the same vector
+    # arriving twice costs one rejected INSERT and nothing else.
+    "CREATE TABLE IF NOT EXISTS vec_payload ("
+    " uid TEXT PRIMARY KEY,"
+    " kind TEXT NOT NULL,"          # 'vector' (pooled) or 'frame_vector'
+    " video_key TEXT NOT NULL,"
+    " space TEXT NOT NULL,"         # siglip2 | clip | bge-m3 | clap
+    " dim INTEGER NOT NULL,"
+    " n INTEGER NOT NULL,"          # frames covered; 1 for a pooled vector
+    " dtype TEXT NOT NULL,"         # f16 | f32
+    " shot_idx INTEGER,"
+    " created_at REAL,"
+    " frames BLOB,"                 # int32×n frame indices; NULL when pooled
+    " data BLOB NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS ix_vecpay_space "
+    "ON vec_payload(space, kind, video_key)",
 )
 
 
@@ -633,6 +660,101 @@ def _ensure_shard_table(conn: sqlite3.Connection, table: str,
     return [c for c in types if c in have]
 
 
+# ── the payload lane ──────────────────────────────────────────────────────
+# `_is_opaque` was right about what it was looking at and wrong about what to do
+# with it. Hex is `[A-Za-z0-9]`, and one 1152-dim shot vector hex-encodes to
+# 9,216 characters, a 900-frame SigLIP reel to about 4 MB — so every embedding
+# the processing plane has ever produced matched `_OPAQUE` and was dropped at
+# this door, which is why no vector ever reached Atlas and reverse image search
+# did not exist.
+#
+# The generic path keeps dropping them, deliberately: those columns are useless
+# *there*, as reflected TEXT in a browsable table. They land here instead, once,
+# as the bytes they always were. Two tables carry them and only two, so this is a
+# named lane rather than a rule inferred from values.
+_PAYLOAD_KINDS = {"vector", "frame_vector"}
+
+# `pooled` keeps one vector per shot and drops the per-frame rows, for a machine
+# whose disk cannot hold 270 MB of frame embeddings. It degrades image search to
+# shot resolution rather than to nothing, which is the only reason it exists.
+_VEC_KEEP = (os.environ.get("ATLAS_VEC_KEEP", "all") or "all").strip().lower()
+
+
+def _unhex(v):
+    """Hex text from a shard back to bytes, or None if it is not hex.
+
+    Never raises: a torn shard can end mid-token, and one malformed payload must
+    cost that vector rather than the import.
+    """
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v)
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        return bytes.fromhex(v)
+    except ValueError:
+        return None
+
+
+def _import_payloads(conn: sqlite3.Connection, kind: str, rows: list) -> dict:
+    """Land `vector` or `frame_vector` payloads in `vec_payload`.
+
+    Returns `{"added": n, "skipped": n, "bytes": n}`. Never raises — a payload
+    that cannot be decoded is counted and passed over, because the claims in the
+    same shard are worth importing regardless.
+
+    `dim`, `n` and `dtype` are carried because they are what makes the buffer
+    readable: `data` is `n × dim` values of `dtype`, little-endian, and a reader
+    that has to guess any of the three cannot reshape it. A pooled `vector` row
+    has no `n` and no `dtype` of its own — it is one float32 vector by
+    definition, so it is recorded as `n=1, dtype='f32'` rather than left null for
+    every reader to special-case.
+    """
+    out = {"added": 0, "skipped": 0, "bytes": 0}
+    if kind == "frame_vector" and _VEC_KEEP == "pooled":
+        out["skipped"] = len(rows)
+        return out
+    batch = []
+    for r in rows:
+        uid = r.get("uid")
+        data = _unhex(r.get("data"))
+        if not uid or not data or not r.get("space") or not r.get("video_key"):
+            out["skipped"] += 1
+            continue
+        dim = int(r.get("dim") or 0)
+        if dim <= 0:
+            out["skipped"] += 1
+            continue
+        if kind == "frame_vector":
+            n = int(r.get("n") or 0)
+            dtype = str(r.get("dtype") or "f16")
+            frames = _unhex(r.get("frames"))
+        else:
+            n, dtype, frames = 1, "f32", None
+        batch.append((uid, kind, r["video_key"], r["space"], dim, n, dtype,
+                      r.get("shot_idx"), r.get("created_at"), frames, data))
+        out["bytes"] += len(data)
+    if not batch:
+        return out
+    try:
+        # Created on demand as well as in `ensure_meta`, because a database that
+        # reached this function without the table would lose every vector in the
+        # shard to a caught error and report it as a skip. The DDL is idempotent
+        # and this costs one lookup per shard.
+        if not _table_exists(conn, "vec_payload"):
+            ensure_meta(conn)
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO vec_payload(uid, kind, video_key, space, "
+            "dim, n, dtype, shot_idx, created_at, frames, data) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", batch)
+        out["added"] = conn.total_changes - before
+    except sqlite3.Error as exc:
+        out["skipped"] += len(batch)
+        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return out
+
+
 def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
     """Download one evidence shard and replay it into atlas.db."""
     seq = "shard:" + tgchannel.shard_seq(info)
@@ -655,6 +777,22 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
     rows_in = sum(len(v) for v in tables.values())
     _set(detail=f"{seq} — replaying {rows_in} row(s)")
     merged, dropped = {}, []
+
+    # Payloads first, and by name rather than by shape. The generic loop below
+    # still drops these columns as opaque — correctly, for what it is building —
+    # so this is the one place the bytes are kept, and it has to run whether or
+    # not the metadata half of the same table lands successfully.
+    vec_bytes = 0
+    for kind in _PAYLOAD_KINDS:
+        if not tables.get(kind):
+            continue
+        got = _import_payloads(conn, kind, tables[kind])
+        if got["added"]:
+            merged[f"vec:{kind}"] = got["added"]
+            vec_bytes += got["bytes"]
+        if got["skipped"]:
+            dropped.append(f"{kind} payload ×{got['skipped']}"
+                           + (f" ({got['error']})" if got.get("error") else ""))
 
     for table, rows in tables.items():
         if not rows or reflect._norm(table) in reflect._ATLAS_OWN or \
@@ -738,8 +876,10 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
         pass
 
     log(f"{seq} imported — {delta or 'no new rows'}"
+        + (f" · {vec_bytes / 1048576:.1f} MB of vectors" if vec_bytes else "")
         + (f" · dropped {len(dropped)} opaque column(s)" if dropped else ""))
-    return {"ok": True, "seq": seq, "rows": merged, "shard": True}
+    return {"ok": True, "seq": seq, "rows": merged, "shard": True,
+            "vec_bytes": vec_bytes}
 
 
 def _scalar(v):

@@ -117,17 +117,32 @@ button{ background:none; border:0; cursor:pointer; }
   background:var(--ink-3);
   border:1px solid var(--line);
   border-radius:99px;
-  padding:0 42px 0 18px;
+  padding:0 74px 0 18px;
   transition:border-color .16s var(--ease), background .16s var(--ease);
 }
 .finder input::placeholder{ color:var(--dim); }
 .finder input:focus{ outline:none; border-color:var(--line-2); background:var(--ink-4); }
-.finder input:focus + .finder-go svg{ stroke:var(--signal); }
+/* `~`, not `+`: the hidden file input sits between the field and the buttons. */
+.finder input:focus ~ .finder-go svg{ stroke:var(--signal); }
 .finder-go{
   position:absolute; right:6px; top:5px; width:28px; height:28px;
   display:grid; place-items:center; border-radius:50%;
 }
 .finder-go svg{ width:17px; height:17px; fill:none; stroke:var(--muted); stroke-width:1.9; stroke-linecap:round; }
+/* Image search lives in the search bar because it is a search, not a tool in a
+   menu somewhere. Dimmer than the magnifier: it is the second thing you reach
+   for, and the amber on hover is the promise that it does something. */
+.finder-img{
+  position:absolute; right:36px; top:5px; width:28px; height:28px;
+  display:grid; place-items:center; border-radius:50%;
+}
+.finder-img svg{
+  width:16px; height:16px; fill:none; stroke:var(--dim); stroke-width:1.7;
+  stroke-linecap:round; stroke-linejoin:round;
+  transition:stroke .16s var(--ease);
+}
+.finder-img:hover{ background:var(--ink-4); }
+.finder-img:hover svg{ stroke:var(--signal); }
 
 .suggest{
   position:absolute; top:44px; left:0; right:0; z-index:60;
@@ -537,6 +552,65 @@ body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .stage{
 /* One line of evidence survives the shrink — enough to say why this is here. */
 .cards[data-view="grid"] .card-hits .hit:nth-child(n+2){ display:none; }
 .cards[data-view="grid"] .card-more{ display:none; }
+
+/* ── image-search results ────────────────────────────────────────────────
+   A frame hit is not a video card with less in it. It has no title, no
+   creator and no matching passage — only a picture, where it is, and how
+   close it came. So the picture is the whole tile and everything else is one
+   line under it, and the grid runs denser than the video grid because the
+   comparison being made is between images. */
+.cards[data-view="frames"]{
+  display:grid; gap:10px;
+  grid-template-columns:repeat(auto-fill,minmax(168px,1fr));
+}
+.vhit{
+  position:relative; cursor:pointer; border-radius:var(--r);
+  display:flex; flex-direction:column; gap:6px;
+}
+.vhit-shot{
+  position:relative; aspect-ratio:16/9; border-radius:var(--r);
+  overflow:hidden; background:var(--ink-4);
+  border:1px solid transparent;
+  transition:border-color .15s var(--ease), transform .15s var(--ease);
+}
+.vhit-shot img{ width:100%; height:100%; object-fit:cover; display:block; }
+.vhit-shot .noshot{
+  position:absolute; inset:0; display:grid; place-items:center; padding:4px;
+  font-family:var(--mono); font-size:9px; color:var(--dim); text-align:center;
+  overflow:hidden;
+}
+.vhit:hover .vhit-shot{ border-color:var(--line-2); transform:translateY(-2px); }
+.vhit:focus-visible{ outline:none; }
+.vhit:focus-visible .vhit-shot{ border-color:var(--signal); }
+.vhit-rank{
+  position:absolute; top:6px; left:6px; z-index:2;
+  font-family:var(--mono); font-size:10px; padding:2px 5px; border-radius:3px;
+  background:rgba(4,10,11,.8); color:var(--muted);
+}
+.vhit-line{
+  display:flex; align-items:baseline; gap:8px;
+  font-family:var(--mono); font-size:10.5px; color:var(--muted);
+}
+/* The score is the reason this tile is at this rank, so it is legible rather
+   than decorative — two hits at .81 and .62 are a different result set from
+   two at .81 and .80. */
+.vhit-line .score{ margin-left:auto; color:var(--dim); }
+.vhit-key{
+  font-family:var(--mono); font-size:9.5px; color:var(--dim);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+/* Chaining is the whole point of reverse frame search — one hit becomes the
+   next query — so the control is on every tile, and quiet until wanted. */
+.vhit-more{
+  position:absolute; right:6px; top:6px; z-index:2; opacity:0;
+  font-family:var(--mono); font-size:9px; text-transform:uppercase;
+  letter-spacing:.06em; padding:3px 7px; border-radius:99px;
+  background:rgba(4,10,11,.85); border:1px solid var(--line-2); color:var(--muted);
+  transition:opacity .15s var(--ease), color .15s var(--ease);
+}
+.vhit:hover .vhit-more, .vhit-more:focus-visible{ opacity:1; }
+.vhit-more:hover{ color:var(--signal); border-color:var(--signal); }
+@media (hover:none){ .vhit-more{ opacity:1; } }
 
 .card{
   display:grid; grid-template-columns:20px 152px minmax(0,1fr);
@@ -965,6 +1039,32 @@ body[data-player-size="theatre"] .screen{
   padding:9px 20px; font-size:13px; z-index:120;
   box-shadow:0 16px 40px rgba(0,0,0,.5);
 }
+
+/* ══ IMAGE DROP ══════════════════════════════════════════════════════════
+   The whole window is the target. A 40-pixel drop zone on the search bar is a
+   way of hiding a feature: a drag is a gesture at the application, and the
+   application should answer it. Nothing here is interactive, so it never
+   intercepts a click — it only appears while a file is over the page. */
+.dropveil{
+  position:fixed; inset:0; z-index:200; display:grid; place-items:center;
+  background:rgba(4,10,11,.78); backdrop-filter:blur(3px);
+  animation:veilIn .12s var(--ease);
+}
+.dropveil[hidden]{ display:none; }
+@keyframes veilIn{ from{ opacity:0 } to{ opacity:1 } }
+.dropveil-card{
+  padding:34px 46px; border-radius:var(--r-lg); text-align:center;
+  border:1.5px dashed var(--signal); background:var(--ink-2);
+  box-shadow:0 30px 80px rgba(0,0,0,.6);
+  display:flex; flex-direction:column; align-items:center; gap:10px;
+}
+.dropveil-card svg{
+  width:34px; height:34px; fill:none; stroke:var(--signal);
+  stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round;
+}
+.dropveil-card b{ font-family:var(--display); font-size:19px; font-weight:600; }
+.dropveil-card span{ color:var(--muted); font-size:13px; max-width:34ch; line-height:1.5; }
+@media (prefers-reduced-motion:reduce){ .dropveil{ animation:none } }
 
 /* ══ CELL INSPECTOR ══════════════════════════════════════════════════════
    A value in a grid is a lookup nobody has done yet. This slab does it: what

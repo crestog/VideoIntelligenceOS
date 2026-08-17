@@ -31,12 +31,12 @@ import sqlite3
 import threading
 import time
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
 from . import (config, graph, index, ingest, maps, media, reflect, roadmap,
-               search)
+               search, vsearch)
 from .tgchannel import log, recent_log
 
 BOOT_T0 = time.time()
@@ -130,6 +130,16 @@ def _boot() -> None:
         _boot_set(phase="ready", detail=f"{held} passage(s) from a previous run",
                   ready_at=time.time())
 
+    # The frame index is loaded from file rather than rebuilt, and it needs no
+    # `expect` guard: it is keyed by `(video_key, frame_idx)`, which no reindex
+    # reassigns, so last session's file is still valid against this session's
+    # database. Frame-to-frame image search therefore works before the channel
+    # is contacted, and it needs no model at all.
+    try:
+        vsearch.reload()
+    except Exception as e:                                  # noqa: BLE001
+        log(f"image index reload failed — {type(e).__name__}: {e}", "WARN")
+
     missing = config.missing_secrets()
     if os.environ.get("ATLAS_NO_SCAN") == "1":
         note = "started with --no-scan; the channel was not contacted"
@@ -161,6 +171,14 @@ def _boot() -> None:
                 _index_if_stale(bundle_conn, force=bool(added))
             except Exception as e:
                 log(f"index after bundle {result.get('seq')} failed — {e}")
+            # And the image index, on its own debounce. A shard that carried no
+            # vector bytes moves nothing here, so this costs nothing on the
+            # common case; `build_if_due` owns how often a rebuild is worth it.
+            try:
+                vsearch.build_if_due(bundle_conn, result.get("vec_bytes") or 0)
+            except Exception as e:                          # noqa: BLE001
+                log(f"image index after bundle {result.get('seq')} failed — "
+                    f"{type(e).__name__}: {e}")
 
         ingest.scan_and_import(full=True, on_bundle=after_bundle)
 
@@ -169,6 +187,15 @@ def _boot() -> None:
     except Exception as e:
         log(f"index build failed — {type(e).__name__}: {e}")
         _boot_set(error=f"{type(e).__name__}: {e}")
+
+    # The end-of-scan build. Forced only when nothing is resident — the first
+    # build of a database that already held payloads, or a session whose index
+    # files were lost with the scratch disk. With an index already loaded this
+    # just flushes whatever bytes the debounce was still holding.
+    try:
+        vsearch.build_if_due(conn, force=not vsearch.ready())
+    except Exception as e:                                  # noqa: BLE001
+        log(f"image index build failed — {type(e).__name__}: {e}", "WARN")
 
     # An index carried over from an earlier run is not proof of a graph: this
     # database may predate the graph tables entirely. Deriving it costs a few
@@ -488,6 +515,10 @@ def rescan(full: bool = True, max_messages: int = 0) -> bool:
             _index_if_stale(conn, force=bool(added))
         except Exception as e:
             log(f"post-bundle index failed — {e}")
+        try:
+            vsearch.build_if_due(conn, result.get("vec_bytes") or 0)
+        except Exception as e:                              # noqa: BLE001
+            log(f"post-bundle image index failed — {type(e).__name__}: {e}")
 
     return ingest.scan_in_background(full=full, max_messages=max_messages,
                                      on_bundle=after)
@@ -549,6 +580,132 @@ def api_suggest(q: str = "", limit: int = 8):
 @app.get("/api/similar/{video_key}")
 def api_similar(video_key: str, limit: int = 12):
     return {"results": search.similar(db(), video_key, limit)}
+
+
+# ── image search ──────────────────────────────────────────────────────────
+# A lane of its own, deliberately not fused into `/api/search`'s rank fusion:
+# that fusion mixes BM25 with Atlas's *text* embedding space, and folding a third
+# geometry into the same scoring is a recall trade-off worth measuring against a
+# working image lane rather than guessing at now.
+def _vsearch_reply(got: dict, took: float) -> dict:
+    hits = got.get("hits") or []
+    return {"ok": True, "count": len(hits), "took_ms": round(took * 1000),
+            "hits": hits, "space": got.get("space", ""),
+            "query": got.get("query") or {},
+            "searched_videos": got.get("searched_videos", 0),
+            # Present only when there is nothing to show. Four different causes
+            # produce an empty list — no payloads imported, no numpy, no
+            # encoder, or a genuinely unlike archive — and a caller cannot tell
+            # them apart from the list alone.
+            "reason": got.get("reason", "")}
+
+
+@app.get("/api/vsearch")
+def api_vsearch(q: str = Query("", description="text, into the image space"),
+                frame: str = Query("", description="<video_key>:<frame_idx>"),
+                t: float = Query(None, description="seconds, instead of an idx"),
+                space: str = "", limit: int = 40,
+                same_video: bool = False):
+    """Search frames. `frame=` needs no model; `q=` loads CLIP on first use.
+
+    `frame=<key>:<idx>` is the mode to reach for — the query vector is already
+    in the database, so it answers in either space with nothing downloaded. `q=`
+    goes through CLIP's text tower into the `clip` space, which is the only
+    space a CLIP vector may be compared in.
+
+    `frame=<key>&t=<seconds>` is the same query from a player's point of view:
+    the interface has a playhead, not a frame number, and `fps` is a column
+    Atlas holds and the browser does not. Converting here keeps the one piece of
+    arithmetic that can be wrong in the place that has the data for it.
+    """
+    t0 = time.time()
+    limit = max(1, min(int(limit or 40), 200))
+    if frame:
+        key, _sep, raw = frame.rpartition(":")
+        if not key:
+            key, raw = frame, ""
+        key = reflect.normalize_key(key)
+        if t is not None and not raw:
+            idx = vsearch.frame_for_time(db(), key, t)
+            if idx is None:
+                return {"ok": False, "count": 0, "hits": [],
+                        "reason": f"{key} has no frame rate on record, so a "
+                                  f"timestamp cannot name a frame — pass "
+                                  f"frame={key}:<frame_idx>"}
+        else:
+            try:
+                idx = int(raw or 0)
+            except ValueError:
+                return {"ok": False, "count": 0, "hits": [],
+                        "reason": f"'{frame}' is not <video_key>:<frame_idx>"}
+        sp = space or config.VSEARCH_SPACES[0]
+        got = vsearch.similar_to_frame(db(), key, idx, space=sp, limit=limit,
+                                       same_video=bool(same_video))
+    elif q.strip():
+        if space and space != "clip":
+            return {"ok": False, "count": 0, "hits": [],
+                    "reason": "text and image queries are encoded by CLIP, so "
+                              "they can only be searched in the clip space"}
+        got = vsearch.search_text(db(), q.strip(), limit=limit)
+    else:
+        return {"ok": False, "count": 0, "hits": [],
+                "reason": "pass ?q=<text> or ?frame=<video_key>:<frame_idx>"}
+    return _vsearch_reply(got, time.time() - t0)
+
+
+@app.post("/api/vsearch/image")
+async def api_vsearch_image(file: UploadFile = File(...), limit: int = 40):
+    """Drop a screenshot, get the frames that look like it.
+
+    Read with a ceiling rather than `await file.read()` unbounded: this is a
+    public-facing multipart endpoint and the file only has to survive being
+    decoded to 224x224. Eight megabytes is a generous screenshot.
+    """
+    t0 = time.time()
+    data = await file.read(8 * 1024 * 1024)
+    if not data:
+        return {"ok": False, "count": 0, "hits": [],
+                "reason": "the upload was empty"}
+    got = vsearch.search_image(db(), data,
+                               limit=max(1, min(int(limit or 40), 200)))
+    return _vsearch_reply(got, time.time() - t0)
+
+
+@app.get("/api/vsearch/state")
+def api_vsearch_state():
+    """Spaces, frame counts, the chosen stride, resident MB and encoder state."""
+    return {"ok": True, **vsearch.state()}
+
+
+@app.post("/api/vsearch/build")
+def api_vsearch_build():
+    """Rebuild the frame index now. Normally the import loop does this."""
+    return {"ok": True, "spaces": vsearch.build(db())}
+
+
+@app.post("/api/vsearch/warm")
+def api_vsearch_warm():
+    """Load the query encoder now, so the first text query is not the slow one."""
+    ok = vsearch.warm()
+    return {"ok": ok, "encoder": vsearch.state()["encoder"]}
+
+
+@app.get("/api/frame/{video_key}")
+def api_frame(video_key: str, i: int = 0, t: float = None):
+    """Render one frame of one video, for an image-search result thumbnail.
+
+    Frames are not stored — the processing plane's frame tiers live on its own
+    scratch disk and never enter a shard — so this renders from the poster path
+    Atlas already has, at the timestamp the frame index implies. `t` may be
+    given directly when the caller already has one.
+    """
+    key = reflect.normalize_key(video_key)
+    at = t if t is not None else vsearch.frame_time(db(), key, i)
+    path = media.poster(db(), key, at=at)
+    if not path:
+        return Response(status_code=204)
+    return FileResponse(path, media_type="image/jpeg", headers={
+        "Cache-Control": "public, max-age=604800, immutable"})
 
 
 # ── library ───────────────────────────────────────────────────────────────

@@ -86,6 +86,15 @@
     <input id="q" name="q" type="search" spellcheck="false"
            placeholder="Describe the moment you are looking for"
            aria-describedby="finder-hint">
+    <!-- Image search. The file input is hidden because a bare "Choose file"
+         control says nothing about what it does; the button explains it and
+         dropping an image anywhere on the page does the same thing. -->
+    <input id="qImage" type="file" accept="image/*" hidden>
+    <button type="button" class="finder-img" id="qImageBtn"
+            title="Search by image — drop a screenshot anywhere"
+            aria-label="Search by image">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3.2"/><path d="M7.5 5 9 3h6l1.5 2"/></svg>
+    </button>
     <button type="submit" class="finder-go" aria-label="Search">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
     </button>
@@ -241,7 +250,10 @@
                allowed in. The evidence-type chips above stay where they are:
                they narrow which passages count as a match, which is a different
                question from which videos survive. -->
-          <div class="results-controls">
+          <!-- Hidden as a block during image search: every control in it governs
+               a list of videos ordered by text relevance, and a list of frames
+               has neither. -->
+          <div class="results-controls" id="resultsControls">
             <div class="rc-views" role="group" aria-label="Result layout">
               <button class="rc-view on" data-view="list" title="One result per row, with its matching passages">rows</button>
               <button class="rc-view" data-view="grid" title="Thumbnail grid — hover any tile to watch its moment">grid</button>
@@ -601,6 +613,11 @@
         <span class="pnav-gap"></span>
         <button class="pnav pnav-quiet" id="momLoop" aria-pressed="false"
                 title="Loop the moment you are on (o)">loop</button>
+        <!-- Reverse frame search from the playhead. This one needs no model:
+             the frame's embedding is already in the database, so it answers
+             from a matrix in memory. -->
+        <button class="pnav pnav-quiet" id="momLike"
+                title="Find frames across the archive that look like this one">looks like ›</button>
       </div>
 
       <div class="ribbon-block">
@@ -637,6 +654,18 @@
   </div>
   <div class="cs-body" id="cellBody"></div>
 </aside>
+
+<!-- Drag an image anywhere on the page to search the archive's frames for it.
+     A full-window target rather than a small one on the search bar: a drop is a
+     gesture at the whole application, and a 40-pixel target for it is a way of
+     hiding the feature. -->
+<div class="dropveil" id="dropVeil" hidden aria-hidden="true">
+  <div class="dropveil-card">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3.2"/><path d="M7.5 5 9 3h6l1.5 2"/></svg>
+    <b>Drop an image</b>
+    <span>Every frame in the archive is searched for what it looks like</span>
+  </div>
+</div>
 
 <div class="toast" id="toast" hidden></div>
 <script src="atlas.js" onerror="window.__atlasFault &amp;&amp; window.__atlasFault('atlas.js could not be fetched — the interface has no code to run')"></script>
