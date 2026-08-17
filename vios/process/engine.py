@@ -177,6 +177,47 @@ def _safe(key: str) -> str:
     return "".join(c if (c.isalnum() or c in "-_") else "_" for c in key)[:64]
 
 
+_ENV_UNKNOWN: dict = {}
+
+
+def _env_ids(name: str) -> list:
+    """A comma-separated env var as a list of component ids, unknowns dropped.
+
+    Unknown ids are dropped rather than raised on: these variables exist to let
+    a session be narrowed from a Kaggle cell, and a typo should cost the pass it
+    named, not the run.
+
+    A dropped name is still an operator error, so it is recorded in
+    `_ENV_UNKNOWN` for `_narrowed` to log through the engine's own log — which
+    is what shows up on the process tab. Warning to stderr here would be
+    warning into a Kaggle cell that nobody reads back.
+    """
+    raw = os.environ.get(name, "") or ""
+    want = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    known = set(registry.all_ids())
+    _ENV_UNKNOWN[name] = [p for p in want if p not in known]
+    return [p for p in want if p in known]
+
+
+def _env_waves(name: str = "VIOS_WAVES") -> set:
+    """Which waves this session runs. Default: the spine, then the refinement.
+
+    Wave 3 is off by default for the same reason its members are — it holds the
+    passes that need both cards or are not part of the archive's baseline. Set
+    `VIOS_WAVES=1` for a session that only wants the searchable spine, or
+    `1,2,3` for everything.
+    """
+    raw = (os.environ.get(name, "") or "").strip()
+    if not raw:
+        return {registry.WAVE_SPINE, registry.WAVE_FULL}
+    out = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out or {registry.WAVE_SPINE, registry.WAVE_FULL}
+
+
 class ProcessEngine:
     """One instance per process. Configure it, start it, watch it, stop it."""
 
@@ -208,6 +249,18 @@ class ProcessEngine:
         self.cache_budget_mb = CACHE_BUDGET_MB
         self.disk_floor_mb = DISK_FLOOR_MB
         self.video_limit = 0            # 0 = the whole partition
+
+        # ── ordering and narrowing, read once from the environment ────────
+        # `VIOS_WAVES` picks which waves run, `VIOS_WAVE1` redefines the spine
+        # by id, `VIOS_ONLY`/`VIOS_EXCEPT` narrow the selection. All four are
+        # applied before the packer, so a narrowed session is a smaller plan
+        # rather than a full plan with passes vetoed one video at a time — and
+        # every one of them is a Kaggle-cell edit rather than a code change.
+        self.waves_on: set = _env_waves()
+        self.spine_override: list = _env_ids("VIOS_WAVE1")
+        self.only: list = _env_ids("VIOS_ONLY")
+        self.exclude: list = _env_ids("VIOS_EXCEPT")
+        self._selection_logged = False
 
         # When this container last replayed shards from the channel. The boot
         # restore and `restore_on_start` are the same scan over thousands of
@@ -262,6 +315,10 @@ class ProcessEngine:
         # five minutes, and so the log says it once rather than once per video.
         self._elsewhere: set = set()
         self._elsewhere_logged: set = set()
+
+        # The component ids this rotation planned. Set once per sweep; read by
+        # the dependency gate to tell "not run yet" from "never selected".
+        self._runnable: set = set()
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -812,7 +869,7 @@ class ProcessEngine:
                 self.resources = res
             self._log(resources.describe(res))
 
-            sel = list(self.selected)
+            sel = self._narrowed()
             cannot = registry.unrunnable(sel, res)
             for cid, why in cannot.items():
                 self._log(f"{cid} cannot run here: {why}", "warn")
@@ -822,7 +879,37 @@ class ProcessEngine:
                     "no selected pass can run on this machine — "
                     + "; ".join(f"{k}: {v}" for k, v in cannot.items()))
 
+            # Which components are the spine, and which waves this session runs.
+            # Closing an operator's `VIOS_WAVE1` over its own needs is what keeps
+            # a hand-written spine safe: a wave whose members need something from
+            # a later wave runs passes with nothing to read, and that failure is
+            # invisible in the output.
+            spine = None
+            if self.spine_override:
+                spine = registry.close_needs(self.spine_override, runnable)
+                pulled = sorted(set(spine) - set(self.spine_override))
+                if pulled and not self._selection_logged:
+                    self._log(f"VIOS_WAVE1 also pulls in {', '.join(pulled)} — "
+                              f"needed by the spine you named")
+            runnable = [cid for w, group in registry.waves(runnable, spine)
+                        if w in self.waves_on for cid in group]
+            if not runnable:
+                raise RuntimeError(
+                    f"VIOS_WAVES={','.join(str(w) for w in sorted(self.waves_on))} "
+                    f"selects no pass that can run here")
+            leaks = registry.wave_leaks(runnable, spine)
+            for cid, need, w in leaks:
+                self._log(f"{cid} needs {need}, which is in wave {w} — a later "
+                          f"wave than its own; it will run without it", "warn")
+            self._selection_logged = True
+
             cov.plan(runnable)
+            # What "in the plan" means to the dependency gate below. A hard need
+            # inside this set is work this session intends to do, so a pass that
+            # finds it not yet run waits for it; a hard need outside the set was
+            # never selected, and waiting for it would be waiting forever.
+            with self._lock:
+                self._runnable = set(runnable)
             reclaimed = cov.reclaim_stale()
             if reclaimed:
                 self._log(f"Reclaimed {reclaimed} stale leases from a session "
@@ -861,48 +948,80 @@ class ProcessEngine:
 
             budget = max(res.get("usable_vram_mb", 0) - self.vram_headroom_mb,
                          512)
-            cohorts = registry.plan_cohorts(
-                runnable, budget, max(res.get("gpu_count", 0), 1),
-                res.get("disk_free_mb", 0))
+            # Cohorts are packed per wave rather than once over everything, and
+            # that is the whole of the ordering change. The barrier is unaffected:
+            # `plan_cohorts` still packs first-fit over `topo_sort`, so a cohort's
+            # outputs are still complete and uploaded before the next begins.
+            # Waves sit above cohorts and make the boundary coarser, not weaker —
+            # wave 1 finishes across every video, publishes, and only then does
+            # the wave that refines the same database start.
+            #
+            # Cohort indices are renumbered across the whole rotation so that a
+            # publish label, a log line and `self.cohort_index` each still name
+            # exactly one cohort.
+            plan: list = []
+            for wv, group in registry.waves(runnable, spine):
+                cs = registry.plan_cohorts(
+                    group, budget, max(res.get("gpu_count", 0), 1),
+                    res.get("disk_free_mb", 0))
+                for c in cs:
+                    c.index += sum(len(p[2]) for p in plan)
+                plan.append((wv, group, cs))
+
+            cohorts = [c for _w, _g, cs in plan for c in cs]
+            rows: list = []
+            for wv, group, cs in plan:
+                for c in cs:
+                    rows.append({**c.as_dict(), "wave": wv,
+                                 "wave_name": registry.WAVE_NAMES.get(
+                                     wv, str(wv))})
             with self._lock:
-                self.cohorts = [c.as_dict() for c in cohorts]
-            self._log(f"Plan: {len(cohorts)} cohorts over {len(runnable)} "
-                      f"passes, {budget} MB per card")
+                self.cohorts = rows
+            self._log(f"Plan: {len(plan)} waves, {len(cohorts)} cohorts over "
+                      f"{len(runnable)} passes, {budget} MB per card")
+            for wv, group, cs in plan:
+                self._log(f"  wave {wv} ({registry.WAVE_NAMES.get(wv, wv)}): "
+                          f"{len(group)} passes in {len(cs)} cohorts, "
+                          f"{sum(registry.get(i).seconds for i in group):.0f} s "
+                          f"per video")
             self._preflight_cloud(runnable)
 
-            # Where each registry stage ends. A cohort is a VRAM grouping and
-            # can straddle two stages, so the boundary is "the last cohort that
-            # holds any component of this stage" — computed from the plan rather
-            # than assumed from cohort order, because the packer is free to
-            # split a stage across cohorts and routinely does.
-            stage_end: dict = {}
-            for c in cohorts:
-                for cid in c.components:
-                    comp = registry.BY_ID.get(cid)
-                    if comp is not None:
-                        stage_end[comp.stage_name] = max(
-                            stage_end.get(comp.stage_name, -1), c.index)
-            ends_at: dict = {}
-            for st, idx in stage_end.items():
-                ends_at.setdefault(idx, []).append(st)
-
             worked = 0
-            for cohort in cohorts:
-                if self._stopping():
+            preempted = False
+            for wv, group, cs in plan:
+                if self._stopping() or preempted:
                     break
-                worked += self._run_cohort(cohort)
-                self._unload(f"cohort {cohort.index} complete")
-                self._publish(f"cohort-{cohort.index}")
-                self._retry_pending_stages(runnable)
-                for st in ends_at.get(cohort.index, []):
+                for cohort in cs:
                     if self._stopping():
                         break
-                    self._publish_stage(
-                        st, registry.components_in_stage(st, runnable))
+                    # Wave 1 has absolute priority, permanently. A video posted
+                    # to the channel during wave 2 gets its spine before wave 2
+                    # continues — the rotation restarts at wave 1 and the
+                    # ordering self-heals, with no special case for late
+                    # arrivals anywhere in the loop.
+                    if self._earlier_wave_waiting(plan, wv, runnable):
+                        preempted = True
+                        break
+                    worked += self._run_cohort(cohort, wv)
+                    self._unload(f"cohort {cohort.index} complete")
+                    self._publish(f"cohort-{cohort.index}")
+                    self._retry_pending_stages(runnable)
+                if preempted or self._stopping():
+                    break
+                # The wave finished across every video. That is a database in
+                # which a whole layer is complete rather than a cohort boundary
+                # nobody outside this loop can interpret, so it is the boundary
+                # the snapshot bundle is cut on.
+                self._publish_stage(registry.WAVE_NAMES.get(wv, str(wv)), group)
 
             if self._stopping():
                 break
-            if worked == 0:
+            # A preemption means an earlier wave has work waiting *right now*,
+            # so the rotation restarts immediately. Falling into the idle branch
+            # here would sleep on work we have just been told exists — the one
+            # case where "nothing ran this rotation" does not mean "nothing to
+            # run".
+            if worked == 0 and not preempted:
                 deferred = cov.deferred()
                 if deferred["rows"] and self.follow:
                     due = deferred["due_at"]
@@ -947,6 +1066,91 @@ class ProcessEngine:
         self._publish("final")
         self._log("Stopped cleanly")
 
+    # ── selection ────────────────────────────────────────────────────────
+    def _narrowed(self) -> list:
+        """The selected components, after `VIOS_ONLY` and `VIOS_EXCEPT`.
+
+        The escape hatch for a pass that misbehaves on one machine, and for
+        running one pass across the archive from a second machine — a shard
+        replays into any database by uid, so a host that runs only `ocr` is a
+        contributor and not a fork. Narrowing happens here, above the wave
+        filter and well above `plan_cohorts`, so everything downstream sees
+        one list and no stage has to know these variables exist.
+
+        An empty result is an operator error, not a state to soldier on in:
+        the caller raises rather than sweeping zero passes and reporting
+        success.
+        """
+        sel = list(self.selected)
+        keep, drop = self.only, self.exclude
+        if keep:
+            sel = [c for c in sel if c in keep]
+        if drop:
+            sel = [c for c in sel if c not in drop]
+        if not self._selection_logged:
+            for var, names in _ENV_UNKNOWN.items():
+                if names:
+                    self._log(f"{var} names {', '.join(names)}, which is not a "
+                              f"component id — ignored", "warn")
+        if (keep or drop) and not self._selection_logged:
+            if keep:
+                self._log(f"VIOS_ONLY: running only "
+                          f"{', '.join(c for c in keep if c in self.selected)}")
+            if drop:
+                self._log(f"VIOS_EXCEPT: skipping "
+                          f"{', '.join(c for c in drop if c in self.selected)}")
+        if not sel:
+            raise RuntimeError(
+                "VIOS_ONLY/VIOS_EXCEPT leave no pass selected — "
+                f"only={','.join(keep) or '-'} except={','.join(drop) or '-'}")
+        return sel
+
+    def _earlier_wave_waiting(self, plan: list, wave: int,
+                              runnable: list) -> bool:
+        """Is there outstanding work in a wave before this one?
+
+        This is what makes wave 1's priority permanent rather than a one-time
+        ordering. A video posted to the channel while wave 2 is running has no
+        transcript, no vectors and no description — it is invisible to search
+        until its spine runs — so the rotation abandons wave 2 at the next
+        cohort boundary, restarts at wave 1, and picks wave 2 back up
+        afterwards. Nothing is lost by restarting: coverage remembers every
+        row that is already `done`, so the second pass over wave 2 resumes
+        where the first stopped.
+
+        A cohort boundary is the only place this may be answered, because it
+        is the only place the barrier holds — preempting mid-cohort would
+        leave a cohort's outputs half-written and unpublished.
+
+        In follow mode the check first pulls the ledger and re-plans, because
+        a video captured minutes ago has no coverage rows at all yet and
+        `candidates` cannot see work that was never planned.
+        """
+        earlier = [cid for w, group, _cs in plan if w < wave for cid in group]
+        if not earlier:
+            return False
+        if self.follow and self.sync_on_start:
+            try:
+                got = intake.sync(self.store, self.ledger_path)
+                if got.get("added"):
+                    self._log(f"{got['added']} new videos arrived during "
+                              f"wave {wave}")
+                    self.coverage.plan(runnable)
+            except Exception as exc:                   # noqa: BLE001
+                # A ledger that cannot be read costs freshness, never the
+                # rotation: the wave keeps running and the next boundary asks
+                # again.
+                self._log(f"Ledger check failed, continuing: "
+                          f"{type(exc).__name__}: {exc}", "warn")
+        if not self.coverage.candidates(earlier, limit=1):
+            return False
+        self._log(f"Wave {wave} yields — an earlier wave has work outstanding; "
+                  f"restarting the rotation so the searchable spine goes first")
+        with self._lock:
+            self.message = (f"Pausing wave {wave} — new videos need their "
+                            f"searchable spine first.")
+        return True
+
     def _sleep(self, seconds: float) -> None:
         """Interruptible wait, in short slices, so stop is felt immediately."""
         end = time.time() + seconds
@@ -954,7 +1158,7 @@ class ProcessEngine:
             time.sleep(min(1.0, max(end - time.time(), 0)))
 
     # ── one cohort ───────────────────────────────────────────────────────
-    def _run_cohort(self, cohort) -> int:
+    def _run_cohort(self, cohort, wave: int = 0) -> int:
         """Run every pass in this cohort over every video that still needs one.
 
         `seen` is why a failure does not become a spin: a video whose pass
@@ -962,14 +1166,21 @@ class ProcessEngine:
         remembering that it was attempted this cohort, `candidates` would hand
         it straight back and the loop would grind on the same reel until its
         attempts ran out. Retries belong to the next rotation, not this one.
+
+        `wave` is carried for the log and the status line only. A cohort runs
+        the same way whichever wave admitted it; naming the wave is what makes
+        "the spine is still going" readable in a log that is otherwise a list
+        of cohort numbers.
         """
         ids = list(cohort.components)
+        wname = registry.WAVE_NAMES.get(wave, "") if wave else ""
+        tag = f" [{wname}]" if wname else ""
         with self._lock:
             self.cohort_index = cohort.index
-            self.message = (f"Cohort {cohort.index + 1}: "
+            self.message = (f"Cohort {cohort.index + 1}{tag}: "
                             f"{', '.join(registry.get(i).title for i in ids[:4])}"
                             + (f" +{len(ids) - 4} more" if len(ids) > 4 else ""))
-        self._log(f"Cohort {cohort.index}: {len(ids)} passes, "
+        self._log(f"Cohort {cohort.index}{tag}: {len(ids)} passes, "
                   f"{cohort.vram_mb} MB, {len(cohort.loads)} model loads")
 
         seen: set = set()
@@ -1090,14 +1301,51 @@ class ProcessEngine:
 
         # Dependency gate. A pass whose input was never produced should not
         # spend a GPU second discovering that for itself.
+        #
+        # `soft` narrows the veto to inputs that supply a pass's subject. The
+        # runners were written for absence — `Job.text_bundle` returns an empty
+        # `on_screen` list when OCR wrote nothing, and `narrate`, `keyphrase`,
+        # `concepts` and `text-embed` each raise their own skip naming every
+        # source they looked in — so one engine that could not start was
+        # deleting six passes that would have run without it. Membership in
+        # `needs` is unchanged, so `topo_sort` and `plan_cohorts` still order
+        # the work exactly as before; only the veto is narrower.
         broken = [n for n in comp.needs
-                  if states.get(n) in ("failed", "skipped")]
+                  if n not in comp.soft
+                  and states.get(n) in ("failed", "skipped")]
         if broken:
             why = (f"depends on {', '.join(broken)}, which produced nothing "
                    f"for this video")
             cov.skip(key, cid, why)
             self.session["skipped"] += 1
             return "skipped"
+
+        degraded = [n for n in comp.soft
+                    if states.get(n) in ("failed", "skipped")]
+        if degraded:
+            # Recorded, not vetoed: the claim this pass writes carries a note
+            # saying which inputs were missing, so a thinner answer is legible
+            # as thinner rather than passed off as complete.
+            self._log(f"{key} {cid}: running without {', '.join(degraded)} "
+                      f"— soft input, the pass reports what it had", "warn")
+
+        # A hard need that has not run yet. The serial cohort barrier means this
+        # cannot fire today: `topo_sort` puts every need ahead of its consumer
+        # inside one video, and a cross-cohort need is complete before this
+        # cohort begins. It is the net under that invariant — a future packer,
+        # a wave boundary or a second worker taking a different slice of the
+        # same video degrades into a retry in sixty seconds instead of a pass
+        # silently fed nothing.
+        pending = [n for n in comp.needs
+                   if n not in comp.soft
+                   and n in self._runnable
+                   and states.get(n) not in ("done", "failed", "skipped",
+                                             "deferred")]
+        if pending:
+            cov.defer(key, cid, f"waiting on {', '.join(pending)}, not yet run "
+                                f"for this video", 60.0)
+            self.session["deferred"] = self.session.get("deferred", 0) + 1
+            return "deferred"
 
         # A dependency that deferred has not failed — it is waiting on a clock.
         # Skipping this pass would make a rate limit permanent for the video,
@@ -1722,7 +1970,14 @@ class ProcessEngine:
 
     def _publish_stage(self, stage: str, components: list,
                        force: bool = False) -> dict:
-        """Cut this stage's bundle and send it up. Never raises.
+        """Cut this group's bundle and send it up. Never raises.
+
+        `stage` is a *group label*, not necessarily a registry stage: it is a
+        stage name when a caller asks for one, and a wave name — `spine`,
+        `refine`, `deep` — when the rotation cuts on a wave boundary, which is
+        the usual case. Nothing below reads it as anything but a label and a
+        meta key; `stage_report` takes it purely to name what it describes, and
+        `group_members` resolves either kind back on a retry.
 
         Order is load-bearing, and it is the same order `_publish` uses for the
         same reason: the watermark advances **last**. A bundle whose upload fails
@@ -1894,11 +2149,16 @@ class ProcessEngine:
             pass
 
     def _retry_pending_stages(self, planned: list) -> None:
-        """Re-attempt every stage bundle that failed to upload earlier.
+        """Re-attempt every bundle that failed to upload earlier.
 
-        Called on the ordinary publish tick, which is the point: a stage never
+        Called on the ordinary publish tick, which is the point: a group never
         waits on the one before it, and a transport outage costs a retry rather
         than a bundle.
+
+        The pending label may name a wave rather than a stage, because that is
+        the boundary the rotation cuts on — `group_members` resolves either, and
+        it takes the same spine override the rotation planned with so a wave
+        label resolves to the components the bundle actually described.
         """
         try:
             pending = json.loads(
@@ -1907,10 +2167,12 @@ class ProcessEngine:
             return
         if not isinstance(pending, list) or not pending:
             return
+        spine = registry.close_needs(self.spine_override, planned) \
+            if self.spine_override else None
         for stage in list(pending):
             if self._stopping():
                 return
-            comps = registry.components_in_stage(stage, planned)
+            comps = registry.group_members(stage, planned, spine)
             if not comps:
                 self._mark_stage_pending(stage, add=False)
                 continue

@@ -62,6 +62,26 @@ STAGE_NAMES = {
     STAGE_LANGUAGE: "language",
 }
 
+# Waves — the cut a stage cannot make.
+#
+# Stage says what a pass depends on. It does not say whether the pass is what
+# makes the archive searchable, and stage 2 mixes the 40-second SigLIP that does
+# with the 110-second Florence-2 that refines it. Running the whole registry over
+# video 1 before video 2 begins means nothing is searchable until everything is
+# done; running the spine over every video first means the archive is searchable
+# — by text and by image — in the first hour, and every wave after that improves
+# the same database in place.
+#
+# Wave 1 is need-closed: every hard need of a wave-1 pass is itself wave 1. That
+# is what makes the wave safe rather than merely fast, and `wave_leaks` asserts
+# it instead of trusting it.
+WAVE_SPINE, WAVE_FULL, WAVE_DEEP = 1, 2, 3
+WAVE_NAMES = {
+    WAVE_SPINE: "spine",
+    WAVE_FULL: "refine",
+    WAVE_DEEP: "deep",
+}
+
 
 @dataclass(frozen=True)
 class Component:
@@ -87,12 +107,25 @@ class Component:
 
     device: str = "cpu"              # cpu | gpu
     cards: int = 1                   # 2 means it must be sharded across both T4s
+    wave: int = WAVE_FULL            # 1 = the searchable spine, run first
+    # Only wave 1 is hand-set, and only on the thirteen passes that produce
+    # something a search box can reach: shots, transcript, caption, description,
+    # and the three vector spaces. Wave 3 is derived rather than declared
+    # (`wave_of`), so a pass that needs both cards or is off by default cannot be
+    # left in an early wave by a field nobody remembered to change.
     vram_mb: int = 0
     ram_mb: int = 512
     disk_mb: int = 0                 # weights to download, for the disk check
     seconds: float = 1.0             # per video, on one T4, ~30 s reel
 
     needs: tuple = ()                # component ids that must finish first
+    soft: tuple = ()                 # subset of `needs` whose absence is survivable
+    # A soft need still orders the work — it stays in `needs`, so `topo_sort` and
+    # `plan_cohorts` keep the edge — but a soft need that failed or skipped no
+    # longer vetoes this pass. It is the difference between "OCR found no text"
+    # and "OCR could not run": the runners were written for the first case
+    # (`Job.text_bundle` returns an empty list when OCR wrote nothing) and the
+    # engine's gate was turning the second into a deletion of every consumer.
     produces: tuple = ("claims",)
     kinds: tuple = ()                # claim kinds, so the tab can say what it wrote
     requires: tuple = ()             # importable module names, for preflight
@@ -129,6 +162,7 @@ class Component:
 _STRUCTURE = [
     Component(
         id="probe", title="Probe", stage=STAGE_STRUCTURE, family="ffmpeg",
+        wave=WAVE_SPINE,
         summary="Container truth: duration, resolution, fps, codecs, bitrate.",
         detail=(
             "ffprobe on the original mp4. Fills the video row rather than "
@@ -141,6 +175,7 @@ _STRUCTURE = [
     ),
     Component(
         id="artifacts", title="Artifacts", stage=STAGE_STRUCTURE, family="ffmpeg",
+        wave=WAVE_SPINE,
         summary="Poster, sprite sheet, 4-second loop, 480p proxy, waveform, wav.",
         detail=(
             "One ffmpeg invocation per artifact, all derived and all "
@@ -154,6 +189,7 @@ _STRUCTURE = [
     ),
     Component(
         id="shots", title="Shot detection", stage=STAGE_STRUCTURE, family="vision",
+        wave=WAVE_SPINE,
         summary="TransNetV2 over a PySceneDetect prefilter — the atomic unit.",
         detail=(
             "Shots are the spine of the whole database. Every claim about "
@@ -170,6 +206,7 @@ _STRUCTURE = [
     ),
     Component(
         id="keyframes", title="Keyframes", stage=STAGE_STRUCTURE, family="ffmpeg",
+        wave=WAVE_SPINE,
         summary="One sharp representative frame per shot, plus its atlas tile.",
         detail=(
             "Picks the least-blurred frame in each shot by variance of the "
@@ -182,6 +219,7 @@ _STRUCTURE = [
     ),
     Component(
         id="allframes", title="All frames", stage=STAGE_STRUCTURE, family="ffmpeg",
+        wave=WAVE_SPINE,
         summary="Every frame of the video, with a per-frame timestamp and a "
                 "coverage proof.",
         detail=(
@@ -224,6 +262,7 @@ _STRUCTURE = [
 _SIGNAL = [
     Component(
         id="caption", title="Caption and comments", stage=STAGE_SIGNAL,
+        wave=WAVE_SPINE,
         family="signal", channel="caption",
         summary="The creator's text, hashtags, mentions, and the captured comments.",
         detail=(
@@ -237,6 +276,7 @@ _SIGNAL = [
     ),
     Component(
         id="cuts", title="Cut rhythm", stage=STAGE_SIGNAL, family="signal",
+        wave=WAVE_SPINE,
         channel="style",
         summary="Average shot length, cut rate, and how regular the rhythm is.",
         detail=(
@@ -354,6 +394,7 @@ _PERCEPTION = [
     # ── speech ──────────────────────────────────────────────────────────
     Component(
         id="transcribe", title="Transcribe", stage=STAGE_PERCEPTION, family="audio",
+        wave=WAVE_SPINE,
         channel="speech",
         summary="Whisper large-v3 via CTranslate2, word timestamps, 99 languages.",
         detail=(
@@ -449,7 +490,7 @@ _PERCEPTION = [
     Component(
         id="ocr", title="On-screen text", stage=STAGE_PERCEPTION, family="vision",
         channel="ocr",
-        summary="PP-OCRv5, Latin and Devanagari, with temporal deduplication.",
+        summary="PP-OCRv5 (EasyOCR fallback), with temporal deduplication.",
         detail=(
             "Reels caption themselves; the words burned into the frame are "
             "often the whole message and never appear in the transcript. "
@@ -459,7 +500,12 @@ _PERCEPTION = [
             "exactly what was on screen at any frame inside it. Reading "
             "keyframes instead would have meant one frame per shot: a caption "
             "that appears and leaves inside a single shot was invisible, and "
-            "that is most captions."),
+            "that is most captions.\n\n"
+            "PP-OCR is preferred and EasyOCR is the fallback, because "
+            "paddlepaddle-gpu is a ~700 MB wheel that must match the CUDA "
+            "build and is deliberately not installed here — without a backend "
+            "every PaddleOCR constructor fails. EasyOCR is torch, is already "
+            "installed, and the emission records which engine answered."),
         model="PaddlePaddle/PP-OCRv5", weights="ppocr-v5", device="gpu",
         revision="2",
         vram_mb=1500, disk_mb=400, seconds=90.0,
@@ -477,13 +523,19 @@ _PERCEPTION = [
             "fail in different ways: the first drops stylised type, the second "
             "hallucinates plausible words. Running both and keeping both means "
             "the failures do not overlap, and agreement between them is a much "
-            "stronger signal than either one's own confidence score."),
+            "stronger signal than either one's own confidence score.\n\n"
+            "Its remote code needs timm, and its flash-attention guard has to "
+            "be stripped from the import check because flash-attn needs Ampere "
+            "and these are T4s. `hf_revision` pins the remote code to one "
+            "commit: it is executed in this process, so 'whatever main says "
+            "today' is not a version."),
         model="microsoft/Florence-2-large", weights="florence-2-large",
         quant="fp16", device="gpu", vram_mb=1700, disk_mb=1600, seconds=110.0,
-        revision="2",
-        needs=("allframes",), requires=("transformers", "torch"),
+        revision="3",
+        needs=("allframes",), requires=("transformers", "torch", "timm"),
         kinds=("text",),
-        params={"tier": "full", "batch": 4, "stride": 1},
+        params={"tier": "full", "batch": 4, "stride": 1,
+                "hf_revision": "21a599d414c4d928c9032694c424fb94458e3594"},
     ),
 
     # ── what is in frame ────────────────────────────────────────────────
@@ -559,6 +611,7 @@ _PERCEPTION = [
     ),
     Component(
         id="visual-embed", title="Visual embedding", stage=STAGE_PERCEPTION,
+        wave=WAVE_SPINE,
         family="vision", channel="visual",
         summary="SigLIP-2 per frame — the vectors behind visual search.",
         detail=(
@@ -580,6 +633,7 @@ _PERCEPTION = [
     ),
     Component(
         id="clip-embed", title="Visual embedding (second space)",
+        wave=WAVE_SPINE,
         stage=STAGE_PERCEPTION, family="vision", channel="visual",
         summary="CLIP ViT-L/14 over the same frames — a second, independent "
                 "retrieval space.",
@@ -605,6 +659,7 @@ _PERCEPTION = [
     ),
     Component(
         id="tag", title="Zero-shot tags", stage=STAGE_PERCEPTION, family="vision",
+        wave=WAVE_SPINE,
         channel="visual",
         summary="Cosine similarity against a curated label set. No prompting.",
         detail=(
@@ -660,6 +715,7 @@ _VLM = "qwen3-vl-8b-awq"
 _LANGUAGE = [
     Component(
         id="describe", title="Describe shots", stage=STAGE_LANGUAGE, family="vlm",
+        wave=WAVE_SPINE,
         channel="visual",
         summary="Qwen3-VL 8B AWQ: what is physically present, shot by shot.",
         detail=(
@@ -690,6 +746,10 @@ _LANGUAGE = [
         model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
         device="gpu", vram_mb=6200, disk_mb=0, seconds=20.0, ram_mb=3072,
         needs=("describe", "transcribe", "ocr", "loudness", "cuts"),
+        # `describe` is the subject; the rest enrich the prompt. narrate carries
+        # its own truthful guard — "nothing was said, written or captioned" —
+        # so an OCR engine that could not start must not delete this pass.
+        soft=("transcribe", "ocr", "loudness", "cuts"),
         requires=("transformers", "torch"),
         kinds=("hook", "beat", "turn", "payoff", "premise", "why_it_works",
                "weakness"),
@@ -708,6 +768,9 @@ _LANGUAGE = [
         model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
         device="gpu", vram_mb=6200, disk_mb=0, seconds=12.0, ram_mb=3072,
         needs=("describe", "colour", "motion", "cuts"),
+        # The measurements are what ground the vocabulary, and the pass already
+        # prints "not measured" for any of them that is absent.
+        soft=("colour", "motion", "cuts"),
         requires=("transformers", "torch"),
         kinds=("technique", "lighting", "grade", "framing", "edit_style",
                "reference"),
@@ -723,6 +786,9 @@ _LANGUAGE = [
             "model's concept extraction is judged: a concept the model reports "
             "and neither extractor can find is a concept worth doubting."),
         needs=("transcribe", "ocr", "caption"), seconds=0.6,
+        # Three sources of text, any one of which is enough. The pass raises its
+        # own skip naming all three when every one of them is empty.
+        soft=("transcribe", "ocr", "caption"),
         requires=("yake",), kinds=("keyphrase",),
     ),
     Component(
@@ -738,11 +804,16 @@ _LANGUAGE = [
         model="Qwen/Qwen3-4B-Instruct-AWQ", weights="qwen3-4b-awq", quant="awq",
         device="gpu", vram_mb=3400, disk_mb=3000, seconds=8.0,
         needs=("transcribe", "ocr", "caption", "keyphrase"),
+        # Same three text sources, plus the statistical control it is scored
+        # against. Without the control every concept simply lands unsupported,
+        # which is a weaker claim rather than a missing one.
+        soft=("transcribe", "ocr", "caption", "keyphrase"),
         requires=("transformers", "torch"),
         kinds=("entity", "topic", "technique", "claim_span", "unsupported"),
     ),
     Component(
         id="text-embed", title="Text embedding", stage=STAGE_LANGUAGE,
+        wave=WAVE_SPINE,
         family="text", channel="concept",
         summary="BGE-M3 over transcript, caption, OCR and narration.",
         detail=(
@@ -754,6 +825,9 @@ _LANGUAGE = [
         model="BAAI/bge-m3", weights="bge-m3", quant="fp16", device="gpu",
         vram_mb=2400, disk_mb=2300, seconds=2.0,
         needs=("transcribe", "caption"), produces=("vectors",),
+        # It embeds whatever passages exist — speech, caption, on-screen text,
+        # narrative beats — and skips itself when there are none.
+        soft=("transcribe", "caption"),
         requires=("transformers", "torch"), kinds=(),
     ),
     Component(
@@ -767,6 +841,10 @@ _LANGUAGE = [
             "exist. Cheap to compute and re-computable the instant the "
             "definition of 'the hook' changes."),
         needs=("transcribe", "ocr", "cuts", "loudness", "describe"),
+        # Pure assembly: every input is optional and each one absent costs one
+        # claim, not the pass. `shots` is the only thing it cannot do without,
+        # and that arrives through `cuts`.
+        soft=("transcribe", "ocr", "cuts", "loudness"),
         seconds=0.3, kinds=("hook_words", "hook_cuts", "hook_loudness",
                             "hook_text", "hook_visual"),
         params={"window_seconds": 3.0},
@@ -788,6 +866,7 @@ _LANGUAGE = [
         quant="awq", device="gpu", cards=2, vram_mb=21500, disk_mb=21000,
         seconds=95.0, ram_mb=6144,
         needs=("describe", "transcribe", "ocr", "narrate"),
+        soft=("transcribe", "ocr"),
         requires=("transformers", "torch"),
         kinds=("hook", "beat", "turn", "payoff", "why_it_works", "critique"),
         tier="deep", default_on=False,
@@ -816,6 +895,10 @@ _LANGUAGE = [
         model="", weights="", device="cpu", vram_mb=0, disk_mb=0,
         seconds=25.0, ram_mb=256,
         needs=("describe", "transcribe", "ocr", "narrate", "detect"),
+        # The cloud model is handed the local narrative to second-guess, so
+        # `describe` and `narrate` are its subject. The measurement channels it
+        # quotes are not: `_signal_summary` prints what is there.
+        soft=("transcribe", "ocr", "detect"),
         requires=("openai",),
         produces=("claims",),
         kinds=("premise", "hook", "hook_why", "beat", "turn", "payoff",
@@ -887,6 +970,34 @@ def components_in_stage(stage: str, ids=None) -> list:
             if i in BY_ID and BY_ID[i].stage_name == stage]
 
 
+def group_members(label: str, ids=None, spine=None) -> list:
+    """Resolve a bundle label back to the components it covered.
+
+    A snapshot bundle is named after the group it was cut on, and since the
+    rotation cuts on wave boundaries that label is a wave name (`spine`,
+    `refine`, `deep`) as often as it is a stage name. A retry after a failed
+    upload has only the label to work from, so it needs one function that
+    answers both — otherwise a wave-labelled bundle looks like a stage that no
+    longer exists and its pending flag is silently cleared.
+
+    `spine` must be the same override the rotation planned with, or a wave name
+    resolves to a different set of components than the bundle carried.
+
+    Stage names win a collision, because they are the older meaning and
+    `stages_of` still produces them; no stage and no wave share a name today
+    and `validate` has no reason to allow it.
+    """
+    pool = list(ids) if ids is not None else all_ids()
+    hit = [i for i in pool if i in BY_ID and BY_ID[i].stage_name == label]
+    if hit:
+        return hit
+    for wave, name in WAVE_NAMES.items():
+        if name == label or label == str(wave):
+            return [i for w, group in waves(pool, spine)
+                    if w == wave for i in group]
+    return []
+
+
 def validate() -> list:
     """Structural checks over the catalogue itself.
 
@@ -954,6 +1065,76 @@ def topo_sort(ids) -> list:
     if remaining:
         raise ValueError(f"dependency cycle among {sorted(remaining)}")
     return out
+
+
+def wave_of(component) -> int:
+    """Which wave a component belongs to, derivation included.
+
+    Wave 3 is derived rather than declared: a pass that needs both cards cannot
+    share a cohort with anything, and a pass that is off by default is not part
+    of the archive's baseline. Either way it belongs after the passes that are.
+    Deriving it means a new component lands in the right wave with no field set.
+    """
+    c = component if isinstance(component, Component) else BY_ID.get(component)
+    if c is None:
+        return WAVE_FULL
+    if c.cards > 1 or not c.default_on:
+        return WAVE_DEEP
+    return int(c.wave)
+
+
+def waves(ids, spine=None) -> list:
+    """`[(wave, [component ids])]`, ascending, over the ids given.
+
+    `spine` overrides which components are wave 1 (the `VIOS_WAVE1` env var).
+    An override is closed over its own needs by the caller — `close_needs` — so
+    a hand-written spine cannot leave a pass waiting for an input that is
+    scheduled two waves later.
+    """
+    out: dict = {}
+    over = set(spine) if spine else None
+    for cid in ids:
+        c = BY_ID.get(cid)
+        if c is None:
+            continue
+        w = wave_of(c)
+        if over is not None:
+            w = WAVE_SPINE if cid in over else max(w, WAVE_FULL)
+        out.setdefault(w, []).append(cid)
+    return [(w, out[w]) for w in sorted(out)]
+
+
+def close_needs(ids, universe=None) -> list:
+    """`ids` plus every component they transitively need, within `universe`.
+
+    This is what makes a wave safe. A wave whose members need something from a
+    later wave is a wave that runs passes with nothing to read — and because
+    `soft` needs still order the work, the closure covers both kinds.
+    """
+    pool = set(universe) if universe is not None else set(BY_ID)
+    out, stack = set(), list(ids)
+    while stack:
+        cid = stack.pop()
+        if cid in out or cid not in BY_ID:
+            continue
+        out.add(cid)
+        stack.extend(n for n in BY_ID[cid].needs if n in pool)
+    return [c for c in out if c in pool]
+
+
+def wave_leaks(ids, spine=None) -> list:
+    """`[(component, need, need_wave)]` for every need scheduled after its user.
+
+    Empty is the invariant. Asserted here rather than trusted, because a wave
+    that is not need-closed does not fail — it quietly produces a thinner
+    database, which is the one failure mode this archive cannot notice by
+    looking at it.
+    """
+    by_id = {cid: w for w, group in waves(ids, spine) for cid in group}
+    return [(cid, n, by_id[n])
+            for cid, w in by_id.items()
+            for n in BY_ID[cid].needs
+            if n in by_id and by_id[n] > w]
 
 
 def missing_dependencies(ids) -> dict:

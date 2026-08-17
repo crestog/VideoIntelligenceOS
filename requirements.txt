@@ -53,6 +53,15 @@ pyannote.audio              # diarisation; also needs an accepted licence + HF t
 insightface                 # faces and framing
 onnxruntime-gpu             # insightface's runtime
 # paddleocr also needs paddlepaddle-gpu, which is a ~700 MB wheel that must match
-# the image's CUDA. If it fails, `ocr` is skipped and `ocr-alt` (Florence-2, pure
-# transformers) still reads the on-screen text. Install it by hand if you want both.
+# the image's CUDA and is deliberately not installed. Without a backend every
+# PaddleOCR constructor fails, so `ocr` falls back to EasyOCR (above — already
+# installed, already used by the v1 plane on this image) and still reads the
+# on-screen text. Install paddlepaddle-gpu by hand if you want PP-OCR itself.
 paddleocr
+# Florence-2 (`ocr-alt`) is NOT "pure transformers": its remote code does
+# `from timm.layers import DropPath, trunc_normal_` at module top level, so
+# without timm the class never builds and the pass raised a bare AttributeError
+# every run. timm.layers (rather than timm.models.layers) needs 0.9.16 or newer.
+# The other half of that failure is flash_attn, which cannot be built on a T4 —
+# runners/base.no_flash_attn() strips it from the import check instead.
+timm>=0.9.16

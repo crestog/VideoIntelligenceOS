@@ -38,6 +38,7 @@ this design exists to remove.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import gc
 import json
 import os
@@ -922,3 +923,68 @@ def torch_dtype(name: str):
     import torch  # noqa: PLC0415
     return {"bfloat16": torch.bfloat16, "float16": torch.float16,
             "float32": torch.float32}.get(name, torch.float16)
+
+
+def cuda_ordinal() -> int:
+    """Which card this thread is on, for the few libraries that demand a number.
+
+    Almost nothing needs this. `device_and_dtype` returns a bare `"cuda"` and
+    every `.to("cuda")` in the runners resolves against CUDA's *current device*,
+    which is per host thread — so a worker that calls `torch.cuda.set_device(i)`
+    once puts its whole cohort on card `i` with no runner edits at all.
+
+    The exceptions are libraries that take a device *string* of their own and
+    parse it themselves: PaddleOCR's `"gpu:0"` and onnxruntime's `ctx_id`. A
+    literal `0` there sends every worker to card 0 no matter which thread it is,
+    which is how one card ends up holding six gigabytes while the other holds
+    a hundred megabytes and neither is busy. Asking is one call; guessing is a
+    silent half-machine.
+    """
+    try:
+        import torch  # noqa: PLC0415
+        if torch.cuda.is_available():
+            return int(torch.cuda.current_device())
+    except Exception:                                      # noqa: BLE001
+        pass
+    return 0
+
+
+@contextlib.contextmanager
+def no_flash_attn():
+    """Let `trust_remote_code` models load without flash-attention installed.
+
+    `transformers.dynamic_module_utils.get_imports` regex-scans a remote module
+    for every import it contains — *including the ones inside
+    `if is_flash_attn_2_available():` guards* — and `check_imports` then refuses
+    to run the file until each one is installed. Florence-2's remote code has
+    such a guard, so on a machine without flash-attn the load dies before a
+    single weight is read, and it dies with an exception that names neither
+    flash-attn nor the guard.
+
+    flash-attn cannot be installed here at all: it requires Ampere or newer and
+    Kaggle's T4s are Turing. The guard would have evaluated to False and the
+    model would have used SDPA, which `resources.capabilities()` already reports
+    as this machine's attention path. So the import list is filtered rather than
+    satisfied — this is the documented workaround for
+    huggingface/transformers#31793 — and restored on the way out, because the
+    patch is global and a later pass may legitimately want the real answer.
+    """
+    try:
+        from transformers import dynamic_module_utils  # noqa: PLC0415
+    except Exception:                                  # noqa: BLE001
+        yield False
+        return
+
+    original = getattr(dynamic_module_utils, "get_imports", None)
+    if original is None:
+        yield False
+        return
+
+    def filtered(filename):
+        return [m for m in original(filename) if m != "flash_attn"]
+
+    dynamic_module_utils.get_imports = filtered
+    try:
+        yield True
+    finally:
+        dynamic_module_utils.get_imports = original

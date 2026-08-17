@@ -908,7 +908,8 @@ def keyphrase(job: Job) -> Emission:
         bundle["transcript"], bundle["caption"],
         " ".join(bundle["on_screen"])])).strip()
     if len(text) < 40:
-        raise SkipPass("not enough text to extract phrases from")
+        raise SkipPass("no transcript, caption or on-screen text for this "
+                       f"video — {len(text)} characters between all three")
 
     em = Emission()
     got = []

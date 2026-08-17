@@ -278,7 +278,8 @@ def describe(job: Job) -> Emission:
                          max_new_tokens=int(p.get("max_new_tokens", 320)),
                          temperature=float(p.get("temperature", 0.2)))
         except Exception as exc:                       # noqa: BLE001
-            job.note(f"describe failed on shots {ids}: {type(exc).__name__}")
+            job.note(f"describe failed on shots {ids}: "
+                     f"{type(exc).__name__}: {str(exc)[:200]}")
             continue
 
         for entry in _as_list(_parse_json(reply)):
@@ -547,7 +548,8 @@ def style_read(job: Job) -> Emission:
         reply = _ask(job, bundle, prompt, [f["path"] for f in picks],
                      max_new_tokens=420, temperature=0.25)
     except Exception as exc:                           # noqa: BLE001
-        raise SkipPass(f"the model failed: {type(exc).__name__}") from None
+        raise SkipPass(f"the model failed: "
+                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     data = _parse_json(reply)
     if not isinstance(data, dict):
@@ -612,7 +614,8 @@ def concepts(job: Job) -> Emission:
         bundle["transcript"], bundle["caption"],
         " ".join(bundle["on_screen"])])).strip()
     if len(source) < 40:
-        raise SkipPass("not enough text to extract concepts from")
+        raise SkipPass("no transcript, caption or on-screen text for this "
+                       f"video — {len(source)} characters between all three")
 
     comp = job.component
     device, dtype = device_and_dtype(job.resources)
@@ -634,7 +637,7 @@ def concepts(job: Job) -> Emission:
         pack = job.cache.get(comp.load_key, loader)
     except Exception as exc:                           # noqa: BLE001
         raise SkipPass(f"{comp.model} could not be loaded: "
-                       f"{type(exc).__name__}") from None
+                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     import torch  # noqa: PLC0415
     model, tok = pack["model"], pack["tokenizer"]
@@ -731,7 +734,8 @@ def text_embed(job: Job) -> Emission:
             passages.append((row.get("shot_idx"), str(row["value"])))
     passages = [(i, t.strip()) for i, t in passages if t and t.strip()]
     if not passages:
-        raise SkipPass("no text to embed")
+        raise SkipPass("no transcript, caption, on-screen text or narrative "
+                       "beat for this video — nothing to embed")
 
     comp = job.component
     device, dtype = device_and_dtype(job.resources)
@@ -752,7 +756,7 @@ def text_embed(job: Job) -> Emission:
         pack = job.cache.get(comp.load_key, loader)
     except Exception as exc:                           # noqa: BLE001
         raise SkipPass(f"{comp.model} could not be loaded: "
-                       f"{type(exc).__name__}") from None
+                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     import torch  # noqa: PLC0415
     model, tok = pack["model"], pack["tokenizer"]
@@ -823,7 +827,7 @@ def narrate_deep(job: Job) -> Emission:
         pack = job.cache.get(comp.load_key, loader)
     except Exception as exc:                           # noqa: BLE001
         raise SkipPass(f"{comp.model} could not be loaded: "
-                       f"{type(exc).__name__}") from None
+                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     frames = job.frames()
     picks = [frames[i] for i in

@@ -38,7 +38,8 @@ import hashlib
 import math
 
 from .. import registry
-from .base import Emission, Job, SkipPass, device_and_dtype, torch_dtype
+from .base import (Emission, Job, SkipPass, cuda_ordinal, device_and_dtype,
+                   no_flash_attn, torch_dtype)
 
 
 def _np():
@@ -487,6 +488,93 @@ def _screen_text(lines) -> str:
     return " │ ".join(sorted({t for t in lines if t}))
 
 
+# PP-OCR's language names against EasyOCR's. The two libraries agree on almost
+# nothing here: Paddle names a *script* ("devanagari", "cyrillic", "latin") and
+# EasyOCR names a *language* ("hi", "ru", "en"), because their recognisers are
+# trained per script and per language respectively. Only the pairs we actually
+# configure need to be right; anything unmapped passes through unchanged and
+# EasyOCR rejects it by name, which is a legible failure.
+_EASY_LANG = {
+    "en": "en", "latin": "en",
+    "devanagari": "hi", "hi": "hi", "mr": "mr", "ne": "ne",
+    "ch": "ch_sim", "chinese_cht": "ch_tra",
+    "japan": "ja", "korean": "ko",
+    "arabic": "ar", "cyrillic": "ru", "ta": "ta", "te": "te", "ka": "kn",
+}
+
+
+class _EasyOCR:
+    """EasyOCR wearing PaddleOCR 2.x's return shape.
+
+    One class rather than a branch in the pass body: `_paddle_lines`, `_rect`,
+    `_screen_text` and the run-length collapse below are the part of this pass
+    that took the longest to get right, and they are all indifferent to which
+    recogniser produced the tuples. So the adapter converts at the boundary and
+    nothing downstream learns that a second engine exists.
+
+    EasyOCR reads all its languages in one Reader — Paddle needs one engine per
+    language — so this object is registered under a single synthetic key and the
+    per-language loop below runs once.
+    """
+
+    def __init__(self, reader):
+        self._reader = reader
+
+    def ocr(self, img, cls: bool = True) -> list:      # noqa: ARG002
+        out = []
+        for box, text, conf in self._reader.readtext(img):
+            out.append([box, (str(text), float(conf))])
+        return [out]
+
+
+def _easyocr_engines(job: Job, langs: list, why: dict) -> dict:
+    """The last rung of the OCR ladder: the reader this image already runs.
+
+    `paddleocr` is in requirements.txt but `paddlepaddle-gpu` deliberately is
+    not — a ~700 MB wheel that has to match the CUDA build — so PaddleOCR has no
+    backend here and every constructor shape fails. That is the whole reason the
+    OCR pass declined all run, and with it the six language passes that read its
+    output.
+
+    `easyocr` needs no extra wheel: it is torch, it is already in
+    requirements.txt, and the v1 plane loads it on this exact image
+    (`model_manager.load_easyocr`). Its weights land in the scratch cache
+    through `EASYOCR_MODULE_PATH`, which `config.configure_environment` already
+    sets, so they download once per machine and not once per session.
+
+    Registered under the same `load_key` as PP-OCR on purpose: the packer's
+    1500 MB budget for this component covers either engine — EasyOCR's detector
+    plus recogniser is ~1.5 GB — so the cohort plan is unchanged, and the cache
+    slot means "whichever OCR engine answered", which is what the rest of the
+    pass wants.
+    """
+    try:
+        import easyocr                                     # noqa: PLC0415
+    except Exception as exc:                               # noqa: BLE001
+        why["easyocr"] = f"import: {type(exc).__name__}: {str(exc)[:160]}"
+        return {}
+
+    import logging                                          # noqa: PLC0415
+    logging.getLogger("easyocr").setLevel(logging.ERROR)
+
+    wanted = list(dict.fromkeys(_EASY_LANG.get(l, l) for l in langs)) or ["en"]
+    gpu = bool(job.resources.get("gpu_count"))
+    # `gpu=True` resolves to the bare string "cuda" inside EasyOCR, which lands
+    # on this thread's current device — the same per-thread rule every other
+    # runner relies on. Naming a card here would pin all workers to one.
+    for attempt in (wanted, ["en"]):
+        try:
+            reader = easyocr.Reader(attempt, gpu=gpu, verbose=False)
+        except Exception as exc:                           # noqa: BLE001
+            why[f"easyocr {'+'.join(attempt)}"] = \
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            continue
+        job.note(f"OCR is EasyOCR ({', '.join(attempt)}) — PaddleOCR has no "
+                 f"backend on this image")
+        return {"+".join(attempt): _EasyOCR(reader)}
+    return {}
+
+
 def ocr(job: Job) -> Emission:
     """Read the burned-in text of every frame, then collapse it in time.
 
@@ -505,8 +593,14 @@ def ocr(job: Job) -> Emission:
     floor = float(job.component.params.get("min_confidence", 0.6))
 
     def loader():
-        from paddleocr import PaddleOCR  # noqa: PLC0415
+        engines, why = {}, {}
+        try:
+            from paddleocr import PaddleOCR  # noqa: PLC0415
+        except Exception as exc:                           # noqa: BLE001
+            why["paddleocr"] = f"import: {type(exc).__name__}: {str(exc)[:160]}"
+            PaddleOCR = None                               # noqa: N806
         gpu = bool(job.resources.get("gpu_count"))
+        card = f"gpu:{cuda_ordinal()}" if gpu else "cpu"
 
         # PaddleOCR has had three constructor generations and Kaggle's image
         # pins whichever one it pins this month. 2.x takes use_gpu/show_log;
@@ -522,23 +616,23 @@ def ocr(job: Job) -> Emission:
         # `use_gpu` on a 3.x build that has quietly started ignoring it.
         attempts = [
             ({"lang": None, "use_textline_orientation": True,
-              "device": "gpu:0" if gpu else "cpu"}, "3.x"),
-            ({"lang": None, "device": "gpu:0" if gpu else "cpu"}, "3.x minimal"),
+              "device": card}, "3.x"),
+            ({"lang": None, "device": card}, "3.x minimal"),
             ({"lang": None, "use_angle_cls": True, "show_log": False,
               "use_gpu": gpu}, "2.x"),
             ({"lang": None}, "bare"),
         ]
 
-        engines, why = {}, {}
-        for lang in langs:
+        for lang in (langs if PaddleOCR is not None else []):
             for kwargs, label in attempts:
                 try:
                     engines[lang] = PaddleOCR(**{**kwargs, "lang": lang})
                     break
                 except (TypeError, ValueError, RuntimeError) as exc:
                     why[lang] = f"{label}: {type(exc).__name__}: {exc}"
-                except ImportError:
-                    raise
+                except ImportError as exc:
+                    why[lang] = f"{label}: {type(exc).__name__}: {exc}"
+                    break
                 except Exception as exc:      # noqa: BLE001
                     # A download failure or a missing model file is not an
                     # argument problem and retrying with fewer kwargs will not
@@ -548,14 +642,22 @@ def ocr(job: Job) -> Emission:
         for lang in langs:
             if lang not in engines and lang in why:
                 job.note(f"PP-OCR could not initialise '{lang}' — {why[lang]}")
-        return engines
 
-    try:
-        engines = job.cache.get(job.component.load_key, loader)
-    except ImportError:
-        raise SkipPass("paddleocr is not installed") from None
+        which = "PP-OCRv5" if engines else ""
+        if not engines:
+            # Every PaddleOCR shape has failed. Read the frames anyway with the
+            # engine this image has been carrying all along, rather than
+            # declining the pass and taking six language passes down with it.
+            engines = _easyocr_engines(job, langs, why)
+            which = "easyocr" if engines else ""
+        return {"engines": engines, "which": which, "why": why}
+
+    bundle = job.cache.get(job.component.load_key, loader)
+    engines, which = bundle["engines"], bundle["which"]
     if not engines:
-        raise SkipPass("no OCR language could be initialised")
+        raise SkipPass("no OCR engine could be initialised: " +
+                       "; ".join(f"{k} → {v}"
+                                 for k, v in bundle["why"].items())[:400])
 
     em = Emission()
     readings: list = []              # (frame_idx, frame_t, canonical text)
@@ -638,13 +740,31 @@ def ocr(job: Job) -> Emission:
     em.claim("ocr", "text_coverage", num=round(covered / max(read, 1), 4))
     em.notes = {**_coverage(job, read), "strings": len(per_string),
                 "runs": rows, "frames_with_text": covered,
-                "languages": langs, "tier": "full"}
+                "languages": langs, "engine": which, "tier": "full"}
     return em
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # ocr-alt — Florence-2, the same frames, a different architecture
 # ══════════════════════════════════════════════════════════════════════════
+
+def _remote_class(name: str):
+    """A class from a `trust_remote_code` module, by name, after it has loaded.
+
+    Remote code lands in `transformers_modules.<owner>.<repo>.<sha>.<file>`,
+    which is not importable by a literal path — the sha is whichever revision
+    was resolved. But by the time a class inside it raises, the module is in
+    `sys.modules`, so the failing class can be found and patched there.
+    """
+    import sys  # noqa: PLC0415
+    for mod_name, mod in list(sys.modules.items()):
+        if "florence2" not in mod_name.lower():
+            continue
+        found = getattr(mod, name, None)
+        if isinstance(found, type):
+            return found
+    return None
+
 
 def ocr_alt(job: Job) -> Emission:
     """The same frames, a different architecture, and both answers kept.
@@ -667,25 +787,81 @@ def ocr_alt(job: Job) -> Emission:
         raise SkipPass("transformers/torch are not installed") from None
 
     device, dtype = device_and_dtype(job.resources)
+    revision = str(job.params.get("hf_revision") or "").strip()
+    shimmed = False
+
+    def _shim_initialise(cls) -> bool:
+        """Give DaViT the `_initialize_weights` hook newer transformers calls.
+
+        `PreTrainedModel.post_init` calls `self._initialize_weights` on every
+        submodule that declares itself a PreTrainedModel. Florence-2's vision
+        tower was written against a transformers that did not, so on a newer one
+        the load dies with `'DaViT' object has no attribute
+        '_initialize_weights'` — the bare AttributeError this pass reported all
+        run. A no-op is the correct body: every weight comes from the checkpoint
+        a line later, so there is nothing to initialise.
+        """
+        if cls is None or hasattr(cls, "_initialize_weights"):
+            return False
+        cls._initialize_weights = lambda self, *a, **k: None   # noqa: ARG005
+        return True
 
     def loader():
-        model = AutoModelForCausalLM.from_pretrained(
-            job.component.model, trust_remote_code=True,
-            torch_dtype=torch_dtype(dtype) if device == "cuda"
-            else torch.float32)
-        proc = AutoProcessor.from_pretrained(job.component.model,
-                                             trust_remote_code=True)
-        model.eval()
-        if device == "cuda":
-            model = model.to("cuda")
-        return {"model": model, "processor": proc}
+        nonlocal shimmed
+        common = {"trust_remote_code": True,
+                  "torch_dtype": (torch_dtype(dtype) if device == "cuda"
+                                  else torch.float32)}
+        if revision:
+            common["revision"] = revision
+
+        # Newest first, like `ocr`'s ladder. `sdpa` is what this machine
+        # actually has; `eager` is what an older transformers understands; bare
+        # is for a build that rejects the kwarg outright.
+        attempts = [({**common, "attn_implementation": "sdpa"}, "sdpa"),
+                    ({**common, "attn_implementation": "eager"}, "eager"),
+                    (common, "default")]
+        last = None
+        with no_flash_attn() as patched:
+            for kwargs, label in attempts:
+                for _ in range(2):          # second turn is after the shim
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(
+                            job.component.model, **kwargs)
+                    except AttributeError as exc:
+                        last = f"{label}: {type(exc).__name__}: {exc}"
+                        if "_initialize_weights" not in str(exc):
+                            break
+                        if not _shim_initialise(_remote_class("DaViT")):
+                            break
+                        shimmed = True
+                        continue            # retry this same shape, shimmed
+                    except Exception as exc:               # noqa: BLE001
+                        last = f"{label}: {type(exc).__name__}: {exc}"
+                        break
+                    else:
+                        proc = AutoProcessor.from_pretrained(
+                            job.component.model, trust_remote_code=True,
+                            **({"revision": revision} if revision else {}))
+                        model.eval()
+                        if device == "cuda":
+                            model = model.to("cuda")
+                        return {"model": model, "processor": proc,
+                                "how": label, "flash_patched": bool(patched),
+                                "shimmed": shimmed}
+        raise RuntimeError(f"every Florence-2 load shape failed — {last}")
 
     try:
         bundle = job.cache.get(job.component.load_key, loader)
     except Exception as exc:
         raise SkipPass(f"Florence-2 could not be loaded: "
-                       f"{type(exc).__name__}") from None
+                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
     model, proc = bundle["model"], bundle["processor"]
+    job.note(f"Florence-2 loaded with attention '{bundle.get('how')}'"
+             + (", flash-attn stripped from the import check"
+                if bundle.get("flash_patched") else "")
+             + (", DaViT._initialize_weights shimmed"
+                if bundle.get("shimmed") else "")
+             + (f", revision {revision[:12]}" if revision else ""))
 
     em = Emission()
     readings: list = []
@@ -875,12 +1051,14 @@ def faces(job: Job) -> Emission:
 
     def loader():
         from insightface.app import FaceAnalysis  # noqa: PLC0415
+        gpu = bool(job.resources.get("gpu_count"))
         providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
-                     if job.resources.get("gpu_count")
-                     else ["CPUExecutionProvider"])
+                     if gpu else ["CPUExecutionProvider"])
         app = FaceAnalysis(name=job.params.get("pack", "buffalo_l"),
                            providers=providers)
-        app.prepare(ctx_id=0 if job.resources.get("gpu_count") else -1,
+        # onnxruntime takes a card number rather than reading CUDA's current
+        # device, so a literal 0 would put every worker's faces on card 0.
+        app.prepare(ctx_id=cuda_ordinal() if gpu else -1,
                     det_size=(640, 640))
         return app
 
@@ -890,7 +1068,7 @@ def faces(job: Job) -> Emission:
         raise SkipPass("insightface is not installed") from None
     except Exception as exc:
         raise SkipPass(f"insightface could not start: "
-                       f"{type(exc).__name__}") from None
+                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     em = Emission()
     tracks: list = []
