@@ -629,6 +629,63 @@ class Coverage:
         out["remaining"] = left
         return out
 
+    def stage_fingerprint(self, components: list) -> str:
+        """A content hash of what a stage's rows actually say.
+
+        This exists because the counter it replaces was not an identity. The old
+        fingerprint was `total:done:skipped:failed:claims:vectors`, and
+        `revive_failed()` runs every rotation and flips one row from `failed` to
+        `queued` — so `5 failed` became `4 failed`, the whole database was
+        vacuumed, gzipped, split and re-uploaded, and the retry that produced the
+        change produced no evidence. That is `language-0013` and `-0014`: two
+        135 MB byte-siblings, one revived row apart.
+
+        Two decisions make this a real identity rather than a longer counter.
+
+        **States are coarsened into classes.** `queued`, `running` and `failed`
+        all hash as `open`, because they are the same statement — *this row has
+        not settled* — expressed at different points in a retry cycle that the
+        rotation drives on its own. `done` and `skipped` stay distinct from each
+        other and from `open`, because those are settlements and a bundle exists
+        to record them. A hash over raw states would move on every revival, which
+        is precisely the bug.
+
+        **Evidence is counted per row, not globally.** The obvious strengthener
+        is to fold in `max_claim_id`/`max_vector_id`, but those advance whenever
+        *any* pass anywhere writes anything, so a stage that did nothing this
+        cohort would still re-ship its database because another stage was busy.
+        Per-row `claims`/`vectors` move only when this stage's own rows gain
+        evidence, which is the question being asked. `observer_id` is in for the
+        same reason: a re-run under a new pass revision produces the same counts
+        from a different reading, and that is a genuinely different database.
+
+        So: a revived retry that produced nothing does not move this hash; a row
+        that gained a claim, settled, or was re-observed does.
+        """
+        import hashlib          # noqa: PLC0415
+
+        comps = sorted({c for c in (components or []) if c})
+        h = hashlib.sha256()
+        h.update(("|".join(comps) + "\n").encode("utf-8"))
+        if not comps:
+            return h.hexdigest()[:24]
+
+        marks = ",".join("?" * len(comps))
+        mine = self._mine()
+        n = 0
+        for r in self.conn.execute(
+                f"SELECT component, video_key, state, observer_id, claims, "
+                f"vectors FROM coverage WHERE component IN ({marks})" + mine
+                + " ORDER BY component, video_key", comps):
+            # `open` collapses queued/running/failed; see the docstring.
+            state = r["state"] if r["state"] in (DONE, SKIPPED) else "open"
+            h.update(f"{r['component']}\x1f{r['video_key']}\x1f{state}\x1f"
+                     f"{r['observer_id'] or ''}\x1f{r['claims'] or 0}\x1f"
+                     f"{r['vectors'] or 0}\n".encode("utf-8"))
+            n += 1
+        h.update(f"rows={n}\n".encode("utf-8"))
+        return h.hexdigest()[:24]
+
     def running(self) -> list:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM coverage WHERE state=? ORDER BY started_at", (RUNNING,))]

@@ -70,12 +70,33 @@ from . import CHANNELS, SCHEMA_VERSION
 
 _CHANNEL_SET = frozenset(CHANNELS)
 
-# Shard schema versions this build can replay. Mirrors
-# `db_restore.SUPPORTED_SCHEMAS`, and the reason is the same: the channel holds
-# the only copy of every earlier session's work, so a shard written last month
-# must still import. A v1 shard replays with NULL frame columns, which is
-# exactly what "this claim is about a shot" already means.
-SHARD_SCHEMAS = (1, 2)
+# Shard schema versions this build can replay. The reason the list grows rather
+# than moves: the channel holds the only copy of every earlier session's work, so
+# a shard written last month must still import. A v1 shard replays with NULL
+# frame columns, which is exactly what "this claim is about a shot" already
+# means; a v1 or v2 shard carries no `coverage` section, which is exactly what
+# "we do not know what this session had already finished" already means — the
+# restore falls back to re-deriving it, which is what it does today.
+SHARD_SCHEMAS = (1, 2, 3)
+
+# How advanced a coverage state is, for the shard replay in `_replay`. Ten
+# workers push shards into one channel and any of them can pull all of them, so
+# two shards can carry the same (video, component) in different states and the
+# import must be order-independent. Ranking makes it so: the higher state wins
+# whichever arrives second.
+#
+# `failed` above `queued`/`running` because it records attempts actually spent,
+# and `skipped` above `failed` because a skip is a decision and a failure is a
+# pending question. `done` is the top and is never overwritten.
+_STATE_RANK = {"queued": 0, "running": 1, "failed": 2, "skipped": 3, "done": 4}
+
+# The coverage columns a shard carries. Everything left out is live-session
+# state that means nothing anywhere else: `worker` and `token` name a lease
+# holder, `lease_until`/`next_try_at` are clocks on a machine that has stopped,
+# and `checkpoint` is a resume cursor into files that are gone.
+_COVERAGE_COLS = ("video_key", "component", "state", "attempts", "revivals",
+                  "seconds", "claims", "vectors", "observer_id", "last_error",
+                  "started_at", "done_at")
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -475,6 +496,38 @@ class Store:
                 self.conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
                 have.add(name)
+
+    def secondary(self) -> "Store":
+        """A second handle on the same file, for a second thread.
+
+        One `Store` is one connection, and a connection carries one implicit
+        transaction. Two threads sharing it therefore share a `commit()`: the
+        publisher folding its watermark writes would commit whatever pass was
+        halfway through writing its claims, and a `SELECT` cursor still open on
+        one thread can be invalidated by the other thread's commit outright.
+        WAL exists precisely so that a reader and a writer can each have their
+        own connection, so the publisher gets one.
+
+        Deliberately does **not** create schema, run migrations, mint a
+        `site_id` or record a schema version. Those must happen exactly once,
+        from the handle that opened the file first; a second copy of them is a
+        second chance to disagree. This is a plain connection with the same
+        pragmas, over a file another `Store` has already prepared.
+        """
+        other = Store.__new__(Store)
+        other.path = self.path
+        other.conn = sqlite3.connect(self.path, check_same_thread=False,
+                                     timeout=30.0)
+        other.conn.row_factory = sqlite3.Row
+        # journal_mode is a property of the file, not the connection, so it is
+        # already WAL; synchronous and busy_timeout are per connection and have
+        # to be asked for again.
+        other.conn.execute("PRAGMA synchronous=NORMAL")
+        other.conn.execute("PRAGMA foreign_keys=OFF")
+        other.conn.execute("PRAGMA busy_timeout=30000")
+        other.fts = self.fts
+        other.migrated_from = 0
+        return other
 
     # ── videos ──────────────────────────────────────────────────────────
     def add_video(self, video_key: str, **fields) -> None:
@@ -1062,6 +1115,14 @@ class Store:
         would look like a successful upload. The same trap applies twice more
         now that per-frame vectors and per-frame metrics are their own tables:
         a pass that writes only `frame_metric` rows must still publish them.
+
+        `coverage` is the exception to "id range": it is keyed by
+        `(video_key, component)` and has no id, so it travels for the videos this
+        shard touches, in whatever state they are in now. That is the point of
+        carrying it at all — a database rebuilt from shards alone knew everything
+        that had been *learned* and nothing about what had been *done*, so it
+        re-attempted three hours of work whose evidence it was already holding.
+        Only settled rows go: see `_settled_coverage`.
         """
         hi_id = hi_id or self.max_claim_id()
         hi_vec = hi_vec or self.max_vector_id()
@@ -1076,7 +1137,7 @@ class Store:
         span = (lo_id, hi_id, lo_vec, hi_vec, lo_fvec, hi_fvec,
                 lo_fmet, hi_fmet)
 
-        n_claims = n_vectors = n_fvec = n_fmet = 0
+        n_claims = n_vectors = n_fvec = n_fmet = n_cov = 0
         with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as fh:
             fh.write(json.dumps({
                 "_": "vios-evidence-shard", "schema": SCHEMA_VERSION,
@@ -1133,14 +1194,46 @@ class Store:
                 d["values_"] = d["values_"].hex()
                 fh.write(json.dumps({"t": "frame_metric", **d}) + "\n")
                 n_fmet += 1
+            for d in self._settled_coverage(keys, span):
+                fh.write(json.dumps({"t": "coverage", **d},
+                                    ensure_ascii=False) + "\n")
+                n_cov += 1
 
         return {"path": path, "claims": n_claims, "vectors": n_vectors,
                 "frame_vectors": n_fvec, "frame_metrics": n_fmet,
+                "coverage": n_cov,
                 "lo_id": lo_id, "hi_id": hi_id,
                 "lo_vec": lo_vec, "hi_vec": hi_vec,
                 "lo_fvec": lo_fvec, "hi_fvec": hi_fvec,
                 "lo_fmet": lo_fmet, "hi_fmet": hi_fmet,
                 "bytes": os.path.getsize(path)}
+
+    def _settled_coverage(self, keys: str, span: tuple) -> list:
+        """The coverage rows worth shipping, for the videos in this shard.
+
+        Only `done`, `skipped` and `failed`. A `queued` row carries no
+        information — the target derives it from the registry the moment it
+        reconciles — and a `running` row is a live lease on a machine the reader
+        cannot see, so importing it would hand a video to a worker that no longer
+        exists and wait `LEASE_SECONDS` to find out.
+
+        `last_error` is truncated here rather than at the reader. A shard is
+        gzipped JSONL and one 8 KB traceback repeated across sixty videos is
+        larger than the evidence it travels with; 500 characters is the whole of
+        every message this codebase raises, because `SkipPass` and the runners
+        already clip theirs to 200.
+        """
+        cols = ",".join(_COVERAGE_COLS)
+        rows = []
+        for r in self.conn.execute(
+                f"SELECT {cols} FROM coverage "
+                f"WHERE state IN ('done','skipped','failed') "
+                f"AND video_key IN {keys} ORDER BY component, video_key", span):
+            d = dict(r)
+            if d.get("last_error"):
+                d["last_error"] = str(d["last_error"])[:500]
+            rows.append(d)
+        return rows
 
     def import_shard(self, path: str) -> dict:
         """Replay a shard into this database. Idempotent by uid.
@@ -1155,10 +1248,19 @@ class Store:
         NULL `frame_idx`, which is precisely what they meant when they were
         written. Refusing them would strand every hour of work done before this
         version, since the channel is the only place that work still exists.
+
+        One caveat worth stating because it is the only way to misuse this: a
+        shard's `coverage` section describes the videos it touches as they stood
+        when it was written, while their claims may have gone up in an *earlier*
+        shard. So importing a hand-picked subset of shards can land a `done` state
+        whose evidence is in a file you did not import. A restore walks the whole
+        channel, which is why it is correct there; "import this one shard into an
+        empty database and expect a complete database" was never a supported
+        reading and is less true now than it was.
         """
         counts = {"claim": 0, "vector": 0, "video": 0, "shot": 0,
                   "observer": 0, "artifact": 0, "frame_vector": 0,
-                  "frame_metric": 0, "skipped": 0}
+                  "frame_metric": 0, "coverage": 0, "skipped": 0}
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             header = json.loads(fh.readline() or "{}")
             if header.get("_") != "vios-evidence-shard":
@@ -1167,6 +1269,11 @@ class Store:
                 raise ValueError(
                     f"{path} is schema v{header.get('schema')}, this code "
                     f"replays {'/'.join('v%d' % v for v in SHARD_SCHEMAS)}")
+            if int(header.get("schema", 0)) >= 3:
+                # Before the loop, not on the first coverage line: `executescript`
+                # issues an implicit COMMIT, and doing that mid-replay would
+                # commit half an import for no reason.
+                self._ensure_coverage_table()
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1274,6 +1381,80 @@ class Store:
                 (rec["video_key"], rec["kind"], rec.get("msg_id"),
                  rec.get("file_id", ""), rec.get("bytes", 0),
                  rec.get("meta", "{}"), rec.get("created_at", time.time())))
+        elif t == "coverage":
+            self._replay_coverage(rec)
+
+    def _replay_coverage(self, rec: dict) -> None:
+        """Land one coverage row, more-advanced-state-wins.
+
+        The rule has to be commutative, because shards arrive in whatever order
+        the channel hands them over and ten workers write them independently. So
+        the comparison is on `_STATE_RANK` and nothing else: whichever of the two
+        states is further along survives, and importing the same shard twice — or
+        two shards in either order — reaches the same row.
+
+        What it must never do is walk a state backwards. A local `done` is a
+        finished pass with its claims in this file; overwriting it with a remote
+        `queued` would schedule work that is already complete, which is the exact
+        failure this section exists to prevent, in the opposite direction.
+        `INSERT … ON CONFLICT DO UPDATE … WHERE` puts that test in the statement
+        rather than in a read-then-write that two threads could interleave.
+
+        `lease_until`, `next_try_at`, `worker`, `token` and `checkpoint` are left
+        at their defaults on insert and untouched on update. A lease belongs to
+        the machine holding it.
+        """
+        state = str(rec.get("state") or "")
+        rank = _STATE_RANK.get(state)
+        if rank is None or rank <= 0:
+            # Not a state worth importing: unknown, or `queued`, which the target
+            # derives for itself. Counted as a replayed row either way — the line
+            # was understood, and it asked for nothing.
+            return
+        self._ensure_coverage_table()
+        cols = ",".join(_COVERAGE_COLS)
+        marks = ",".join("?" * len(_COVERAGE_COLS))
+        self.conn.execute(
+            f"INSERT INTO coverage({cols}) VALUES({marks}) "
+            f"ON CONFLICT(video_key, component) DO UPDATE SET "
+            f"  state       = excluded.state,"
+            f"  attempts    = MAX(COALESCE(coverage.attempts,0),"
+            f"                    COALESCE(excluded.attempts,0)),"
+            f"  revivals    = MAX(COALESCE(coverage.revivals,0),"
+            f"                    COALESCE(excluded.revivals,0)),"
+            f"  seconds     = COALESCE(excluded.seconds, coverage.seconds),"
+            f"  claims      = COALESCE(excluded.claims, coverage.claims),"
+            f"  vectors     = COALESCE(excluded.vectors, coverage.vectors),"
+            f"  observer_id = COALESCE(excluded.observer_id, coverage.observer_id),"
+            f"  last_error  = excluded.last_error,"
+            f"  started_at  = COALESCE(coverage.started_at, excluded.started_at),"
+            f"  done_at     = COALESCE(excluded.done_at, coverage.done_at) "
+            f"WHERE ? > (CASE coverage.state"
+            f"             WHEN 'done' THEN 4 WHEN 'skipped' THEN 3"
+            f"             WHEN 'failed' THEN 2 WHEN 'running' THEN 1"
+            f"             ELSE 0 END)",
+            [rec.get(c) for c in _COVERAGE_COLS] + [rank])
+
+    def _ensure_coverage_table(self) -> None:
+        """Create `coverage` if this database has never had a `Coverage` on it.
+
+        `coverage` is owned by `coverage.py` and normally created when a
+        `Coverage` is constructed over the store's connection — but the restore
+        path opens a `Store` and replays shards, and on a genuinely fresh
+        database that happens before any engine has built a `Coverage`. Without
+        this the coverage section of every shard would land in the
+        `except sqlite3.Error` arm as `skipped`, which is exactly the silent loss
+        the section was added to prevent.
+
+        Idempotent, memoised, and using coverage.py's own DDL rather than a copy
+        of it — a second definition of the table is a second chance for the two to
+        drift.
+        """
+        if getattr(self, "_cov_table", False):
+            return
+        from .coverage import SCHEMA as COVERAGE_SCHEMA  # noqa: PLC0415
+        self.conn.executescript(COVERAGE_SCHEMA)
+        self._cov_table = True
 
     def note_shard(self, shard_id: str, component: str, msg_id: int | None,
                    stats: dict) -> None:

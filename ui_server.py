@@ -1413,6 +1413,20 @@ if __name__ == "__main__":
         except Exception as e:
             custom_print(f"⚠️ [PROCESS] autostart could not be armed: {e}")
 
+        # Publish the tail on the way out. A Kaggle container is deleted when the
+        # session ends, so the last few minutes of evidence only survive if they
+        # reach the channel first — and `signal.signal` only works from the main
+        # thread, which is here and nowhere else in the processing plane (the
+        # engine itself starts on a daemon thread).
+        try:
+            from vios.process.engine import install_exit_flush
+            armed = install_exit_flush()
+            sigs = ", ".join(armed.get("signals") or []) or "none"
+            custom_print(f"💾 [PROCESS] exit flush armed — atexit + signals: "
+                         f"{sigs}")
+        except Exception as e:
+            custom_print(f"⚠️ [PROCESS] exit flush could not be armed: {e}")
+
     # The asset sets Atlas plays from. Every video captured before Phase J has a
     # message in the channel and nothing beside it, so Atlas can only reach those
     # through a media session and a byte-range seek — which is why a

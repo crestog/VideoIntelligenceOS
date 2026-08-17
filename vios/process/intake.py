@@ -687,7 +687,7 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
     makes running this at every startup cheap rather than a full re-import.
     """
     out = {"found": 0, "imported": 0, "skipped": 0, "claims": 0, "vectors": 0,
-           "errors": []}
+           "coverage": 0, "errors": []}
     if not (channel and channel.ready):
         out["reason"] = channel.reason if channel else "no MTProto session"
         return out
@@ -729,6 +729,10 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
                 out["imported"] += 1
                 out["claims"] += counts.get("claim", 0)
                 out["vectors"] += counts.get("vector", 0)
+                # Worth its own number in the report: it is the difference
+                # between a restored session that knows what it has already done
+                # and one that re-earns three hours of it.
+                out["coverage"] += counts.get("coverage", 0)
                 store.note_shard(sid, "restored", int(msg.id),
                                  {"claims": counts.get("claim", 0),
                                   "vectors": counts.get("vector", 0),

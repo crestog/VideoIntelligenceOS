@@ -37,7 +37,14 @@ __all__ = ["SCHEMA_VERSION", "CHANNELS"]
 # `frame_vector` / `frame_metric` tables. Additive only — a v1 database is
 # migrated in place on open and a v1 shard still replays, because the channel
 # holds the only copy of everything processed before this change.
-SCHEMA_VERSION = 2
+#
+# v3 adds no columns at all. It marks a change in what a *shard* carries:
+# `coverage` rows travel with the evidence, so a database rebuilt from shards
+# knows what has already been done and not merely what was learned. Without it a
+# restore holds three hours of claims and re-earns every one of them, which is
+# the difference between losing no compute and losing all of it. The database
+# schema is unchanged, so a v2 file opens as v3 with nothing to migrate.
+SCHEMA_VERSION = 3
 
 # The evidence channels. This is not a loose vocabulary — it is the same list
 # the interface colours by (doc 11's channel spectrum), so adding one here means

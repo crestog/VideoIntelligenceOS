@@ -78,12 +78,26 @@ PUBLISH_EVERY = 1
 # Never upload two shards closer together than this. A shard costs a Telegram
 # round trip and a channel message; below about a minute apart they stop being
 # checkpoints and start being noise.
-PUBLISH_MIN_SECONDS = 90.0
+#
+# Sixty rather than ninety now that the upload runs on its own thread: the floor
+# used to be paying for a worker's stalled time as well as the channel's
+# patience, and it no longer is.
+PUBLISH_MIN_SECONDS = 60.0
 
 # …and never let unpublished work get older than this, however few videos it
 # came from. This is the number that bounds what a killed Kaggle session
 # actually costs, so it is the one to change if that cost feels wrong.
-PUBLISH_MAX_SECONDS = 600.0
+#
+# Five minutes, halved from ten. The old ceiling was chosen when a publish stopped
+# the only worker there was, so making it tighter made the run slower. With the
+# publisher on its own thread nobody waits for it, and the honest reading of "we
+# cannot trust a Kaggle session" is that the worst-case loss window should be as
+# small as the channel will tolerate.
+PUBLISH_MAX_SECONDS = 300.0
+
+# How often the publisher thread wakes on its own to re-check the clocks. Short
+# enough that the ceiling above means what it says, long enough to be free.
+PUBLISH_TICK_SECONDS = 10.0
 
 # One stage bundle part. The Bot API refuses a document over 50 MB and this
 # engine's uploader has no MTProto document path, so a bundle that would exceed
@@ -95,6 +109,14 @@ STAGE_PART_BYTES = 45 * 1024 * 1024
 # whole-database snapshot by filename alone, because downloading the wrong one
 # and replaying it would either do nothing or duplicate a database.
 STAGE_PREFIX = "vios-stage-"
+
+# How many characters of a bundle caption the error digest may spend. Telegram
+# caps a caption at 1024, and the rest of it — file name, counts, worker, part
+# number, revision, delta — is already ~300. One run produced 218 errors; an
+# unbounded list does not truncate gracefully, it takes the caption past the cap
+# and the upload fails, losing the bundle in order to carry errors that would not
+# have been readable in a caption anyway. The full list travels inside the file.
+STAGE_CAPTION_ERROR_BUDGET = 620
 
 # Extra VRAM to leave unclaimed, *on top of* the 1 GB `resources.probe` already
 # holds back. The allocator fragments over a twelve-hour session in a way a
@@ -324,6 +346,25 @@ class ProcessEngine:
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._lock = threading.RLock()
+
+        # ── the publisher ────────────────────────────────────────────────
+        # Exporting and uploading a shard used to happen on the worker thread, so
+        # a 45 MB POST stopped the GPU for as long as Telegram took to answer.
+        # It runs here instead: workers say "rows written" and carry on.
+        #
+        # `_pub_lock` rather than `_lock`, and it guards *publishing* rather than
+        # engine state. Two reasons it has to be its own lock: the status endpoint
+        # reads `_lock` and must not block behind an upload, and `_publish` is now
+        # reachable from three threads — the publisher, the sweep (before cutting
+        # a stage bundle) and a Flask request (the manual button) — which
+        # previously could interleave two exports over one watermark.
+        self._pub_lock = threading.Lock()
+        self._pub_wake = threading.Event()
+        self._pub_thread: threading.Thread | None = None
+        self._pub_note = ""
+        self._pub_force = False
+        self._pub_store: Store | None = None
+        self._exit_flushed = False
 
         self._store: Store | None = None
         self._cov: Coverage | None = None
@@ -744,9 +785,11 @@ class ProcessEngine:
                             "deferred": 0, "elsewhere": 0, "seconds": 0.0,
                             "downloaded": 0, "shards": 0}
             self._elsewhere_logged = set()
+            self._exit_flushed = False
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="vios-process")
             self._thread.start()
+            self._start_publisher()
             self._log("Engine started")
             return {"ok": True}
 
@@ -788,8 +831,17 @@ class ProcessEngine:
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=120)
+        # The publisher last, and synchronously: whatever the sweep wrote in the
+        # seconds before the stop landed is only real once it is in the channel.
+        self._drain_publisher("shutdown")
         self._teardown()
         with self._lock:
+            if self._pub_store is not None:
+                try:
+                    self._pub_store.close()
+                except Exception:               # noqa: BLE001
+                    pass
+                self._pub_store = None
             if self._store is not None:
                 self._store.checkpoint()
                 self._store.close()
@@ -819,6 +871,12 @@ class ProcessEngine:
             self._log(f"CRASH {self.error}", "error")
             self._log(traceback.format_exc()[-900:], "error")
         finally:
+            # Every way out of the sweep ends here: a clean stop, the early
+            # return of a one-shot run, and a crash. All three have rows the
+            # publisher was told about and may not have sent yet, and a crashed
+            # sweep is exactly when losing them would hurt most. Idempotent — the
+            # normal path already drained, and a second drain finds nothing.
+            self._drain_publisher("sweep-end")
             self._teardown()
             with self._lock:
                 if self.state not in (ERROR,):
@@ -1004,7 +1062,10 @@ class ProcessEngine:
                         break
                     worked += self._run_cohort(cohort, wv)
                     self._unload(f"cohort {cohort.index} complete")
-                    self._publish(f"cohort-{cohort.index}")
+                    # Forced, because a cohort boundary is a checkpoint worth
+                    # taking whatever the counters say — and still not worth
+                    # making a card wait for. The publisher has it from here.
+                    self._rows_written(f"cohort-{cohort.index}", force=True)
                     self._retry_pending_stages(runnable)
                 if preempted or self._stopping():
                     break
@@ -1063,7 +1124,7 @@ class ProcessEngine:
 
         with self._lock:
             self.message = "Stopped. Everything finished is recorded."
-        self._publish("final")
+        self._drain_publisher("final")
         self._log("Stopped cleanly")
 
     # ── selection ────────────────────────────────────────────────────────
@@ -1252,8 +1313,11 @@ class ProcessEngine:
         self.session["videos"] += 1
         self.session["seconds"] += time.time() - started
         self.since_publish += 1
-        if self._publish_due():
-            self._publish(f"cohort-{cohort.index}")
+        # Not `if due: publish` any more. The whole point of the publisher thread
+        # is that the decision and the 45 MB POST happen somewhere this loop is
+        # not — so this says "there are rows" and goes back to the next video.
+        # The publisher applies the same `_publish_due` gate on its own tick.
+        self._rows_written(f"cohort-{cohort.index}")
 
         freed = intake.evict(self.cache_dir, self.cache_budget_mb,
                              keep={_safe(key)}, floor_mb=self.disk_floor_mb)
@@ -1753,16 +1817,26 @@ class ProcessEngine:
             return False
         return age >= PUBLISH_MIN_SECONDS
 
-    def _publish(self, note: str) -> str:
+    def _publish(self, note: str, store: Store | None = None) -> str:
         """Export everything written since the last shard and send it up.
 
         Best effort by design. A session with no bot token still produces a
         complete local database, and a shard that fails to upload stays on disk
         with its watermark unmoved, so the next attempt includes it rather than
         losing it.
+
+        Runs under `_pub_lock` from start to finish, so the read of the watermark,
+        the export against it and the write that advances it are one operation
+        even though three threads can reach this method. `_lock` is taken only
+        around the counters — an upload must not hold the lock the status endpoint
+        reads, or the tab freezes for as long as Telegram is slow.
+
+        `store` is the connection to work on. The publisher thread passes its own
+        (`Store.secondary`); everyone else gets the engine's. Two threads on one
+        SQLite connection share one implicit transaction, and this method commits.
         """
-        store = self.store
-        with self._lock:
+        store = store or self.store
+        with self._pub_lock:
             lo_id = int(store.get_meta("shard_lo_id", "0") or 0)
             lo_vec = int(store.get_meta("shard_lo_vec", "0") or 0)
             # Per-frame rows are watermarked separately for the same reason
@@ -1778,13 +1852,15 @@ class ProcessEngine:
             hi_fmet = store.max_frame_metric_id()
             if (hi_id <= lo_id and hi_vec <= lo_vec
                     and hi_fvec <= lo_fvec and hi_fmet <= lo_fmet):
-                self.since_publish = 0
+                with self._lock:
+                    self.since_publish = 0
                 return ""
 
             # The quick early return is the common case for a cohort that
             # wrote nothing. Anything past it is a real export, and the
             # age gate that decided it deserves a real watermark.
-            self.last_publish = time.time()
+            with self._lock:
+                self.last_publish = time.time()
 
             seq = int(store.get_meta("shard_seq", "0") or 0) + 1
             sid = f"{intake.site_id(store)}-{seq:04d}"
@@ -1802,12 +1878,15 @@ class ProcessEngine:
             if stats["frame_vectors"] or stats["frame_metrics"]:
                 frame_note = (f"\n{stats['frame_vectors']} frame-vector rows, "
                               f"{stats['frame_metrics']} frame-metric rows")
+            cov_note = ""
+            if stats.get("coverage"):
+                cov_note = f"\n{stats['coverage']} coverage rows"
             msg_id = None
             if self._tg and self._tg.token:
                 caption = (f"vios evidence · {sid}\n"
                            f"{stats['claims']} claims, {stats['vectors']} "
-                           f"vectors{frame_note}\nworker {self.index + 1}/"
-                           f"{self.partitions} · {note}")
+                           f"vectors{frame_note}{cov_note}\nworker "
+                           f"{self.index + 1}/{self.partitions} · {note}")
                 try:
                     res = self._tg.send_document(
                         path, caption, file_name=intake.shard_name(sid))
@@ -1829,13 +1908,15 @@ class ProcessEngine:
             store.set_meta("shard_seq", str(seq))
             store.checkpoint()
 
-            self.since_publish = 0
-            self.last_publish = time.time()
-            self.session["shards"] += 1
+            with self._lock:
+                self.since_publish = 0
+                self.last_publish = time.time()
+                self.session["shards"] += 1
             self._log(f"Shard {sid}: {stats['claims']} claims, "
                       f"{stats['vectors']} vectors, "
                       f"{stats['frame_vectors']} frame-vector rows, "
                       f"{stats['frame_metrics']} frame-metric rows, "
+                      f"{stats.get('coverage', 0)} coverage rows, "
                       f"{stats['bytes'] / 1024:.0f} KB"
                       + (f" → message {msg_id}" if msg_id else
                          " (held locally — no upload)"))
@@ -1843,11 +1924,154 @@ class ProcessEngine:
                 return ""
             return sid
 
+    # ── the publisher thread ─────────────────────────────────────────────
+    #
+    # Everything above is the work of publishing; everything below is *when*.
+    # The split exists because a worker asking "have I produced enough to
+    # checkpoint?" and a worker waiting for the answer to be uploaded are two
+    # different things, and only the first belongs on the critical path.
+
+    def _publisher_store(self) -> Store:
+        """The publisher's own connection, opened on first use."""
+        if self._pub_store is None:
+            self._pub_store = self.store.secondary()
+        return self._pub_store
+
+    def _start_publisher(self) -> None:
+        t = self._pub_thread
+        if t is not None and t.is_alive():
+            return
+        self._pub_wake.clear()
+        self._pub_thread = threading.Thread(
+            target=self._publisher_loop, name="vios-publish", daemon=True)
+        self._pub_thread.start()
+
+    def _publisher_loop(self) -> None:
+        """Wake on a signal or on a tick, publish if either clock says so.
+
+        The tick is what makes `PUBLISH_MAX_SECONDS` mean anything: a cohort of
+        long passes can go five minutes without finishing a video, and the whole
+        point of the ceiling is that such a cohort still checkpoints. A loop that
+        only woke on a signal would sleep straight through it.
+
+        It exits when `_stop` is set *or* when it is no longer the engine's
+        publisher — `_drain_publisher` retires it by clearing `_pub_thread`, and
+        that has to be a second condition rather than a second flag because the
+        two paths that end a sweep without stopping it (a crash, and a one-shot
+        run reaching the end of its work) would otherwise leave the drain
+        waiting on a thread that had no reason to exit.
+        """
+        me = threading.current_thread()
+        while not self._stop.is_set() and self._pub_thread is me:
+            self._pub_wake.wait(PUBLISH_TICK_SECONDS)
+            self._pub_wake.clear()
+            if self._stop.is_set() or self._pub_thread is not me:
+                break
+            with self._lock:
+                note = self._pub_note or "rows"
+                forced = self._pub_force
+                self._pub_force = False
+            if not (forced or self._publish_due()):
+                continue
+            try:
+                self._publish(note, store=self._publisher_store())
+            except Exception as exc:            # noqa: BLE001
+                # A publisher that dies takes every later checkpoint with it, so
+                # it does not die. The shard stays local with its watermark
+                # unmoved, which is the same state a failed upload leaves.
+                self._log(f"Publisher tick failed: {type(exc).__name__}: "
+                          f"{str(exc)[:200]}", "error")
+                self._stop.wait(5.0)
+
+    def _rows_written(self, note: str, force: bool = False) -> None:
+        """A worker's whole involvement in publishing: say that rows exist.
+
+        `force` skips the count and floor gates but not the publisher — a cohort
+        boundary is a checkpoint worth taking immediately, and still not worth
+        making a GPU wait for.
+        """
+        with self._lock:
+            self._pub_note = note
+            if force:
+                self._pub_force = True
+        self._pub_wake.set()
+
+    def _drain_publisher(self, note: str) -> str:
+        """Retire the publisher thread and publish what is left, synchronously.
+
+        For the moments where "eventually" is not good enough: the sweep
+        finishing, and this process being asked to exit. Everything else signals.
+
+        The thread reference is taken under `_lock` so two callers racing here —
+        `shutdown()` and the sweep's `finally`, or a signal arriving during
+        either — cannot both try to join it. Clearing `_pub_thread` is also what
+        tells the loop to exit, so a drain on a path that has not set `_stop`
+        still terminates.
+
+        It publishes on the *publisher's* connection, not the engine's. This is
+        called from three threads and one of them is a signal handler running on
+        the main thread while the sweep may be mid-pass: two threads sharing one
+        SQLite connection share one implicit transaction, so exporting on
+        `self.store` from here could commit the sweep's half-written batch and
+        invalidate the cursor it is reading. `_pub_lock` keeps this connection
+        single-user even if the retired thread outlives the join.
+        """
+        with self._lock:
+            t = self._pub_thread
+            self._pub_thread = None
+            live = self._store is not None
+        self._pub_wake.set()
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=180)
+        if not live:
+            return ""
+        try:
+            return self._publish(note, store=self._publisher_store())
+        except Exception as exc:                # noqa: BLE001
+            self._log(f"Final publish failed: {type(exc).__name__}: "
+                      f"{str(exc)[:200]}", "error")
+            return ""
+
+    def flush_for_exit(self, why: str = "exit") -> dict:
+        """Publish the work in hand because this process is going away.
+
+        Called from the signal handlers and from `atexit`. A Kaggle session ends
+        by having its container removed, so a shard still on local disk is a shard
+        that never existed — the last window of work is only real once it is in
+        the channel. Idempotent: two paths can both fire and only the first
+        publishes.
+        """
+        with self._lock:
+            if self._exit_flushed:
+                return {"ok": False, "reason": "already flushed"}
+            self._exit_flushed = True
+            # `self._store`, not `self.store`: the property opens the database on
+            # first touch, and a process exiting without ever having run the
+            # engine must not create one on its way out.
+            live = self._store is not None
+        if not live:
+            return {"ok": False, "reason": "engine never opened a database"}
+        self._log(f"Flushing before exit ({why}) — publishing the last window "
+                  f"of work")
+        sid = self._drain_publisher(f"exit-{why}")
+        try:
+            self._store.checkpoint()
+        except Exception:                       # noqa: BLE001
+            pass
+        return {"ok": bool(sid), "shard": sid}
+
     def publish_now(self) -> dict:
         """The tab's manual button. Also the right thing to press before
-        closing a Kaggle session early."""
-        sid = self._publish("manual")
+        closing a Kaggle session early.
+
+        On the publisher's connection, because this arrives on a Flask request
+        thread and the sweep may be mid-pass on the engine's own — same reason
+        `_drain_publisher` uses it.
+        """
+        store = self._publisher_store() if self._store is not None else None
+        sid = self._publish("manual", store=store)
         return {"ok": bool(sid), "shard": sid}
+
 
     # ── stage bundles ────────────────────────────────────────────────────
     #
@@ -1864,17 +2088,102 @@ class ProcessEngine:
     # what is left to learn, consistent with each other. That is why the bundle
     # is one database and not two.
 
-    def _stage_signature(self, report: dict) -> str:
-        """A short fingerprint of a stage's standing.
+    def _stage_signature(self, stage: str, components: list,
+                         report: dict) -> str:
+        """A fingerprint of a stage's standing, used to decide whether to build.
 
         Re-uploading an identical database because a later cohort happened to
         re-enter the same stage would cost a multi-hundred-megabyte transfer and
         add nothing, so a bundle is cut only when this string changes.
+
+        It delegates to `Coverage.stage_fingerprint`, which hashes the rows
+        themselves. The counter this used to be — `total:done:skipped:failed:
+        claims:vectors` — moved every time `revive_failed()` flipped one row from
+        `failed` to `queued`, which happens once per rotation, so the same
+        database shipped twice. The counter survives only as the fallback for a
+        fingerprint that raises: cutting a duplicate bundle is a waste, and not
+        cutting one at all is a lost snapshot, so the degradation goes the way
+        that keeps the snapshot.
         """
-        c = report.get("counts", {})
-        return (f"{c.get('total', 0)}:{c.get('done', 0)}:{c.get('skipped', 0)}:"
-                f"{c.get('failed', 0)}:{report.get('claims', 0)}:"
-                f"{report.get('vectors', 0)}")
+        try:
+            return self.coverage.stage_fingerprint(components)
+        except Exception as exc:                # noqa: BLE001
+            c = report.get("counts", {})
+            self._log(f"stage {stage}: content fingerprint unavailable "
+                      f"({type(exc).__name__}) — falling back to counters, "
+                      f"which may re-ship an unchanged database", "warn")
+            return (f"counts:{c.get('total', 0)}:{c.get('done', 0)}:"
+                    f"{c.get('skipped', 0)}:{c.get('failed', 0)}:"
+                    f"{report.get('claims', 0)}:{report.get('vectors', 0)}")
+
+    def _error_digest(self, report: dict, limit: int = 12) -> str:
+        """The first `limit` distinct (component, message) pairs, plus a total.
+
+        `stage_report`'s `errors` is deliberately unbounded — the full list is the
+        reason to read a bundle — and one run produced 218 of them. A Telegram
+        caption is capped at 1024 characters, so an unbounded list does not
+        truncate gracefully; it takes the caption over the limit and the upload
+        fails, which loses the bundle to make room for errors nobody can read in
+        a caption anyway.
+
+        Distinct pairs rather than the first twelve rows: forty videos failing
+        `ocr-alt` the same way is one fact, and spending the whole budget saying
+        it forty times hides the other three causes. The full list stays inside
+        the bundle, where it has room.
+        """
+        errs = report.get("errors") or []
+        if not errs:
+            return ""
+        seen, lines = set(), []
+        for e in errs:
+            comp = e.get("component") or "?"
+            msg = re.sub(r"\s+", " ", str(e.get("error") or "")).strip()[:110]
+            k = (comp, msg[:60])
+            if k in seen:
+                continue
+            seen.add(k)
+            lines.append(f"• {comp}: {msg}")
+            if len(lines) >= limit:
+                break
+        head = f"{len(errs)} errors, {len(seen)} distinct:"
+        out, budget = [head], STAGE_CAPTION_ERROR_BUDGET - len(head)
+        for ln in lines:
+            if budget - len(ln) - 1 < 0:
+                break
+            out.append(ln)
+            budget -= len(ln) + 1
+        if len(out) - 1 < len(lines):
+            out.append(f"…and {len(lines) - (len(out) - 1)} more kinds")
+        return "\n".join(out)
+
+    def _stage_delta(self, stage: str, report: dict) -> str:
+        """What changed since the bundle that is already in the channel.
+
+        A second file for the same stage is legitimate — a revived pass really
+        did produce evidence the first snapshot lacked — but a second 135 MB
+        upload with an identical-looking caption is indistinguishable from the
+        duplicate bug, which is what made `language-0013`/`-0014` so hard to
+        read. Naming the delta is what makes revision 2 legible.
+        """
+        try:
+            prev = json.loads(
+                self.store.get_meta(f"stage_done:{stage}", "") or "{}")
+        except Exception:                       # noqa: BLE001
+            prev = {}
+        if not prev:
+            return ""
+        bits = []
+        for label, now, before in (
+                ("claims", report.get("claims", 0), prev.get("claims", 0)),
+                ("vectors", report.get("vectors", 0), prev.get("vectors", 0)),
+                ("done", report.get("counts", {}).get("done", 0),
+                 (prev.get("counts") or {}).get("done", prev.get("done", 0))),
+                ("videos", report.get("videos", 0), prev.get("videos", 0))):
+            d = int(now or 0) - int(before or 0)
+            if d:
+                bits.append(f"{d:+d} {label}")
+        return ("changed: " + ", ".join(bits)) if bits else \
+               "changed: re-observed, same totals"
 
     def _stage_bundle_file(self, stage: str, seq: int) -> str:
         return (f"{STAGE_PREFIX}{intake.site_id(self.store)}-{stage}-"
@@ -1981,9 +2290,14 @@ class ProcessEngine:
 
         Order is load-bearing, and it is the same order `_publish` uses for the
         same reason: the watermark advances **last**. A bundle whose upload fails
-        leaves `stage_done:<stage>` untouched and the stage name in
-        `stage_pending`, so the next publish tick tries again. Nothing is
+        leaves `stage_done:<stage>` untouched and an entry in `stage_pending`
+        holding the built parts, so the next tick re-sends those bytes rather
+        than vacuuming and gzipping the database a second time. Nothing is
         recorded as published that is not in the channel.
+
+        `force` now means "cut one even though the content is unchanged" — the
+        manual button and nothing else. It used to be passed by every retry,
+        which is how a transport hiccup turned into a full rebuild each cohort.
 
         A failure here never propagates. The bundle is a convenience for
         debugging a stage in isolation; the database and the shards are the
@@ -1998,7 +2312,7 @@ class ProcessEngine:
             self._log(f"stage {stage}: {out['reason']}", "error")
             return out
 
-        sig = self._stage_signature(report)
+        sig = self._stage_signature(stage, components, report)
         store = self.store
         if not force and store.get_meta(f"stage_sig:{stage}", "") == sig:
             out["reason"] = "unchanged since the last bundle"
@@ -2006,6 +2320,12 @@ class ProcessEngine:
         if not report.get("counts", {}).get("total"):
             out["reason"] = "no rows in this stage"
             return out
+
+        # Revisions are numbered rather than merely sequenced. `stage_seq` is a
+        # per-session counter across all stages, so `-0013` and `-0014` said
+        # nothing about which was the second look at *language*. This does.
+        rev = int(store.get_meta(f"stage_rev:{stage}", "0") or 0) + 1
+        delta = self._stage_delta(stage, report) if rev > 1 else ""
 
         # The delta first, so the shard stream stays continuous and a reader
         # that only follows shards is never behind the bundle.
@@ -2026,6 +2346,8 @@ class ProcessEngine:
             "frames": stats.get("frames_claimed", 0),
             "cut_at": time.time(),
             "signature": sig,
+            "revision": rev,
+            "changed": delta,
         })
 
         seq = int(store.get_meta("stage_seq", "0") or 0) + 1
@@ -2036,39 +2358,106 @@ class ProcessEngine:
         except Exception as exc:                # noqa: BLE001
             out["reason"] = f"bundle build failed: {type(exc).__name__}: {exc}"
             self._log(f"stage {stage}: {out['reason']}", "error")
-            self._mark_stage_pending(stage, add=True)
+            # No parts to keep — a build that failed leaves nothing to re-send,
+            # so this pending entry asks for a rebuild next tick.
+            self._mark_stage_pending(stage, None)
             return out
 
         mb = built["bytes"] / 1048576.0
-        self._log(f"stage {stage}: bundle {name} — {report['videos']} videos, "
-                  f"{report['claims']} claims, {report['vectors']} vectors, "
-                  f"{len(report['errors'])} errors, {mb:.1f} MB")
+        self._log(f"stage {stage}: bundle {name} rev {rev} — "
+                  f"{report['videos']} videos, {report['claims']} claims, "
+                  f"{report['vectors']} vectors, "
+                  f"{len(report['errors'])} errors, {mb:.1f} MB"
+                  + (f" ({delta})" if delta else ""))
+
+        parts = self._split_parts(path)
+        entry = {"stage": stage, "seq": seq, "file": name, "parts": parts,
+                 "captions": self._stage_captions(stage, report, parts, rev,
+                                                  delta),
+                 "message_ids": [], "bytes": built["bytes"],
+                 "signature": sig, "revision": rev, "at": time.time(),
+                 "videos": report["videos"], "claims": report["claims"],
+                 "vectors": report["vectors"],
+                 "counts": dict(report.get("counts") or {}),
+                 "errors": len(report["errors"]),
+                 "complete": report.get("complete", False)}
 
         if not (self._tg and self._tg.token):
             # A local-only session still gets the file, and still records that
-            # it has not been published. The bundle is on disk to be uploaded by
-            # hand or by a later session that has credentials.
+            # it has not been published. The bundle stays on disk to be uploaded
+            # by hand or by a later session that has credentials.
             out.update({"ok": False, "reason": "no Telegram credentials",
                         "path": path, "bytes": built["bytes"]})
-            self._mark_stage_pending(stage, add=True)
+            self._mark_stage_pending(stage, entry)
             return out
 
-        parts = self._split_parts(path)
-        msg_ids, failed = [], ""
-        for i, part in enumerate(parts):
-            caption = (
-                f"vios stage bundle · {stage} · {intake.site_id(store)}\n"
-                f"{report['videos']} videos · {report['claims']} claims · "
-                f"{report['vectors']} vectors\n"
-                f"{report['counts'].get('done', 0)} done, "
-                f"{report['counts'].get('skipped', 0)} skipped, "
-                f"{report['counts'].get('failed', 0)} failed · "
-                f"{len(report['errors'])} errors\n"
-                f"worker {self.index + 1}/{self.partitions}"
-                + (f" · part {i + 1}/{len(parts)}" if len(parts) > 1 else ""))
+        msg_ids, failed = self._send_stage_parts(stage, entry)
+        if failed or len(msg_ids) != len(parts):
+            out["reason"] = failed or "upload incomplete"
+            self._log(f"stage {stage}: bundle not uploaded — {out['reason']} "
+                      f"({len(msg_ids)}/{len(parts)} parts up; the rest are "
+                      f"held on disk for the next tick)", "warn")
+            self._mark_stage_pending(stage, entry)
+            return out
+
+        self._finish_stage(stage, entry)
+        out.update({"ok": True, "record": entry.get("record") or {}})
+        return out
+
+    def _stage_captions(self, stage: str, report: dict, parts: list,
+                        rev: int, delta: str) -> list:
+        """One caption per part, built once and kept with the bytes.
+
+        Built here rather than at send time because a retry must re-send the same
+        bytes *and* describe them the same way: a caption regenerated from a
+        database that has moved on would describe a snapshot that does not match
+        the file it is attached to, which is worse than no caption at all.
+        """
+        site = intake.site_id(self.store)
+        digest = self._error_digest(report)
+        head = (f"vios stage bundle · {stage} · {site}"
+                + (f" · revision {rev}" if rev > 1 else "") + "\n"
+                + f"{report['videos']} videos · {report['claims']} claims · "
+                + f"{report['vectors']} vectors\n"
+                + f"{report['counts'].get('done', 0)} done, "
+                + f"{report['counts'].get('skipped', 0)} skipped, "
+                + f"{report['counts'].get('failed', 0)} failed\n"
+                + (f"{delta}\n" if delta else ""))
+        out = []
+        for i in range(len(parts)):
+            tail = (f"worker {self.index + 1}/{self.partitions}"
+                    + (f" · part {i + 1}/{len(parts)}" if len(parts) > 1
+                       else ""))
+            cap = head + tail + (f"\n{digest}" if digest else "")
+            out.append(cap[:1020])
+        return out
+
+    def _send_stage_parts(self, stage: str, entry: dict) -> tuple:
+        """Send the parts this entry has not sent yet. Returns (msg_ids, error).
+
+        Resumes rather than restarts: `message_ids` records what is already in
+        the channel, so a bundle that failed on part 3 of 4 sends one part on the
+        retry instead of four, and does not leave two copies of parts 1 and 2 in
+        the channel for a restore to trip over.
+        """
+        parts = list(entry.get("parts") or [])
+        caps = list(entry.get("captions") or [])
+        msg_ids = [int(m) for m in (entry.get("message_ids") or [])]
+        failed = ""
+        for i in range(len(msg_ids), len(parts)):
+            if self._stopping():
+                failed = "stopping"
+                break
+            part = parts[i]
+            if not os.path.exists(part):
+                failed = (f"part {i + 1}/{len(parts)} is no longer on disk — "
+                          f"rebuilding next time")
+                entry["parts"] = []
+                break
+            cap = caps[i] if i < len(caps) else f"vios stage bundle · {stage}"
             try:
                 res = self._tg.send_document(
-                    part, caption, file_name=os.path.basename(part))
+                    part, cap, file_name=os.path.basename(part))
                 msg_ids.append(int(res.get("message_id") or 0))
             except UploadError as exc:
                 failed = str(exc)[:200]
@@ -2076,75 +2465,104 @@ class ProcessEngine:
             except Exception as exc:            # noqa: BLE001
                 failed = f"{type(exc).__name__}: {str(exc)[:200]}"
                 break
+        entry["message_ids"] = msg_ids
+        return msg_ids, failed
 
-        # The local copies are scratch either way. On success they are in the
-        # channel; on failure the retry rebuilds from the database, which has
-        # moved on and is the better source anyway. Leaving half a split bundle
-        # in the shard directory would only fill the disk the next cohort needs.
-        for part in parts:
+    def _finish_stage(self, stage: str, entry: dict) -> None:
+        """Pin, record, clear the pending entry, delete the local parts."""
+        store = self.store
+        msg_ids = [int(m) for m in (entry.get("message_ids") or [])]
+        # Pinned like `db_export`'s manifest so a restore finds the newest
+        # bundle in one getChat rather than a history walk the Bot API cannot do.
+        try:
+            pinned = bool(self._tg.pin(msg_ids[-1])) if msg_ids else False
+        except Exception:                       # noqa: BLE001
+            pinned = False
+
+        record = {k: entry.get(k) for k in (
+            "stage", "seq", "file", "signature", "revision", "bytes", "videos",
+            "claims", "vectors", "counts", "errors", "complete")}
+        record.update({"parts": len(entry.get("parts") or []),
+                       "message_ids": msg_ids, "pinned": pinned,
+                       "at": time.time()})
+        entry["record"] = record
+
+        # Watermark last. Everything above is inert until these four writes.
+        store.set_meta("stage_seq", str(int(entry.get("seq") or 0)))
+        store.set_meta(f"stage_rev:{stage}", str(int(entry.get("revision") or 1)))
+        store.set_meta(f"stage_done:{stage}", json.dumps(record))
+        store.set_meta(f"stage_sig:{stage}", str(entry.get("signature") or ""))
+        self._mark_stage_pending(stage, None, drop=True)
+        store.checkpoint()
+
+        # Only now are the local copies scratch: they are in the channel.
+        self._discard_stage_parts(entry)
+        self._log(f"stage {stage}: bundle published"
+                  + (f" rev {entry.get('revision')}"
+                     if int(entry.get("revision") or 1) > 1 else "")
+                  + (f" → message {msg_ids[-1]}" if msg_ids else "")
+                  + ("" if pinned else " (pin failed)"))
+
+    def _discard_stage_parts(self, entry: dict) -> None:
+        for part in (entry.get("parts") or []):
             try:
                 os.remove(part)
             except OSError:
                 pass
+        entry["parts"] = []
 
-        if failed or len(msg_ids) != len(parts):
-            out["reason"] = failed or "upload incomplete"
-            self._log(f"stage {stage}: bundle not uploaded — {out['reason']}",
-                      "warn")
-            self._mark_stage_pending(stage, add=True)
-            return out
+    def _pending_stages(self) -> dict:
+        """`stage_pending` as a dict, whatever shape it is on disk.
 
-        # Pinned like `db_export`'s manifest so a restore finds the newest
-        # bundle in one getChat rather than a history walk the Bot API cannot do.
-        pinned = False
-        try:
-            pinned = bool(self._tg.pin(msg_ids[-1]))
-        except Exception:                       # noqa: BLE001
-            pinned = False
-
-        record = {"stage": stage, "seq": seq, "file": name,
-                  "parts": len(parts), "message_ids": msg_ids,
-                  "bytes": built["bytes"], "pinned": pinned,
-                  "at": time.time(), "signature": sig,
-                  "videos": report["videos"], "claims": report["claims"],
-                  "vectors": report["vectors"],
-                  "errors": len(report["errors"]),
-                  "complete": report.get("complete", False)}
-
-        # Watermark last. Everything above is inert until these three writes.
-        store.set_meta("stage_seq", str(seq))
-        store.set_meta(f"stage_done:{stage}", json.dumps(record))
-        store.set_meta(f"stage_sig:{stage}", sig)
-        self._mark_stage_pending(stage, add=False)
-        store.checkpoint()
-
-        self._log(f"stage {stage}: bundle published → message "
-                  f"{msg_ids[-1]}" + ("" if pinned else " (pin failed)"))
-        out.update({"ok": True, "record": record})
-        return out
-
-    def _mark_stage_pending(self, stage: str, add: bool) -> None:
-        """Remember a stage whose bundle did not make it up, or forget it.
-
-        Kept in `meta` rather than in memory because the reason a bundle fails
-        is usually that Telegram is refusing connections, and that outlives the
-        process far more often than it outlives the session.
+        It was a list of stage names before the built parts were worth keeping.
+        A session that upgrades mid-run reads its own old value, so both shapes
+        are accepted here and only the dict is ever written — a bare name simply
+        means "rebuild", which is exactly what the old behaviour was.
         """
         try:
-            store = self.store
-            cur = json.loads(store.get_meta("stage_pending", "[]") or "[]")
-            if not isinstance(cur, list):
-                cur = []
+            cur = json.loads(self.store.get_meta("stage_pending", "{}") or "{}")
         except Exception:                       # noqa: BLE001
-            cur = []
-        if add and stage not in cur:
-            cur.append(stage)
-        elif not add and stage in cur:
-            cur = [s for s in cur if s != stage]
+            return {}
+        if isinstance(cur, dict):
+            return {k: v for k, v in cur.items() if isinstance(v, dict)}
+        if isinstance(cur, list):
+            return {s: {"stage": s, "parts": []} for s in cur
+                    if isinstance(s, str)}
+        return {}
+
+    def _mark_stage_pending(self, stage: str, entry: dict | None,
+                            drop: bool = False) -> None:
+        """Remember a bundle that did not make it up, with its bytes, or forget it.
+
+        Kept in `meta` rather than in memory because the reason a bundle fails is
+        usually that Telegram is refusing connections, and that outlives the
+        process far more often than it outlives the session.
+
+        `entry` carries the built parts so the retry re-sends them. The one case
+        where that is the wrong trade is a disk with no room left: a held 135 MB
+        bundle competing with the next cohort's working directories would fail
+        the run to save a snapshot, so below the floor the bytes are dropped and
+        the entry degrades to "rebuild later".
+        """
+        cur = self._pending_stages()
+        if drop:
+            cur.pop(stage, None)
+        elif entry is None:
+            cur[stage] = {"stage": stage, "parts": [], "at": time.time()}
         else:
-            return
+            keep = dict(entry)
+            keep.pop("record", None)
+            if keep.get("parts"):
+                free = intake.free_mb(self.shard_dir)
+                if free and free < self.disk_floor_mb:
+                    self._log(f"stage {stage}: {free} MB free is under the "
+                              f"{self.disk_floor_mb} MB floor — discarding the "
+                              f"held bundle and rebuilding on the retry", "warn")
+                    self._discard_stage_parts(keep)
+                    keep["message_ids"] = []
+            cur[stage] = keep
         try:
-            self.store.set_meta("stage_pending", json.dumps(cur))
+            self.store.set_meta("stage_pending", json.dumps(cur, default=str))
         except Exception:                       # noqa: BLE001
             pass
 
@@ -2155,28 +2573,50 @@ class ProcessEngine:
         waits on the one before it, and a transport outage costs a retry rather
         than a bundle.
 
+        Two behaviours, decided by whether the bytes survived. A pending entry
+        that still has its parts re-sends **those parts** — no `VACUUM INTO`, no
+        gzip, no split, and the same captions, so the file in the channel matches
+        what its caption says. An entry with no parts (build failed, or the disk
+        floor took them) rebuilds. The old code passed `force=True` here and
+        rebuilt every time, which is how one transport failure became a
+        multi-hundred-megabyte re-upload after every cohort.
+
         The pending label may name a wave rather than a stage, because that is
         the boundary the rotation cuts on — `group_members` resolves either, and
         it takes the same spine override the rotation planned with so a wave
         label resolves to the components the bundle actually described.
         """
-        try:
-            pending = json.loads(
-                self.store.get_meta("stage_pending", "[]") or "[]")
-        except Exception:                       # noqa: BLE001
-            return
-        if not isinstance(pending, list) or not pending:
+        pending = self._pending_stages()
+        if not pending:
             return
         spine = registry.close_needs(self.spine_override, planned) \
             if self.spine_override else None
-        for stage in list(pending):
+        for stage, entry in list(pending.items()):
             if self._stopping():
                 return
+            parts = [p for p in (entry.get("parts") or []) if os.path.exists(p)]
+            if parts and len(parts) == len(entry.get("parts") or []):
+                if not (self._tg and self._tg.token):
+                    continue
+                sent = len(entry.get("message_ids") or [])
+                self._log(f"stage {stage}: re-sending the bundle already built "
+                          f"({len(parts) - sent} of {len(parts)} parts left)")
+                msg_ids, failed = self._send_stage_parts(stage, entry)
+                if failed or len(msg_ids) != len(parts):
+                    self._log(f"stage {stage}: still not uploaded — "
+                              f"{failed or 'upload incomplete'}", "warn")
+                    self._mark_stage_pending(stage, entry)
+                else:
+                    self._finish_stage(stage, entry)
+                continue
+
             comps = registry.group_members(stage, planned, spine)
             if not comps:
-                self._mark_stage_pending(stage, add=False)
+                self._mark_stage_pending(stage, None, drop=True)
                 continue
-            self._log(f"stage {stage}: retrying the bundle upload")
+            self._log(f"stage {stage}: rebuilding the bundle — the built copy "
+                      f"is gone")
+            self._mark_stage_pending(stage, None, drop=True)
             self._publish_stage(stage, comps, force=True)
 
     def publish_stage_now(self, stage: str = "") -> dict:
@@ -2198,10 +2638,7 @@ class ProcessEngine:
             store, cov = self.store, self.coverage
         except Exception:                       # noqa: BLE001
             return rows
-        try:
-            pending = json.loads(store.get_meta("stage_pending", "[]") or "[]")
-        except Exception:                       # noqa: BLE001
-            pending = []
+        pending = self._pending_stages()
         for s in registry.stages_of(planned):
             comps = registry.components_in_stage(s, planned)
             try:
@@ -2216,6 +2653,12 @@ class ProcessEngine:
                 last = {}
             rep["bundle"] = last or None
             rep["bundle_pending"] = s in pending
+            # A pending entry that still holds its parts will re-send those bytes
+            # rather than rebuild, and that is worth showing: it is the difference
+            # between "waiting on Telegram" and "about to vacuum the database
+            # again".
+            held = pending.get(s) or {}
+            rep["bundle_held_parts"] = len(held.get("parts") or [])
             # The error list travels in the bundle in full; the tab gets the
             # most recent slice so the panel stays readable on a bad day.
             rep["error_count"] = len(rep.get("errors", []))
@@ -2632,3 +3075,95 @@ def get_engine(base_dir: str | None = None) -> ProcessEngine:
         if _engine is None:
             _engine = ProcessEngine(base_dir)
         return _engine
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Publishing on the way out
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A Kaggle session ends by having its container deleted. Everything on scratch
+# disk goes with it, so an exported shard that never reached the channel is a
+# shard that never existed — and the window between the last publish and the end
+# is up to five minutes of work on four workers. Closing that window is the
+# cheapest correctness win in the whole publish path.
+#
+# Two mechanisms, because neither covers the other:
+#
+#   atexit    fires on a normal return and on SIGINT — KeyboardInterrupt unwinds
+#             the stack normally, so the handler runs. It does *not* fire when
+#             the process is signalled dead.
+#   SIGTERM   is what a container stop sends, and its default disposition kills
+#             the process outright without running atexit. It needs a handler,
+#             and the handler must chain to whatever was installed before it so
+#             installing this does not make the process unkillable.
+#
+# `signal.signal` can only be called from the main thread, and this module is
+# imported from a Flask worker as often as not — hence the `ValueError` arm and
+# the rule that `install_exit_flush()` is called from `__main__`.
+
+_exit_flush_installed = False
+
+
+def _flush_engine(why: str) -> None:
+    """Publish the running engine's tail, if there is one. Never raises."""
+    eng = _engine
+    if eng is None:
+        return
+    try:
+        res = eng.flush_for_exit(why)
+        if res.get("shard"):
+            print(f"⚙️  [PROCESS] Exit flush published shard {res['shard']}",
+                  flush=True)
+    except Exception as exc:                    # noqa: BLE001
+        print(f"⚙️  [PROCESS] Exit flush failed: {type(exc).__name__}: "
+              f"{str(exc)[:200]}", flush=True)
+
+
+def install_exit_flush() -> dict:
+    """Arm the exit paths. Idempotent, and safe to call off the main thread.
+
+    Returns what it managed to install, so the caller can log the truth rather
+    than an assumption — a process that could not take the signals still has
+    `atexit`, and that is worth knowing from the log rather than from a lost
+    shard.
+    """
+    global _exit_flush_installed
+    if _exit_flush_installed:
+        return {"atexit": True, "signals": [], "already": True}
+    _exit_flush_installed = True
+
+    import atexit
+    import signal
+
+    atexit.register(_flush_engine, "atexit")
+
+    took = []
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous = signal.getsignal(sig)
+        except Exception:                       # noqa: BLE001
+            previous = None
+
+        def handler(signum, frame, _prev=previous, _name=name):
+            _flush_engine(_name.lower())
+            # Chain, so the process still dies. A handler that swallows SIGTERM
+            # turns a container stop into a hang and then a hard kill, which
+            # loses strictly more than doing nothing would have.
+            if callable(_prev) and _prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                _prev(signum, frame)
+            elif _prev == signal.SIG_IGN:
+                return
+            else:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+        try:
+            signal.signal(sig, handler)
+            took.append(name)
+        except (ValueError, OSError, RuntimeError):
+            # Off the main thread, or a platform without it. atexit still stands.
+            pass
+    return {"atexit": True, "signals": took, "already": False}
