@@ -59,6 +59,21 @@ from omni_models import (MODELS, device_0, hybrid_spatial_proof,
                          siglip_text_vec, clip_text_vec, bge_encode)
 from omni_prompts import PROMPTS
 
+# ── Which plane owns the cards ────────────────────────────────────────────
+# `boot.py` normalises VIOS_GPU_OWNER and re-exports it, so this is a read of a
+# decision already made — one place decides, and this process obeys it.
+#
+# The default is `v2`: the processing engine gets both cards, and this process
+# must not load a model or drain a job. That used to be expressed by boot simply
+# never starting this file, which meant the dashboard was never started either —
+# and the dashboard needs no GPU at all. It is a browser over Postgres, Neo4j
+# and Qdrant, and all three run regardless of who owns the cards. So the process
+# starts either way and drops the GPU half of itself when it does not own one.
+GPU_OWNER = (os.environ.get("VIOS_GPU_OWNER", "") or "v2").strip().lower()
+if GPU_OWNER not in ("v1", "v2", "both"):
+    GPU_OWNER = "v2"
+OWNS_GPU = GPU_OWNER in ("v1", "both")
+
 
 def log(msg, level="INFO"):
     vios_log(msg, "OMNI", level)
@@ -933,10 +948,33 @@ def build_dashboard():
     dash_html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "omni_dashboard.html")
 
+    # Explorer mode has no vision worker, so the frame and narration panels of a
+    # freshly-started archive are legitimately empty. Said in the page, because
+    # "empty because nothing produced this yet" and "empty because something
+    # broke" look identical, and only one of them is worth debugging. Injected
+    # server-side rather than fetched: this process is the one that knows, and a
+    # banner that arrives after a round trip is a banner that flashes.
+    _MODE_BANNER = (
+        '<div style="margin:0;padding:9px 18px;background:#1c2128;'
+        'border-bottom:1px solid #30363d;color:#8b949e;font-size:12.5px;'
+        'line-height:1.5">'
+        '\U0001f5a5️ The v2 <b>processing engine</b> owns the GPUs on this '
+        'run, so this Explorer is serving the databases only — no perception '
+        'models are loaded and the vision/oracle workers are idle. Panels that '
+        'need a fresh GPU pass will stay empty; everything already in Postgres, '
+        'Neo4j and Qdrant is here and browsable. '
+        '<span style="color:#6e7681">Restart with '
+        '<code style="background:#0d1117;border:1px solid #30363d;border-radius:4px;'
+        'padding:1px 5px">VIOS_GPU_OWNER=v1</code> to run this plane instead.'
+        '</span></div>')
+
     @app_dashboard.route("/")
     def index():
         with open(dash_html_path, "r", encoding="utf-8") as f:
-            return f.read()
+            html = f.read()
+        if not OWNS_GPU:
+            html = html.replace("<body>", "<body>\n" + _MODE_BANNER, 1)
+        return html
 
     @app_dashboard.route("/api/videos")
     def get_videos():
@@ -1773,7 +1811,17 @@ def main():
     import nest_asyncio
     nest_asyncio.apply()
 
-    log("🚀 Omniscient Engine igniting — tri-partite DB + Layer 5 orchestration")
+    # The mode, on line one, because every other line of this boot log reads
+    # differently depending on it. A run where the vision panels stay empty
+    # because nothing is draining the queue must not look like a run where they
+    # are empty because something is broken.
+    if OWNS_GPU:
+        log("🚀 Omniscient Engine igniting — tri-partite DB + Layer 5 orchestration")
+    else:
+        log(f"👁️ Omniscient Engine in EXPLORER MODE (VIOS_GPU_OWNER={GPU_OWNER}) — "
+            "the v2 processing engine owns the cards")
+        log("   Databases, schema and the God-Mode Explorer come up. The ~19 GB of "
+            "perception models, both worker loops and the upload bot stay down.")
 
     # 0. Broker first — both worker loops and the bot push jobs immediately.
     if not wait_for_redis(label="OMNI"):
@@ -1787,35 +1835,57 @@ def main():
     #     deliberate response to a lost CUDA context) would sit in PROCESSING
     #     until the whole notebook restarted. max_recoveries caps the
     #     crash-recover-crash loop if the video itself is what kills the engine.
-    try:
-        orphaned = sum(recover_processing_jobs(q, max_recoveries=2)
-                       for q in (QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE))
-        if orphaned:
-            log(f"🔄 Re-queued {orphaned} job(s) orphaned by the last engine restart")
-    except Exception as e:
-        log(f"Orphan recovery skipped: {e}", "WARN")
+    #
+    #     Skipped in explorer mode: re-queueing a job with no worker to drain it
+    #     moves it from one place nothing is reading to another.
+    if OWNS_GPU:
+        try:
+            orphaned = sum(recover_processing_jobs(q, max_recoveries=2)
+                           for q in (QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE))
+            if orphaned:
+                log(f"🔄 Re-queued {orphaned} job(s) orphaned by the last engine restart")
+        except Exception as e:
+            log(f"Orphan recovery skipped: {e}", "WARN")
 
-    # 1. Databases (idempotent service start + schema)
+    # 1. Databases (idempotent service start + schema). These are what the
+    #    Explorer reads, and none of them wants a GPU, so they run in both modes.
     omni_db.ensure_services()
     omni_db.init_pg_schema()
     get_qdrant()
 
-    # 2. Perception models (per-model failure tolerance)
-    omni_models.load_all()
+    # 2. Perception models (per-model failure tolerance) — the GPU half.
+    if OWNS_GPU:
+        omni_models.load_all()
 
-    # 3. Workers + dashboard
-    threading.Thread(target=vision_worker_loop, daemon=True).start()
-    threading.Thread(target=oracle_worker_loop, daemon=True).start()
+    # 3. Workers + dashboard. The dashboard is the point of this process in
+    #    explorer mode; the two loops are the part that needs a card.
+    if OWNS_GPU:
+        threading.Thread(target=vision_worker_loop, daemon=True).start()
+        threading.Thread(target=oracle_worker_loop, daemon=True).start()
     threading.Thread(target=run_dashboard, daemon=True).start()
     log(f"👁️ God-Mode Explorer on 127.0.0.1:{OMNI_DASHBOARD_PORT} → /omni tab in the workstation")
 
     # 4. Telegram bot (main asyncio loop)
+    #
+    #    Off in explorer mode, deliberately. The bot's job is to push vision and
+    #    oracle jobs, and with no worker draining them the queue would grow for
+    #    the whole session — a backlog nobody asked for and nothing will clear.
+    #    The TELEGRAM_MISSING branch below is already the shape of "dashboard up,
+    #    workers off", so explorer mode joins it rather than inventing a third.
     async def _run():
-        if TELEGRAM_MISSING:
-            log(f"⚠️ Telegram bot disabled — missing {', '.join(TELEGRAM_MISSING)}.", "WARN")
-            log("   Set them as Kaggle Secrets and restart to enable uploads and "
-                "bot search. Workers, dashboard and queues are unaffected.", "WARN")
-            log("⚡ OMNISCIENT ENGINE RUNNING — queues hot, bot off.", "SUCCESS")
+        if TELEGRAM_MISSING or not OWNS_GPU:
+            if not OWNS_GPU:
+                log("⚠️ Upload bot held back — it only produces jobs for the two "
+                    "worker loops, and in explorer mode nothing drains them.", "WARN")
+                log("   Uploads and search live in Atlas. VIOS_GPU_OWNER=v1 brings "
+                    "this whole plane back, bot and workers included.", "WARN")
+                log("👁️ EXPLORER RUNNING — databases live, Explorer served, GPU idle "
+                    "for the processing engine.", "SUCCESS")
+            else:
+                log(f"⚠️ Telegram bot disabled — missing {', '.join(TELEGRAM_MISSING)}.", "WARN")
+                log("   Set them as Kaggle Secrets and restart to enable uploads and "
+                    "bot search. Workers, dashboard and queues are unaffected.", "WARN")
+                log("⚡ OMNISCIENT ENGINE RUNNING — queues hot, bot off.", "SUCCESS")
             asyncio.create_task(ui_updater_daemon())
             while True:
                 await asyncio.sleep(3600)

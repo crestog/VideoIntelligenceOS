@@ -393,6 +393,15 @@ print("   🖥️ [UI]        → ui_server.py      (FastAPI + Ghost Worker)", f
 print("   🎞️ [CV-ENGINE] → frame_worker.py   (OpenCV frame extraction)", flush=True)
 if OMNI_ENABLED and V1_GPU:
     print("   🔮 [OMNI]      → omni_engine.py    (Tri-partite DB + GraphRAG + Bot)", flush=True)
+elif OMNI_ENABLED:
+    # Started either way now. The God-Mode Explorer is a browser over Postgres,
+    # Neo4j and Qdrant — none of which wants a card — and the footer links /omni
+    # from every page in the system. Not starting this process meant that link
+    # answered "still booting…" for the whole session about something that was
+    # never going to boot.
+    print("   🔮 [OMNI]      → omni_engine.py    (Explorer only — DBs + GraphRAG,",
+          flush=True)
+    print("                    no models, no workers, no bot)", flush=True)
 elif not OMNI_ENABLED:
     # Said out loud, because the silent version cost a session. VIOS_OMNI=0
     # switches off Neo4j, Postgres, GraphRAG, the narrative passes and /omni,
@@ -409,11 +418,15 @@ print(f"   🎛️ GPU owner   → {GPU_OWNER}", flush=True)
 if not V1_GPU:
     # Named, with the reason and the way back. A worker that silently does not
     # start is indistinguishable from one that started and did nothing.
-    print("      model_manager.py and omni_engine.py are held back so the",
+    print("      model_manager.py is held back so the processing engine has",
           flush=True)
-    print("      processing engine has the whole card — the two planes were",
+    print("      the whole card — the two planes were OOM-ing each other over",
           flush=True)
-    print("      OOM-ing each other over the same seven models.", flush=True)
+    print("      the same seven models. omni_engine.py still runs, serving the",
+          flush=True)
+    print("      Explorer with its models and workers off, because /omni is",
+          flush=True)
+    print("      linked from every page and needs no GPU to answer.", flush=True)
     print("      VIOS_GPU_OWNER=both restores the old behaviour.", flush=True)
 print("=" * 60, flush=True)
 print("", flush=True)
@@ -425,6 +438,11 @@ threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"], "🎞️ [CV-ENGINE]", False), daemon=True).start()
 if OMNI_ENABLED and V1_GPU:
     threading.Thread(target=run_with_watchdog, args=(["python", "-u", "omni_engine.py"], "🔮 [OMNI]", True), daemon=True).start()
+elif OMNI_ENABLED:
+    # `is_engine=False`: the watchdog's engine path exists for a process whose
+    # crashes are CUDA-context losses. In explorer mode this one holds no context
+    # to lose, so it restarts like any other service.
+    threading.Thread(target=run_with_watchdog, args=(["python", "-u", "omni_engine.py"], "🔮 [OMNI]", False), daemon=True).start()
 
 try:
     # Keep main orchestrator alive indefinitely

@@ -1124,9 +1124,19 @@ async def omni_proxy(request: Request, path: str = ""):
                                  headers=resp_headers,
                                  media_type=resp.headers.get("content-type"))
     except Exception as e:
+        # This is now the case it was written for and nothing else. The engine is
+        # started whenever VIOS_OMNI is on — in explorer mode with its models and
+        # workers off, but started — so a connection refusal here means the
+        # process has not finished bringing Postgres, Neo4j and Qdrant up yet,
+        # which takes a minute on a cold session. It used to also cover "the
+        # process was never launched and never will be", which no amount of
+        # waiting fixed.
         return _omni_notice(
-            "🔮 Omniscient Engine is still booting…",
-            "<p>The dashboard appears here once its models finish loading.</p>"
+            "🔮 The Explorer is still coming up…",
+            "<p>Postgres, Neo4j and Qdrant are starting. This page appears as "
+            "soon as they answer — usually within a minute of boot.</p>"
+            "<p>If it stays here, check the <code>🔮 [OMNI]</code> lines in the "
+            "boot log: that is the process this page is served from.</p>"
             f"<p style='font-size:.82em'>{type(e).__name__}</p>", 503)
 
 
