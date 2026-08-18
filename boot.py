@@ -40,6 +40,12 @@ try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from vios import creds as _creds
 
+    # Kaggle rate-limits secret reads per account, and when it does it asks for
+    # twenty seconds at a time. The sweep honours that — up to two and a half
+    # minutes of it — which is a long time for a boot log to say nothing, and a
+    # silent Phase 0 is indistinguishable from a hung one.
+    _creds.on_wait = lambda text: print(f"   ⏳ {text}", flush=True)
+
     _bridged = _creds.export_to_env()
     _report = _creds.kaggle_report()
     if _bridged:

@@ -64,7 +64,7 @@ they have six different remedies and used to share one misleading sentence:
 | `Kaggle answered, and none of the N names … is stored` | The store works and is empty | Check the row exists **and its toggle is on for this notebook**, then restart the session |
 | `unreadable [no-access]` | Kaggle answered HTTP 401/403. If it refused *every* label the token is stale; if it refused some and answered others, those rows are not shared with this notebook | Restart the session, or switch the named rows on for this notebook. This is what "attached after the kernel started" looks like |
 | `unreadable [no-token]` | `KAGGLE_USER_SECRETS_TOKEN` is not in this process at all | Run `boot.py` from a notebook cell, not a Terminal or `nohup`; the variable is inherited, not global |
-| `unreadable [rate-limited]` | HTTP 429. Kaggle counts secret reads **per account** and this one has read too many too recently. The rows, the token and the network are all fine | Wait a minute and re-run the cell. **Do not** restart the session — a new session starts by sweeping the store again. See below |
+| `unreadable [rate-limited]` | HTTP 429. Kaggle counts secret reads **per account** and this one has read too many too recently. The rows, the token and the network are all fine | Phase 0 already waited (up to 150 s) and the limit outlasted it. Wait a minute and re-run the cell. **Do not** restart the session — a new session starts by sweeping the store again. See below |
 | `unreachable` | No answer and **no HTTP status behind it** — this one really is the transport | Settings → Internet → On |
 | `partly unreadable [backend]` | Some rows read, at least one errored | The named labels only; the rest are present |
 
@@ -96,9 +96,29 @@ answering **HTTP 429 `{"errors":["Too many requests"]}`** to everything, which
 `kaggle_secrets` hands over as the same "Connection error" sentence as always.
 
 It is a wait, not a fault, and Phase 0 now treats it as one: it retries the same
-label with a widening backoff, honours a `Retry-After` if the server sends one,
-gives up after four refusals or thirty seconds of waiting — whichever comes
-first, because a limiter counts requests too — and spaces every later call out.
+label — a 429 is about the endpoint, not the row — with a widening backoff, and
+honours a `Retry-After` when the server sends one. **Kaggle's own number is 20
+seconds**, so the budget is sized to it: up to 150 seconds of waiting or six
+refused calls on one label, whichever comes first, because a limiter counts
+requests as well as time. A single 20-second wait is usually the whole story and
+buys back every credential in the store.
+
+Two minutes of silence reads like a hang, so the wait is narrated:
+
+```
+   ⏳ Kaggle is rate-limiting secret reads (HTTP 429). Waiting 20s and asking
+      for VIOS_BOT_TOKEN again — attempt 1 of 6, 0s of 150s spent.
+```
+
+Once through a throttle the sweep also gets cheaper. It notices which spelling
+the store actually uses — a row found as `VIOS_TELEGRAM_BOT_TOKEN` makes
+`VIOS_TELEGRAM_…` the first guess for everything after it — and it stops trying
+every alternative spelling of the *optional* credentials, keeping the full list
+only for the four that gate the Telegram channel. The spellings it skipped are
+named in the log, and a credential whose aliases went unasked is reported as
+*not looked for*, never as "not stored": those are different sentences and Phase 0
+no longer prints both about the same row.
+
 A throttle it rides out is one line in the log; a throttle it cannot is named,
 with the seconds it spent, and never blamed on your network.
 

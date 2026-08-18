@@ -227,14 +227,23 @@ _BLIP_WAIT = 1.5
 #
 #   * It is retried on the *same* label, not counted against it. Waiting is the
 #     documented remedy for a 429 and the only one.
-#   * The waiting is bounded, because Phase 0 blocks the boot. Nineteen seconds
-#     buys back a transient throttle; a minute would just move the complaint.
+#   * The waiting is bounded, because Phase 0 blocks the boot — but the bound has
+#     to be larger than the number Kaggle asks for, or honouring `Retry-After` is
+#     theatre. It asks for twenty seconds. A thirty-second budget therefore waited
+#     the twenty, was refused once more, and gave up with the second wait already
+#     over budget: two and a half minutes of patience is the difference between a
+#     boot that starts a minute late and a twelve-hour session with no Telegram.
 #   * Every call after the first 429 is spaced further apart, since continuing to
 #     hammer a limiter is what extends the window.
-_RATE_BACKOFF = (2.0, 5.0, 12.0)   # per successive 429 on one label
-_RATE_MAX_WAIT = 20.0              # cap on a Retry-After the server asks for
-_RATE_BUDGET = 30.0                # total seconds this sweep will spend waiting
-_RATE_TRIES = 4                    # refused calls on one label before giving up
+_RATE_BACKOFF = (5.0, 15.0, 30.0)  # per successive 429 on one label
+_RATE_MAX_WAIT = 60.0              # cap on a Retry-After the server asks for
+_RATE_BUDGET = 150.0               # total seconds this sweep will spend waiting
+_RATE_TRIES = 6                    # refused calls on one label before giving up
+
+# Called with a progress line while the sweep is waiting out a throttle, if the
+# launcher set it. Phase 0 can now legitimately block for two minutes, and a boot
+# log that goes silent for two minutes is indistinguishable from a hung one.
+on_wait = None
 
 # A small gap between store calls, always. The limiter's shape is not published,
 # so this is a hedge and not a proof: a dozen sequential lookups that each return
@@ -281,14 +290,28 @@ def labels(name: str) -> tuple:
     return (FIELDS[name][0],) + tuple(ALIASES.get(name, ()))
 
 
-def _ordered(name: str, family: int) -> tuple:
-    """`labels(name)`, with the alias position that already answered moved first.
+def _prefix_of(name: str, label: str) -> str:
+    """The spelling `label` used, as a prefix — "" if it was the canonical name.
 
-    The four alias lists line up by position — `VIOS_X`, then `VIOS_TELEGRAM_X`,
-    then `TELEGRAM_X`, then `ATLAS_X` — because someone who stores secrets stores
-    a *set* of them under one spelling. So the position that produced a value for
-    the first credential is the position most likely to produce the next one, and
-    trying it first is free.
+    Derived by walking back from the end of both names until they differ, so the
+    shared tail (`_BOT_TOKEN`) is discarded and what is left is the family
+    (`VIOS_TELEGRAM`, `TELEGRAM`, `ATLAS`). Computed rather than listed because a
+    list of prefixes would be a fourth place that has to agree with ALIASES.
+    """
+    canon = label_of = FIELDS[name][0]
+    shared = 0
+    while (shared < min(len(canon), len(label))
+           and canon[-1 - shared] == label[-1 - shared]):
+        shared += 1
+    return "" if label == label_of else label[:len(label) - shared]
+
+
+def _ordered(name: str, prefix: str) -> tuple:
+    """`labels(name)`, with the spelling that already answered moved first.
+
+    Someone who stores secrets stores a *set* of them under one spelling, so the
+    prefix that produced a value for the first credential is the one most likely
+    to produce the next, and trying it first is free.
 
     It is worth more than tidiness: every label tried and missed is an HTTPS call
     against a store that rate-limits, and this turns the sweep for a
@@ -296,12 +319,22 @@ def _ordered(name: str, family: int) -> tuple:
     Telegram values come from one family rather than a mix, which is what someone
     holding two sets of rows meant.
 
+    By prefix and not by position, which is what it used to be. The alias lists
+    only line up for the four Telegram credentials; `hf_token`'s second entry is
+    `VIOS_HUGGINGFACE_TOKEN`, so a store answering under `VIOS_TELEGRAM_*` taught
+    the sweep to ask for that before `VIOS_HF_TOKEN` — a wasted call, on the field
+    most likely to be stored under its canonical name. A prefix that matches
+    nothing here simply leaves the order alone, which is the correct answer.
+
     Ordering only — nothing here decides *whether* a label is asked for, so no
     credential becomes unreachable because of it.
     """
     labs = list(labels(name))
-    if 0 < family < len(labs):
-        labs.insert(0, labs.pop(family))
+    if prefix:
+        for i, lab in enumerate(labs):
+            if lab.startswith(prefix):
+                labs.insert(0, labs.pop(i))
+                break
     return tuple(labs)
 
 
@@ -484,6 +517,10 @@ def _blank() -> dict:
     return {"values": {}, "reason": "", "detail": "",
             "asked": [], "found": [], "absent": [], "broken": [],
             "codes": {},
+            # Labels a throttle talked the sweep out of trying. Reported, because
+            # "not asked for" and "not stored" reading the same is the original
+            # bug in this module and must not come back through a side door.
+            "skipped": [],
             # How often the store said "too many requests", and how long this
             # sweep spent waiting for it. Counted separately from `codes`
             # because a label that was throttled and then answered is not a
@@ -512,6 +549,7 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
          "absent":  [label, …]  the ones it said are not attached,
          "broken":  [(label, text), …]  the ones that failed some other way,
          "codes":   {label: http status}  every status code seen, error or not,
+         "skipped": [label, …]  aliases a throttle talked the sweep out of,
          "throttled": how many replies were HTTP 429,
          "waited":  seconds this sweep spent waiting one out,
          "token":   whether the session token variable is set — presence only,
@@ -614,6 +652,19 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
                     if (throttles < _RATE_TRIES
                             and report["waited"] + delay <= _RATE_BUDGET):
                         report["waited"] = round(report["waited"] + delay, 1)
+                        if on_wait:
+                            # A name and a number of seconds. The launcher prints
+                            # it so two minutes of waiting reads as waiting.
+                            try:
+                                on_wait(
+                                    f"Kaggle is rate-limiting secret reads "
+                                    f"(HTTP 429). Waiting {delay:g}s and asking "
+                                    f"for {label} again — attempt "
+                                    f"{throttles + 1} of {_RATE_TRIES}, "
+                                    f"{report['waited']:g}s of "
+                                    f"{_RATE_BUDGET:g}s spent.")
+                            except Exception:               # noqa: BLE001
+                                pass
                         time.sleep(delay)
                         continue
                     # Out of budget, or out of tries. Both bounds matter and for
@@ -685,11 +736,20 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
             runs[UNREACHABLE] = runs[BACKEND] = 0
         return val
 
-    family = 0                 # the alias position that last produced a value
+    prefix = ""                # the spelling that last produced a value
     for name in FIELDS:
         if name in skip or stop:
             continue
-        for label in _ordered(name, family):
+        # Once the store has throttled us even once, the long tail of aliases is
+        # no longer free: it is more calls into a limiter that has already said
+        # there have been too many. So an *optional* credential gets its canonical
+        # name and the spelling this store has been answering under, and no more —
+        # two calls rather than four, on the fields whose absence disables one
+        # pass. The four that gate the channel keep every spelling: a session
+        # without them has no harvest, no upload bot and no restore.
+        tail = 2 if (report["throttled"] and name not in _REQUIRED) else None
+        tried = _ordered(name, prefix)
+        for label in tried[:tail]:
             if stop:
                 break
             val = sweep(label)
@@ -698,8 +758,13 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
                 # found under — which alias Kaggle happened to hold must not
                 # leak past this function.
                 report["values"][name] = val
-                family = labels(name).index(label)
+                prefix = _prefix_of(name, label) or prefix
                 break
+        else:
+            # Named, so a credential that was never asked for cannot be reported
+            # as one the store does not hold. That confusion is this module's
+            # original bug, and a throttle must not reintroduce it.
+            report["skipped"] += [lb for lb in tried[tail or len(tried):]]
     for label in PASSTHROUGH:
         if stop or label in skip:
             continue
@@ -841,9 +906,10 @@ def kaggle_advice(report: dict) -> list:
             # across 0 replies" would be a lie about a number nobody needs.
             out.append(
                 f"It waited {waited:g}s across {hits} throttled repl"
-                f"{'y' if hits == 1 else 'ies'} and then stopped, rather than hold "
-                "the boot open. The count is per Kaggle account and it falls back "
-                "down on its own, usually within a minute or two.")
+                f"{'y' if hits == 1 else 'ies'} — up to {_RATE_BUDGET:g}s is "
+                "allowed — and then stopped rather than hold the boot open. The "
+                "count is per Kaggle account and it falls back down on its own, "
+                "usually within a minute or two.")
         out += [
             "So: wait a minute, then re-run the cell. Do not restart the "
             "session — a fresh session starts by sweeping the store again, "
@@ -874,10 +940,15 @@ def kaggle_advice(report: dict) -> list:
         # everything reads as a failure — the same confusion this function
         # exists to end, pointed the other way.
         have = set(report.get("values") or ())
+        left = set(report.get("skipped") or ())
 
         def _short(names) -> list:
+            # A credential with an unasked spelling is not reported here at all.
+            # "Not stored" and "not looked for" are different sentences, the
+            # second one is printed below, and a field cannot honestly get both.
             return [FIELDS[n][0] for n in names if n not in have
-                    and any(lbl in absent for lbl in labels(n))]
+                    and any(lbl in absent for lbl in labels(n))
+                    and not any(lbl in left for lbl in labels(n))]
 
         missing = _short(_REQUIRED)
         optional = _short([n for n in FIELDS if n not in _REQUIRED])
@@ -904,6 +975,18 @@ def kaggle_advice(report: dict) -> list:
             f"the sweep waited {report.get('waited') or 0:g}s for the limit to "
             "clear. Nothing was lost; if it starts happening every boot, see the "
             "bridge cell in RUNNING.md, which asks the store for nothing.")
+    if report.get("skipped"):
+        # Not the same sentence as "absent", and never merged into it: these
+        # labels were never asked about. The credential may be stored under one of
+        # them, and the reason it was not looked for is that looking costs a call.
+        skipped = list(report["skipped"])
+        out.append(
+            f"To stay under the limit it stopped trying alternative spellings for "
+            f"optional credentials: {', '.join(skipped[:6])}"
+            f"{f' and {len(skipped) - 6} more' if len(skipped) > 6 else ''}. "
+            "These were not asked about, which is not the same as not stored — "
+            "the four that gate the channel were tried under every spelling. A "
+            "later boot with no throttle asks for all of them.")
     if codes:
         # The line that would have ended the worst version of this bug in a
         # minute. `kaggle_secrets` prints "Connection error trying to communicate

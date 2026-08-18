@@ -419,13 +419,27 @@ _thr = _check("throttled, then the store answers (HTTP 429 ×2)", _Throttled,
 assert set(_thr["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
                               "VIOS_NIM_API_KEY"}, sorted(_thr["values"])
 assert _thr["throttled"] == 2, _thr["throttled"]
-# 2 s then 5 s: the schedule, on the same label, not counted against it.
+# 5 s then 15 s: the schedule, on the same label, not counted against it.
 assert _thr["waited"] == sum(creds._RATE_BACKOFF[:2]), _thr["waited"]
 assert not creds._code_tally(_thr).get(429), \
     "a label that was throttled and then answered is not a failed label"
+# The optional credentials keep their canonical spelling and the one this store
+# answers under, and lose the rest — those are calls into a limiter that has
+# just complained. Named in the advice, never counted as absent.
+assert _thr["skipped"], "a throttled sweep still tried every alias"
+assert not set(_thr["skipped"]) & set(_thr["asked"]), \
+    f"reported as skipped and asked for: {_thr['skipped']}"
+for _lbl in _thr["skipped"]:
+    assert not any(_lbl in creds.labels(n) for n in creds._REQUIRED), \
+        f"skipped a spelling of a credential that gates the channel: {_lbl}"
 _adv = " ".join(creds.kaggle_advice(_thr)).lower()
 assert "429" in _adv and "waited" in _adv, _adv
-print("   waited it out on the first label and finished the sweep")
+assert "not the same as not stored" in _adv, _adv
+# And it must not say both. A field with an unasked spelling cannot be reported
+# as one the store does not hold — that is this module's original bug verbatim.
+assert "vios_hf_token" not in _adv.split("optional credentials")[0], _adv
+print(f"   waited it out on the first label and finished the sweep, "
+      f"{len(_thr['skipped'])} optional spellings left unasked")
 
 
 class _HardThrottle:
@@ -466,10 +480,69 @@ assert creds._RATE_BACKOFF[0] not in SLEPT, \
 assert _ra["waited"] <= creds._RATE_BUDGET, _ra["waited"]
 # A small Retry-After must not turn into a long series of refused calls: the
 # limiter is counting requests, so the number of tries is bounded as well as the
-# time. Nine seconds of waiting, four calls, then a sentence in the log.
+# time. Eighteen seconds of waiting, six calls, then a sentence in the log.
 assert _ra["throttled"] == creds._RATE_TRIES, _ra["throttled"]
 print(f"   honoured the server's own number for {_ra['throttled']} tries "
       f"({_ra['waited']:g}s), then stopped instead of hammering it")
+
+
+# The number Kaggle actually sends is twenty seconds, and the budget has to be
+# bigger than it or honouring Retry-After is theatre: the previous 30 s budget
+# waited the twenty, was refused once, and quit with the second wait already over
+# budget. That is the boot log the user sent — "waited 20s across 2 throttled
+# replies", one label asked, twelve rows never reached.
+class _RetryAfter20:
+    def get_secret(self, label):
+        _raise_masked(429, _TOO_MANY, msg="Too Many Requests",
+                      hdrs={"Retry-After": "20"})
+
+
+_ra20 = _check("the store asks for 20s, repeatedly", _RetryAfter20,
+               expect=creds.RATE_LIMIT, asked=1)
+assert _ra20["throttled"] > 2, \
+    f"gave up after {_ra20['throttled']} replies again: {_ra20['waited']}s"
+assert _ra20["waited"] >= 60, _ra20["waited"]
+assert SLEPT.count(20.0) >= 3, SLEPT
+print(f"   honoured 20s {_ra20['throttled'] - 1}× ({_ra20['waited']:g}s) "
+      f"instead of quitting on the second")
+
+
+# And the same store, throttled once and then answering — the case the budget
+# exists for. Everything resolves; the boot is a minute late instead of blind.
+class _ThrottledOnce:
+    def __init__(self):
+        self.n = 0
+
+    def get_secret(self, label):
+        self.n += 1
+        if self.n == 1:
+            _raise_masked(429, _TOO_MANY, msg="Too Many Requests",
+                          hdrs={"Retry-After": "20"})
+        if label not in STORE:
+            _raise_masked(404, _NO_ROW, msg="Not Found")
+        return STORE[label]
+
+
+_once = _check("throttled once for 20s, then the store answers", _ThrottledOnce,
+               expect="")
+assert set(_once["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
+                               "VIOS_NIM_API_KEY"}, sorted(_once["values"])
+assert _once["waited"] == 20, _once["waited"]
+print("   one 20s wait bought back every credential in the store")
+
+
+# The launcher gets told about a wait that long, because a boot log that says
+# nothing for two minutes reads as a hung one.
+print("\n== a long wait is announced, not silent ==")
+_said = []
+_c = _fresh(_RetryAfter20)
+_c.on_wait = _said.append
+_c.read_kaggle()
+assert _said, "waited without a word in the log"
+assert any("429" in line and "20s" in line for line in _said), _said
+for v in STORE.values():
+    assert v not in " ".join(_said), "the wait notice leaked a value"
+print(f"   {len(_said)} progress line(s), e.g. {_said[0][:88]}")
 
 
 # Fewer calls is the other half of not being throttled, and it costs nothing:
@@ -486,9 +559,16 @@ assert _learn["asked"][:2] == ["VIOS_BOT_TOKEN", "VIOS_TELEGRAM_BOT_TOKEN"], \
 # Position 1 answered for bot_token, so position 1 is asked first for the next
 # credential — one call instead of two, and the same store, and the same answer.
 assert _learn["asked"][2] == "VIOS_TELEGRAM_CHANNEL_ID", _learn["asked"][2]
+# But only where the spelling exists. hf_token has no VIOS_TELEGRAM_ form, and
+# the positional version of this learned "position 1" and duly asked for
+# VIOS_HUGGINGFACE_TOKEN before VIOS_HF_TOKEN — a wasted call on the field most
+# likely to be stored under its canonical name.
+assert (_learn["asked"].index("VIOS_HF_TOKEN")
+        < _learn["asked"].index("VIOS_HUGGINGFACE_TOKEN")), _learn["asked"]
 assert set(_learn["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
                                  "VIOS_NIM_API_KEY"}, sorted(_learn["values"])
 assert len(_learn["asked"]) <= 13, len(_learn["asked"])
+assert not _learn["skipped"], "nothing was throttled, so nothing may be skipped"
 print(f"   {len(_learn['asked'])} calls where asking every alias in order is 16")
 
 
