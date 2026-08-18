@@ -21,6 +21,16 @@ row per value, using these exact names:
 | `VIOS_API_HASH` | my.telegram.org |
 | `VIOS_HF_TOKEN` | Hugging Face — optional, only the diarisation pass needs it |
 
+`VIOS_TELEGRAM_BOT_TOKEN` and plain `TELEGRAM_BOT_TOKEN` are accepted too, and
+likewise for the other three — the bridge tries every spelling, so a row stored
+under any of them is found. `VIOS_NIM_API_KEY` is read straight through if you
+have one.
+
+**After attaching a secret, restart the session.** Attaching does not reach a
+kernel that is already running: Kaggle hands the session a token when it starts,
+and a token minted before the secret existed is refused. This is the single most
+common reason for "I added them and it says they are missing".
+
 Secrets are attached to your Kaggle account, not to a notebook or a session, so
 this is genuinely once: every future session of every future notebook has them
 until you delete the row. **Do not paste any of these into the cell.** `boot.py`
@@ -44,9 +54,23 @@ The first lines of the boot log tell you whether the secrets arrived:
    ✅ Kaggle Secrets → environment: VIOS_API_HASH, VIOS_API_ID, VIOS_BOT_TOKEN, VIOS_CHANNEL_ID
 ```
 
-Names only — a value is never printed. If a row is missing you get
-`⚠️ [SECRETS] Telegram disabled — not set: …` further down, naming exactly which
-ones, and everything that does not need Telegram still runs.
+Names only — a value is never printed.
+
+If they did not arrive, Phase 0 now says which of five things happened, because
+they have five different remedies and used to share one misleading sentence:
+
+| Phase 0 says | What it means | What to do |
+|---|---|---|
+| `Kaggle answered, and none of the N names … is stored` | The store works and is empty | Check the row exists **and its toggle is on for this notebook**, then restart the session |
+| `unreadable [no-access]` | A token is present and Kaggle refused it — stale | Restart the session. This is what "attached after the kernel started" looks like |
+| `unreadable [no-token]` | `KAGGLE_USER_SECRETS_TOKEN` is not in this process at all | Run `boot.py` from a notebook cell, not a Terminal or `nohup`; the variable is inherited, not global |
+| `unreachable` | The secrets proxy did not answer, twice | Settings → Internet → On |
+| `partly unreadable [backend]` | Some rows read, at least one errored | The named labels only; the rest are present |
+
+The line under a failure — `session: KAGGLE_USER_SECRETS_TOKEN=present/ABSENT …`
+— reports presence, never the token. `⚠️ [SECRETS] Telegram disabled — not set: …`
+still appears further down naming exactly which credentials are missing, and
+everything that does not need Telegram still runs.
 
 `setup.sh` installs Neo4j and Postgres for the older omniscient layer, which is
 about half the install time. If you only want the v2 planes (capture, process

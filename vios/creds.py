@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 # name → (env var / secret label, human description)
 FIELDS = {
@@ -121,6 +122,53 @@ ENV = "environment"
 FILE = "local file"
 TYPED = "typed this session"
 
+# ── why a Kaggle sweep found nothing ──────────────────────────────────────
+# The variable Kaggle injects into a notebook session, and which `kaggle_secrets`
+# requires before it will talk to the secrets proxy at all. Named here because
+# its absence has to be told apart from a *rejected* token: the client raises
+# CredentialError for both, and the only way to know which is to ask whether the
+# variable is there. The two have opposite remedies.
+KAGGLE_TOKEN_VAR = "KAGGLE_USER_SECRETS_TOKEN"
+
+# The five ways a sweep can fail, none of which used to be reported.
+#
+# `_from_kaggle` returned a bare `{}` for every one of them, so the boot log
+# printed a single sentence — "No Kaggle Secrets to add (already set, or none
+# stored)" — that is false for four of the five. A session with thirteen secrets
+# attached correctly read as a session with none, and the only remedy the log
+# offered was to store the secrets that were already stored.
+#
+# This module's docstring already says a stored secret that is never asked for
+# is indistinguishable from a missing one. A stored secret whose *lookup* failed
+# is the same bug one layer down, and it was in this file the whole time.
+NO_MODULE = "no-module"        # not a Kaggle session — nothing to ask
+NO_TOKEN = "no-token"          # the token variable is absent from THIS process
+NO_ACCESS = "no-access"        # 401/403 — a token is present and was refused
+UNREACHABLE = "unreachable"    # URLError, or the client's own 40 s timeout
+BACKEND = "backend"            # anything else the proxy said
+
+# Failures where every remaining label would fail identically. The client's
+# per-call timeout is 40 seconds and a full sweep is two dozen calls, so carrying
+# on past one of these costs a quarter-hour of silent boot to learn what is
+# already known. A BACKEND is not in here, because one of those says something
+# about one row rather than about the connection — but a *run* of them says the
+# opposite, so `_BACKEND_RUN` bounds that case instead of trusting it.
+_FATAL = (NO_TOKEN, NO_ACCESS, UNREACHABLE)
+
+# How many consecutive BACKEND failures, with nothing found yet, before the
+# sweep stops believing they are about individual rows. Three costs two minutes
+# at worst; twenty-four costs sixteen.
+_BACKEND_RUN = 3
+
+# The credentials whose absence stops something whole rather than one feature.
+# These four gate the channel, and the channel is where every bundle lives — so
+# without them there is no harvest, no upload bot and no restore. `hf_token` and
+# `ig_cookies` each disable exactly one pass, which is worth one quiet line
+# rather than the same alarm. config.py's `missing_telegram_secrets` is the
+# authority at run time; this list exists only so the advice can rank itself,
+# and creds must not import config (config imports the environment this fills).
+_REQUIRED = ("bot_token", "channel_id", "api_id", "api_hash")
+
 
 def labels(name: str) -> tuple:
     """Every name a credential may be stored under, canonical first.
@@ -150,46 +198,286 @@ def on_kaggle() -> bool:
 
 
 # ── the four sources ──────────────────────────────────────────────────────
-def _from_kaggle() -> dict:
-    """Kaggle Secrets, or {} anywhere else.
+# Every sweep this process has done, keyed by the `skip` it was given. Values
+# live here in memory only — the same place `os.environ` keeps them — and never
+# reach disk. Kept because secrets cannot change during a Kaggle session
+# (attaching one requires a restart), so re-sweeping is thirteen HTTPS calls for
+# an answer that could not have moved, and `describe` runs on every status poll.
+_KAGGLE_CACHE: dict = {}
 
-    Every read is individually guarded: a secret that has not been added
-    raises, and one missing secret must not hide the five that are present.
-    Each field is tried under all of its names and stops at the first hit, so
-    the cost is one call per credential when the canonical name was used and a
-    handful of failed calls when it was not. That is paid once, at boot.
 
-    Passthrough secrets come back keyed by their own env-var name, which is
-    never a key in FIELDS — so `resolve` and `describe`, which filter on
-    FIELDS, ignore them, and only `export_to_env` passes them on.
+def _classify(exc) -> tuple:
+    """(reason, text) for one failed lookup.
+
+    A reason of `""` means the proxy answered cleanly that this label is not
+    attached, which is not a failure and must not stop the sweep. Kaggle has no
+    exception type for that case — `get_secret` raises `BackendError` whose args
+    carry "No user secrets exist", and the only place Kaggle itself tells the two
+    apart is by searching for that string — so this does the same, plus
+    "not found" as a second spelling in case the wording moves.
     """
+    name = type(exc).__name__
+    text = (str(exc) or str(getattr(exc, "args", "")) or name).strip()
+    low = (text + " " + str(getattr(exc, "args", ""))).lower()
+    if name == "NotFoundError" or "no user secrets exist" in low \
+            or "not found" in low:
+        return "", text
+    if name == "CredentialError":
+        # Present and refused, or never there at all. Same exception, opposite
+        # remedy: restart the session, versus fix how boot.py was started.
+        return (NO_ACCESS if os.environ.get(KAGGLE_TOKEN_VAR)
+                else NO_TOKEN), text
+    if name == "ConnectionError" or "timeout" in low:
+        return UNREACHABLE, text
+    return BACKEND, text
+
+
+def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
+    """Ask Kaggle Secrets for every credential, and say what happened.
+
+    Returns
+
+        {"values":  {field or passthrough label: value},
+         "reason":  "" or one of NO_MODULE / NO_TOKEN / NO_ACCESS /
+                    UNREACHABLE / BACKEND,
+         "detail":  the exception text, when there was one,
+         "asked":   [label, …]  every name the proxy was asked for,
+         "found":   [label, …]  the ones it answered with a value,
+         "absent":  [label, …]  the ones it said are not attached,
+         "broken":  [(label, text), …]  the ones that failed some other way,
+         "token":   whether the session token variable is set — presence only,
+         "run_type": KAGGLE_KERNEL_RUN_TYPE, for the log}
+
+    `reason` is `""` whenever the proxy answered at all, however it answered. A
+    session with nothing attached is a *working* sweep that found nothing, and it
+    needs a different sentence from a sweep that could not run — the two used to
+    share one, and the shared one described neither.
+
+    Every read is still individually guarded, because one missing secret must not
+    hide the five that are present. What is no longer guarded away is the reason:
+    a lookup that failed on a timeout was indistinguishable from a row that was
+    never created, so one blip on the first of two dozen sequential HTTPS calls
+    disabled Telegram for a twelve-hour session and blamed the user for not
+    storing what they had stored.
+
+    `skip` names fields already satisfied from a higher-priority source. An
+    explicit export outranks a stored secret anyway, so asking about one is a
+    call with a 40-second timeout whose answer is discarded.
+    """
+    key = tuple(sorted(skip))
+    if not force and key in _KAGGLE_CACHE:
+        return _KAGGLE_CACHE[key]
+
+    report = {"values": {}, "reason": "", "detail": "",
+              "asked": [], "found": [], "absent": [], "broken": [],
+              # Presence only, never the value: it is a bearer JWT. Recorded
+              # even on the paths that never reach the proxy, because it is the
+              # single bit that separates "no token here" from "token refused",
+              # and those two have opposite remedies.
+              "token": bool(os.environ.get(KAGGLE_TOKEN_VAR, "").strip()),
+              "run_type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "")}
+    stop: set = set()          # a reason that makes the remaining labels moot
+    run: list = []             # consecutive BACKEND failures, nothing found yet
+
+    def done() -> dict:
+        _KAGGLE_CACHE[key] = report
+        return report
+
     try:
         from kaggle_secrets import UserSecretsClient  # noqa: PLC0415
-    except Exception:
-        return {}
+    except Exception as exc:                                # noqa: BLE001
+        report["reason"] = NO_MODULE
+        report["detail"] = f"{type(exc).__name__}: {exc}"
+        return done()
     try:
         client = UserSecretsClient()
-    except Exception:
-        return {}
+    except Exception as exc:                                # noqa: BLE001
+        report["reason"] = NO_ACCESS if report["token"] else NO_TOKEN
+        report["detail"] = f"{type(exc).__name__}: {exc}"
+        return done()
 
-    def _get(label):
-        try:
-            val = client.get_secret(label)
-        except Exception:
-            return ""
-        return str(val).strip() if val else ""
+    def ask(label: str) -> tuple:
+        """(value, reason, text), with one retry and only for the transport."""
+        report["asked"].append(label)
+        for attempt in (0, 1):
+            try:
+                val = client.get_secret(label)
+            except Exception as exc:                         # noqa: BLE001
+                reason, text = _classify(exc)
+                if reason == UNREACHABLE and attempt == 0:
+                    # The proxy is genuinely flaky, and the cost of believing it
+                    # the first time is a whole session with no Telegram. One
+                    # retry, then take the answer.
+                    time.sleep(1.5)
+                    continue
+                return "", reason, text
+            return (str(val).strip() if val else ""), "", ""
+        return "", UNREACHABLE, "no answer, twice"
 
-    out = {}
+    def sweep(label: str) -> str:
+        val, reason, text = ask(label)
+        if reason:
+            report["reason"] = report["reason"] or reason
+            report["detail"] = report["detail"] or text
+            report["broken"].append((label, text[:200]))
+            if reason in _FATAL:
+                stop.add(reason)
+            elif reason == BACKEND and not report["found"]:
+                # A bad row, or a bad connection wearing a row's clothing. The
+                # run length is what tells them apart, and it is cheaper to
+                # decide after three than to pay for twenty-four.
+                run.append(label)
+                if len(run) >= _BACKEND_RUN:
+                    stop.add(BACKEND)
+        elif val:
+            report["found"].append(label)
+            run.clear()
+        else:
+            report["absent"].append(label)
+            run.clear()
+        return val
+
     for name in FIELDS:
+        if name in skip or stop:
+            continue
         for label in labels(name):
-            val = _get(label)
+            if stop:
+                break
+            val = sweep(label)
             if val:
-                out[name] = val
+                # Keyed by the canonical field name, never by the alias it was
+                # found under — which alias Kaggle happened to hold must not
+                # leak past this function.
+                report["values"][name] = val
                 break
     for label in PASSTHROUGH:
-        val = _get(label)
+        if stop or label in skip:
+            continue
+        val = sweep(label)
         if val:
-            out[label] = val
+            # Passthroughs come back under their own env-var name, which is
+            # never a key in FIELDS — so `resolve` and `describe`, which filter
+            # on FIELDS, ignore them, and only `export_to_env` passes them on.
+            report["values"][label] = val
+    return done()
+
+
+def _from_kaggle() -> dict:
+    """Just the values, for `resolve`. See `read_kaggle` for the diagnosis.
+
+    Reuses what this process has already swept rather than re-asking. After
+    `export_to_env` every value found is in `os.environ`, so a second sweep can
+    only re-ask about labels that were *absent* — two dozen HTTPS calls, on a
+    status poll, for an answer a Kaggle session cannot change.
+    """
+    if _KAGGLE_CACHE:
+        merged = {}
+        for rep in _KAGGLE_CACHE.values():
+            merged.update(rep["values"])
+        return merged
+    return dict(read_kaggle()["values"])
+
+
+def kaggle_report() -> dict:
+    """The sweep already done in this process, or a fresh one.
+
+    Prefers a report that carries a `reason`: a failure is the thing a caller
+    needs to show, and a later skip-limited sweep that asked nothing would
+    otherwise look clean.
+    """
+    for rep in _KAGGLE_CACHE.values():
+        if rep["reason"]:
+            return rep
+    if _KAGGLE_CACHE:
+        return max(_KAGGLE_CACHE.values(), key=lambda r: len(r["asked"]))
+    return read_kaggle()
+
+
+def kaggle_advice(report: dict) -> list:
+    """What to do about a sweep that came back empty, as printable lines.
+
+    Shared by the boot log and the Setup page so the two cannot drift, and it
+    names remedies rather than restating the failure — the previous advice was
+    "add these as Kaggle Secrets", which is useless to the only person who ever
+    reads it: someone who has already added them.
+
+    Never contains a value. That is the whole premise of this module.
+    """
+    reason = report.get("reason") or ""
+    absent = list(report.get("absent") or ())
+    broken = list(report.get("broken") or ())
+    out = []
+    if reason == NO_MODULE:
+        out.append("Not a Kaggle session — `kaggle_secrets` will not import "
+                   "here, so Add-ons → Secrets is not the store in use. Set the "
+                   "VIOS_* environment variables instead.")
+    elif reason == NO_TOKEN:
+        out += [
+            f"{KAGGLE_TOKEN_VAR} is not in this process's environment, so no "
+            "secret can be read at all — the store was never reached.",
+            "Kaggle sets it in a notebook session and child processes inherit "
+            "it. Restart the session (Run → Restart session) and re-run the "
+            "launch cell.",
+            "If boot.py was started from a Kaggle Terminal, or detached with "
+            "nohup, run it from a notebook cell instead: the variable is "
+            "inherited, not global.",
+        ]
+    elif reason == NO_ACCESS:
+        out += [
+            "Kaggle refused this session's token (401/403). A token is "
+            "present, so the secrets are not missing — the token is stale.",
+            "That is exactly what a session started *before* the secrets were "
+            "attached looks like: attaching does not reach a kernel that is "
+            "already running. Restart the session and re-run the launch cell.",
+        ]
+    elif reason == UNREACHABLE:
+        out += [
+            "The Kaggle secrets proxy did not answer, twice. Secrets are read "
+            "over HTTPS, so Internet must be on for the notebook "
+            "(Settings → Internet).",
+        ]
+    elif reason == BACKEND:
+        if report.get("found"):
+            out.append(
+                f"Kaggle answered for {len(report['found'])} label(s) and "
+                "errored on at least one other — those credentials are "
+                "present, and only the failed labels below are unresolved.")
+        else:
+            out.append("Kaggle answered with an error instead of a value — the "
+                       "detail above is its own wording. The sweep stopped "
+                       f"after {_BACKEND_RUN} in a row rather than spend "
+                       "forty seconds per label proving it.")
+    elif absent:
+        # Only credentials that ended up with no value at all, named by their
+        # canonical label rather than by every alias tried. A field found under
+        # its third alias leaves the first two in `absent` quite legitimately,
+        # and reporting those as "not attached" after a sweep that resolved
+        # everything reads as a failure — the same confusion this function
+        # exists to end, pointed the other way.
+        have = set(report.get("values") or ())
+
+        def _short(names) -> list:
+            return [FIELDS[n][0] for n in names if n not in have
+                    and any(lbl in absent for lbl in labels(n))]
+
+        missing = _short(_REQUIRED)
+        optional = _short([n for n in FIELDS if n not in _REQUIRED])
+        optional += [lbl for lbl in PASSTHROUGH
+                     if lbl in absent and lbl not in have]
+        if missing:
+            out += [
+                "Kaggle answered, and holds no row for: " + ", ".join(missing)
+                + f" — nor for any alias of them ({len(absent)} labels tried).",
+                "In Add-ons → Secrets check the row exists, check its toggle is "
+                "on for this notebook, and then restart the session — attaching "
+                "a secret does not reach a kernel that is already running.",
+            ]
+        elif optional:
+            out.append("Kaggle answered. Not stored, each disabling only its "
+                       "own feature: " + ", ".join(optional) + ".")
+    if broken and reason != NO_MODULE:
+        out.append("Failed for another reason: "
+                   + "; ".join(f"{lbl} — {txt}" for lbl, txt in broken[:3]))
     return out
 
 
@@ -252,8 +540,23 @@ def export_to_env() -> dict:
     The reverse also happens, for the few names third-party code insists on:
     see MIRROR. Those entries come back keyed `field:ENV_NAME` so a launcher can
     show that HF_TOKEN was set without implying a second secret was found.
+
+    Nothing is asked about a credential that is already in the environment. Each
+    Kaggle lookup carries a 40-second timeout, so a sweep for values that would
+    be discarded anyway is minutes of boot spent to lose an argument it already
+    lost.
     """
-    from_kaggle = _from_kaggle()
+    # What is already satisfied, decided before the sweep so the sweep can skip
+    # it. `labels()` covers the canonical name and every alias, which is the same
+    # rule the per-field loop below applies — kept as one expression so the two
+    # cannot disagree about what "already set" means.
+    satisfied = tuple(
+        name for name in FIELDS
+        if any(os.environ.get(lbl, "").strip() for lbl in labels(name))
+    ) + tuple(
+        label for label in PASSTHROUGH if os.environ.get(label, "").strip()
+    )
+    from_kaggle = read_kaggle(skip=satisfied)["values"]
     exported = {}
 
     for name in FIELDS:
@@ -336,10 +639,21 @@ def describe(typed: dict | None = None) -> dict:
             "present": bool(values.get(name)),
             "source": sources.get(name, ""),
         })
+    # The diagnosis, not a re-sweep. `bool(_from_kaggle())` used to mean thirteen
+    # HTTPS calls on every status poll, and it answered the wrong question: False
+    # said "no secrets" when it often meant "could not ask", which is the failure
+    # a Setup page exists to explain.
+    report = kaggle_report()
     return {
         "fields": rows,
         "on_kaggle": on_kaggle(),
-        "kaggle_secrets_available": bool(_from_kaggle()),
+        "kaggle_secrets_available": bool(report["found"]),
+        "kaggle_reason": report["reason"],
+        "kaggle_detail": report["detail"][:300],
+        "kaggle_token": report["token"],
+        "kaggle_asked": len(report["asked"]),
+        "kaggle_found": len(report["found"]),
+        "kaggle_advice": kaggle_advice(report),
         "local_file": local_path(),
         "local_file_present": os.path.isfile(local_path()),
         "complete": all(values.get(k) for k in

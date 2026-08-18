@@ -41,12 +41,54 @@ try:
     from vios import creds as _creds
 
     _bridged = _creds.export_to_env()
+    _report = _creds.kaggle_report()
     if _bridged:
         print(f"   ✅ Kaggle Secrets → environment: "
               f"{', '.join(sorted(_bridged.values()))}", flush=True)
-    elif _creds.on_kaggle():
-        print("   ℹ️ No Kaggle Secrets to add (already set, or none stored).",
+    elif _report["found"]:
+        print(f"   ℹ️ Kaggle holds {len(_report['found'])} secret(s), all of "
+              f"them already in the environment — nothing to add.", flush=True)
+    elif not _report["reason"] and _creds.on_kaggle():
+        # The proxy answered and had nothing. The one case the old sentence
+        # described correctly, and it still needs a verdict line of its own —
+        # otherwise the advice below hangs under no heading at all.
+        print(f"   ℹ️ Kaggle answered, and none of the "
+              f"{len(_report['asked'])} names VIOS reads is stored.",
               flush=True)
+
+    # Why the sweep came back empty, in the log, at the moment it happens.
+    #
+    # This used to print "No Kaggle Secrets to add (already set, or none
+    # stored)" for all five possible causes, four of which it described
+    # incorrectly. A session with thirteen secrets attached read as a session
+    # with none, and the only remedy offered was to store what was already
+    # stored. The reason is now named, and the remedies differ by reason —
+    # a stale token wants a session restart, a missing token wants a different
+    # way of launching, and an unattached label wants the toggle.
+    #
+    # A laptop is not a broken Kaggle session, so it hears none of this: there,
+    # `kaggle_secrets` simply does not import and the environment is the store.
+    _relevant = _creds.on_kaggle() or _report["reason"] != _creds.NO_MODULE
+    if _report["reason"] and _relevant:
+        # A sweep that returned five credentials and errored on a sixth is not
+        # unreadable, and calling it that sends someone to fix a store that is
+        # working. Severity follows what actually came back.
+        _partial = bool(_report["found"])
+        print(f"   {'ℹ️' if _partial else '⚠️'} Kaggle Secrets "
+              f"{'partly unreadable' if _partial else 'unreadable'} "
+              f"[{_report['reason']}]: {_report['detail'][:200]}", flush=True)
+        if not _partial:
+            # Presence, never values, and only when the sweep failed: if the
+            # proxy answered, the token plainly worked and this line says
+            # nothing. Which of these two bits is set is the whole diagnosis
+            # otherwise, and neither was anywhere in the log before.
+            print(f"      session: {_creds.KAGGLE_TOKEN_VAR}="
+                  f"{'present' if _report['token'] else 'ABSENT'}"
+                  f"  run_type={_report['run_type'] or 'unset'}"
+                  f"  asked={len(_report['asked'])} labels", flush=True)
+    if _relevant:
+        for _line in _creds.kaggle_advice(_report):
+            print(f"      {_line}", flush=True)
 except Exception as _e:
     print(f"   ⚠️ Kaggle Secrets unavailable: {type(_e).__name__}: {_e}",
           flush=True)
@@ -334,15 +376,28 @@ try:
 
     _absent = missing_telegram_secrets()
     if _absent:
+        # Whether Phase 0 could read the store at all decides what to say here.
+        # Telling someone to add secrets they have already added is worse than
+        # saying nothing: it sends them to fix the one thing that is not broken,
+        # and it is what this block did for a session with thirteen attached.
+        try:
+            _kr = _creds.kaggle_report()
+        except Exception:
+            _kr = {"reason": "", "found": [], "detail": ""}
         print("", flush=True)
         print(f"⚠️ [SECRETS] Telegram disabled — not set: {', '.join(_absent)}", flush=True)
         print("      The web UI, CV pipeline, dashboard and queues all still run.", flush=True)
-        print("      To enable channel harvesting and the upload bot, add these", flush=True)
-        print("      as Kaggle Secrets (Add-ons → Secrets) and restart. Any of", flush=True)
-        print("      VIOS_BOT_TOKEN / VIOS_TELEGRAM_BOT_TOKEN / TELEGRAM_BOT_TOKEN", flush=True)
-        print("      is accepted, and likewise for CHANNEL_ID, API_ID, API_HASH.", flush=True)
-        print("      Phase 0 above picks them up on its own — nothing needs", flush=True)
-        print("      exporting in the launch cell.", flush=True)
+        if _kr.get("reason"):
+            print(f"      Phase 0 hit a problem reading Kaggle Secrets "
+                  f"[{_kr['reason']}] — see its advice above. The rows may "
+                  f"well exist; this run could not read them.", flush=True)
+        else:
+            print("      To enable channel harvesting and the upload bot, add these", flush=True)
+            print("      as Kaggle Secrets (Add-ons → Secrets) and restart. Any of", flush=True)
+            print("      VIOS_BOT_TOKEN / VIOS_TELEGRAM_BOT_TOKEN / TELEGRAM_BOT_TOKEN", flush=True)
+            print("      is accepted, and likewise for CHANNEL_ID, API_ID, API_HASH.", flush=True)
+            print("      Phase 0 above picks them up on its own — nothing needs", flush=True)
+            print("      exporting in the launch cell.", flush=True)
     else:
         print("🔑 [SECRETS] Telegram credentials present.", flush=True)
     if not NIM_API_KEY:
