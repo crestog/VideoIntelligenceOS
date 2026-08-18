@@ -76,6 +76,19 @@ def _safe(video_key: str) -> str:
     return _UNSAFE.sub("_", str(video_key))[:120] or "unknown"
 
 
+# The suffix that separates a proxy's cache identity from its video's. A dot,
+# because `_safe` permits one and `os.path.splitext` therefore reads
+# `1234.proxy.mp4`'s stem as `1234.proxy` — which is exactly the string
+# `proxy_key` returns, so `resident_keys` can recognise a cached proxy by
+# splitting on it rather than by guessing.
+_PROXY_SUFFIX = ".proxy"
+
+
+def proxy_key(video_key: str) -> str:
+    """The cache identity of this video's 480p proxy."""
+    return f"{_safe(video_key)}{_PROXY_SUFFIX}"
+
+
 def _cache_path(video_key: str) -> str:
     return os.path.join(config.VIDEO_CACHE, f"{video_key}.mp4")
 
@@ -95,8 +108,13 @@ def resident(local_path: str, video_key: str) -> bool:
     lives on the scratch disk and is wiped between sessions. So a stored path
     is a hint, not a fact — the disk is asked. Without this, every card claims
     to be resident after a restart while `resolve()` correctly says `remote`.
+
+    A cached 480p proxy counts, because `resolve()` will play it. Checked last:
+    it is the least likely of the three to be present and the only one that
+    needs a string built for it.
     """
-    for p in (local_path, _cache_path(str(video_key))):
+    for p in (local_path, _cache_path(str(video_key)),
+              _cache_path(proxy_key(video_key))):
         if not p:
             continue
         try:
@@ -128,11 +146,19 @@ def resident_keys(conn: sqlite3.Connection, force: bool = False) -> frozenset:
     try:
         for name in os.listdir(config.VIDEO_CACHE):
             stem, ext = os.path.splitext(name)
+            if ext != ".mp4":
+                continue
+            # `1234.proxy.mp4` is this video's 480p proxy, and playing it needs
+            # no network either — so it counts as resident, under the video's
+            # own key. Without this line a proxy-only video wears a "fetching"
+            # badge and then plays instantly, which reads as a bug in the badge.
+            if stem.endswith(_PROXY_SUFFIX):
+                stem = stem[:-len(_PROXY_SUFFIX)]
             # Video keys are the digits of a Telegram message id, so anything
             # else in here is not a video. Zero-byte files are a download that
             # died between create and write — claiming those are playable puts
             # a spinner on a card that promised none.
-            if ext != ".mp4" or not stem.isdigit():
+            if not stem.isdigit():
                 continue
             try:
                 if os.path.getsize(os.path.join(config.VIDEO_CACHE, name)) > 0:
@@ -203,6 +229,72 @@ def _row(conn: sqlite3.Connection, video_key: str) -> dict:
     return dict(zip([d[0] for d in cur.description], row))
 
 
+def artifact(conn: sqlite3.Connection, video_key: str, kind: str) -> dict:
+    """The best row of the `artifact` table for this kind, or `{}`.
+
+    The processing plane's `artifacts` pass renders a 480p `+faststart` proxy, a
+    poster, a sprite sheet and a waveform per video, and now uploads them and
+    records the message id. The table lands in Atlas generically — it is not in
+    `reflect._ATLAS_OWN`, so `import_shard`'s inferred-table loop creates it from
+    the shard's own columns.
+
+    Which is why every failure here is `{}` rather than an exception. Three
+    entirely normal databases have no usable row: one whose shards predate the
+    upload (the `msg_id` column was all-NULL, and `_sql_type` drops an all-None
+    column, so the table exists without it), one that has imported no shard
+    carrying artifacts at all, and one whose `artifacts` pass failed for this
+    video. In all three the caller must fall back to the original, so a missing
+    table and a missing row have to be the same answer.
+
+    Why "best" and not "the" row
+    ────────────────────────────
+    In the processing plane `(video_key, kind)` is the primary key, so there is
+    exactly one row. In Atlas it is not: `ingest._dedup_columns` infers the
+    unique key from a single shard's rows, and for this table more than one
+    candidate is unique within a batch. So a re-rendered proxy uploaded to a new
+    message can land as a second row rather than replacing the first, and taking
+    whichever sqlite returns first would eventually point playback at a
+    superseded message.
+
+    Resolved here rather than by constraining the table, because a constraint
+    inferred per shard cannot be relied on retroactively and this cannot be
+    wrong: prefer a row that carries a message id, and among those the newest.
+    Ordering happens in Python because `created_at` is not guaranteed to be a
+    column — an all-None column is dropped at ingest, so `ORDER BY` on one that
+    was dropped would take the whole lookup down.
+    """
+    try:
+        cur = conn.execute(
+            "SELECT * FROM artifact WHERE video_key = ? AND kind = ?",
+            (str(video_key), str(kind)))
+        names = [d[0] for d in cur.description]
+        rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    except sqlite3.Error:
+        return {}
+    if not rows:
+        return {}
+
+    def clean(got: dict) -> dict:
+        try:
+            got["msg_id"] = int(got.get("msg_id") or 0) or None
+        except (TypeError, ValueError):
+            got["msg_id"] = None
+        try:
+            got["bytes"] = int(got.get("bytes") or 0)
+        except (TypeError, ValueError):
+            got["bytes"] = 0
+        return got
+
+    def rank(got: dict) -> tuple:
+        try:
+            when = float(got.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            when = 0.0
+        return (1 if got.get("msg_id") else 0, when, got.get("msg_id") or 0)
+
+    return max((clean(r) for r in rows), key=rank)
+
+
 def resolve(conn: sqlite3.Connection, video_key: str) -> dict:
     """Where this video can be played from, right now.
 
@@ -210,21 +302,62 @@ def resolve(conn: sqlite3.Connection, video_key: str) -> dict:
     possible answer and the reason this check comes first. `cache` means Atlas
     downloaded it earlier. `remote` means it exists in the channel but not here
     yet, and `missing` means there is no message id to fetch it with.
+
+    Two identities, not one
+    ───────────────────────
+    Every answer carries a **`cache_key`** as well as a `key`. They differ when
+    the bytes on offer are not the original reel: the processing plane's
+    `artifacts` pass renders a 480p `+faststart` proxy and now uploads it, and
+    for playback that file is strictly better — two megabytes instead of forty,
+    a moov atom at the front, and a seek that lands on the first request.
+
+    So the proxy has to cache under its own name. Everything downstream —
+    `_cache_path`, the `.sparse` file, `_sparse_index`, `fill`, `state` — is
+    keyed by whatever string it is handed, and handing them the plain video key
+    for proxy bytes would let `sparse_hit` return chunks of the *original* to a
+    range computed against the *proxy's* length. That splice would play as
+    corruption, so the two files get two keys and can never mix.
+
+    Callers that only want to know "can this play, and from where" can keep
+    ignoring the field; callers that touch the cache must pass `cache_key` on.
+
+    Order of preference, cheapest first: an original already on disk beats
+    everything, because it costs no network at all and is better quality. After
+    that the proxy wins — a cached proxy over a channel fetch, and a channel
+    fetch of two megabytes over a channel fetch of forty.
     """
     key = str(video_key)
     info = _row(conn, key)
 
     local = info.get("local_path")
     if local and os.path.exists(local) and os.path.getsize(local) > 0:
-        return {"key": key, "where": "local", "path": local,
+        return {"key": key, "cache_key": key, "via": "original",
+                "where": "local", "path": local,
                 "size": os.path.getsize(local),
                 "duration": info.get("duration"), "msg_id": info.get("msg_id")}
 
     cached = _cache_path(key)
     if os.path.exists(cached) and os.path.getsize(cached) > 0:
-        return {"key": key, "where": "cache", "path": cached,
+        return {"key": key, "cache_key": key, "via": "original",
+                "where": "cache", "path": cached,
                 "size": os.path.getsize(cached),
                 "duration": info.get("duration"), "msg_id": info.get("msg_id")}
+
+    proxy = artifact(conn, key, "proxy")
+    if proxy.get("msg_id"):
+        pkey = proxy_key(key)
+        pcached = _cache_path(pkey)
+        if os.path.exists(pcached) and os.path.getsize(pcached) > 0:
+            return {"key": key, "cache_key": pkey, "via": "proxy",
+                    "where": "cache", "path": pcached,
+                    "size": os.path.getsize(pcached),
+                    "duration": info.get("duration"),
+                    "msg_id": int(proxy["msg_id"])}
+        return {"key": key, "cache_key": pkey, "via": "proxy",
+                "where": "remote", "path": None,
+                "size": int(proxy.get("bytes") or 0),
+                "duration": info.get("duration"),
+                "msg_id": int(proxy["msg_id"])}
 
     # The video key is the digits of the Telegram message id, so even a video
     # with no metadata row is still fetchable.
@@ -247,9 +380,11 @@ def resolve(conn: sqlite3.Connection, video_key: str) -> dict:
         except Exception:                                   # noqa: BLE001
             msg_id = None
     if msg_id:
-        return {"key": key, "where": "remote", "path": None, "size": 0,
+        return {"key": key, "cache_key": key, "via": "original",
+                "where": "remote", "path": None, "size": 0,
                 "duration": info.get("duration"), "msg_id": int(msg_id)}
-    return {"key": key, "where": "missing", "path": None, "size": 0,
+    return {"key": key, "cache_key": key, "via": "original",
+            "where": "missing", "path": None, "size": 0,
             "duration": info.get("duration"), "msg_id": None}
 
 
@@ -311,28 +446,36 @@ def ensure(conn: sqlite3.Connection, video_key: str, wait: float = 0.0) -> dict:
     is to start the transfer, not to block on it. A positive wait is for the
     click path, where the caller would rather hold the connection for a second
     than hand back a 404 for a file that is 90% there.
+
+    Everything past `resolve` uses `cache_key`, not `video_key`. When the answer
+    is the 480p proxy that is a different string, and it has to be: the download
+    lands at `<cache_key>.mp4`, so keying the in-flight event or the destination
+    by the video would write proxy bytes over the path the original claims.
     """
     key = str(video_key)
     found = resolve(conn, key)
+    ck = found.get("cache_key") or key
     if found["where"] in ("local", "cache"):
         _touch(found["path"])
-        return {"ok": True, "where": found["where"], "state": "ready"}
+        return {"ok": True, "where": found["where"], "state": "ready",
+                "via": found.get("via", "original")}
     if found["where"] == "missing":
         return {"ok": False, "where": "missing",
                 "note": "no Telegram message id for this video"}
 
     with _LOCK:
-        ev = _INFLIGHT.get(key)
+        ev = _INFLIGHT.get(ck)
         fresh = ev is None
         if fresh:
             ev = threading.Event()
-            _INFLIGHT[key] = ev
+            _INFLIGHT[ck] = ev
     if fresh:
-        threading.Thread(target=_download, args=(key, found["msg_id"]),
-                         name=f"atlas-fetch-{key}", daemon=True).start()
+        threading.Thread(target=_download, args=(ck, found["msg_id"]),
+                         name=f"atlas-fetch-{ck}", daemon=True).start()
     if wait > 0:
         ev.wait(timeout=wait)
-    return {"ok": True, "where": "remote", "state": state(key)["status"]}
+    return {"ok": True, "where": "remote", "state": state(ck)["status"],
+            "via": found.get("via", "original")}
 
 
 def prefetch(conn: sqlite3.Connection, keys: list, limit: int = None) -> int:
@@ -348,6 +491,10 @@ def prefetch(conn: sqlite3.Connection, keys: list, limit: int = None) -> int:
 
     Without MTProto there is no chunk access, so this falls back to the whole
     file over the Bot API, which is the only thing that transport can do.
+
+    Where a proxy exists this warms the proxy, because that is what a click will
+    play — and at 480p the head and tail chunks are a larger fraction of the
+    file, so the same two chunks buy more of it.
     """
     limit = config.PREFETCH_TOP_N if limit is None else limit
     from . import tgchannel
@@ -360,13 +507,14 @@ def prefetch(conn: sqlite3.Connection, keys: list, limit: int = None) -> int:
             continue
         if found["where"] in ("local", "cache", "missing"):
             continue
+        ck = found.get("cache_key") or key
         with _LOCK:
-            if key in _INFLIGHT:
+            if ck in _INFLIGHT:
                 continue
         if stream_ok:
             # Already warmed is a success, not a reason to fall back to
             # pulling the entire file.
-            if warm(key, found["msg_id"]):
+            if warm(ck, found["msg_id"]):
                 started += 1
             continue
         ensure(conn, key, wait=0)
@@ -564,6 +712,75 @@ def clear_cache() -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 _FFMPEG = shutil.which("ffmpeg")
 
+_ARTIFACT_LOCK = threading.RLock()
+_ARTIFACT_INFLIGHT: dict = {}
+
+
+def artifact_file(conn: sqlite3.Connection, video_key: str, kind: str,
+                  ext: str = ".jpg", wait: float = 20.0) -> str:
+    """Fetch one small artifact out of the channel onto disk. Path or "".
+
+    Only for the small ones — the poster, the sprite sheet, the waveform. The
+    proxy is a video and goes through the ordinary cache and range machinery, so
+    it deliberately does not come through here; downloading a whole proxy to
+    answer a thumbnail request would defeat the point of having one.
+
+    Concurrency is the same bargain `clip_fetch` makes, for the same reason: a
+    grid of twenty cards asks for twenty posters at once and several ask twice.
+    One in-flight fetch per artifact, everyone else waits on it.
+    """
+    row = artifact(conn, video_key, kind)
+    if not row.get("msg_id") and not (row.get("file_id") or ""):
+        return ""
+
+    dest = os.path.join(config.POSTER_CACHE,
+                        f"{_safe(video_key)}_{_safe(kind)}{ext}")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+
+    ident = f"{video_key}#{kind}"
+    with _ARTIFACT_LOCK:
+        ev = _ARTIFACT_INFLIGHT.get(ident)
+        mine = ev is None
+        if mine:
+            ev = threading.Event()
+            _ARTIFACT_INFLIGHT[ident] = ev
+
+    if not mine:
+        ev.wait(max(0.5, float(wait)))
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return dest
+        return ""
+
+    try:
+        tmp = dest + ".part"
+        info = {"file_id": row.get("file_id") or "",
+                "message_id": row.get("msg_id"),
+                "file_size": int(row.get("bytes") or 0),
+                "file_name": f"{_safe(video_key)}-{_safe(kind)}{ext}"}
+        ok = False
+        try:
+            from . import tgchannel          # noqa: PLC0415 (cycle at import)
+            ok = bool(tgchannel.fetch_document(info, tmp))
+        except Exception as e:                              # noqa: BLE001
+            log(f"artifact {ident} fetch failed — {type(e).__name__}: {e}")
+        if ok and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            try:
+                os.replace(tmp, dest)
+                return dest
+            except OSError:
+                pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return ""
+    finally:
+        with _ARTIFACT_LOCK:
+            _ARTIFACT_INFLIGHT.pop(ident, None)
+        ev.set()
+
 
 def poster(conn: sqlite3.Connection, video_key: str, at: float = None) -> str:
     """A still frame, cached on disk. Returns a path or "".
@@ -579,17 +796,34 @@ def poster(conn: sqlite3.Connection, video_key: str, at: float = None) -> str:
     The clip index removes that: a two-second segment covering the moment is a
     small standalone mp4, so the frame can be cut from it without the reel
     ever being downloaded.
+
+    Three sources, cheapest first
+    ────────────────────────────
+    For the cover frame — `at` unset or zero — the processing plane has already
+    rendered exactly this image and now uploads it, so the first thing tried is
+    a ~30 KB download of a finished JPEG. That beats both alternatives outright:
+    no ffmpeg, no video bytes, and it is the frame the plane itself chose.
+
+    A positional request skips it, because a poster artifact is one frame and it
+    is not the one being asked for. Those fall through to cutting the frame from
+    whatever file is here, and then to `clip_poster`.
     """
     key = str(video_key)
+    pos = 0.0 if at is None else max(0.0, float(at))
+
+    if pos <= 0.0:
+        got = artifact_file(conn, key, "poster")
+        if got:
+            return got
+
     if not _FFMPEG:
         return ""
     found = resolve(conn, key)
     if found["where"] not in ("local", "cache"):
-        return clip_poster(conn, key, 0.0 if at is None else float(at))
+        return clip_poster(conn, key, pos)
 
-    pos = 0.0 if at is None else max(0.0, float(at))
     stamp = f"{pos:.0f}"
-    dest = os.path.join(config.POSTER_CACHE, f"{key}_{stamp}.jpg")
+    dest = os.path.join(config.POSTER_CACHE, f"{_safe(key)}_{stamp}.jpg")
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         return dest
 

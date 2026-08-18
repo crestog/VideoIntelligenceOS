@@ -61,7 +61,7 @@ from .runners.base import DeferPass, Job, ModelCache, SkipPass
 from .store import Store
 from .store import observer_id as store_observer_id
 
-from ..capture.upload import Telegram, UploadError
+from ..capture.upload import BOT_UPLOAD_LIMIT, Telegram, UploadError
 
 IDLE, RUNNING, PAUSED, STOPPING, ERROR = (
     "idle", "running", "paused", "stopping", "error")
@@ -210,6 +210,27 @@ _ARTIFACT_FILES = {
     "proxy": "proxy.mp4", "wav": "audio.wav", "poster": "poster.jpg",
     "sprite": "sprite.jpg", "loop": "loop.mp4", "waveform": "waveform.png",
 }
+
+# Which of those get a message of their own, in upload order.
+#
+# The `artifacts` pass spends fourteen seconds a video rendering a 480p
+# `+faststart` proxy, a poster, a sprite sheet and a waveform — and every one of
+# them lived in a working directory that `intake.evict` deletes. Four messages a
+# video is what turns that spend into something Atlas can still play tomorrow,
+# and the proxy alone is the difference between streaming a 40 MB original to
+# show one frame and streaming two megabytes.
+#
+# `proxy` is first because it is the one playback needs; if a rate limit is
+# going to bite, it should bite the sprite sheet. `wav` and `loop` are left out:
+# the wav is an intermediate that `transcribe` re-derives and is the largest
+# file of the six, and the loop is a nicety against sixty-two more messages.
+_UPLOAD_ARTIFACTS = ("proxy", "poster", "sprite", "waveform")
+
+# Between artifact uploads, and only between artifact uploads. Matches
+# `assets.CHUNK_PAUSE`: the Bot API's limit is per chat, and the shard uploads
+# that are this session's actual backup share that chat.
+_ARTIFACT_PAUSE = float(os.environ.get("VIOS_ARTIFACT_PAUSE", "0.35") or 0.35)
+
 
 
 def _default_base() -> str:
@@ -516,6 +537,13 @@ class ProcessEngine:
         # limit is per chat, so four lanes pulling at once is slower than one and
         # can be a ban. Extraction and inference are what parallelise.
         self._fetch_lock = threading.Lock()
+
+        # And artifact uploads stay single-file for the mirror-image reason: the
+        # Bot API's flood limit is per chat, and the shards that are this
+        # session's only real backup go to the same chat. Four lanes each posting
+        # four files per video would spend the budget that matters on thumbnails.
+        # Separate from `_fetch_lock` so an upload never blocks a download.
+        self._upload_lock = threading.Lock()
 
         # The cloud lane's shopping list, recomputed once per rotation from the
         # *runnable* set so the wave filter and `VIOS_ONLY`/`VIOS_EXCEPT` are
@@ -2053,6 +2081,19 @@ class ProcessEngine:
                 if store.add_frame_metric(key, fm["name"], fm["frames"],
                                           fm["values"], observer):
                     n_vectors += 1
+            # What the channel already holds for this video, read *before* the
+            # loop below overwrites it. `set_artifact` is INSERT OR REPLACE on
+            # `(video_key, kind)`, so recording the fresh emission plainly would
+            # erase the message id of an artifact uploaded on an earlier
+            # rotation — and `revive_failed` guarantees earlier rotations
+            # happen. Reading first, then carrying a still-valid id forward, is
+            # the whole of what makes the upload idempotent.
+            prior = {}
+            if em.artifacts:
+                try:
+                    prior = store.artifacts(key)
+                except Exception:                           # noqa: BLE001
+                    prior = {}
             for a in em.artifacts:
                 size = 0
                 try:
@@ -2060,7 +2101,26 @@ class ProcessEngine:
                             if os.path.isfile(a["path"]) else 0)
                 except OSError:
                     pass
-                store.set_artifact(key, a["name"], None, "", size, a["meta"])
+                # Same bytes as the copy already in the channel → that message
+                # still describes this file, so keep it. Any other size means a
+                # re-render, and pointing at the old message would be a lie.
+                old = prior.get(a["name"]) or {}
+                msg_id, file_id = None, ""
+                try:
+                    if old.get("msg_id") and int(old.get("bytes") or 0) == size:
+                        msg_id = int(old["msg_id"])
+                        file_id = old.get("file_id") or ""
+                except (TypeError, ValueError):
+                    msg_id, file_id = None, ""
+                store.set_artifact(key, a["name"], msg_id, file_id, size,
+                                   a["meta"])
+            # Then, and only for the four kinds worth a message, put them
+            # somewhere that survives the working directory being evicted. After
+            # `set_artifact`, never instead of it: the row is evidence that the
+            # pass produced the file, and it has to land whether or not Telegram
+            # is reachable.
+            if em.artifacts:
+                self._upload_artifacts(key, em.artifacts, store, lane)
         except Exception as exc:
             state = cov.fail(key, cid, f"store rejected the emission: "
                                        f"{type(exc).__name__}: {exc}")
@@ -2696,6 +2756,130 @@ class ProcessEngine:
         except Exception as exc:
             self._log(f"{job.key}: rebuilding {what} failed — "
                       f"{type(exc).__name__}: {exc}", "warn")
+
+    # ── artifacts: the proxy that was being computed and thrown away ──────
+    def _upload_artifacts(self, key: str, made: list, store: Store,
+                          lane: "Lane") -> None:
+        """Put the proxy, poster, sprite and waveform in the channel.
+
+        **This never raises and never fails the pass.** By the time it runs the
+        emission is already in the database and `cov.done` is one line away; the
+        files are an optimisation over evidence that is already safe, exactly as
+        `capture.assets.publish_assets` treats clips. A reel that plays from its
+        original instead of its proxy is slower, not broken.
+
+        Threaded as replies to the video's own channel message, so the artifacts
+        travel with the thing they describe and a channel export keeps them
+        together. `allow_sending_without_reply` is set inside `send_document`, so
+        a video message deleted by hand costs the threading and not the upload.
+
+        Re-runs cost nothing. `revive_failed` flips a `failed` row back to
+        `queued` every rotation, so this method has to assume it will see the
+        same video again: an artifact already recorded with a real `msg_id` and
+        the same byte count is left alone rather than posted twice.
+        """
+        if not (self._tg and self._tg.token):
+            return
+        anchor = 0
+        try:
+            anchor = int((store.video(key) or {}).get("msg_id") or 0)
+        except (TypeError, ValueError):
+            anchor = 0
+
+        try:
+            have = store.artifacts(key)
+        except Exception:                                   # noqa: BLE001
+            have = {}
+        by_name = {a["name"]: a for a in made}
+
+        sent, kept, failed = 0, 0, []
+        for name in _UPLOAD_ARTIFACTS:
+            a = by_name.get(name)
+            if not a:
+                continue
+            path = a.get("path") or ""
+            try:
+                size = os.path.getsize(path) if os.path.isfile(path) else 0
+            except OSError:
+                size = 0
+            if not size:
+                continue
+
+            old = have.get(name) or {}
+            try:
+                same = bool(old.get("msg_id")) and \
+                    int(old.get("bytes") or 0) == size
+            except (TypeError, ValueError):
+                # Nothing writes a non-numeric size, but this method's promise is
+                # that it cannot fail the pass — and the emission is already in
+                # the database by the time it runs, so a raise here would fail a
+                # video over a thumbnail. Unreadable row → treat it as absent.
+                same = False
+            if same:
+                # Same bytes, already in the channel. Nothing to do, and saying
+                # so would be noise on every revived video.
+                kept += 1
+                continue
+
+            if size > BOT_UPLOAD_LIMIT:
+                # `send_document` has no MTProto fallback — only `send_video`
+                # does — so this would raise inside the loop and lose the
+                # artifacts queued behind it. A 480p proxy over 50 MB means a
+                # very long video, which is the case where the original is
+                # unpleasant to stream and the proxy would have helped most, so
+                # it is worth a warning rather than silence.
+                failed.append(f"{name} is {size / 1048576:.0f} MB, over the "
+                              f"Bot API's upload cap")
+                continue
+
+            try:
+                with self._upload_lock:
+                    got = self._tg.send_document(
+                        path, caption=f"{name} · vios:{key}",
+                        reply_to=anchor or None,
+                        file_name=f"{key}-{os.path.basename(path)}")
+                    if _ARTIFACT_PAUSE > 0:
+                        time.sleep(_ARTIFACT_PAUSE)
+            except UploadError as exc:
+                failed.append(f"{name}: {str(exc)[:120]}")
+                continue
+            except Exception as exc:                        # noqa: BLE001
+                failed.append(f"{name}: {type(exc).__name__}: "
+                              f"{str(exc)[:120]}")
+                continue
+
+            # Same reasoning as the byte comparison above: `send_document`
+            # returns the Bot API's `result` object and a message id in it is an
+            # integer, but an unexpected shape must not fail the pass.
+            try:
+                msg_id = int((got or {}).get("message_id") or 0) or None
+            except (AttributeError, TypeError, ValueError):
+                msg_id = None
+            if not msg_id:
+                failed.append(f"{name}: upload returned no message id")
+                continue
+            try:
+                store.set_artifact(key, name, msg_id,
+                                   got.get("file_id") or "", size, a["meta"])
+            except Exception as exc:                        # noqa: BLE001
+                # The file is in the channel but this database does not know
+                # where. Worth an error line, because the next run will upload
+                # it again and the duplicate is the visible symptom.
+                self._log(f"{key}: {name} uploaded as message {msg_id} but the "
+                          f"row would not update — {type(exc).__name__}: "
+                          f"{exc}", "error")
+                continue
+            sent += 1
+
+        if sent:
+            self._progress(f"artifacts: {sent} uploaded", lane=lane)
+            self._log(f"{key}: {sent} artifact(s) uploaded"
+                      + (f", {kept} already in the channel" if kept else "")
+                      + (f" — threaded under message {anchor}" if anchor
+                         else " (no anchor message, posted unthreaded)"))
+        if failed:
+            self._log(f"{key}: artifact(s) not uploaded — "
+                      + "; ".join(failed[:4]), "warn")
 
     # ══════════════════════════════════════════════════════════════════════
     # Unloading and publishing

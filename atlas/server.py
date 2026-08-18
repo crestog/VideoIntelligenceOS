@@ -912,6 +912,7 @@ def api_video(video_key: str, full: bool = True):
             "moments": moments, "related": related,
             "playback": {"where": playback["where"],
                          "size": playback.get("size", 0),
+                         "via": playback.get("via", "original"),
                          "msg_id": playback.get("msg_id")}}
 
 
@@ -1286,6 +1287,14 @@ def api_play(video_key: str, request: Request):
     Only when MTProto is unavailable — bot-only credentials, a dead session —
     does this fall back to the old blocking download, because the HTTP Bot API
     cannot stream and 20 MB is all it will hand over.
+
+    Every tier below `resolve` is keyed by `found["cache_key"]`, not by `key`.
+    When the plane has uploaded a 480p `+faststart` proxy that is what plays,
+    and it is a different file with a different length — so the sparse file,
+    the window arithmetic and the background fill all have to agree on which
+    file they are talking about. Mixing the two would compute a range against
+    the proxy's size and serve chunks of the original into it, which plays as
+    corruption rather than as an error.
     """
     conn = db()
     key = reflect.normalize_key(video_key)
@@ -1299,15 +1308,16 @@ def api_play(video_key: str, request: Request):
             {"ok": False, "note": "no Telegram message id for this video"},
             status_code=404)
 
+    ck = found.get("cache_key") or key
     plan = {}
     note = ""
     try:
-        plan = media.remote_plan(key, found["msg_id"], rng)
+        plan = media.remote_plan(ck, found["msg_id"], rng)
     except Exception as e:                      # MTProto down, message gone
         note = f"{type(e).__name__}: {e}"
 
     if plan:
-        part = media.sparse_hit(key, plan["start"], plan["end"])
+        part = media.sparse_hit(ck, plan["start"], plan["end"])
         if part:
             media.touch(part)
             body = media.stream(part, plan["start"], plan["end"])
@@ -1316,8 +1326,8 @@ def api_play(video_key: str, request: Request):
             # playback; the background fill covers everything after it, so the
             # seeks that follow are answered from disk instead of costing a new
             # Telegram media session each.
-            media.fill(key, found["msg_id"], plan["size"])
-            body = media.stream_remote(key, plan["message"], plan["start"],
+            media.fill(ck, found["msg_id"], plan["size"])
+            body = media.stream_remote(ck, plan["message"], plan["start"],
                                        plan["end"], plan["size"])
         return StreamingResponse(
             body, status_code=plan["status"], headers=plan["headers"],
@@ -1328,7 +1338,7 @@ def api_play(video_key: str, request: Request):
     if found["where"] in ("local", "cache"):
         return _serve_file(found["path"], rng)
 
-    st = media.state(key)
+    st = media.state(found.get("cache_key") or key)
     return JSONResponse(
         {"ok": False, "state": st,
          "note": note or st.get("note") or "still downloading from Telegram"},
@@ -1338,12 +1348,15 @@ def api_play(video_key: str, request: Request):
 @app.get("/api/media/{video_key}/state")
 def api_media_state(video_key: str):
     key = reflect.normalize_key(video_key)
-    st = media.state(key)
-    st["where"] = media.resolve(db(), key)["where"]
+    found = media.resolve(db(), key)
+    ck = found.get("cache_key") or key
+    st = media.state(ck)
+    st["where"] = found["where"]
+    st["via"] = found.get("via", "original")
     # A video being streamed through is playing right now even though no file
     # exists yet, so the interface must be able to tell that apart from a
     # download that has not started.
-    part = media.stream_progress(key)
+    part = media.stream_progress(ck)
     if part:
         st["streamed_bytes"] = part["bytes"]
         if st.get("status") in ("absent", "unknown", ""):
