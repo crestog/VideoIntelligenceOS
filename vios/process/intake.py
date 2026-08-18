@@ -785,9 +785,14 @@ def evict(cache_dir: str, budget_mb: int, keep: set | None = None,
 
     Nothing here is load-bearing for correctness. Every file it deletes can be
     rebuilt from the original, and the engine rebuilds them on demand.
+
+    `names` carries the directory names actually removed. The engine needs them:
+    with several lanes running it keeps a set of videos whose bytes are staged,
+    and a stage that says "ready" about a directory this function has just
+    deleted sends a worker to a video with no `source.mp4`.
     """
     keep = keep or set()
-    out = {"removed": 0, "freed_mb": 0}
+    out = {"removed": 0, "freed_mb": 0, "names": []}
     if not os.path.isdir(cache_dir):
         return out
     entries = []
@@ -811,6 +816,7 @@ def evict(cache_dir: str, budget_mb: int, keep: set | None = None,
         try:
             shutil.rmtree(path, ignore_errors=True)
             out["removed"] += 1
+            out["names"].append(os.path.basename(path))
             out["freed_mb"] += nbytes // (1024 ** 2)
             total_mb -= nbytes // (1024 ** 2)
         except OSError:

@@ -107,8 +107,23 @@ def wait_for_redis(timeout=30.0, label="", probe_interval=1.0):
 # QUEUE_OMNI_*: Telegram-bot uploads ride the PRIORITY lane, Ghost Worker
 # harvest jobs ride the DEFAULT lane — the bot always wins.
 PRIORITY_QUEUES = {"QUEUE_VISION", "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"}
+
+# The v2 processing plane's lanes. PREP stages the next videos' source file and
+# frame tiers, GPU and CPU each carry one video's slice of the admitted cohort,
+# and CLOUD runs continuously across the cohort barrier on states it has checked.
+#
+# Registered here and not only inside `vios.process.jobs` on purpose: a lane the
+# broker does not know about is a lane whose orphaned PROCESSING entries are
+# never recovered at boot and whose depth never appears in `get_queue_metrics`.
+# Both of those are how "is everything busy?" became a guess in the first place.
+QUEUE_V2_PREP = "QUEUE_V2_PREP"
+QUEUE_V2_GPU = "QUEUE_V2_GPU"
+QUEUE_V2_CPU = "QUEUE_V2_CPU"
+QUEUE_V2_CLOUD = "QUEUE_V2_CLOUD"
+V2_QUEUES = [QUEUE_V2_PREP, QUEUE_V2_GPU, QUEUE_V2_CPU, QUEUE_V2_CLOUD]
+
 ALL_QUEUES = ["QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_MODELS",
-              "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"]
+              "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"] + V2_QUEUES
 MAX_RETRIES = 3
 
 

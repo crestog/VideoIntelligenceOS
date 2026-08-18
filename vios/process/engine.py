@@ -43,6 +43,7 @@ mid-sweep, the next one re-reads the shards and continues.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -51,7 +52,7 @@ import time
 import traceback
 from collections import deque
 
-from . import intake, media, registry, resources
+from . import intake, jobs, media, registry, resources
 from .. import creds as _creds
 from .coverage import Coverage, worker_id
 from .runners import get as get_runner
@@ -117,6 +118,55 @@ STAGE_PREFIX = "vios-stage-"
 # and the upload fails, losing the bundle in order to carry errors that would not
 # have been readable in a caption anyway. The full list travels inside the file.
 STAGE_CAPTION_ERROR_BUDGET = 620
+
+# ══════════════════════════════════════════════════════════════════════════
+# How many of each worker
+# ══════════════════════════════════════════════════════════════════════════
+# One GPU worker per card, by default. The measured problem this fixes: at 44
+# minutes into a two-T4 run, card 0 held six gigabytes of loaded models at 0%
+# utilisation, card 1 held 105 MiB at 0%, and the CPU was at 264% grinding
+# through ffmpeg. Every runner resolves `.to("cuda")` against CUDA's *current
+# device*, which is per host thread — so one `torch.cuda.set_device(i)` per
+# worker thread puts that worker's whole cohort on card `i`, with no runner
+# edits at all. `probe()` reports `usable_vram_mb` as the *minimum* free across
+# cards, so a cohort the packer approved already fits on each card
+# independently: replicating a cohort per card needs no repacking.
+_GPU_LANES = int(os.environ.get("VIOS_GPU_LANES", "0") or 0)
+
+# Two CPU workers, because ffmpeg is already internally multithreaded and four
+# vCPUs will not feed more without the two fighting each other.
+_CPU_LANES = max(0, int(os.environ.get("VIOS_CPU_LANES", "2") or 0))
+
+# How many videos are kept fully staged — source downloaded, frame tiers
+# extracted — ahead of the ones being processed. This is the number that
+# produced constant GPU utilisation in the architecture that worked: a GPU
+# worker never blocks on Telegram or on ffmpeg, because by the time it asks for
+# a video the bytes are already on disk. Three is enough to cover one download
+# plus one extraction at the rate a cohort consumes them, without letting the
+# working-directory cache run away from `CACHE_BUDGET_MB`.
+_PREP_AHEAD = max(1, int(os.environ.get("VIOS_PREP_AHEAD", "3") or 3))
+
+# How many times the prep lane will try to stage one video before its rows are
+# failed with that reason. A video that cannot be staged must stop being a
+# `candidates` answer, or the planner offers it every second and the cohort never
+# drains — and a permanent stall is a far worse outcome than a failed row that
+# `revive_failed` picks up next rotation. Three, because the common cause is a
+# Telegram hiccup that the second attempt clears.
+PREP_MAX_TRIES = 3
+
+# `VIOS_LANES=0` (or `VIOS_WORKERS=1`) forces the old single-threaded sweep. Kept
+# because it is the shape eleven months of runs were debugged in: if the job
+# plane ever misbehaves, this is how an operator gets a known-good run tonight
+# rather than tomorrow. The workers path is the default, not the experiment.
+_LANES_ON = (os.environ.get("VIOS_LANES", "1") or "1").strip().lower() \
+    not in ("0", "off", "false", "no")
+
+# How long the planner waits for a cohort's lanes to drain before deciding
+# something is wedged and finishing the cohort on its own thread. Generous: a
+# single Qwen3-VL pass on a long reel is minutes, and a whole cohort slice for
+# one video can legitimately be a quarter of an hour.
+_COHORT_DRAIN_TIMEOUT = float(os.environ.get("VIOS_COHORT_TIMEOUT", "3600")
+                              or 3600)
 
 # Extra VRAM to leave unclaimed, *on top of* the 1 GB `resources.probe` already
 # holds back. The allocator fragments over a twelve-hour session in a way a
@@ -202,6 +252,26 @@ def _safe(key: str) -> str:
 _ENV_UNKNOWN: dict = {}
 
 
+def _known(ids) -> list:
+    """A job payload's component list, filtered to ids this build has.
+
+    A hint is JSON that may have been written by a *different* version of this
+    code — Redis outlives a `git pull`, and `recover_processing_jobs` at boot
+    hands a restarted session the jobs the old one was holding. An unknown id
+    would make `registry.get` raise inside a worker loop, which is a crashed lane
+    over a stale string. Dropping it costs one pass one round; the planner posts
+    it again under its current name.
+    """
+    out = []
+    for cid in ids or ():
+        try:
+            registry.get(str(cid))
+        except Exception:                              # noqa: BLE001
+            continue
+        out.append(str(cid))
+    return out
+
+
 def _env_ids(name: str) -> list:
     """A comma-separated env var as a list of component ids, unknowns dropped.
 
@@ -238,6 +308,86 @@ def _env_waves(name: str = "VIOS_WAVES") -> set:
         if part.isdigit():
             out.add(int(part))
     return out or {registry.WAVE_SPINE, registry.WAVE_FULL}
+
+
+class Lane:
+    """One worker's own resources, so N workers are not N users of one object.
+
+    Everything a pass touches while it runs is per-lane, and each field is here
+    because sharing it across threads was either wrong or unreadable:
+
+    * **`store` / `cov`** — its own sqlite connection, from `Store.secondary()`.
+      `Store` opens `check_same_thread=False` with WAL and a 30 s busy timeout,
+      so one connection *works* from five threads; what it cannot do is keep
+      five implicit transactions apart. Every write method commits at its end,
+      so worker B's commit lands worker A's half-written batch, and a commit
+      during `export_shard`'s multi-megabyte blob reads invalidates a
+      partially-consumed cursor. Per-connection rather than one global lock on
+      purpose: a call site missed under a lock is silent corruption, a call site
+      missed with separate connections is nothing at all.
+
+      The **worker id stays identical** across lanes. `Coverage._mine()` scopes
+      by partition and leases are owned by worker id, so two lanes with
+      different ids would each think the other's claims were somebody else's.
+      Lanes are threads inside one worker, not separate workers.
+
+    * **`cache`** — its own `ModelCache`. Two cards need two copies of a
+      cohort's weights; that is not waste, it is what "both GPUs busy" costs,
+      and it is a disk read from the shared `MODEL_CACHE_DIR` rather than a
+      download. Its log lines carry the lane name because `ModelCache.vram()`
+      reads the *current* device: an unattributed leak warning is unactionable
+      with two cards.
+
+    * **`slot`** — what this lane is doing, for the tab. `self.current` was one
+      dict for one video and could not describe four workers at once.
+
+    * **`device`** — the card index this lane pinned, or -1. Set once, by the
+      lane's own thread, before it claims anything.
+    """
+
+    __slots__ = ("name", "kind", "device", "store", "cov", "cache", "slot",
+                 "videos", "passes", "started_at", "thread")
+
+    def __init__(self, name: str, kind: str, device: int = -1):
+        self.name = name
+        self.kind = kind                 # "gpu" | "cpu" | "prep" | "cloud"
+        self.device = device
+        self.store: Store | None = None
+        self.cov: Coverage | None = None
+        self.cache: ModelCache | None = None
+        self.slot: dict = {}
+        self.videos = 0
+        self.passes = 0
+        self.started_at = 0.0
+        self.thread: threading.Thread | None = None
+
+    def busy(self) -> bool:
+        return bool(self.slot.get("video_key"))
+
+    def as_dict(self) -> dict:
+        slot = dict(self.slot)
+        if slot.get("since"):
+            slot["elapsed"] = round(time.time() - slot["since"], 1)
+        return {
+            "name": self.name, "kind": self.kind,
+            "device": self.device if self.device >= 0 else None,
+            "busy": self.busy(), "videos": self.videos, "passes": self.passes,
+            "resident": self.cache.loaded() if self.cache else [],
+            "current": slot,
+        }
+
+    def close(self) -> None:
+        try:
+            if self.cache is not None:
+                self.cache.unload_all()
+        except Exception:                             # noqa: BLE001
+            pass
+        try:
+            if self.store is not None:
+                self.store.close()
+        except Exception:                             # noqa: BLE001
+            pass
+        self.store = self.cov = None
 
 
 class ProcessEngine:
@@ -324,13 +474,57 @@ class ProcessEngine:
         self.resources: dict = {}
         self.cohorts: list = []
         self.cohort_index = -1
-        self.current: dict = {}
         self.session = {"videos": 0, "passes": 0, "claims": 0, "vectors": 0,
                         "skipped": 0, "failed": 0, "deferred": 0,
                         "elsewhere": 0,
                         "seconds": 0.0, "downloaded": 0, "shards": 0}
         self.last_publish: float | None = None
         self.since_publish = 0
+
+        # ── the lanes ────────────────────────────────────────────────────
+        # `self.current` used to be one dict describing one video, which is the
+        # right shape for exactly one worker. It is now a property over these,
+        # returning the busiest lane, so every existing reader — the process tab,
+        # the browser, `_live()` — keeps working unchanged while the per-lane
+        # rows appear beside it.
+        self.workers: dict = {}
+        self._lanes: list = []
+        self._jobs = jobs.Broker(self._log)
+        self._lane_error = ""
+
+        # One video, one worker. `claim_for` already stops two lanes taking the
+        # same *(video, component)*, but the CPU and cloud lanes claim *different*
+        # component subsets of the same video, and two lanes inside one video
+        # would share a `workdir` — the same directory `intake.evict` is deciding
+        # whether to delete. Held keys are also the eviction keep-set, which fixes
+        # a bug the lanes would otherwise create: `keep={_safe(key)}` is a
+        # keep-set of one, and under concurrency it deletes a live working
+        # directory out from under another lane.
+        self._inflight: dict = {}
+        self._staged: set = set()          # videos whose prep job has acked
+        self._prep_posted: set = set()
+        self._prep_fails: dict = {}        # key → consecutive staging failures
+        # Hints a lane consumed without processing anything, so the planner can
+        # offer them again. Distinct from a *failed* video, which is not re-posted
+        # inside the same cohort.
+        self._retry_hint: set = set()
+        self._lanes_up = False
+        self._sweep_lane_obj: Lane | None = None
+
+        # Downloads stay single-file however many lanes there are. pyrogram's
+        # `Channel` is not safe for concurrent downloads and the Bot API's rate
+        # limit is per chat, so four lanes pulling at once is slower than one and
+        # can be a ban. Extraction and inference are what parallelise.
+        self._fetch_lock = threading.Lock()
+
+        # The cloud lane's shopping list, recomputed once per rotation from the
+        # *runnable* set so the wave filter and `VIOS_ONLY`/`VIOS_EXCEPT` are
+        # already applied, plus the keys already posted to it this session. The
+        # posted set exists because the cloud lane is fed every planner round: a
+        # video whose hints are already in the lane must not be re-posted forty
+        # times while its `describe` finishes.
+        self._cloud_ids: list = []
+        self._cloud_posted: set = set()
 
         # Components deferred because this machine cannot run them, so their
         # dependents can be told the same thing instead of being retried every
@@ -437,6 +631,80 @@ class ProcessEngine:
                 self._cov = Coverage(self.store.conn, self.partitions,
                                      self.index, self.worker)
             return self._cov
+
+    # ── what one worker looked like, when there was one ──────────────────
+    @property
+    def current(self) -> dict:
+        """The busiest lane's slot, so every existing reader keeps working.
+
+        Before the lanes this was a plain attribute holding one video. Making it
+        a property rather than deleting it is deliberate: the process tab, the
+        browser's live panel, `_note`, `_progress` and `_live` all read
+        `current`, and a shape change there is a UI rewrite for no gain. The
+        per-lane rows are added *beside* it in the status payload.
+
+        "Busiest" is the lane that has held its video longest — the one an
+        operator watching a single line most wants to see, because it is the one
+        closest to being stuck.
+        """
+        lanes = list(self._lanes)
+        if self._sweep_lane_obj is not None:
+            # The `VIOS_LANES=0` path has no entry in `_lanes` — it runs on the
+            # sweep thread — and leaving it out here would blank the live panel
+            # for exactly the configuration an operator falls back to when
+            # something is wrong.
+            lanes.append(self._sweep_lane_obj)
+        best, oldest = {}, None
+        for lane in lanes:
+            slot = lane.slot
+            if not slot.get("video_key"):
+                continue
+            since = slot.get("since") or 0.0
+            if oldest is None or since < oldest:
+                best, oldest = slot, since
+        return dict(best)
+
+    def _bump(self, field: str, n=1) -> None:
+        """One session counter, atomically.
+
+        `self.session[k] += 1` is a read-modify-write, and with four lanes doing
+        it the tab's totals drift low by however many increments interleaved.
+        Every mutation goes through here so there is one place holding the lock
+        rather than fourteen call sites each remembering to.
+        """
+        with self._lock:
+            self.session[field] = self.session.get(field, 0) + n
+
+    # ── one video, one worker ────────────────────────────────────────────
+    @contextlib.contextmanager
+    def _hold(self, key: str, lane: Lane):
+        """Take exclusive hold of a video, or yield False.
+
+        The unit that must not be shared is the *working directory*, not the
+        (video, component) pair — `claim_for` already guards that. Two lanes
+        inside one video would write `frames/`, `proxy.mp4` and `audio.wav`
+        underneath each other, and `intake.evict` would be deciding whether to
+        delete a directory another lane is mid-pass in.
+
+        Held keys double as the eviction keep-set for exactly that reason.
+        """
+        with self._lock:
+            if key in self._inflight:
+                got = False
+            else:
+                self._inflight[key] = lane.name
+                got = True
+        try:
+            yield got
+        finally:
+            if got:
+                with self._lock:
+                    self._inflight.pop(key, None)
+
+    def _held(self) -> set:
+        """Every working directory a lane is inside right now."""
+        with self._lock:
+            return {_safe(k) for k in self._inflight}
 
     def _log(self, text: str, level: str = "info") -> None:
         """One activity line, and stdout too when it is a fault.
@@ -831,6 +1099,11 @@ class ProcessEngine:
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=120)
+        # Lanes before the publisher, because a lane still mid-pass is still
+        # writing rows the publisher has to carry. `_run`'s `finally` has usually
+        # done this already; both paths are idempotent, and this one covers a
+        # sweep thread that outlived its join.
+        self._stop_lanes()
         # The publisher last, and synchronously: whatever the sweep wrote in the
         # seconds before the stop landed is only real once it is in the channel.
         self._drain_publisher("shutdown")
@@ -876,6 +1149,11 @@ class ProcessEngine:
             # publisher was told about and may not have sent yet, and a crashed
             # sweep is exactly when losing them would hurt most. Idempotent — the
             # normal path already drained, and a second drain finds nothing.
+            #
+            # Lanes first, publisher second, teardown last, and the order is
+            # load-bearing: a lane still running writes rows the publisher must
+            # see, and `_teardown` checkpoints the connection those rows are in.
+            self._stop_lanes()
             self._drain_publisher("sweep-end")
             self._teardown()
             with self._lock:
@@ -883,8 +1161,9 @@ class ProcessEngine:
                     self.state = IDLE
                     self.message = (self.message if self._stop.is_set()
                                     else self.message) or "Stopped."
-                self.current = {}
                 self.cohort_index = -1
+            if self._sweep_lane_obj is not None:
+                self._sweep_lane_obj.slot = {}
 
     def _sweep(self) -> None:
         store, cov = self.store, self.coverage
@@ -926,6 +1205,12 @@ class ProcessEngine:
             with self._lock:
                 self.resources = res
             self._log(resources.describe(res))
+
+            # The lanes, once, now that the card count is known. Everything below
+            # is written to work with `self._lanes` empty, so a machine where this
+            # decides on zero lanes runs the original single-threaded sweep with
+            # no second code path to keep in step.
+            self._start_lanes(res)
 
             sel = self._narrowed()
             cannot = registry.unrunnable(sel, res)
@@ -1043,6 +1328,14 @@ class ProcessEngine:
                           f"{sum(registry.get(i).seconds for i in group):.0f} s "
                           f"per video")
             self._preflight_cloud(runnable)
+
+            # What the cloud lane is allowed to take, for this rotation. Derived
+            # from `runnable` rather than from the catalogue so the wave filter
+            # and `VIOS_ONLY`/`VIOS_EXCEPT` are already applied — the lane crosses
+            # the cohort barrier, but never the operator's selection.
+            with self._lock:
+                self._cloud_ids = [c for c in runnable
+                                   if registry.get(c).family == "cloud"]
 
             worked = 0
             preempted = False
@@ -1220,13 +1513,14 @@ class ProcessEngine:
 
     # ── one cohort ───────────────────────────────────────────────────────
     def _run_cohort(self, cohort, wave: int = 0) -> int:
-        """Run every pass in this cohort over every video that still needs one.
+        """Get this cohort done across every video, then return.
 
-        `seen` is why a failure does not become a spin: a video whose pass
-        failed is still claimable — that is the point of retries — and without
-        remembering that it was attempted this cohort, `candidates` would hand
-        it straight back and the loop would grind on the same reel until its
-        attempts ran out. Retries belong to the next rotation, not this one.
+        Two execution shapes behind one contract, and the barrier means the same
+        thing in both. With lanes up this is a *planner*: it stages the next
+        videos' bytes ahead of the work, posts one job per video per lane kind,
+        and does not return until every pass lane is idle and its queues are
+        empty. With `VIOS_LANES=0` it runs the same work inline on this thread,
+        which is exactly the sweep that shipped before the lanes existed.
 
         `wave` is carried for the log and the status line only. A cohort runs
         the same way whichever wave admitted it; naming the wave is what makes
@@ -1244,11 +1538,25 @@ class ProcessEngine:
         self._log(f"Cohort {cohort.index}{tag}: {len(ids)} passes, "
                   f"{cohort.vram_mb} MB, {len(cohort.loads)} model loads")
 
+        if self._lanes:
+            return self._plan_cohort(cohort, wave)
+        return self._sweep_cohort(cohort, ids)
+
+    def _sweep_cohort(self, cohort, ids: list) -> int:
+        """Every video, one at a time, on this thread — the pre-lanes sweep.
+
+        `seen` is why a failure does not become a spin: a video whose pass
+        failed is still claimable — that is the point of retries — and without
+        remembering that it was attempted this cohort, `candidates` would hand
+        it straight back and the loop would grind on the same reel until its
+        attempts ran out. Retries belong to the next rotation, not this one.
+        """
+        lane = self._sweep_lane()
         seen: set = set()
         worked = 0
         while not self._stopping():
             self._wait_if_paused()
-            keys = [k for k in self.coverage.candidates(ids, limit=64)
+            keys = [k for k in lane.cov.candidates(ids, limit=64)
                     if k not in seen]
             if not keys:
                 break
@@ -1261,13 +1569,205 @@ class ProcessEngine:
                     self._log(f"Reached the {self.video_limit}-video limit "
                               f"for this session")
                     return worked
-                if self._process_video(key, ids, cohort):
+                if self._process_video(key, ids, cohort.index, lane):
                     worked += 1
         return worked
 
+    def _split_cohort(self, ids: list) -> dict:
+        """Which lane kind may take which of this cohort's passes.
+
+        CPU components cost no VRAM, so `plan_cohorts` drops them into whichever
+        cohort is open when topo order reaches them — sometimes directly beside
+        the GPU passes that consume them (`allframes`, 45 s, is a hard need of
+        most perception passes). Handing one of those to a different lane would
+        put a cohort's own dependency edge across two threads, and the consumer
+        would find its input still `queued` and defer for sixty seconds.
+
+        So the CPU lane takes only passes with **no edge to a GPU pass of this
+        cohort, in either direction** — computed from the registry rather than
+        listed by hand, so a component added later is classified correctly
+        without anybody remembering this function exists. Everything else stays
+        in the video's own `topo_sort` order on one lane, exactly as before.
+
+        Cloud passes come out separately: they are network and no local compute,
+        and `_cloud_loop` explains why they are allowed across the barrier.
+        """
+        gpu_ids = {c for c in ids if registry.get(c).device == "gpu"}
+        cloud = [c for c in ids if registry.get(c).family == "cloud"]
+        rest = [c for c in ids if c not in cloud]
+        edge_free = [c for c in rest
+                     if registry.get(c).device == "cpu"
+                     and not (set(registry.get(c).needs) & gpu_ids)
+                     and not any(c in registry.get(g).needs for g in gpu_ids)]
+        return {"gpu": [c for c in rest if c not in edge_free],
+                "cpu": edge_free, "cloud": cloud}
+
+    def _plan_cohort(self, cohort, wave: int) -> int:
+        """Post this cohort's work, keep the lanes fed, then hold the barrier.
+
+        The planner never runs a pass itself. It answers one question in a loop —
+        *which videos still owe this cohort something, and are their bytes on
+        disk?* — and posts a hint per (video, lane kind). Ownership is settled in
+        sqlite by `claim_for`, so a hint posted twice, or posted for a video
+        another lane already took, costs one ack and nothing else.
+
+        It returns when the pass lanes are idle, their queues are empty and
+        `candidates` has nothing left. That is precisely the barrier
+        `plan_cohorts` documents — a cohort's outputs complete before the next
+        begins — held by four workers instead of one. The cloud lane is
+        deliberately not part of that test.
+        """
+        split = self._split_cohort(list(cohort.components))
+        gpu_ids, cpu_ids = split["gpu"], split["cpu"]
+        self._log(f"  lanes: {len(gpu_ids)} on the GPU lanes, {len(cpu_ids)} "
+                  f"edge-free on the CPU lanes"
+                  + (f", {len(split['cloud'])} cloud (runs across the barrier)"
+                     if split["cloud"] else "")
+                  + (f" — CPU lane takes {', '.join(cpu_ids)}" if cpu_ids
+                     else ""))
+
+        before = self.session["videos"]
+        mine = list(gpu_ids) + list(cpu_ids)
+        deadline = time.time() + _COHORT_DRAIN_TIMEOUT
+        posted: set = set()
+        quiet = 0
+
+        while not self._stopping():
+            self._wait_if_paused()
+            if self.video_limit and self.session["videos"] >= self.video_limit:
+                self._log(f"Reached the {self.video_limit}-video limit for "
+                          f"this session")
+                break
+
+            # The cloud lane first, and every round: it is fed independently of
+            # the cohort so that a 25 s network pass is never what a card is
+            # waiting behind.
+            self._post_cloud()
+
+            # Hints a lane consumed without processing anything — it found the
+            # video held by another lane, or `claim_for` had already given the
+            # rows away. Those are the only cases worth posting twice: a video
+            # that *was* processed stays in `posted` however its passes went, so
+            # a reel whose every pass fails costs one attempt this cohort and its
+            # retries belong to the next rotation.
+            with self._lock:
+                again, self._retry_hint = self._retry_hint, set()
+            posted -= again
+
+            # `posted` is also what stops a failed video spinning: it is still a
+            # `candidates` answer — that is what retries are — and without
+            # remembering the attempt this loop would grind on the same reel.
+            todo = [k for k in self.coverage.candidates(mine, limit=64)
+                    if k not in posted] if mine else []
+            staged = self._stage_ahead(todo, mine)
+
+            # A hint is only posted for a video whose bytes are already down.
+            # That single rule is what keeps a GPU lane from ever blocking on
+            # Telegram or on ffmpeg — the whole point of the prep lane.
+            fed = 0
+            for key in staged:
+                posted.add(key)
+                if gpu_ids:
+                    fed += bool(self._jobs.push(jobs.QUEUE_V2_GPU, {
+                        "video_key": key, "cohort": cohort.index, "wave": wave,
+                        "components": gpu_ids}))
+                if cpu_ids:
+                    fed += bool(self._jobs.push(jobs.QUEUE_V2_CPU, {
+                        "video_key": key, "cohort": cohort.index, "wave": wave,
+                        "components": cpu_ids}))
+
+            # Drained? Three things have to be true at once, and they are
+            # checked twice in a row before believing it: a lane can be between
+            # `claim` returning and its slot being filled, which for one instant
+            # looks exactly like idle.
+            work_left = bool(todo) or fed > 0
+            busy = any(l.busy() for l in self._lanes if l.kind in ("gpu", "cpu"))
+            depth = (self._jobs.depth(jobs.QUEUE_V2_GPU)
+                     + self._jobs.depth(jobs.QUEUE_V2_CPU)
+                     + self._jobs.depth(jobs.QUEUE_V2_PREP))
+            if not work_left and not busy and depth == 0:
+                quiet += 1
+                if quiet >= 2:
+                    break
+            else:
+                quiet = 0
+
+            if time.time() > deadline:
+                # Never silently: a cohort that will not drain is a stuck lane
+                # or a video that hangs a runner, and the next cohort starting
+                # on top of it is how a barrier becomes a suggestion.
+                self._log(f"Cohort {cohort.index} did not drain within "
+                          f"{_COHORT_DRAIN_TIMEOUT:.0f}s — "
+                          f"{'a lane is still busy' if busy else 'queues stalled'}"
+                          f", {depth} hints queued. Moving on; the rows stay "
+                          f"claimable and the next rotation retries them",
+                          "error")
+                break
+
+            with self._lock:
+                self.message = (
+                    f"Cohort {cohort.index + 1}: "
+                    f"{sum(1 for l in self._lanes if l.busy())}/"
+                    f"{len(self._lanes)} lanes working, {len(todo)} videos "
+                    f"outstanding, {depth} queued")
+            self._sleep(1.0 if (work_left or busy) else 0.5)
+
+        # Hints for a cohort nobody is going to admit again are noise the next
+        # cohort's lanes would claim and immediately ack.
+        for q in (jobs.QUEUE_V2_GPU, jobs.QUEUE_V2_CPU):
+            self._jobs.drain(q)
+        return max(self.session["videos"] - before, 0)
+
+    def _stage_ahead(self, todo: list, ids: list) -> list:
+        """Post prep for the next few videos; answer which are ready now.
+
+        `_PREP_AHEAD` bounds how far ahead the prep lane runs, because staging is
+        the one activity that consumes disk without producing evidence — and
+        `intake.evict` protects held directories, so unbounded staging would fill
+        the cache with videos no lane has reached.
+
+        The bookkeeping is done under the lock and the pushes outside it: the
+        prep lanes mutate both sets, and a Redis round trip is not something to
+        hold an engine lock across.
+        """
+        with self._lock:
+            ready = [k for k in todo if k in self._staged]
+            want = max(_PREP_AHEAD - len(ready), 1)
+            post: list = []
+            for key in todo:
+                if want <= 0:
+                    break
+                if key in self._staged or key in self._prep_posted:
+                    continue
+                self._prep_posted.add(key)
+                post.append(key)
+                want -= 1
+        for key in post:
+            self._jobs.push(jobs.QUEUE_V2_PREP,
+                            {"video_key": key, "components": ids})
+        return ready
+
+    def _post_cloud(self) -> None:
+        """Feed the cloud lane, whatever cohort the cards are on."""
+        ids = list(self._cloud_ids)
+        if not ids or not any(l.kind == "cloud" for l in self._lanes):
+            return
+        for key in self.coverage.candidates(ids, limit=16):
+            if key in self._cloud_posted:
+                continue
+            self._cloud_posted.add(key)
+            self._jobs.push(jobs.QUEUE_V2_CLOUD,
+                            {"video_key": key, "components": ids})
+        # Bounded, because this set is the only thing in the plane that grows
+        # for the whole session. A key dropped from it is re-posted and
+        # re-acked — the cost of forgetting is one wasted claim.
+        if len(self._cloud_posted) > 4096:
+            self._cloud_posted.clear()
+
     # ── one video, every resident pass ───────────────────────────────────
-    def _process_video(self, key: str, ids: list, cohort) -> bool:
-        cov, store = self.coverage, self.store
+    def _process_video(self, key: str, ids: list, cohort_index: int,
+                       lane: "Lane") -> bool:
+        cov, store = lane.cov, lane.store
         video = store.video(key)
         if video is None:
             return False
@@ -1279,25 +1779,27 @@ class ProcessEngine:
         workdir = os.path.join(self.cache_dir, _safe(key))
         started = time.time()
 
-        with self._lock:
-            self.current = {"video_key": key, "cohort": cohort.index,
-                            "component": "", "title": "fetching",
-                            "since": started, "passes": len(order)}
+        lane.slot = {"video_key": key, "cohort": cohort_index,
+                     "component": "", "title": "fetching",
+                     "since": started, "passes": len(order),
+                     "lane": lane.name, "device": lane.device}
 
         try:
-            source = self._source.ensure(video, workdir)
+            source = self._fetch(video, workdir)
         except intake.SourceError as exc:
             for cid in order:
                 cov.fail(key, cid, str(exc))
             self._log(f"{key}: {exc}", "warn")
-            self.session["failed"] += len(order)
+            self._bump("failed", len(order))
+            lane.slot = {}
             return False
         except Exception as exc:
             for cid in order:
                 cov.fail(key, cid, f"{type(exc).__name__}: {exc}")
             self._log(f"{key}: fetch failed — {type(exc).__name__}: {exc}",
                       "error")
-            self.session["failed"] += len(order)
+            self._bump("failed", len(order))
+            lane.slot = {}
             return False
         intake.touch(workdir)
 
@@ -1308,30 +1810,55 @@ class ProcessEngine:
                 continue
             self._wait_if_paused()
             states[cid] = self._run_pass(key, cid, video, source, workdir,
-                                         states, cohort)
+                                         states, lane)
 
-        self.session["videos"] += 1
-        self.session["seconds"] += time.time() - started
-        self.since_publish += 1
+        lane.videos += 1
+        self._bump("videos")
+        self._bump("seconds", time.time() - started)
+        with self._lock:
+            self.since_publish += 1
         # Not `if due: publish` any more. The whole point of the publisher thread
         # is that the decision and the 45 MB POST happen somewhere this loop is
         # not — so this says "there are rows" and goes back to the next video.
         # The publisher applies the same `_publish_due` gate on its own tick.
-        self._rows_written(f"cohort-{cohort.index}")
+        self._rows_written(f"cohort-{cohort_index}")
 
+        # `keep` is every working directory any lane is inside, not just this
+        # one. A keep-set of one is what would delete a live workdir out from
+        # under another lane mid-pass.
         freed = intake.evict(self.cache_dir, self.cache_budget_mb,
-                             keep={_safe(key)}, floor_mb=self.disk_floor_mb)
+                             keep=self._held() | {_safe(key)},
+                             floor_mb=self.disk_floor_mb)
         if freed["removed"]:
             self._log(f"Cache: removed {freed['removed']} working directories, "
                       f"{freed['freed_mb']} MB")
+            # Whatever was evicted is no longer staged, whether or not this lane
+            # was the one that staged it. Saying otherwise would have the planner
+            # post a pass job for a video whose bytes are gone.
+            with self._lock:
+                self._staged -= {k for k in self._staged
+                                 if _safe(k) in set(freed.get("names") or ())}
+        lane.slot = {}
         with self._lock:
-            self.current = {}
+            self._staged.discard(key)
         return True
+
+    def _fetch(self, video: dict, workdir: str) -> str:
+        """`Source.ensure`, one lane at a time.
+
+        Idempotent and usually instant — `source.mp4` and `record.json` present
+        means `reused += 1` and return — so the lock costs nothing on the common
+        path. It is held across the download because pyrogram's `Channel` is not
+        safe for concurrent downloads and the Bot API's rate limit is per chat:
+        four lanes pulling at once is slower than one, and can be a ban.
+        """
+        with self._fetch_lock:
+            return self._source.ensure(video, workdir)
 
     # ── one pass ─────────────────────────────────────────────────────────
     def _run_pass(self, key: str, cid: str, video: dict, source: str,
-                  workdir: str, states: dict, cohort) -> str:
-        cov, store = self.coverage, self.store
+                  workdir: str, states: dict, lane: "Lane") -> str:
+        cov, store = lane.cov, lane.store
         comp = registry.get(cid)
 
         # Can this machine run it at all?
@@ -1355,7 +1882,7 @@ class ProcessEngine:
             why = (f"not runnable on {where} — flagged kaggle_ok=False in the "
                    f"registry, held for a machine that can run it")
             cov.defer(key, cid, why, ELSEWHERE_SECONDS)
-            self.session["elsewhere"] = self.session.get("elsewhere", 0) + 1
+            self._bump("elsewhere")
             self._elsewhere.add(cid)
             if cid not in self._elsewhere_logged:
                 self._elsewhere_logged.add(cid)
@@ -1381,7 +1908,7 @@ class ProcessEngine:
             why = (f"depends on {', '.join(broken)}, which produced nothing "
                    f"for this video")
             cov.skip(key, cid, why)
-            self.session["skipped"] += 1
+            self._bump("skipped")
             return "skipped"
 
         degraded = [n for n in comp.soft
@@ -1408,7 +1935,7 @@ class ProcessEngine:
         if pending:
             cov.defer(key, cid, f"waiting on {', '.join(pending)}, not yet run "
                                 f"for this video", 60.0)
-            self.session["deferred"] = self.session.get("deferred", 0) + 1
+            self._bump("deferred")
             return "deferred"
 
         # A dependency that deferred has not failed — it is waiting on a clock.
@@ -1427,17 +1954,16 @@ class ProcessEngine:
                        f"different machine")
             cov.defer(key, cid, why,
                       ELSEWHERE_SECONDS if elsewhere else 300.0)
-            self.session["deferred"] = self.session.get("deferred", 0) + 1
+            self._bump("deferred")
             return "deferred"
 
-        with self._lock:
-            self.current.update({"component": cid, "title": comp.title,
-                                 "component_since": time.time(), "note": "",
-                                 "detail": "", "detail_at": 0.0,
-                                 "frames_done": 0, "frames_total": 0})
+        lane.slot.update({"component": cid, "title": comp.title,
+                          "component_since": time.time(), "note": "",
+                          "detail": "", "detail_at": 0.0,
+                          "frames_done": 0, "frames_total": 0})
         # So a load or unload fault names the pass that provoked it rather than
         # whichever pass happened to be running when the log was read.
-        self._cache.context = cid
+        lane.cache.context = cid
 
         params = dict(comp.params)
         if self._hf_token:
@@ -1445,10 +1971,10 @@ class ProcessEngine:
         job = Job(
             video=dict(video), component=comp, store=store, source=source,
             workdir=workdir, params=params, resources=self.resources,
-            cache=self._cache,
+            cache=lane.cache,
             renew=lambda progress="", k=key, c=cid: cov.renew(k, c, progress),
-            progress=self._progress,
-            log=self._note)
+            progress=lambda d, _l=lane: self._progress(d, _l),
+            log=lambda m, _l=lane: self._note(m, _l))
 
         t0 = time.time()
         try:
@@ -1457,7 +1983,7 @@ class ProcessEngine:
             em = fn(job)
         except SkipPass as exc:
             cov.skip(key, cid, str(exc))
-            self.session["skipped"] += 1
+            self._bump("skipped")
             self._log(f"{key} · {cid}: skipped — {exc}")
             return "skipped"
         except DeferPass as exc:
@@ -1467,7 +1993,7 @@ class ProcessEngine:
             wait = max(30.0, min(float(getattr(exc, "retry_after", 300.0)),
                                  3600.0))
             cov.defer(key, cid, str(exc), wait)
-            self.session["deferred"] = self.session.get("deferred", 0) + 1
+            self._bump("deferred")
             self._log(f"{key} · {cid}: deferred {wait:.0f}s — {exc}")
             return "deferred"
         except (KeyboardInterrupt, SystemExit):
@@ -1478,12 +2004,12 @@ class ProcessEngine:
             # that reads "OutOfMemoryError" tells the operator nothing they can
             # act on; one that reads "loading Qwen/Qwen3-VL-8B-AWQ" tells them
             # which model to move off this card.
-            blame = self._loading_blame(exc, t0)
+            blame = self._loading_blame(exc, t0, lane)
             reason = f"{type(exc).__name__}: {exc}"
             if blame:
                 reason = f"{reason} [{blame}]"
             state = cov.fail(key, cid, reason)
-            self.session["failed"] += 1
+            self._bump("failed")
             self._log(f"{key} · {cid}: {type(exc).__name__}: "
                       f"{str(exc)[:200]}" + (f" — while {blame}" if blame else ""),
                       "error")
@@ -1494,9 +2020,13 @@ class ProcessEngine:
                           + (f" — {v.get('allocated', 0)} MB allocated, "
                              f"{v.get('free', 0)} MB free of "
                              f"{v.get('total', 0)}; resident: "
-                             f"{', '.join(self._cache.loaded()) or 'nothing'}"
+                             f"{', '.join(lane.cache.loaded()) or 'nothing'}"
                              if v else ""), "error")
-                self._unload("out of VRAM — dropping every resident model")
+                # This lane's models only. Another lane's card has its own
+                # budget and is very likely mid-pass; dropping its weights to
+                # answer an OOM over here would turn one failure into two.
+                self._unload("out of VRAM — dropping every resident model",
+                             lane)
             return state
 
         # ── accept the emission ──────────────────────────────────────────
@@ -1534,50 +2064,72 @@ class ProcessEngine:
         except Exception as exc:
             state = cov.fail(key, cid, f"store rejected the emission: "
                                        f"{type(exc).__name__}: {exc}")
-            self.session["failed"] += 1
+            self._bump("failed")
             self._log(f"{key} · {cid}: store rejected the emission — "
                       f"{type(exc).__name__}: {exc}", "error")
             return state
 
         seconds = time.time() - t0
         cov.done(key, cid, seconds, n_claims, n_vectors, observer)
-        self.session["passes"] += 1
-        self.session["claims"] += n_claims
-        self.session["vectors"] += n_vectors
+        lane.passes += 1
+        self._bump("passes")
+        self._bump("claims", n_claims)
+        self._bump("vectors", n_vectors)
         return "done"
 
-    def _note(self, message: str) -> None:
-        with self._lock:
-            if self.current:
-                self.current["note"] = str(message)[:200]
+    def _note(self, message: str, lane: "Lane | None" = None) -> None:
+        slot = self._slot_of(lane)
+        if slot is not None:
+            slot["note"] = str(message)[:200]
         self._log(message)
 
-    def _progress(self, detail: str) -> None:
+    def _slot_of(self, lane: "Lane | None"):
+        """The dict to write a live detail into — the object, never a copy.
+
+        Every real call site passes its lane. The fallback exists because
+        `self.current` returns a *copy*, so writing to it would silently discard
+        the note, and a defaulted argument that quietly does nothing is worse
+        than one that raises.
+        """
+        if lane is not None:
+            return lane.slot
+        if self._sweep_lane_obj is not None:
+            return self._sweep_lane_obj.slot
+        for l in list(self._lanes):
+            if l.busy():
+                return l.slot
+        return None
+
+    def _progress(self, detail: str, lane: "Lane | None" = None) -> None:
         """A pass's own report of where it is inside itself.
 
         Deliberately not logged. `job.heartbeat` fires once per batch, so a
         900-frame OCR pass produces about thirty of these per video and several
         thousand per sweep; putting them in the activity ring would push out
-        every error the ring exists to keep. They go to `current` only, which is
-        what the live panel reads.
+        every error the ring exists to keep. They go to the lane's slot only,
+        which is what the live panel reads.
 
         `frame 320/900` is parsed into counters here rather than in the browser
         so the shape stays in one place: the runners already emit that string,
         and a progress bar in the interface should not depend on a regex in
         JavaScript agreeing with a format string in Python.
+
+        No lock. A lane's slot is written by exactly one thread — its own — and
+        every reader takes a copy; taking the engine lock thirty times a video
+        per lane would put four workers in a queue behind a status poll.
         """
         detail = str(detail)[:200]
-        with self._lock:
-            if not self.current:
-                return
-            self.current["detail"] = detail
-            done = total = 0
-            hit = _PROGRESS_RE.search(detail)
-            if hit:
-                done, total = int(hit.group(1)), int(hit.group(2))
-            self.current["frames_done"] = done
-            self.current["frames_total"] = total
-            self.current["detail_at"] = time.time()
+        slot = self._slot_of(lane)
+        if not slot:
+            return
+        slot["detail"] = detail
+        done = total = 0
+        hit = _PROGRESS_RE.search(detail)
+        if hit:
+            done, total = int(hit.group(1)), int(hit.group(2))
+        slot["frames_done"] = done
+        slot["frames_total"] = total
+        slot["detail_at"] = time.time()
 
     @staticmethod
     def _is_oom(exc: Exception) -> bool:
@@ -1586,7 +2138,8 @@ class ProcessEngine:
                 or "CUDA out of memory" in str(exc)
                 or "CUBLAS_STATUS_ALLOC_FAILED" in str(exc))
 
-    def _loading_blame(self, exc: Exception, since: float) -> str:
+    def _loading_blame(self, exc: Exception, since: float,
+                       lane: "Lane | None" = None) -> str:
         """"loading <key>", when this failure came out of a model load.
 
         `ModelCache` records every load fault as it happens, with the key it
@@ -1594,10 +2147,14 @@ class ProcessEngine:
         wrapper keeps the original traceback intact — which is what someone
         reading the Kaggle log actually needs — while still putting the model
         name in the coverage row, where it is queryable.
+
+        The lane's own cache, because with two cards there are two of them and
+        the other lane's most recent load failure is a different card's problem.
         """
         try:
+            cache = lane.cache if lane is not None else self._cache
             msg = str(exc)[:300]
-            for f in reversed(self._cache.recent_failures(8)):
+            for f in reversed(cache.recent_failures(8)):
                 if f.get("at", 0) < since - 1.0:
                     break
                 if f.get("phase") == "load" and f.get("key"):
@@ -1610,6 +2167,398 @@ class ProcessEngine:
         # load. Saying nothing is the honest answer — naming the resident model
         # here would blame whichever one happened to be loaded.
         return ""
+
+    # ══════════════════════════════════════════════════════════════════════
+    # The lanes
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _sweep_lane(self) -> "Lane":
+        """The sweep thread's own lane, for the `VIOS_LANES=0` path.
+
+        Wraps the primary store, coverage and cache, so `_process_video` has one
+        signature whether it is running on a worker thread or on the sweep.
+        """
+        with self._lock:
+            if self._sweep_lane_obj is None:
+                lane = Lane("sweep", "gpu", -1)
+                lane.store = self.store
+                lane.cov = self.coverage
+                lane.cache = self._cache
+                lane.started_at = time.time()
+                self._sweep_lane_obj = lane
+            return self._sweep_lane_obj
+
+    def _start_lanes(self, res: dict) -> None:
+        """Bring up the workers, once, at the top of the first rotation.
+
+        Here and not in `__init__` because the lane count comes from `probe()` —
+        one GPU lane per card, and the number of cards is not known until the
+        first probe. Everything downstream reads `self._lanes`, so a machine
+        where this decides on zero lanes runs the single-threaded sweep with no
+        further branching anywhere.
+        """
+        if self._lanes or self._lanes_up:
+            return
+        self._lanes_up = True
+        if not _LANES_ON:
+            self._log("VIOS_LANES=0 — single-threaded sweep: one video, one "
+                      "pass, one card at a time")
+            return
+
+        gpus = int(res.get("gpu_count", 0) or 0)
+        n_gpu = _GPU_LANES if _GPU_LANES else gpus
+        n_cpu = _CPU_LANES
+        n_prep = max(1, min(2, _PREP_AHEAD))
+        if n_gpu <= 0 and gpus <= 0:
+            # No card at all: CPU passes still parallelise, and the CPU lane's
+            # `_split_cohort` sees no GPU ids so every pass is edge-free.
+            n_gpu = 0
+        kind = self._jobs.start(wait_seconds=5.0)
+
+        specs = [(f"gpu{i}", "gpu", (i % gpus) if gpus else -1)
+                 for i in range(n_gpu)]
+        specs += [(f"cpu{i}", "cpu", -1) for i in range(n_cpu)]
+        specs += [(f"prep{i}", "prep", -1) for i in range(n_prep)]
+        if self._cloud_possible():
+            specs.append(("cloud", "cloud", -1))
+        if not specs:
+            self._log("No lane could be started — falling back to the "
+                      "single-threaded sweep", "warn")
+            return
+
+        # Orphans from a session that died holding jobs. The rows' leases would
+        # free them eventually; recovering the hints means a lane takes them now.
+        for q in jobs.V2_QUEUES:
+            got = self._jobs.recover(q)
+            if got:
+                self._log(f"Recovered {got} orphaned hints from {q}")
+
+        for name, lane_kind, device in specs:
+            lane = Lane(name, lane_kind, device)
+            t = threading.Thread(target=self._lane_main, args=(lane,),
+                                 name=f"vios-{name}", daemon=True)
+            lane.thread = t
+            with self._lock:
+                self._lanes.append(lane)
+            t.start()
+
+        with self._lock:
+            self.workers = {l.name: l.as_dict() for l in self._lanes}
+        self._log(
+            f"Lanes up on {kind}: {n_gpu} GPU"
+            + (f" (cards {', '.join(str(s[2]) for s in specs if s[1] == 'gpu')})"
+               if n_gpu else "")
+            + f", {n_cpu} CPU, {n_prep} prep"
+            + (", 1 cloud" if any(s[1] == "cloud" for s in specs) else "")
+            + f" — {len(specs)} workers claiming in parallel")
+
+    def _cloud_possible(self) -> bool:
+        """Is there a cloud pass to run, and a key to run it with?
+
+        Asked before the lane is created rather than inside it: a lane that
+        exists only to discover on every claim that there is no API key is a
+        thread and a queue that mean nothing on the tab.
+        """
+        try:
+            if not any(registry.get(c).family == "cloud"
+                       for c in self._narrowed()):
+                return False
+            from .runners.cloud import client      # noqa: PLC0415
+            return bool(client().configured())
+        except Exception:                          # noqa: BLE001
+            return False
+
+    def _stop_lanes(self) -> None:
+        """Join every lane, then close its connection and drop its weights.
+
+        `_stop` is already set by every path that gets here, so the loops are
+        on their way out; the join is what makes "the sweep has stopped" mean
+        "nothing is still writing". Generous timeout because a lane may be
+        inside a 110 s Florence-2 pass, and killing that would abandon a claim
+        with a live lease.
+        """
+        lanes = list(self._lanes)
+        if not lanes:
+            return
+        self._log(f"Stopping {len(lanes)} lanes")
+        for lane in lanes:
+            t = lane.thread
+            if t and t.is_alive():
+                t.join(timeout=300)
+        still = [l.name for l in lanes if l.thread and l.thread.is_alive()]
+        if still:
+            self._log(f"Lanes still running after 300s: {', '.join(still)} — "
+                      f"their claims stay leased and are reclaimed as stale",
+                      "warn")
+        for lane in lanes:
+            lane.close()
+        with self._lock:
+            self._lanes = []
+            self._lanes_up = False
+            self.workers = {}
+
+    def _lane_open(self, lane: "Lane") -> None:
+        """Pin the card and open this lane's own resources, on its own thread.
+
+        `torch.cuda.set_device` sets CUDA's *current device for this host
+        thread*, and `device_and_dtype` returns a bare `"cuda"` — so this one
+        call is what puts every `.to("cuda")` in every runner this thread ever
+        calls onto card `lane.device`, with no runner edited and nothing passed
+        down. It has to happen here, on the lane's thread, which is why lane
+        setup is not in `_start_lanes`.
+        """
+        if lane.device >= 0:
+            try:
+                import torch                       # noqa: PLC0415
+                torch.cuda.set_device(lane.device)
+            except Exception as exc:               # noqa: BLE001
+                self._log(f"{lane.name}: could not pin card {lane.device} — "
+                          f"{type(exc).__name__}: {str(exc)[:120]}; it will "
+                          f"share whichever card CUDA defaults to", "warn")
+        lane.store = self.store.secondary()
+        lane.cov = Coverage(lane.store.conn, self.partitions, self.index,
+                            self.worker)
+        lane.cache = ModelCache(
+            lambda text, level="info", _n=lane.name:
+            self._log(f"[{_n}] {text}", level))
+        lane.started_at = time.time()
+
+    def _lane_main(self, lane: "Lane") -> None:
+        try:
+            self._lane_open(lane)
+        except Exception as exc:                   # noqa: BLE001
+            self._log(f"{lane.name}: could not start — {type(exc).__name__}: "
+                      f"{str(exc)[:160]}", "error")
+            with self._lock:
+                self._lane_error = f"{lane.name}: {type(exc).__name__}"
+            return
+        try:
+            if lane.kind == "prep":
+                self._prep_loop(lane)
+            elif lane.kind == "cloud":
+                self._cloud_loop(lane)
+            else:
+                self._pass_loop(lane)
+        except Exception as exc:                   # noqa: BLE001
+            self._log(f"{lane.name} stopped on {type(exc).__name__}: "
+                      f"{str(exc)[:200]}", "error")
+            self._log(traceback.format_exc()[-700:], "error")
+            with self._lock:
+                self._lane_error = f"{lane.name}: {type(exc).__name__}"
+        finally:
+            lane.slot = {}
+            lane.close()
+
+    def _pass_loop(self, lane: "Lane") -> None:
+        """Claim a video's slice of the admitted cohort, run it, ack.
+
+        The hint says which video and which components. `claim_for` says whether
+        they are actually this lane's — and when it says no, that is the normal
+        answer to two lanes racing for the same reel, so the job is acked and
+        the loop moves on without a word.
+        """
+        qname = jobs.QUEUE_V2_GPU if lane.kind == "gpu" else jobs.QUEUE_V2_CPU
+        while not self._stopping():
+            self._wait_if_paused()
+            job, raw = self._jobs.claim(qname)
+            if not job:
+                continue
+            p = job.get("payload") or {}
+            key = str(p.get("video_key") or "")
+            ids = _known(p.get("components") or [])
+            if not key or not ids:
+                self._jobs.ack(qname, job, raw)
+                continue
+            try:
+                with self._hold(key, lane) as got:
+                    ran = (self._process_video(
+                        key, ids, int(p.get("cohort", -1) or -1), lane)
+                        if got else False)
+                if not ran:
+                    # Nothing was attempted: another lane holds the video, or
+                    # `claim_for` had already given the rows away. The planner
+                    # re-posts this key so a reel is not left queued when the
+                    # cohort barrier lifts — and only this case re-posts, so a
+                    # video whose passes all failed still costs one attempt.
+                    with self._lock:
+                        self._retry_hint.add(key)
+            except (KeyboardInterrupt, SystemExit):
+                self._jobs.fail(qname, job, raw, "worker stopped")
+                raise
+            except Exception as exc:               # noqa: BLE001
+                # `_process_video` records its own failures in coverage, so
+                # anything reaching here is a bug in the plane rather than in a
+                # pass. Retried three times, then the DLQ — which is why a
+                # non-zero DLQ is worth reading.
+                verdict = self._jobs.fail(qname, job, raw,
+                                          f"{type(exc).__name__}: {exc}")
+                self._log(f"{lane.name} {key}: job {verdict.lower()} — "
+                          f"{type(exc).__name__}: {str(exc)[:160]}", "error")
+                lane.slot = {}
+                continue
+            self._jobs.ack(qname, job, raw)
+
+    def _prep_loop(self, lane: "Lane") -> None:
+        """Stage the next videos' bytes, so no card ever waits on Telegram."""
+        while not self._stopping():
+            self._wait_if_paused()
+            job, raw = self._jobs.claim(jobs.QUEUE_V2_PREP)
+            if not job:
+                continue
+            p = job.get("payload") or {}
+            key = str(p.get("video_key") or "")
+            ids = _known(p.get("components") or [])
+            if not key:
+                self._jobs.ack(jobs.QUEUE_V2_PREP, job, raw)
+                continue
+            ok = False
+            try:
+                with self._hold(key, lane) as got:
+                    if got:
+                        ok = self._prep_video(key, ids, lane)
+            except (KeyboardInterrupt, SystemExit):
+                self._jobs.fail(jobs.QUEUE_V2_PREP, job, raw, "worker stopped")
+                raise
+            except Exception as exc:               # noqa: BLE001
+                self._jobs.fail(jobs.QUEUE_V2_PREP, job, raw,
+                                f"{type(exc).__name__}: {exc}")
+                lane.slot = {}
+                continue
+            self._jobs.ack(jobs.QUEUE_V2_PREP, job, raw)
+            # Dropped from `_prep_posted` whatever happened, so a video the
+            # planner still wants is posted again rather than waiting forever on
+            # a hint that has already been consumed. `_staged` is the positive
+            # answer, and only success writes it.
+            with self._lock:
+                self._prep_posted.discard(key)
+                if ok:
+                    self._staged.add(key)
+                    self._prep_fails.pop(key, None)
+                    tries = 0
+                else:
+                    tries = self._prep_fails[key] = \
+                        self._prep_fails.get(key, 0) + 1
+            # A video that cannot be staged has to stop being a candidate, or the
+            # planner offers it every second and the cohort never drains. Failing
+            # the rows is the honest way to do that: the reason lands in the
+            # coverage table where the matrix shows it, and `revive_failed` gives
+            # it another go next rotation rather than this one.
+            if tries >= PREP_MAX_TRIES and ids:
+                why = f"could not be staged after {tries} attempts"
+                for cid in ids:
+                    lane.cov.fail(key, cid, why)
+                self._bump("failed", len(ids))
+                self._log(f"{key}: {why} — its rows are failed so the cohort "
+                          f"can finish; the next rotation retries them", "warn")
+                with self._lock:
+                    self._prep_fails.pop(key, None)
+
+    def _prep_video(self, key: str, ids: list, lane: "Lane") -> bool:
+        """Get this video's bytes and derived files onto disk. Claims nothing.
+
+        Two jobs, and neither writes evidence — which is what makes prep safe to
+        run for the *next* cohort's videos while this one is still going:
+
+        1. `Source.ensure`, behind the fetch lock. Idempotent, so a video already
+           down costs a `stat`.
+        2. `_ensure_inputs` for each of this cohort's components — the rebuild of
+           `proxy.mp4`, `audio.wav` and the frame tiers that coverage says are
+           `done` but eviction or another worker's shard has left absent. That is
+           45 s of ffmpeg a GPU lane would otherwise pay for at the head of its
+           own pass, and nothing about it needs a claim: `_rebuild` throws the
+           emission away because the store already holds it.
+        """
+        store = lane.store
+        video = store.video(key)
+        if video is None:
+            return False
+        workdir = os.path.join(self.cache_dir, _safe(key))
+        lane.slot = {"video_key": key, "cohort": -1, "component": "prep",
+                     "title": "staging", "since": time.time(), "passes": 0,
+                     "lane": lane.name, "device": -1}
+        try:
+            source = self._fetch(video, workdir)
+        except intake.SourceError as exc:
+            # The same verdict `_process_video` reaches, reached earlier. Marking
+            # the rows failed is what stops the planner posting this video again
+            # every second for the rest of the session.
+            for cid in ids:
+                lane.cov.fail(key, cid, str(exc))
+            self._log(f"{key}: {exc} (staging)", "warn")
+            self._bump("failed", len(ids))
+            lane.slot = {}
+            return False
+        except Exception as exc:                   # noqa: BLE001
+            self._log(f"{key}: staging failed — {type(exc).__name__}: "
+                      f"{str(exc)[:160]}", "warn")
+            lane.slot = {}
+            return False
+        intake.touch(workdir)
+
+        for cid in ids:
+            if self._stopping():
+                break
+            comp = registry.get(cid)
+            if not (set(comp.needs) & {"artifacts", "keyframes", "allframes"}):
+                continue
+            job = Job(video=dict(video), component=comp, store=store,
+                      source=source, workdir=workdir,
+                      params=dict(comp.params), resources=self.resources,
+                      cache=lane.cache,
+                      renew=lambda progress="": None,
+                      progress=lambda d, _l=lane: self._progress(d, _l),
+                      log=lambda m, _l=lane: self._note(m, _l))
+            try:
+                self._ensure_inputs(job, comp)
+            except Exception as exc:               # noqa: BLE001
+                # Never fatal to staging: the pass lane runs `_ensure_inputs`
+                # again for itself and will report the same fault where it can
+                # be attributed to a component.
+                self._log(f"{key}: staging {cid}'s inputs raised "
+                          f"{type(exc).__name__}: {str(exc)[:120]}", "warn")
+        lane.videos += 1
+        lane.slot = {}
+        return True
+
+    def _cloud_loop(self, lane: "Lane") -> None:
+        """The cloud lane, and why it is allowed across the cohort barrier.
+
+        `narrate-cloud` is 25 s of network and no local compute, and topo order
+        puts it after `describe`, `detect` and `ocr` — but position in the plan
+        is not what makes crossing safe. *Checking* is. This lane reads the
+        video's coverage row and hands the components to `_process_video`, whose
+        dependency gate refuses anything whose hard needs are not `done` and
+        defers it for sixty seconds. So the lane can be a cohort behind or a
+        cohort ahead and still never run on an input that does not exist.
+
+        What it buys: a network pass never holds a serial slot again, and a key
+        that is sitting there unused starts contributing from the first video
+        whose description lands.
+        """
+        while not self._stopping():
+            self._wait_if_paused()
+            job, raw = self._jobs.claim(jobs.QUEUE_V2_CLOUD)
+            if not job:
+                continue
+            p = job.get("payload") or {}
+            key = str(p.get("video_key") or "")
+            ids = _known(p.get("components") or [])
+            if not key or not ids:
+                self._jobs.ack(jobs.QUEUE_V2_CLOUD, job, raw)
+                continue
+            try:
+                with self._hold(key, lane) as got:
+                    if got:
+                        self._process_video(key, ids, -1, lane)
+            except (KeyboardInterrupt, SystemExit):
+                self._jobs.fail(jobs.QUEUE_V2_CLOUD, job, raw, "worker stopped")
+                raise
+            except Exception as exc:               # noqa: BLE001
+                self._jobs.fail(jobs.QUEUE_V2_CLOUD, job, raw,
+                                f"{type(exc).__name__}: {exc}")
+                lane.slot = {}
+                continue
+            self._jobs.ack(jobs.QUEUE_V2_CLOUD, job, raw)
 
     # ── the cross-cohort problem ─────────────────────────────────────────
     def _ensure_inputs(self, job: Job, comp) -> None:
@@ -1752,38 +2701,67 @@ class ProcessEngine:
     # Unloading and publishing
     # ══════════════════════════════════════════════════════════════════════
 
-    def _unload(self, why: str = "") -> None:
+    def _unload(self, why: str = "", lane: "Lane | None" = None) -> None:
         """Drop every resident model and say what actually came back.
 
         The reclaimed total is logged against the cohort that held the models,
         because that is the only moment the number is attributable. A leak
         found later — as an OOM in the next cohort — names the wrong pass.
+
+        With no `lane`, every lane's cache plus the sweep's own: that is the
+        cohort boundary, where by construction no lane is mid-pass. With a lane,
+        only that lane's — an OOM on card 0 is not a reason to drop card 1's
+        weights while it is using them.
+
+        "By construction" has one hole, and it is skipped rather than trusted: a
+        cohort that hits `_COHORT_DRAIN_TIMEOUT` moves on with a lane still
+        inside a pass, and freeing that lane's weights from under it is a
+        segfault, not an exception. A busy lane keeps its cache; the next
+        boundary it is idle at collects it.
         """
-        loaded = self._cache.loaded()
-        expected = sum(self._cache.footprints().get(k, 0) for k in loaded)
+        if lane is not None:
+            self._unload_cache(lane.cache, why, lane.name)
+            return
+        for l in list(self._lanes):
+            if l.cache is None:
+                continue
+            if l.busy():
+                held = len(l.cache.loaded())
+                if held:
+                    self._log(f"[{l.name}] still mid-pass — keeping its "
+                              f"{held} resident model(s) until it is idle",
+                              "warn")
+                continue
+            self._unload_cache(l.cache, why, l.name)
+        self._unload_cache(self._cache, why, "")
+
+    def _unload_cache(self, cache: ModelCache, why: str, who: str) -> None:
+        tag = f"[{who}] " if who else ""
+        loaded = cache.loaded()
+        expected = sum(cache.footprints().get(k, 0) for k in loaded)
         before = ModelCache.vram()
-        freed = self._cache.unload_all()
+        freed = cache.unload_all()
         after = ModelCache.vram()
         if not loaded:
             return
 
-        line = (f"Unloaded {len(loaded)} models — {freed} MB reclaimed"
+        line = (f"{tag}Unloaded {len(loaded)} models — {freed} MB reclaimed"
                 + (f" of {expected} MB held" if expected else "")
                 + (f" — {why}" if why else ""))
         self._log(line)
         if after:
-            self._log(f"VRAM now {after.get('allocated', 0)} MB allocated, "
+            self._log(f"{tag}VRAM now {after.get('allocated', 0)} MB allocated, "
                       f"{after.get('free', 0)} MB free of "
                       f"{after.get('total', 0)}; resident: "
-                      f"{', '.join(self._cache.loaded()) or 'nothing'}")
+                      f"{', '.join(cache.loaded()) or 'nothing'}")
         # Still resident after an unload_all means a drop raised and the
         # reference survived. Loud, because the packer's next plan is wrong.
-        if self._cache.loaded():
-            self._log(f"Models still resident after unload: "
-                      f"{', '.join(self._cache.loaded())} — the next cohort "
+        if cache.loaded():
+            self._log(f"{tag}Models still resident after unload: "
+                      f"{', '.join(cache.loaded())} — the next cohort "
                       f"is planned against VRAM that is not free", "error")
         elif expected >= 512 and freed < expected // 2 and before:
-            self._log(f"Only {freed} MB of {expected} MB came back after "
+            self._log(f"{tag}Only {freed} MB of {expected} MB came back after "
                       f"{why or 'unload'} — the next cohort has that much "
                       f"less than the packer assumed", "warn")
 
@@ -2802,20 +3780,62 @@ class ProcessEngine:
         cur = dict(self.current) if self.current else {}
         if cur.get("since"):
             cur["elapsed"] = round(time.time() - cur["since"], 1)
+        lanes = list(self._lanes)
+        rows = [l.as_dict() for l in lanes]
+        with self._lock:
+            self.workers = {r["name"]: r for r in rows}
+        # Every lane's resident set, unioned, plus the sweep's own. Reporting only
+        # `self._cache.loaded()` here was true when there was one cache; with a
+        # cache per card it would report an empty resident set for a run holding
+        # twelve gigabytes of weights, which is exactly the reading that made
+        # "card 1 is idle" invisible for 44 minutes.
+        resident: list = []
+        for cache in [l.cache for l in lanes] + [self._cache]:
+            if cache is None:
+                continue
+            try:
+                for name in cache.loaded():
+                    if name not in resident:
+                        resident.append(name)
+            except Exception:                          # noqa: BLE001
+                pass
+        footprints: dict = {}
+        for cache in [l.cache for l in lanes] + [self._cache]:
+            if cache is None:
+                continue
+            try:
+                footprints.update(cache.footprints())
+            except Exception:                          # noqa: BLE001
+                pass
         return {
             "state": self.state,
             "message": self.message,
             "current": cur,
             "session": dict(self.session),
-            "loaded": self._cache.loaded(),
+            "loaded": resident,
             # What the GPU is actually doing, next to what the packer assumed
             # it would be doing. A leak is visible here as a resident set whose
             # footprints do not add up to the allocated total.
             "models": {
-                "resident": self._cache.loaded(),
-                "footprints_mb": self._cache.footprints(),
+                "resident": resident,
+                "footprints_mb": footprints,
                 "vram": ModelCache.vram(),
                 "failures": self._cache.recent_failures(10),
+            },
+            # One row per lane, and the queue depths behind them. This panel is
+            # how "is everything busy?" stops being a guess: four rows on four
+            # different video keys with non-zero queue depths is the run working,
+            # and a dead-letter count above zero is always a real bug.
+            "workers": rows,
+            "lanes": {
+                "count": len(rows),
+                "busy": sum(1 for r in rows if r["busy"]),
+                "backend": self._jobs.kind,
+                "error": self._lane_error,
+                "inflight": len(self._inflight),
+                "staged": len(self._staged),
+                "queues": self._jobs.metrics() if self._jobs.ready() else {},
+                "dead": self._jobs.dead() if self._jobs.ready() else 0,
             },
             "uptime": (round(time.time() - self.started_at, 1)
                        if self.started_at else 0),

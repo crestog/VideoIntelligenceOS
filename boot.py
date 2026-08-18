@@ -254,9 +254,15 @@ if is_fresh_session:
 else:
     print("🔄 [SYSTEM] Phase 3: Crash Recovery — same session, checking orphaned jobs...", flush=True)
     try:
-        from queue_manager import recover_processing_jobs, get_queue_metrics
+        from queue_manager import recover_processing_jobs, get_queue_metrics, V2_QUEUES
         recovered = 0
-        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"):
+        # The v1 lanes plus the v2 processing plane's four. A v2 GPU worker that
+        # dies holding a job — the correct response to an unrecoverable CUDA
+        # fault — leaves that video's cohort slice in PROCESSING, and without
+        # recovery it is never re-offered. The row's lease expiry would free it
+        # eventually; recovering the hint means the next worker takes it now.
+        for _q in ("QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_OMNI_VISION",
+                   "QUEUE_OMNI_ORACLE", *V2_QUEUES):
             recovered += recover_processing_jobs(_q)
         if recovered > 0:
             print(f"   🔄 Recovered {recovered} orphaned job(s) from PROCESSING → DEFAULT queue.", flush=True)
