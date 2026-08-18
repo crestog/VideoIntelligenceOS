@@ -50,7 +50,9 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
+from urllib.error import HTTPError
 
 # name → (env var / secret label, human description)
 FIELDS = {
@@ -147,18 +149,58 @@ NO_ACCESS = "no-access"        # 401/403 — a token is present and was refused
 UNREACHABLE = "unreachable"    # URLError, or the client's own 40 s timeout
 BACKEND = "backend"            # anything else the proxy said
 
-# Failures where every remaining label would fail identically. The client's
-# per-call timeout is 40 seconds and a full sweep is two dozen calls, so carrying
-# on past one of these costs a quarter-hour of silent boot to learn what is
-# already known. A BACKEND is not in here, because one of those says something
-# about one row rather than about the connection — but a *run* of them says the
-# opposite, so `_BACKEND_RUN` bounds that case instead of trusting it.
-_FATAL = (NO_TOKEN, NO_ACCESS, UNREACHABLE)
+# The one failure where every remaining label would fail identically *and* the
+# fact is provable without asking: the session token is not in this process, so
+# the store was never reachable in the first place.
+#
+# UNREACHABLE used to be in here, and that single entry cost this module the very
+# thing it exists for. Kaggle's own client reports every HTTP status — 401, 403,
+# 404, 500 — with the sentence "Connection error trying to communicate with
+# service", because in `kaggle_web_client.make_post_request` the
+# `except (URLError, socket.timeout)` clause is written *above* the `except
+# HTTPError` one, and HTTPError is a subclass of URLError. So the HTTPError
+# branch is unreachable code and "this row does not exist" arrives wearing the
+# clothes of "the network is down". One strike was fatal, the first label asked
+# is VIOS_BOT_TOKEN, and a user who had stored thirteen secrets under the
+# TELEGRAM_* and VIOS_TELEGRAM_* spellings had their sweep end after that one
+# label — twelve rows that were sitting right there were never asked for, and
+# the boot log told them to turn on the internet they were plainly using.
+#
+# `_http_status` now digs the status code out of `__cause__`, so a 404 is read as
+# what it is. What remains genuinely worth abandoning a sweep for is a *run* of
+# transport failures with no status code behind them, because those are the only
+# ones that cost 40 seconds each.
+_FATAL = (NO_TOKEN,)
 
 # How many consecutive BACKEND failures, with nothing found yet, before the
 # sweep stops believing they are about individual rows. Three costs two minutes
 # at worst; twenty-four costs sixteen.
 _BACKEND_RUN = 3
+
+# How many consecutive genuine transport failures — no HTTP status anywhere in
+# the chain — before the sweep gives up. Two, because each one is two 40-second
+# waits and the second says nothing the first did not; but two rather than one,
+# because a single blip must never again cost a twelve-hour session its
+# credentials.
+_UNREACHABLE_RUN = 2
+
+# A 401 or 403 is not fatal either, though it looks session-wide. Kaggle answers
+# a row that exists but is not switched on for *this* notebook the same way it
+# answers a stale token, and the toggle case is per-label — so the sweep keeps
+# going (an HTTP error costs no timeout) and `kaggle_advice` decides afterwards,
+# from how many labels were refused versus answered, which of the two it was.
+_REFUSED = (401, 403)
+
+# Statuses whose meaning is settled by the number, so the error body is never
+# read: 401/403 is "refused", 404 is "no such row". Anything else — a 400, a 500 —
+# is a status VIOS has no rule for, and there the body is the only thing that
+# might say which row or what went wrong.
+_CODE_IS_ENOUGH = _REFUSED + (404,)
+
+# How far to walk `__cause__`/`__context__` looking for the real exception.
+# Kaggle wraps once; this allows for a wrapper of a wrapper without ever risking
+# a cycle.
+_CHAIN = 6
 
 # The credentials whose absence stops something whole rather than one feature.
 # These four gate the channel, and the channel is where every bundle lives — so
@@ -206,30 +248,108 @@ def on_kaggle() -> bool:
 _KAGGLE_CACHE: dict = {}
 
 
-def _classify(exc) -> tuple:
-    """(reason, text) for one failed lookup.
+def _http_status(exc) -> tuple:
+    """(code, body) for the HTTPError buried under Kaggle's ConnectionError.
 
-    A reason of `""` means the proxy answered cleanly that this label is not
-    attached, which is not a failure and must not stop the sweep. Kaggle has no
-    exception type for that case — `get_secret` raises `BackendError` whose args
-    carry "No user secrets exist", and the only place Kaggle itself tells the two
-    apart is by searching for that string — so this does the same, plus
-    "not found" as a second spelling in case the wording moves.
+    The load-bearing function in this file. `kaggle_secrets` cannot tell a
+    missing row from a dead network — see the note above `_FATAL` for why — but
+    it does re-raise `from e`, so the HTTPError is still hanging on `__cause__`
+    with its status code intact. Reading it back is the difference between "no
+    such secret, ask about the next one" and "the internet is off, stop".
+
+    `(0, "")` when there is no HTTPError in the chain, which is the one case that
+    really is a transport failure.
+    """
+    cur, seen = exc, 0
+    while cur is not None and seen < _CHAIN:
+        if isinstance(cur, HTTPError):
+            code = 0
+            try:
+                code = int(getattr(cur, "code", 0) or 0)
+            except (TypeError, ValueError):
+                code = 0
+            # The body is only consulted for statuses the code alone does not
+            # settle. Reading it means reading from the socket urlopen left open,
+            # and while its 40-second timeout bounds that, spending it is
+            # pointless for a 404 — which already says everything a 404 can say.
+            if code and code in _CODE_IS_ENOUGH:
+                return code, str(getattr(cur, "reason", "") or "").strip()
+            body = ""
+            try:
+                # Kaggle never reads the error body, so it is usually still
+                # there — and it is where "No user secrets exist for kernel id
+                # …" is written. Capped, and never trusted to exist.
+                raw = cur.read(2000)
+                body = (raw.decode("utf-8", "replace")
+                        if isinstance(raw, (bytes, bytearray)) else str(raw))
+            except Exception:                                # noqa: BLE001
+                body = str(getattr(cur, "reason", "") or "")
+            return code, body.strip()
+        seen += 1
+        cur = cur.__cause__ or cur.__context__
+    return 0, ""
+
+
+def _is_timeout(exc) -> bool:
+    """Whether a real socket timeout is anywhere under this exception."""
+    cur, seen = exc, 0
+    while cur is not None and seen < _CHAIN:
+        if isinstance(cur, (socket.timeout, TimeoutError)):
+            return True
+        if isinstance(getattr(cur, "reason", None),
+                      (socket.timeout, TimeoutError)):
+            return True
+        seen += 1
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _code_tally(report: dict) -> dict:
+    """{http status: how many labels got it}, for the log and the Setup page."""
+    tally: dict = {}
+    for code in (report.get("codes") or {}).values():
+        tally[code] = tally.get(code, 0) + 1
+    return tally
+
+
+def _classify(exc) -> tuple:
+    """(reason, text, http_code) for one failed lookup.
+
+    A reason of `""` means the store answered cleanly that this label is not
+    attached, which is not a failure and must not stop the sweep. Kaggle has two
+    ways of saying it and neither is an exception type of its own: on some
+    backends `get_secret` raises `BackendError` whose args carry "No user secrets
+    exist", and on others the proxy returns an HTTP 404 that arrives here
+    disguised as a connection error. Both are read as "not stored".
+
+    The status code is returned as well as consumed, so the report can say
+    "HTTP 404 ×24" — which is the sentence that would have ended this bug in a
+    minute rather than a session.
     """
     name = type(exc).__name__
     text = (str(exc) or str(getattr(exc, "args", "")) or name).strip()
     low = (text + " " + str(getattr(exc, "args", ""))).lower()
-    if name == "NotFoundError" or "no user secrets exist" in low \
-            or "not found" in low:
-        return "", text
+
+    code, body = _http_status(exc)
+    if code:
+        blow = body.lower()
+        detail = f"HTTP {code} — {body[:120] if body else text}"
+        if code in _REFUSED:
+            return NO_ACCESS, detail, code
+        if code == 404 or "no user secret" in blow or "not found" in blow:
+            return "", detail, code
+        return BACKEND, detail, code
+
+    if name == "NotFoundError" or "no user secret" in low or "not found" in low:
+        return "", text, 0
     if name == "CredentialError":
         # Present and refused, or never there at all. Same exception, opposite
         # remedy: restart the session, versus fix how boot.py was started.
         return (NO_ACCESS if os.environ.get(KAGGLE_TOKEN_VAR)
-                else NO_TOKEN), text
-    if name == "ConnectionError" or "timeout" in low:
-        return UNREACHABLE, text
-    return BACKEND, text
+                else NO_TOKEN), text, 0
+    if name == "ConnectionError" or "timeout" in low or _is_timeout(exc):
+        return UNREACHABLE, text, 0
+    return BACKEND, text, 0
 
 
 def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
@@ -245,6 +365,7 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
          "found":   [label, …]  the ones it answered with a value,
          "absent":  [label, …]  the ones it said are not attached,
          "broken":  [(label, text), …]  the ones that failed some other way,
+         "codes":   {label: http status}  every status code seen, error or not,
          "token":   whether the session token variable is set — presence only,
          "run_type": KAGGLE_KERNEL_RUN_TYPE, for the log}
 
@@ -260,6 +381,11 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
     disabled Telegram for a twelve-hour session and blamed the user for not
     storing what they had stored.
 
+    Nor does one failed label end the sweep any more. It did, and because the
+    first label asked is `VIOS_BOT_TOKEN` — a name nobody has to use, since three
+    aliases are accepted — a store holding thirteen secrets under the other
+    spellings was declared unreadable after a single question. See `_FATAL`.
+
     `skip` names fields already satisfied from a higher-priority source. An
     explicit export outranks a stored secret anyway, so asking about one is a
     call with a 40-second timeout whose answer is discarded.
@@ -270,6 +396,7 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
 
     report = {"values": {}, "reason": "", "detail": "",
               "asked": [], "found": [], "absent": [], "broken": [],
+              "codes": {},
               # Presence only, never the value: it is a bearer JWT. Recorded
               # even on the paths that never reach the proxy, because it is the
               # single bit that separates "no token here" from "token refused",
@@ -277,7 +404,7 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
               "token": bool(os.environ.get(KAGGLE_TOKEN_VAR, "").strip()),
               "run_type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "")}
     stop: set = set()          # a reason that makes the remaining labels moot
-    run: list = []             # consecutive BACKEND failures, nothing found yet
+    runs = {UNREACHABLE: 0, BACKEND: 0}   # consecutive failures, by kind
 
     def done() -> dict:
         _KAGGLE_CACHE[key] = report
@@ -303,11 +430,15 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
             try:
                 val = client.get_secret(label)
             except Exception as exc:                         # noqa: BLE001
-                reason, text = _classify(exc)
+                reason, text, code = _classify(exc)
+                if code:
+                    report["codes"][label] = code
                 if reason == UNREACHABLE and attempt == 0:
                     # The proxy is genuinely flaky, and the cost of believing it
                     # the first time is a whole session with no Telegram. One
-                    # retry, then take the answer.
+                    # retry, then take the answer. Only reached when there was no
+                    # HTTP status behind the error — a 404 is an answer, and
+                    # asking it twice is 1.5 s spent to hear it again.
                     time.sleep(1.5)
                     continue
                 return "", reason, text
@@ -322,19 +453,33 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
             report["broken"].append((label, text[:200]))
             if reason in _FATAL:
                 stop.add(reason)
+            elif reason == UNREACHABLE:
+                # No status code anywhere in the chain, so this one really is the
+                # transport — and the only failure that costs two 40-second waits
+                # per label. A run of them is worth abandoning the sweep for; the
+                # first of them never was.
+                runs[UNREACHABLE] += 1
+                runs[BACKEND] = 0
+                if runs[UNREACHABLE] >= _UNREACHABLE_RUN:
+                    stop.add(UNREACHABLE)
             elif reason == BACKEND and not report["found"]:
                 # A bad row, or a bad connection wearing a row's clothing. The
                 # run length is what tells them apart, and it is cheaper to
                 # decide after three than to pay for twenty-four.
-                run.append(label)
-                if len(run) >= _BACKEND_RUN:
+                runs[BACKEND] += 1
+                runs[UNREACHABLE] = 0
+                if runs[BACKEND] >= _BACKEND_RUN:
                     stop.add(BACKEND)
+            # NO_ACCESS deliberately falls through: an HTTP 401/403 costs no
+            # timeout, and it is per-label whenever the cause is a row that
+            # exists but is not switched on for this notebook. Stopping here
+            # would turn one un-toggled row into a session with no credentials.
         elif val:
             report["found"].append(label)
-            run.clear()
+            runs[UNREACHABLE] = runs[BACKEND] = 0
         else:
             report["absent"].append(label)
-            run.clear()
+            runs[UNREACHABLE] = runs[BACKEND] = 0
         return val
 
     for name in FIELDS:
@@ -406,6 +551,8 @@ def kaggle_advice(report: dict) -> list:
     reason = report.get("reason") or ""
     absent = list(report.get("absent") or ())
     broken = list(report.get("broken") or ())
+    codes = dict(report.get("codes") or {})
+    asked = list(report.get("asked") or ())
     out = []
     if reason == NO_MODULE:
         out.append("Not a Kaggle session — `kaggle_secrets` will not import "
@@ -423,17 +570,33 @@ def kaggle_advice(report: dict) -> list:
             "inherited, not global.",
         ]
     elif reason == NO_ACCESS:
-        out += [
-            "Kaggle refused this session's token (401/403). A token is "
-            "present, so the secrets are not missing — the token is stale.",
-            "That is exactly what a session started *before* the secrets were "
-            "attached looks like: attaching does not reach a kernel that is "
-            "already running. Restart the session and re-run the launch cell.",
-        ]
+        refused = sorted(lbl for lbl, c in codes.items() if c in _REFUSED)
+        answered = len(report.get("found") or ()) + len(absent)
+        if refused and answered:
+            # Some labels answered and others were refused, which a stale token
+            # cannot do — a token is either good for the session or good for
+            # none of it. What is per-row is the notebook toggle.
+            out += [
+                f"Kaggle answered for {answered} label(s) and refused "
+                f"{len(refused)}: " + ", ".join(refused[:6])
+                + ". A refusal for some rows and not others is the per-notebook "
+                "switch, not the session token.",
+                "In Add-ons → Secrets, switch those rows on for THIS notebook, "
+                "then restart the session.",
+            ]
+        else:
+            out += [
+                "Kaggle refused this session's token (401/403). A token is "
+                "present, so the secrets are not missing — the token is stale.",
+                "That is exactly what a session started *before* the secrets were "
+                "attached looks like: attaching does not reach a kernel that is "
+                "already running. Restart the session and re-run the launch cell.",
+            ]
     elif reason == UNREACHABLE:
         out += [
-            "The Kaggle secrets proxy did not answer, twice. Secrets are read "
-            "over HTTPS, so Internet must be on for the notebook "
+            "The Kaggle secrets proxy did not answer, twice, and there was no "
+            "HTTP status behind it — so this one is the transport. Secrets are "
+            "read over HTTPS, so Internet must be on for the notebook "
             "(Settings → Internet).",
         ]
     elif reason == BACKEND:
@@ -475,6 +638,19 @@ def kaggle_advice(report: dict) -> list:
         elif optional:
             out.append("Kaggle answered. Not stored, each disabling only its "
                        "own feature: " + ", ".join(optional) + ".")
+    if codes:
+        # The line that would have ended the worst version of this bug in a
+        # minute. `kaggle_secrets` prints "Connection error trying to communicate
+        # with service" for a 404 and for a dead network alike, so the status
+        # codes are the only honest evidence about which happened — and until
+        # they were dug out of `__cause__` nothing in the log had them.
+        tally: dict = _code_tally(report)
+        out.append(
+            "Status from the store: "
+            + ", ".join(f"HTTP {c} ×{n}" for c, n in sorted(tally.items()))
+            + f" over {len(asked)} label(s). Kaggle's client reports every one "
+            "of these as \"Connection error trying to communicate with "
+            "service\", so that wording is not evidence about your network.")
     if broken and reason != NO_MODULE:
         out.append("Failed for another reason: "
                    + "; ".join(f"{lbl} — {txt}" for lbl, txt in broken[:3]))
@@ -653,6 +829,7 @@ def describe(typed: dict | None = None) -> dict:
         "kaggle_token": report["token"],
         "kaggle_asked": len(report["asked"]),
         "kaggle_found": len(report["found"]),
+        "kaggle_codes": _code_tally(report),
         "kaggle_advice": kaggle_advice(report),
         "local_file": local_path(),
         "local_file_present": os.path.isfile(local_path()),
@@ -698,3 +875,41 @@ def forget_local() -> dict:
         os.remove(path)
         return {"removed": True, "path": path}
     return {"removed": False, "path": path}
+
+
+# ── the probe ─────────────────────────────────────────────────────────────
+# `python -m vios.creds`, from the same notebook cell that runs boot.py.
+#
+# Phase 0 prints a summary, and a summary is the wrong instrument when the
+# question is "which of my rows did the store actually answer for". This prints
+# one line per label with the HTTP status beside it, which is the fact that was
+# missing while a masked 404 was being read as a dead network.
+#
+# It prints names and statuses. It never prints a value, and it never prints the
+# session token — the same rule as everything else in this file, because a
+# notebook log is a thing people paste into issues.
+if __name__ == "__main__":
+    _rep = read_kaggle(force=True)
+    print(f"on_kaggle={on_kaggle()}  {KAGGLE_TOKEN_VAR}="
+          f"{'present' if _rep['token'] else 'ABSENT'}  "
+          f"run_type={_rep['run_type'] or 'unset'}")
+    print(f"asked={len(_rep['asked'])}  found={len(_rep['found'])}  "
+          f"not-stored={len(_rep['absent'])}  failed={len(_rep['broken'])}  "
+          f"reason={_rep['reason'] or '(none — the store answered)'}")
+    _tally = _code_tally(_rep)
+    if _tally:
+        print("status codes: "
+              + ", ".join(f"HTTP {c} ×{n}" for c, n in sorted(_tally.items())))
+    _why = dict(_rep["broken"])
+    for _label in _rep["asked"]:
+        if _label in _rep["found"]:
+            _state = "STORED (value not printed)"
+        elif _label in _rep["absent"]:
+            _state = "not stored"
+        else:
+            _state = "FAILED — " + _why.get(_label, "")
+        _code = _rep["codes"].get(_label)
+        print(f"   {_label:<26} {_state}"
+              + (f"   [HTTP {_code}]" if _code else ""))
+    for _line in kaggle_advice(_rep):
+        print(f"   {_line}")

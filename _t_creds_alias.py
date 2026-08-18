@@ -12,9 +12,20 @@ the log described all five as "already set, or none stored". Each cause is
 exercised here, because the only thing that distinguishes them is code that has
 to keep working.
 
+The third half — `_raise_masked` and everything below it — is the one that
+actually bit. Kaggle's own client reports every HTTP status as
+"Connection error trying to communicate with service", because in
+`kaggle_web_client.make_post_request` the `except (URLError, socket.timeout)`
+clause sits above the `except HTTPError` one and HTTPError subclasses URLError.
+So "there is no row called VIOS_BOT_TOKEN" arrives looking exactly like "the
+internet is off" — and since VIOS_BOT_TOKEN is the first label asked and one
+unreachable used to be fatal, a store holding thirteen secrets was declared
+unreadable after a single question, with twelve of those rows never asked for.
+
 Values here are obvious fakes. Nothing real is ever hardcoded in this repo.
 """
-import os, sys, types
+import io, os, sys, types
+from urllib.error import HTTPError
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -40,6 +51,26 @@ class CredentialError(Exception): pass
 class BackendError(Exception): pass
 class ValidationError(Exception): pass
 class ConnectionError(Exception): pass  # noqa: A001 — mirrors Kaggle exactly
+
+
+_ENDPOINT = "https://www.kaggle.com/requests/GetUserSecretByLabelRequest"
+
+
+def _raise_masked(code, body=b"", msg="error"):
+    """Fail the way Kaggle really fails: an HTTP status wearing a network error.
+
+    `make_post_request` catches URLError before HTTPError, so it re-raises every
+    status — 401, 403, 404, 500 — as this one ConnectionError sentence. `from`
+    is what saves it: the HTTPError stays on `__cause__`, which is where
+    `creds._http_status` goes looking for the code.
+    """
+    http = HTTPError(_ENDPOINT, code, msg, {}, io.BytesIO(body))
+    raise ConnectionError(
+        "Connection error trying to communicate with service.") from http
+
+
+_NO_ROW = b'{"wasSuccessful":false,"errors":[{"message":' \
+          b'"No user secrets exist for kernel id 1234567"}]}'
 
 
 class _Client:
@@ -177,6 +208,10 @@ def _check(title, client_factory, expect, token=True, asked=None, values=None):
     print(f"   asked   : {len(rep['asked'])} labels   "
           f"found={len(rep['found'])} absent={len(rep['absent'])} "
           f"broken={len(rep['broken'])}   token={rep['token']}")
+    tally = creds._code_tally(rep)
+    if tally:
+        print("   status  : "
+              + ", ".join(f"HTTP {c} ×{n}" for c, n in sorted(tally.items())))
     for line in advice:
         print(f"     - {line[:100]}")
     assert rep["reason"] == expect, (title, rep["reason"], expect)
@@ -219,9 +254,11 @@ _nak = _check("token present and refused (401/403)",
               expect=creds.NO_ACCESS, token=True, asked=0)
 assert any("restart" in line.lower() for line in creds.kaggle_advice(_nak))
 
-# The proxy did not answer. Retried once, then the whole sweep aborts: at 40 s
-# per call, believing thirteen of these costs most of nine minutes of silent
-# boot to learn what the first one already said.
+# The proxy did not answer, and no HTTP status is hiding underneath — the one
+# case that really is the transport. Retried once per label, then abandoned after
+# a run of two: at 40 s per call, believing a dozen of these costs most of nine
+# minutes of silent boot. Two rather than one, because one used to be fatal and
+# that is what cost a session with thirteen secrets all of them.
 _calls = []
 
 
@@ -231,9 +268,12 @@ class _Dead:
         raise ConnectionError("timed out talking to the secrets proxy")
 
 
-_unr = _check("proxy unreachable", _Dead, expect=creds.UNREACHABLE, asked=1)
-assert len(_calls) == 2, f"expected one retry, got {len(_calls)} calls"
-assert len(_unr["broken"]) == 1, _unr["broken"]
+_unr = _check("proxy unreachable", _Dead, expect=creds.UNREACHABLE,
+              asked=creds._UNREACHABLE_RUN)
+assert len(_calls) == 2 * creds._UNREACHABLE_RUN, \
+    f"expected one retry per label, got {len(_calls)} calls"
+assert len(_unr["broken"]) == creds._UNREACHABLE_RUN, _unr["broken"]
+assert not creds._code_tally(_unr), "a transport failure has no status code"
 
 # And the reason that retry exists: one blip used to disable Telegram for a
 # twelve-hour session, because a transient failure and an absent secret were
@@ -255,6 +295,70 @@ _ok = _check("one transient blip, then the proxy answers", _Flaky, expect="")
 assert set(_ok["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
                              "VIOS_NIM_API_KEY"}, sorted(_ok["values"])
 print("   recovered: the blip cost a retry, not the session")
+
+
+# ── the session in the bug report ─────────────────────────────────────────
+# Thirteen rows stored, none of them under a name creds asks for *first*, and a
+# store that answers a missing label with an HTTP 404 masked as a connection
+# error. Every credential is there; the old sweep saw one "connection error" on
+# VIOS_BOT_TOKEN, called the store unreachable, and stopped — so the log advised
+# turning on the internet that had just finished installing 200 MB of wheels.
+class _MaskedNotFound:
+    def get_secret(self, label):
+        if label not in STORE:
+            _raise_masked(404, _NO_ROW, msg="Not Found")
+        return STORE[label]
+
+
+_mask = _check("a missing row arrives as \"Connection error\" (HTTP 404)",
+               _MaskedNotFound, expect="")
+assert set(_mask["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
+                                "VIOS_NIM_API_KEY"}, sorted(_mask["values"])
+assert len(_mask["asked"]) > 12, \
+    f"the sweep stopped early again: {_mask['asked']}"
+assert not _mask["broken"], \
+    f"a 404 is an answer, not a failure: {_mask['broken']}"
+assert creds._code_tally(_mask).get(404), "the status code was not recovered"
+print("   404 read as \"no such row\": the sweep carried on and found all four")
+
+# The same masking over a stale token. Nothing can be read, and the remedy is a
+# restart — but it must not be described as a network fault, and every label is
+# still asked because an HTTP error costs no timeout.
+class _MaskedRefused:
+    def get_secret(self, label):
+        _raise_masked(401, b"", msg="Unauthorized")
+
+
+_ref = _check("a stale token arrives the same way (HTTP 401)", _MaskedRefused,
+              expect=creds.NO_ACCESS)
+assert len(_ref["asked"]) > 12, _ref["asked"]
+assert creds._code_tally(_ref) == {401: len(_ref["asked"])}, \
+    creds._code_tally(_ref)
+_adv = " ".join(creds.kaggle_advice(_ref)).lower()
+assert "restart" in _adv, _adv
+assert "internet" not in _adv, f"blamed the network for a 401: {_adv}"
+
+# And a 403 on some rows while others answer, which a stale token cannot do: a
+# row that exists but is not switched on for this notebook. Per-label, so the
+# sweep must keep going — the lower aliases still resolve every credential.
+class _NotSharedWithNotebook:
+    def get_secret(self, label):
+        if label.startswith("VIOS_TELEGRAM_"):
+            _raise_masked(403, b"", msg="Forbidden")
+        if label not in STORE:
+            _raise_masked(404, _NO_ROW, msg="Not Found")
+        return STORE[label]
+
+
+_tog = _check("some rows not shared with this notebook (HTTP 403)",
+              _NotSharedWithNotebook, expect=creds.NO_ACCESS)
+assert set(_tog["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
+                               "VIOS_NIM_API_KEY"}, sorted(_tog["values"])
+assert _tog["values"]["bot_token"] == STORE["TELEGRAM_BOT_TOKEN"], \
+    "the un-shared alias should have fallen through to the shared one"
+_adv = " ".join(creds.kaggle_advice(_tog)).lower()
+assert "this notebook" in _adv, _adv
+print("   the four credentials still came back, from the aliases that answered")
 
 # Anything else the backend said, carried through verbatim rather than reduced
 # to an empty dict — and abandoned after three consecutive failures, because at

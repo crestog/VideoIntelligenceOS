@@ -62,10 +62,55 @@ they have five different remedies and used to share one misleading sentence:
 | Phase 0 says | What it means | What to do |
 |---|---|---|
 | `Kaggle answered, and none of the N names … is stored` | The store works and is empty | Check the row exists **and its toggle is on for this notebook**, then restart the session |
-| `unreadable [no-access]` | A token is present and Kaggle refused it — stale | Restart the session. This is what "attached after the kernel started" looks like |
+| `unreadable [no-access]` | Kaggle answered HTTP 401/403. If it refused *every* label the token is stale; if it refused some and answered others, those rows are not shared with this notebook | Restart the session, or switch the named rows on for this notebook. This is what "attached after the kernel started" looks like |
 | `unreadable [no-token]` | `KAGGLE_USER_SECRETS_TOKEN` is not in this process at all | Run `boot.py` from a notebook cell, not a Terminal or `nohup`; the variable is inherited, not global |
-| `unreachable` | The secrets proxy did not answer, twice | Settings → Internet → On |
+| `unreachable` | No answer and **no HTTP status behind it** — this one really is the transport | Settings → Internet → On |
 | `partly unreadable [backend]` | Some rows read, at least one errored | The named labels only; the rest are present |
+
+Under any failure there is also a `Status from the store: HTTP … ×N` line, and it
+matters more than the wording above it. Kaggle's own client cannot tell a missing
+row from a dead network: in `kaggle_web_client.make_post_request` the
+`except (URLError, socket.timeout)` clause sits above `except HTTPError`, and
+`HTTPError` is a subclass of `URLError`, so **every** HTTP status — 401, 403, 404,
+500 — is re-raised as the sentence *"Connection error trying to communicate with
+service."* Phase 0 digs the real code back out of `__cause__` and prints it, and
+never again treats one masked 404 as proof the internet is off.
+
+That mattered because the first label asked is `VIOS_BOT_TOKEN`, which nobody has
+to use — three aliases are accepted. A store holding thirteen secrets under the
+`TELEGRAM_*` and `VIOS_TELEGRAM_*` spellings answered "no such row" for it, the
+answer arrived disguised as a network fault, one of those used to end the sweep,
+and twelve rows that were sitting right there were never asked for.
+
+To see the whole store one label at a time, in the same notebook, run:
+
+```python
+!python -m vios.creds
+```
+
+That prints every name asked, whether it is stored, and the HTTP status beside
+it. Names and statuses only — never a value, never the session token.
+
+If it says the transport is down even though downloads in the same session work,
+hand the values across the process boundary yourself. This reads them from the
+store, so nothing is typed into the notebook, and `boot.py` in a later cell
+inherits them and skips its own sweep:
+
+```python
+import os
+from kaggle_secrets import UserSecretsClient
+_s = UserSecretsClient()
+for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_ID", "TELEGRAM_API_ID",
+           "TELEGRAM_API_HASH", "VIOS_HF_TOKEN", "VIOS_NIM_API_KEY"):
+    try:
+        os.environ[_k] = _s.get_secret(_k)
+        print(_k, "→ ok")
+    except Exception as _e:
+        print(_k, "→", type(_e).__name__, _e)
+```
+
+The names there are the ones you actually stored; every spelling in the table
+above works, because the environment is source #3 and the bridge normalises it.
 
 The line under a failure — `session: KAGGLE_USER_SECRETS_TOKEN=present/ABSENT …`
 — reports presence, never the token. `⚠️ [SECRETS] Telegram disabled — not set: …`
