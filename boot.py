@@ -89,6 +89,19 @@ try:
     if _relevant:
         for _line in _creds.kaggle_advice(_report):
             print(f"      {_line}", flush=True)
+
+    # The answer, handed to every process started below. Each of them — the web
+    # server, both v2 engines inside it, every worker — calls resolve() in a
+    # process whose own cache is empty, and each used to sweep the store again
+    # for values that are already in this environment. Two or three sweeps per
+    # boot, against a store that counts reads per account, is how a session with
+    # thirteen good rows ends up hearing HTTP 429.
+    #
+    # Set here rather than by the sweep itself, and so only for the children of
+    # this process, which die when it does. A verdict cached in the notebook
+    # kernel would outlive the minute a rate limit takes to clear, and re-running
+    # this cell is the remedy for that.
+    _creds.mark_swept(_report)
 except Exception as _e:
     print(f"   ⚠️ Kaggle Secrets unavailable: {type(_e).__name__}: {_e}",
           flush=True)

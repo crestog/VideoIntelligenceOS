@@ -22,6 +22,14 @@ internet is off" — and since VIOS_BOT_TOKEN is the first label asked and one
 unreachable used to be fatal, a store holding thirteen secrets was declared
 unreadable after a single question, with twelve of those rows never asked for.
 
+The fourth is the session after that one, where the store answered HTTP 429
+"Too many requests" instead. Kaggle counts secret reads per account, a sweep is
+a dozen of them, and re-running the boot cell a few times is enough to run the
+count out. That is a wait, not an error, and it was being reported as an error
+with no remedy — so the cases below pin down that a throttle is retried on the
+same label, bounded in both seconds and calls, and that the advice says "wait"
+rather than anything about the network, the rows or a restart.
+
 Values here are obvious fakes. Nothing real is ever hardcoded in this repo.
 """
 import io, os, sys, types
@@ -56,21 +64,25 @@ class ConnectionError(Exception): pass  # noqa: A001 — mirrors Kaggle exactly
 _ENDPOINT = "https://www.kaggle.com/requests/GetUserSecretByLabelRequest"
 
 
-def _raise_masked(code, body=b"", msg="error"):
+def _raise_masked(code, body=b"", msg="error", hdrs=None):
     """Fail the way Kaggle really fails: an HTTP status wearing a network error.
 
     `make_post_request` catches URLError before HTTPError, so it re-raises every
-    status — 401, 403, 404, 500 — as this one ConnectionError sentence. `from`
-    is what saves it: the HTTPError stays on `__cause__`, which is where
-    `creds._http_status` goes looking for the code.
+    status — 401, 403, 404, 429, 500 — as this one ConnectionError sentence.
+    `from` is what saves it: the HTTPError stays on `__cause__`, which is where
+    `creds._http_status` goes looking for the code, the body and Retry-After.
     """
-    http = HTTPError(_ENDPOINT, code, msg, {}, io.BytesIO(body))
+    http = HTTPError(_ENDPOINT, code, msg, hdrs or {}, io.BytesIO(body))
     raise ConnectionError(
         "Connection error trying to communicate with service.") from http
 
 
 _NO_ROW = b'{"wasSuccessful":false,"errors":[{"message":' \
           b'"No user secrets exist for kernel id 1234567"}]}'
+
+# Verbatim from the boot log that prompted this half of the file.
+_TOO_MANY = b'{"errors":["Too many requests"],"error":{"code":8},' \
+            b'"wasSuccessful":false}'
 
 
 class _Client:
@@ -97,6 +109,20 @@ for k in list(os.environ):
         del os.environ[k]
 
 from vios import creds
+
+# Every wait creds asks for, recorded instead of taken. There are three of them
+# now — the pacing gap between calls, the retry after a dropped connection, and
+# the backoff for a 429 — and a test that actually slept through them would take
+# minutes to prove something about seconds.
+SLEPT = []
+
+
+def _no_sleep(mod):
+    mod.time = types.SimpleNamespace(sleep=SLEPT.append)
+    return mod
+
+
+_no_sleep(creds)
 
 print("== what the bridge asks Kaggle for ==")
 got = creds._from_kaggle()
@@ -195,7 +221,8 @@ def _fresh(client_factory, token=True):
         m.UserSecretsClient = client_factory
         sys.modules["kaggle_secrets"] = m
     importlib.reload(creds)
-    return creds
+    SLEPT.clear()
+    return _no_sleep(creds)
 
 
 def _check(title, client_factory, expect, token=True, asked=None, values=None):
@@ -212,6 +239,9 @@ def _check(title, client_factory, expect, token=True, asked=None, values=None):
     if tally:
         print("   status  : "
               + ", ".join(f"HTTP {c} ×{n}" for c, n in sorted(tally.items())))
+    if rep["throttled"]:
+        print(f"   throttle: {rep['throttled']} × HTTP 429, "
+              f"waited {rep['waited']:g}s of a {creds._RATE_BUDGET:g}s budget")
     for line in advice:
         print(f"     - {line[:100]}")
     assert rep["reason"] == expect, (title, rep["reason"], expect)
@@ -314,7 +344,7 @@ _mask = _check("a missing row arrives as \"Connection error\" (HTTP 404)",
                _MaskedNotFound, expect="")
 assert set(_mask["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
                                 "VIOS_NIM_API_KEY"}, sorted(_mask["values"])
-assert len(_mask["asked"]) > 12, \
+assert len(_mask["asked"]) > 8, \
     f"the sweep stopped early again: {_mask['asked']}"
 assert not _mask["broken"], \
     f"a 404 is an answer, not a failure: {_mask['broken']}"
@@ -360,6 +390,108 @@ _adv = " ".join(creds.kaggle_advice(_tog)).lower()
 assert "this notebook" in _adv, _adv
 print("   the four credentials still came back, from the aliases that answered")
 
+
+# ── the throttle ──────────────────────────────────────────────────────────
+# The next session in the same bug report. Internet on, token present, thirteen
+# rows attached, and the store answered every call with HTTP 429 "Too many
+# requests" — a count Kaggle keeps per *account*, run up by sweeping the store
+# once per boot and then re-running the boot. It landed in BACKEND, which stops
+# after three and offers no remedy, so a limit that clears itself in a minute
+# disabled Telegram for a twelve-hour session and the log called it an error
+# instead of a wait.
+class _Throttled:
+    """Throttles the first two calls, then behaves. The common case."""
+
+    def __init__(self):
+        self.n = 0
+
+    def get_secret(self, label):
+        self.n += 1
+        if self.n <= 2:
+            _raise_masked(429, _TOO_MANY, msg="Too Many Requests")
+        if label not in STORE:
+            _raise_masked(404, _NO_ROW, msg="Not Found")
+        return STORE[label]
+
+
+_thr = _check("throttled, then the store answers (HTTP 429 ×2)", _Throttled,
+              expect="")
+assert set(_thr["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
+                              "VIOS_NIM_API_KEY"}, sorted(_thr["values"])
+assert _thr["throttled"] == 2, _thr["throttled"]
+# 2 s then 5 s: the schedule, on the same label, not counted against it.
+assert _thr["waited"] == sum(creds._RATE_BACKOFF[:2]), _thr["waited"]
+assert not creds._code_tally(_thr).get(429), \
+    "a label that was throttled and then answered is not a failed label"
+_adv = " ".join(creds.kaggle_advice(_thr)).lower()
+assert "429" in _adv and "waited" in _adv, _adv
+print("   waited it out on the first label and finished the sweep")
+
+
+class _HardThrottle:
+    """Throttles everything. The remedy is a clock, and the budget is the point."""
+
+    def get_secret(self, label):
+        _raise_masked(429, _TOO_MANY, msg="Too Many Requests")
+
+
+_hard = _check("throttled all the way through", _HardThrottle,
+               expect=creds.RATE_LIMIT, asked=1)
+assert _hard["waited"] <= creds._RATE_BUDGET, _hard["waited"]
+assert _hard["waited"] >= creds._RATE_BACKOFF[0], _hard["waited"]
+assert _hard["throttled"] <= creds._RATE_TRIES, _hard["throttled"]
+# One label, because every further call is refused anyway and each one pushes
+# the window out. This is the only reason that stops the sweep on its first row.
+assert creds._code_tally(_hard) == {429: 1}, creds._code_tally(_hard)
+_adv = " ".join(creds.kaggle_advice(_hard)).lower()
+assert "wait a minute" in _adv, _adv
+assert "internet" not in _adv, f"blamed the network for a 429: {_adv}"
+assert "too many requests" in _hard["detail"].lower(), _hard["detail"]
+print(f"   gave up after {_hard['waited']:g}s of waiting, not after a restart")
+
+
+class _RetryAfter:
+    """Same, but the server says how long. Its number wins over the schedule."""
+
+    def get_secret(self, label):
+        _raise_masked(429, _TOO_MANY, msg="Too Many Requests",
+                      hdrs={"Retry-After": "3"})
+
+
+_ra = _check("the store says Retry-After: 3", _RetryAfter,
+             expect=creds.RATE_LIMIT, asked=1)
+assert 3.0 in SLEPT, SLEPT
+assert creds._RATE_BACKOFF[0] not in SLEPT, \
+    f"ignored Retry-After and used the schedule: {SLEPT}"
+assert _ra["waited"] <= creds._RATE_BUDGET, _ra["waited"]
+# A small Retry-After must not turn into a long series of refused calls: the
+# limiter is counting requests, so the number of tries is bounded as well as the
+# time. Nine seconds of waiting, four calls, then a sentence in the log.
+assert _ra["throttled"] == creds._RATE_TRIES, _ra["throttled"]
+print(f"   honoured the server's own number for {_ra['throttled']} tries "
+      f"({_ra['waited']:g}s), then stopped instead of hammering it")
+
+
+# Fewer calls is the other half of not being throttled, and it costs nothing:
+# the alias lists line up by position, so the spelling that answered for the
+# first credential is tried first for the rest.
+print("\n== the sweep learns which spelling the store uses ==")
+_c = _fresh(_Client)
+ASKED.clear()
+_learn = _c.read_kaggle()
+print(f"   asked   : {len(_learn['asked'])} labels")
+print("     " + ", ".join(_learn["asked"]))
+assert _learn["asked"][:2] == ["VIOS_BOT_TOKEN", "VIOS_TELEGRAM_BOT_TOKEN"], \
+    _learn["asked"][:2]
+# Position 1 answered for bot_token, so position 1 is asked first for the next
+# credential — one call instead of two, and the same store, and the same answer.
+assert _learn["asked"][2] == "VIOS_TELEGRAM_CHANNEL_ID", _learn["asked"][2]
+assert set(_learn["values"]) == {"bot_token", "channel_id", "api_id", "api_hash",
+                                 "VIOS_NIM_API_KEY"}, sorted(_learn["values"])
+assert len(_learn["asked"]) <= 13, len(_learn["asked"])
+print(f"   {len(_learn['asked'])} calls where asking every alias in order is 16")
+
+
 # Anything else the backend said, carried through verbatim rather than reduced
 # to an empty dict — and abandoned after three consecutive failures, because at
 # that point it is plainly not about one row. Twenty-four × 40 s is sixteen
@@ -394,6 +526,57 @@ print("   the other four credentials still came back")
 # Not Kaggle at all. The one case where the boot log must stay silent.
 _nm = _check("not a Kaggle session", None, expect=creds.NO_MODULE, asked=0)
 assert "kaggle_secrets" in _nm["detail"], _nm["detail"]
+
+print("\n== a child process does not ask again ==")
+# One boot is several processes. Phase 0 sweeps and bridges, then ui_server.py
+# starts and both v2 engines call resolve() in *their* process, where this
+# module's cache is empty — so a store that answered was asked for everything
+# two or three times per boot, and that is what runs an account into the 429.
+# The marker parent → child carries the verdict; the values are already in the
+# environment the child inherited.
+parent = _fresh(_Client)
+ASKED.clear()
+parent.export_to_env()
+_paid = len(ASKED)
+assert _paid, "the parent has to do the actual reading"
+# Sweeping does not mark. Only a launcher does, because its environment dies
+# with it — a verdict left in a twelve-hour notebook kernel would outlast the
+# minute a rate limit takes to clear, and re-running the cell is that remedy.
+assert creds.SWEPT_VAR not in os.environ, "the sweep marked the environment"
+assert parent.mark_swept() == "ok", os.environ.get(creds.SWEPT_VAR)
+
+importlib.reload(creds)              # a child: fresh module, inherited environ
+_no_sleep(creds)
+ASKED.clear()
+child = creds.read_kaggle()
+assert ASKED == [], f"the child re-swept the store: {ASKED}"
+assert child["reason"] == "", child["reason"]
+child_env = creds.export_to_env()    # the second call in that process, too
+assert ASKED == [], f"export_to_env re-swept the store: {ASKED}"
+assert not child_env, f"nothing left to bridge: {child_env}"
+print(f"   parent paid {_paid} calls; the child's own resolve() and "
+      f"export_to_env() cost {len(ASKED)}")
+
+# And the Setup page in that child still says where the value came from. It
+# arrived as an environment variable, but it *originated* in the store, and the
+# question the page is answering is "did my stored row get used".
+child_src = creds.resolve()["sources"]
+assert child_src["bot_token"] == creds.SECRET, child_src
+print("   and it still reports bot_token as", child_src["bot_token"])
+
+# A failure is inherited too — with its remedy, and without inventing counters
+# the child never had.
+os.environ[creds.SWEPT_VAR] = creds.RATE_LIMIT
+importlib.reload(creds)
+_no_sleep(creds)
+ASKED.clear()
+inherited = creds.read_kaggle()
+assert ASKED == [], ASKED
+assert inherited["reason"] == creds.RATE_LIMIT, inherited["reason"]
+_adv = " ".join(creds.kaggle_advice(inherited)).lower()
+assert "wait a minute" in _adv, _adv
+assert "waited 0s" not in _adv, _adv
+print("   a throttled Phase 0 reaches the Setup page as a throttle, not a blank")
 
 print("\n== the sweep is not repeated ==")
 c = _fresh(_Client)

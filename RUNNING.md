@@ -56,14 +56,15 @@ The first lines of the boot log tell you whether the secrets arrived:
 
 Names only — a value is never printed.
 
-If they did not arrive, Phase 0 now says which of five things happened, because
-they have five different remedies and used to share one misleading sentence:
+If they did not arrive, Phase 0 now says which of six things happened, because
+they have six different remedies and used to share one misleading sentence:
 
 | Phase 0 says | What it means | What to do |
 |---|---|---|
 | `Kaggle answered, and none of the N names … is stored` | The store works and is empty | Check the row exists **and its toggle is on for this notebook**, then restart the session |
 | `unreadable [no-access]` | Kaggle answered HTTP 401/403. If it refused *every* label the token is stale; if it refused some and answered others, those rows are not shared with this notebook | Restart the session, or switch the named rows on for this notebook. This is what "attached after the kernel started" looks like |
 | `unreadable [no-token]` | `KAGGLE_USER_SECRETS_TOKEN` is not in this process at all | Run `boot.py` from a notebook cell, not a Terminal or `nohup`; the variable is inherited, not global |
+| `unreadable [rate-limited]` | HTTP 429. Kaggle counts secret reads **per account** and this one has read too many too recently. The rows, the token and the network are all fine | Wait a minute and re-run the cell. **Do not** restart the session — a new session starts by sweeping the store again. See below |
 | `unreachable` | No answer and **no HTTP status behind it** — this one really is the transport | Settings → Internet → On |
 | `partly unreadable [backend]` | Some rows read, at least one errored | The named labels only; the rest are present |
 
@@ -82,19 +83,33 @@ to use — three aliases are accepted. A store holding thirteen secrets under th
 answer arrived disguised as a network fault, one of those used to end the sweep,
 and twelve rows that were sitting right there were never asked for.
 
-To see the whole store one label at a time, in the same notebook, run:
+### When it says `rate-limited`
 
-```python
-!python -m vios.creds
-```
+Reading a secret is an HTTPS call, and Kaggle counts those calls per account.
+One boot spends about eleven of them: a credential is looked up under each
+spelling until one answers. It is eleven *per boot* rather than per process —
+Phase 0 asks, and the web server and both v2 engines are told the answer through
+the environment they inherit, where before they each swept the store again on
+startup. `python -m vios.creds` is still a whole sweep of its own, because it is
+asked to be. Boot, probe, boot again, restart, boot again — and the store starts
+answering **HTTP 429 `{"errors":["Too many requests"]}`** to everything, which
+`kaggle_secrets` hands over as the same "Connection error" sentence as always.
 
-That prints every name asked, whether it is stored, and the HTTP status beside
-it. Names and statuses only — never a value, never the session token.
+It is a wait, not a fault, and Phase 0 now treats it as one: it retries the same
+label with a widening backoff, honours a `Retry-After` if the server sends one,
+gives up after four refusals or thirty seconds of waiting — whichever comes
+first, because a limiter counts requests too — and spaces every later call out.
+A throttle it rides out is one line in the log; a throttle it cannot is named,
+with the seconds it spent, and never blamed on your network.
 
-If it says the transport is down even though downloads in the same session work,
-hand the values across the process boundary yourself. This reads them from the
-store, so nothing is typed into the notebook, and `boot.py` in a later cell
-inherits them and skips its own sweep:
+The remedy really is just the clock. Restarting the session is the one thing
+that makes it worse, since a fresh session begins by sweeping the store again.
+
+If you re-run `boot.py` often, spend the reads once instead. Run this in the
+notebook **once per session**: it reads the store into the kernel's own
+environment, every later `!python boot.py` inherits it, and Phase 0 then asks
+Kaggle for nothing at all. The values come from the store, so nothing is typed
+into the notebook.
 
 ```python
 import os
@@ -111,6 +126,19 @@ for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_ID", "TELEGRAM_API_ID",
 
 The names there are the ones you actually stored; every spelling in the table
 above works, because the environment is source #3 and the bridge normalises it.
+The same cell is the answer if Phase 0 insists the transport is down while
+downloads in the same session plainly work.
+
+To see the whole store one label at a time, run:
+
+```python
+!python -m vios.creds
+```
+
+That prints every name asked, whether it is stored, and the HTTP status beside
+it. Names and statuses only — never a value, never the session token. It costs a
+full sweep, so run it *instead of* `boot.py` when you are diagnosing, not
+seconds before it.
 
 The line under a failure — `session: KAGGLE_USER_SECRETS_TOKEN=present/ABSENT …`
 — reports presence, never the token. `⚠️ [SECRETS] Telegram disabled — not set: …`

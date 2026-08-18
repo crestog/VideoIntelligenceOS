@@ -132,7 +132,32 @@ TYPED = "typed this session"
 # variable is there. The two have opposite remedies.
 KAGGLE_TOKEN_VAR = "KAGGLE_USER_SECRETS_TOKEN"
 
-# The five ways a sweep can fail, none of which used to be reported.
+# Set by the launcher, to the outcome of the sweep it did, and inherited by every
+# process it starts. Names a fact, never a value. Written only by `mark_swept`.
+#
+# One boot is not one sweep. Phase 0 sweeps, and then ui_server.py starts and
+# both v2 engines call `resolve()` in *their* process, where this module's cache
+# is empty — so a boot that found nothing asked the store for everything twice.
+# Kaggle counts secret reads per account, and that multiplication is how a store
+# holding thirteen good rows starts answering "Too many requests".
+#
+# The saving is free rather than a trade: attaching a secret does not reach a
+# running kernel, so nothing the store holds can change during a session, and
+# every value the sweep found is already in this environment — `Popen` hands it
+# over. A second sweep can only hear the same answer, more slowly, and closer to
+# the limit.
+SWEPT_VAR = "VIOS_KAGGLE_SWEPT"
+
+# Which fields the value in this environment originally came out of the store
+# for. Field *names*, never values — the companion to `SWEPT_VAR`, and the reason
+# the Setup page in a child process can still say "from Kaggle Secrets" about a
+# value it received as an inherited environment variable. Both statements are
+# true; this is the more useful one, because it answers "did my stored row get
+# used" rather than "which mechanism carried it across a process boundary".
+ORIGIN_VAR = "VIOS_KAGGLE_ORIGIN"
+
+
+# The ways a sweep can fail, none of which used to be reported.
 #
 # `_from_kaggle` returned a bare `{}` for every one of them, so the boot log
 # printed a single sentence — "No Kaggle Secrets to add (already set, or none
@@ -147,6 +172,7 @@ NO_MODULE = "no-module"        # not a Kaggle session — nothing to ask
 NO_TOKEN = "no-token"          # the token variable is absent from THIS process
 NO_ACCESS = "no-access"        # 401/403 — a token is present and was refused
 UNREACHABLE = "unreachable"    # URLError, or the client's own 40 s timeout
+RATE_LIMIT = "rate-limited"    # 429 — too many reads, per account, clears itself
 BACKEND = "backend"            # anything else the proxy said
 
 # The one failure where every remaining label would fail identically *and* the
@@ -184,6 +210,40 @@ _BACKEND_RUN = 3
 # credentials.
 _UNREACHABLE_RUN = 2
 
+# How long to wait after a single transport failure before asking the same label
+# once more. Small on purpose: this is for a reset connection, not for a throttle.
+_BLIP_WAIT = 1.5
+
+# ── the throttle ──────────────────────────────────────────────────────────
+# HTTP 429, `{"errors":["Too many requests"],"error":{"code":8}}`. The store is
+# not broken, the rows are not missing, the network is fine, and the token is
+# good: Kaggle is counting how many secrets this *account* has read lately and
+# asking VIOS to come back later. It was landing in BACKEND — "anything else the
+# proxy said" — which stopped after three and offered no remedy, so a limit that
+# clears itself in about a minute disabled Telegram for a twelve-hour session.
+#
+# Three things follow from that, and all three are here rather than in the
+# classifier, because a 429 is about the endpoint and not about the row:
+#
+#   * It is retried on the *same* label, not counted against it. Waiting is the
+#     documented remedy for a 429 and the only one.
+#   * The waiting is bounded, because Phase 0 blocks the boot. Nineteen seconds
+#     buys back a transient throttle; a minute would just move the complaint.
+#   * Every call after the first 429 is spaced further apart, since continuing to
+#     hammer a limiter is what extends the window.
+_RATE_BACKOFF = (2.0, 5.0, 12.0)   # per successive 429 on one label
+_RATE_MAX_WAIT = 20.0              # cap on a Retry-After the server asks for
+_RATE_BUDGET = 30.0                # total seconds this sweep will spend waiting
+_RATE_TRIES = 4                    # refused calls on one label before giving up
+
+# A small gap between store calls, always. The limiter's shape is not published,
+# so this is a hedge and not a proof: a dozen sequential lookups that each return
+# in 200 ms is a burst, and a burst is the shape most rate limiters are built to
+# catch. Eleven labels cost about two seconds of boot for it. After a 429 the gap
+# widens, where it is no longer a guess.
+_PACE = 0.2
+_PACE_SLOW = 1.0
+
 # A 401 or 403 is not fatal either, though it looks session-wide. Kaggle answers
 # a row that exists but is not switched on for *this* notebook the same way it
 # answers a stale token, and the toggle case is per-label — so the sweep keeps
@@ -220,6 +280,31 @@ def labels(name: str) -> tuple:
     """
     return (FIELDS[name][0],) + tuple(ALIASES.get(name, ()))
 
+
+def _ordered(name: str, family: int) -> tuple:
+    """`labels(name)`, with the alias position that already answered moved first.
+
+    The four alias lists line up by position — `VIOS_X`, then `VIOS_TELEGRAM_X`,
+    then `TELEGRAM_X`, then `ATLAS_X` — because someone who stores secrets stores
+    a *set* of them under one spelling. So the position that produced a value for
+    the first credential is the position most likely to produce the next one, and
+    trying it first is free.
+
+    It is worth more than tidiness: every label tried and missed is an HTTPS call
+    against a store that rate-limits, and this turns the sweep for a
+    `VIOS_TELEGRAM_*` store from sixteen calls into eleven. It also means the four
+    Telegram values come from one family rather than a mix, which is what someone
+    holding two sets of rows meant.
+
+    Ordering only — nothing here decides *whether* a label is asked for, so no
+    credential becomes unreachable because of it.
+    """
+    labs = list(labels(name))
+    if 0 < family < len(labs):
+        labs.insert(0, labs.pop(family))
+    return tuple(labs)
+
+
 _local_path_override = ""
 
 
@@ -247,9 +332,37 @@ def on_kaggle() -> bool:
 # an answer that could not have moved, and `describe` runs on every status poll.
 _KAGGLE_CACHE: dict = {}
 
+# The `skip` keys this process actually put on the wire, as opposed to answered
+# from the cache or from a parent's verdict. Separate from `_KAGGLE_CACHE`
+# because "we have an answer" and "we are the ones who paid for it" are different
+# questions, and only the second one decides whether `SWEPT_VAR` still applies.
+_SWEPT_HERE: set = set()
+
+
+def _retry_after(exc) -> float:
+    """The server's own answer to "how long should I wait", or 0.0.
+
+    A 429 usually carries `Retry-After` in seconds. It may instead carry an HTTP
+    date, which is ignored rather than parsed: guessing wrong there means either
+    hammering the limiter or holding the boot for a minute, and the backoff
+    schedule is a safe default for both.
+    """
+    hdrs = getattr(exc, "headers", None) or getattr(exc, "hdrs", None)
+    raw = None
+    try:
+        raw = hdrs.get("Retry-After") if hdrs is not None else None
+    except Exception:                                        # noqa: BLE001
+        raw = None
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0.0
+
 
 def _http_status(exc) -> tuple:
-    """(code, body) for the HTTPError buried under Kaggle's ConnectionError.
+    """(code, body, retry_after) for the HTTPError under Kaggle's ConnectionError.
 
     The load-bearing function in this file. `kaggle_secrets` cannot tell a
     missing row from a dead network — see the note above `_FATAL` for why — but
@@ -257,8 +370,8 @@ def _http_status(exc) -> tuple:
     with its status code intact. Reading it back is the difference between "no
     such secret, ask about the next one" and "the internet is off, stop".
 
-    `(0, "")` when there is no HTTPError in the chain, which is the one case that
-    really is a transport failure.
+    `(0, "", 0.0)` when there is no HTTPError in the chain, which is the one case
+    that really is a transport failure.
     """
     cur, seen = exc, 0
     while cur is not None and seen < _CHAIN:
@@ -268,12 +381,16 @@ def _http_status(exc) -> tuple:
                 code = int(getattr(cur, "code", 0) or 0)
             except (TypeError, ValueError):
                 code = 0
+            wait = _retry_after(cur)
             # The body is only consulted for statuses the code alone does not
             # settle. Reading it means reading from the socket urlopen left open,
             # and while its 40-second timeout bounds that, spending it is
             # pointless for a 404 — which already says everything a 404 can say.
+            # A 429 is not in that set on purpose: "Too many requests" in the body
+            # is what finally identified this failure, and it costs nothing next
+            # to the wait that follows it.
             if code and code in _CODE_IS_ENOUGH:
-                return code, str(getattr(cur, "reason", "") or "").strip()
+                return code, str(getattr(cur, "reason", "") or "").strip(), wait
             body = ""
             try:
                 # Kaggle never reads the error body, so it is usually still
@@ -284,10 +401,10 @@ def _http_status(exc) -> tuple:
                         if isinstance(raw, (bytes, bytearray)) else str(raw))
             except Exception:                                # noqa: BLE001
                 body = str(getattr(cur, "reason", "") or "")
-            return code, body.strip()
+            return code, body.strip(), wait
         seen += 1
         cur = cur.__cause__ or cur.__context__
-    return 0, ""
+    return 0, "", 0.0
 
 
 def _is_timeout(exc) -> bool:
@@ -313,7 +430,7 @@ def _code_tally(report: dict) -> dict:
 
 
 def _classify(exc) -> tuple:
-    """(reason, text, http_code) for one failed lookup.
+    """(reason, text, http_code, retry_after) for one failed lookup.
 
     A reason of `""` means the store answered cleanly that this label is not
     attached, which is not a failure and must not stop the sweep. Kaggle has two
@@ -330,26 +447,55 @@ def _classify(exc) -> tuple:
     text = (str(exc) or str(getattr(exc, "args", "")) or name).strip()
     low = (text + " " + str(getattr(exc, "args", ""))).lower()
 
-    code, body = _http_status(exc)
+    code, body, wait = _http_status(exc)
     if code:
         blow = body.lower()
         detail = f"HTTP {code} — {body[:120] if body else text}"
         if code in _REFUSED:
-            return NO_ACCESS, detail, code
+            return NO_ACCESS, detail, code, wait
+        if code == 429 or "too many requests" in blow:
+            # Not this row, not this notebook, not the network. A count, kept per
+            # account, that goes back down on its own — so it is the one failure
+            # whose remedy is to wait, and the only one worth spending boot time
+            # on rather than reporting.
+            return RATE_LIMIT, detail, code, wait
         if code == 404 or "no user secret" in blow or "not found" in blow:
-            return "", detail, code
-        return BACKEND, detail, code
+            return "", detail, code, wait
+        return BACKEND, detail, code, wait
 
     if name == "NotFoundError" or "no user secret" in low or "not found" in low:
-        return "", text, 0
+        return "", text, 0, 0.0
     if name == "CredentialError":
         # Present and refused, or never there at all. Same exception, opposite
         # remedy: restart the session, versus fix how boot.py was started.
         return (NO_ACCESS if os.environ.get(KAGGLE_TOKEN_VAR)
-                else NO_TOKEN), text, 0
+                else NO_TOKEN), text, 0, 0.0
+    if "too many requests" in low or "rate limit" in low:
+        # The same throttle with no HTTPError under it — a wrapper that kept only
+        # the sentence. Rare, and cheap to honour.
+        return RATE_LIMIT, text, 0, 0.0
     if name == "ConnectionError" or "timeout" in low or _is_timeout(exc):
-        return UNREACHABLE, text, 0
-    return BACKEND, text, 0
+        return UNREACHABLE, text, 0, 0.0
+    return BACKEND, text, 0, 0.0
+
+
+def _blank() -> dict:
+    """An empty sweep report. Shape documented on `read_kaggle`."""
+    return {"values": {}, "reason": "", "detail": "",
+            "asked": [], "found": [], "absent": [], "broken": [],
+            "codes": {},
+            # How often the store said "too many requests", and how long this
+            # sweep spent waiting for it. Counted separately from `codes`
+            # because a label that was throttled and then answered is not a
+            # failed label — it is a slow one, and the difference is the whole
+            # reason the boot no longer gives up on it.
+            "throttled": 0, "waited": 0.0,
+            # Presence only, never the value: it is a bearer JWT. Recorded even
+            # on the paths that never reach the proxy, because it is the single
+            # bit that separates "no token here" from "token refused", and
+            # those two have opposite remedies.
+            "token": bool(os.environ.get(KAGGLE_TOKEN_VAR, "").strip()),
+            "run_type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "")}
 
 
 def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
@@ -359,13 +505,15 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
 
         {"values":  {field or passthrough label: value},
          "reason":  "" or one of NO_MODULE / NO_TOKEN / NO_ACCESS /
-                    UNREACHABLE / BACKEND,
+                    UNREACHABLE / RATE_LIMIT / BACKEND,
          "detail":  the exception text, when there was one,
          "asked":   [label, …]  every name the proxy was asked for,
          "found":   [label, …]  the ones it answered with a value,
          "absent":  [label, …]  the ones it said are not attached,
          "broken":  [(label, text), …]  the ones that failed some other way,
          "codes":   {label: http status}  every status code seen, error or not,
+         "throttled": how many replies were HTTP 429,
+         "waited":  seconds this sweep spent waiting one out,
          "token":   whether the session token variable is set — presence only,
          "run_type": KAGGLE_KERNEL_RUN_TYPE, for the log}
 
@@ -389,25 +537,37 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
     `skip` names fields already satisfied from a higher-priority source. An
     explicit export outranks a stored secret anyway, so asking about one is a
     call with a 40-second timeout whose answer is discarded.
+
+    If `SWEPT_VAR` is in the environment and this process has not swept, the
+    sweep is inherited rather than repeated: a parent already asked, this session,
+    and put what it found here. `force=True` overrides that — the `__main__`
+    probe means the question literally.
     """
     key = tuple(sorted(skip))
     if not force and key in _KAGGLE_CACHE:
         return _KAGGLE_CACHE[key]
 
-    report = {"values": {}, "reason": "", "detail": "",
-              "asked": [], "found": [], "absent": [], "broken": [],
-              "codes": {},
-              # Presence only, never the value: it is a bearer JWT. Recorded
-              # even on the paths that never reach the proxy, because it is the
-              # single bit that separates "no token here" from "token refused",
-              # and those two have opposite remedies.
-              "token": bool(os.environ.get(KAGGLE_TOKEN_VAR, "").strip()),
-              "run_type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "")}
+    # Somebody already asked, in this session, on our behalf. `SWEPT_VAR` says
+    # so and says how it went. Ask nothing: the store cannot have changed since
+    # (attaching a secret does not reach a running kernel), whatever was found is
+    # in this environment already, and the store is counting.
+    swept = os.environ.get(SWEPT_VAR, "").strip()
+    if swept and not force and not _SWEPT_HERE:
+        report = _blank()
+        report["reason"] = "" if swept == "ok" else swept
+        report["detail"] = ("An earlier process in this session already read the "
+                            "store; not asking again.")
+        _KAGGLE_CACHE[key] = report
+        return report
+
+    report = _blank()
     stop: set = set()          # a reason that makes the remaining labels moot
     runs = {UNREACHABLE: 0, BACKEND: 0}   # consecutive failures, by kind
+    gap = [_PACE]              # seconds between calls; widens after a throttle
 
     def done() -> dict:
         _KAGGLE_CACHE[key] = report
+        _SWEPT_HERE.add(key)
         return report
 
     try:
@@ -424,26 +584,59 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
         return done()
 
     def ask(label: str) -> tuple:
-        """(value, reason, text), with one retry and only for the transport."""
+        """(value, reason, text). Retries the transport once, a throttle longer.
+
+        Two failures are retried here rather than reported, because for both of
+        them the answer is not about the label being asked about: a reset
+        connection, and a 429. Everything else is an answer, including "no such
+        row", and asking twice would only cost a call against a store that
+        counts them.
+        """
         report["asked"].append(label)
-        for attempt in (0, 1):
+        throttles, blipped = 0, False
+        while True:
+            if gap[0]:
+                time.sleep(gap[0])
             try:
                 val = client.get_secret(label)
             except Exception as exc:                         # noqa: BLE001
-                reason, text, code = _classify(exc)
-                if code:
+                reason, text, code, wait = _classify(exc)
+                if reason == RATE_LIMIT:
+                    report["throttled"] += 1
+                    # The server's own Retry-After if it sent one, capped, else
+                    # the schedule. Widen the gap for every later call too: the
+                    # limiter has just said the current rate is too high, and
+                    # the rest of the sweep is what would prove it right.
+                    delay = min(wait or _RATE_BACKOFF[
+                        min(throttles, len(_RATE_BACKOFF) - 1)], _RATE_MAX_WAIT)
+                    throttles += 1
+                    gap[0] = max(gap[0], _PACE_SLOW)
+                    if (throttles < _RATE_TRIES
+                            and report["waited"] + delay <= _RATE_BUDGET):
+                        report["waited"] = round(report["waited"] + delay, 1)
+                        time.sleep(delay)
+                        continue
+                    # Out of budget, or out of tries. Both bounds matter and for
+                    # different reasons: Phase 0 blocks the boot, so the remedy
+                    # for a long window is a sentence in the log rather than a
+                    # longer wait — and a limiter counts *requests*, so a server
+                    # that asks for three seconds twenty times over must not be
+                    # answered with twenty more calls.
                     report["codes"][label] = code
-                if reason == UNREACHABLE and attempt == 0:
+                    return "", RATE_LIMIT, text
+                if reason == UNREACHABLE and not blipped:
                     # The proxy is genuinely flaky, and the cost of believing it
                     # the first time is a whole session with no Telegram. One
                     # retry, then take the answer. Only reached when there was no
                     # HTTP status behind the error — a 404 is an answer, and
                     # asking it twice is 1.5 s spent to hear it again.
-                    time.sleep(1.5)
+                    blipped = True
+                    time.sleep(_BLIP_WAIT)
                     continue
+                if code:
+                    report["codes"][label] = code
                 return "", reason, text
             return (str(val).strip() if val else ""), "", ""
-        return "", UNREACHABLE, "no answer, twice"
 
     def sweep(label: str) -> str:
         val, reason, text = ask(label)
@@ -452,6 +645,11 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
             report["detail"] = report["detail"] or text
             report["broken"].append((label, text[:200]))
             if reason in _FATAL:
+                stop.add(reason)
+            elif reason == RATE_LIMIT:
+                # It already waited as long as it is allowed to, so every further
+                # label is a call that will be refused and will push the window
+                # out. Nothing here is wrong with the store or the rows.
                 stop.add(reason)
             elif reason == UNREACHABLE:
                 # No status code anywhere in the chain, so this one really is the
@@ -474,6 +672,11 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
             # timeout, and it is per-label whenever the cause is a row that
             # exists but is not switched on for this notebook. Stopping here
             # would turn one un-toggled row into a session with no credentials.
+            if stop:
+                # What ended the sweep outranks whatever merely happened during
+                # it, because that is the line someone has to act on.
+                report["reason"] = reason
+                report["detail"] = text or report["detail"]
         elif val:
             report["found"].append(label)
             runs[UNREACHABLE] = runs[BACKEND] = 0
@@ -482,10 +685,11 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
             runs[UNREACHABLE] = runs[BACKEND] = 0
         return val
 
+    family = 0                 # the alias position that last produced a value
     for name in FIELDS:
         if name in skip or stop:
             continue
-        for label in labels(name):
+        for label in _ordered(name, family):
             if stop:
                 break
             val = sweep(label)
@@ -494,6 +698,7 @@ def read_kaggle(skip: tuple = (), force: bool = False) -> dict:
                 # found under — which alias Kaggle happened to hold must not
                 # leak past this function.
                 report["values"][name] = val
+                family = labels(name).index(label)
                 break
     for label in PASSTHROUGH:
         if stop or label in skip:
@@ -536,6 +741,25 @@ def kaggle_report() -> dict:
     if _KAGGLE_CACHE:
         return max(_KAGGLE_CACHE.values(), key=lambda r: len(r["asked"]))
     return read_kaggle()
+
+
+def mark_swept(report: dict | None = None) -> str:
+    """Record this sweep's verdict for the processes this one is about to start.
+
+    The launcher calls this, never the sweep itself, and that is the whole safety
+    of it. `boot.py` marks the answer for the children it spawns, and its
+    environment dies with it — so re-running the cell asks the store again, which
+    is the documented remedy for a rate limit and has to keep working. A notebook
+    kernel that imports this module marks nothing: a verdict left in a kernel
+    that lives twelve hours would outlast the minute a limit takes to clear and
+    would make every later boot inherit a failure that had already passed.
+
+    Returns the verdict written, which is a reason or "ok" — never a value.
+    """
+    rep = report if report is not None else kaggle_report()
+    verdict = (rep.get("reason") or "ok") if rep else "ok"
+    os.environ[SWEPT_VAR] = verdict
+    return verdict
 
 
 def kaggle_advice(report: dict) -> list:
@@ -599,6 +823,38 @@ def kaggle_advice(report: dict) -> list:
             "read over HTTPS, so Internet must be on for the notebook "
             "(Settings → Internet).",
         ]
+    elif reason == RATE_LIMIT:
+        # The remedy is a clock, so the advice has to say so plainly. Everything
+        # a person would reach for first — check the rows, check the toggle,
+        # check the internet, restart the session — is wasted here, and a restart
+        # actively makes it worse: the new session starts by sweeping again.
+        waited = report.get("waited") or 0
+        hits = report.get("throttled") or 0
+        out.append(
+            "Kaggle is rate-limiting secret reads for this account (HTTP 429). "
+            "The rows are fine, the token is fine, the network is fine — the "
+            "store is counting how many secrets have been read lately and is "
+            "asking VIOS to come back later.")
+        if hits:
+            # Only when this process is the one that waited. A child process
+            # inherits the verdict without the counters, and "it waited 0s
+            # across 0 replies" would be a lie about a number nobody needs.
+            out.append(
+                f"It waited {waited:g}s across {hits} throttled repl"
+                f"{'y' if hits == 1 else 'ies'} and then stopped, rather than hold "
+                "the boot open. The count is per Kaggle account and it falls back "
+                "down on its own, usually within a minute or two.")
+        out += [
+            "So: wait a minute, then re-run the cell. Do not restart the "
+            "session — a fresh session starts by sweeping the store again, "
+            "which is the one thing that keeps the window open.",
+            "What runs the count up is repeated sweeps in a short window: every "
+            "boot.py asks for up to a dozen labels, and `python -m vios.creds` "
+            "is a whole sweep of its own. If you are re-running boot.py a lot, "
+            "run the bridge cell in RUNNING.md once instead — it puts the values "
+            "in the notebook kernel's environment, and every later boot inherits "
+            "them and asks the store for nothing.",
+        ]
     elif reason == BACKEND:
         if report.get("found"):
             out.append(
@@ -638,6 +894,16 @@ def kaggle_advice(report: dict) -> list:
         elif optional:
             out.append("Kaggle answered. Not stored, each disabling only its "
                        "own feature: " + ", ".join(optional) + ".")
+    if (report.get("throttled") or 0) and reason != RATE_LIMIT:
+        # The sweep was throttled and rode it out. Worth one line, because
+        # otherwise twenty extra seconds of silence in Phase 0 has no
+        # explanation — and because it is the warning shot before the version of
+        # this that does not recover.
+        out.append(
+            f"Kaggle throttled {report['throttled']} read(s) with HTTP 429 and "
+            f"the sweep waited {report.get('waited') or 0:g}s for the limit to "
+            "clear. Nothing was lost; if it starts happening every boot, see the "
+            "bridge cell in RUNNING.md, which asks the store for nothing.")
     if codes:
         # The line that would have ended the worst version of this bug in a
         # minute. `kaggle_secrets` prints "Connection error trying to communicate
@@ -734,6 +1000,7 @@ def export_to_env() -> dict:
     )
     from_kaggle = read_kaggle(skip=satisfied)["values"]
     exported = {}
+    origin = {n for n in os.environ.get(ORIGIN_VAR, "").split(",") if n}
 
     for name in FIELDS:
         canonical = FIELDS[name][0]
@@ -743,7 +1010,10 @@ def export_to_env() -> dict:
                 if os.environ.get(label, "").strip():
                     val = os.environ[label].strip()
                     break
-            val = (val or str(from_kaggle.get(name, "") or "")).strip()
+            if not val:
+                val = str(from_kaggle.get(name, "") or "").strip()
+                if val:
+                    origin.add(name)       # so every later process can say so
             if val:
                 os.environ[canonical] = val
                 exported[name] = canonical
@@ -769,6 +1039,8 @@ def export_to_env() -> dict:
             os.environ[label] = str(val)
             exported[label] = label
 
+    if origin:
+        os.environ[ORIGIN_VAR] = ",".join(sorted(origin))
     return exported
 
 
@@ -793,6 +1065,15 @@ def resolve(typed: dict | None = None) -> dict:
         for k, v in layer.items():
             values[k] = v
             sources[k] = origin
+
+    # A value that reached this process as an environment variable because a
+    # parent process read it out of the store is still, to the person reading the
+    # Setup page, "from Kaggle Secrets" — and saying "environment" there would
+    # send them looking for an export they never wrote. Only ever narrows ENV to
+    # SECRET, so a hand-set override keeps its own label.
+    for name in (n for n in os.environ.get(ORIGIN_VAR, "").split(",") if n):
+        if sources.get(name) == ENV:
+            sources[name] = SECRET
 
     if "api_id" in values:
         try:
@@ -830,6 +1111,8 @@ def describe(typed: dict | None = None) -> dict:
         "kaggle_asked": len(report["asked"]),
         "kaggle_found": len(report["found"]),
         "kaggle_codes": _code_tally(report),
+        "kaggle_throttled": report.get("throttled", 0),
+        "kaggle_waited": report.get("waited", 0.0),
         "kaggle_advice": kaggle_advice(report),
         "local_file": local_path(),
         "local_file_present": os.path.isfile(local_path()),
@@ -889,6 +1172,8 @@ def forget_local() -> dict:
 # session token — the same rule as everything else in this file, because a
 # notebook log is a thing people paste into issues.
 if __name__ == "__main__":
+    print("(this is a full sweep of its own — Kaggle counts secret reads per "
+          "account, so run it instead of boot.py, not seconds before it)")
     _rep = read_kaggle(force=True)
     print(f"on_kaggle={on_kaggle()}  {KAGGLE_TOKEN_VAR}="
           f"{'present' if _rep['token'] else 'ABSENT'}  "
@@ -896,6 +1181,9 @@ if __name__ == "__main__":
     print(f"asked={len(_rep['asked'])}  found={len(_rep['found'])}  "
           f"not-stored={len(_rep['absent'])}  failed={len(_rep['broken'])}  "
           f"reason={_rep['reason'] or '(none — the store answered)'}")
+    if _rep["throttled"]:
+        print(f"throttled={_rep['throttled']} replies  "
+              f"waited={_rep['waited']:g}s")
     _tally = _code_tally(_rep)
     if _tally:
         print("status codes: "
