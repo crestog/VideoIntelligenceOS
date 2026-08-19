@@ -768,8 +768,35 @@ class ProcessEngine:
         Credentials live here and only here — instance attributes on a running
         process, never written to a file, a notebook cell, or the database.
         Re-typing them after a restart is the intended cost.
+
+        "Here and only here" was true too literally. `self._tg` is what the
+        uploader reads, and nothing else in the process reads it: `db_restore`,
+        `tg_transport`, the harvester and Atlas all read `os.environ`. So a user
+        whose Phase 0 was throttled, who then typed four correct credentials
+        into this tab, still got "Telegram is not configured" out of restore —
+        the values were in this object and nowhere the restore could see. They
+        are now bridged with `creds.adopt` (environment only, still never disk),
+        the same way `hf_token` has always been bridged for pyannote below.
         """
         with self._lock:
+            # First, before anything that can raise. `Telegram(...)` below
+            # rejects a malformed channel id, and the caller's `except` then
+            # discards the three credentials that were fine — which is the same
+            # coupling `_adopt_stored_credentials` already works around by
+            # bridging before it configures. Writing the environment costs
+            # nothing and is idempotent, so it goes where it cannot be skipped.
+            #
+            # Typed overrides what is there — that is what typing it means — and
+            # a blank field is skipped rather than written, so submitting this
+            # form with one field filled cannot unset the other three.
+            _adopted = _creds.adopt({"bot_token": bot_token,
+                                     "channel_id": channel_id,
+                                     "api_id": api_id,
+                                     "api_hash": api_hash})
+            if _adopted:
+                self._log(f"credentials accepted: "
+                          f"{', '.join(sorted(_adopted.values()))}")
+
             if bot_token or channel_id:
                 token = bot_token or (self._tg.token if self._tg else "")
                 chan = channel_id or (self._tg.channel if self._tg else None)

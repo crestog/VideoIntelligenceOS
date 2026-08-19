@@ -57,7 +57,12 @@ always wrapped in a hard timeout.
 import os
 import time
 
-from config import BOT_TOKEN, CHANNEL_ID
+# `import config`, not `from config import BOT_TOKEN`. The second form binds the
+# value into this module at import time and Python never asks again, which made a
+# credential that arrived late — after a throttled Phase 0, or typed into the
+# Setup page — permanently invisible to every upload, download and restore in
+# this process. `config.BOT_TOKEN` is a lookup; see the note in config.py.
+import config
 from logger import vios_log
 
 API_ROOT = "https://api.telegram.org"
@@ -88,11 +93,11 @@ class Cancelled(RuntimeError):
 
 
 def available() -> bool:
-    return bool(BOT_TOKEN)
+    return bool(config.BOT_TOKEN)
 
 
 def _url(method: str) -> str:
-    return f"{API_ROOT}/bot{BOT_TOKEN}/{method}"
+    return f"{API_ROOT}/bot{config.BOT_TOKEN}/{method}"
 
 
 class _ProgressFile:
@@ -162,7 +167,7 @@ def _post(method: str, data: dict | None = None, file_factory=None,
     rather than as an open handle: a progress-wrapped file is single-use, so a
     retry has to reopen it or httpx streams from a spent descriptor.
     """
-    if not BOT_TOKEN:
+    if not config.BOT_TOKEN:
         raise TelegramError("No bot token configured (VIOS_BOT_TOKEN).")
 
     import httpx
@@ -226,14 +231,14 @@ def _post(method: str, data: dict | None = None, file_factory=None,
 # MESSAGES
 # ═══════════════════════════════════════════════════════════
 def send_message(text: str, silent: bool = True) -> int:
-    res = _post("sendMessage", {"chat_id": CHANNEL_ID, "text": text,
+    res = _post("sendMessage", {"chat_id": config.CHANNEL_ID, "text": text,
                                 "disable_notification": silent})
     return int(res["message_id"])
 
 
 def delete_message(message_id: int) -> bool:
     try:
-        _post("deleteMessage", {"chat_id": CHANNEL_ID,
+        _post("deleteMessage", {"chat_id": config.CHANNEL_ID,
                                 "message_id": message_id}, attempts=1)
         return True
     except TelegramError:
@@ -265,7 +270,7 @@ def send_document(path: str, caption: str = "", file_name: str | None = None,
     # reject or mangle them. A caption is a label, not a document.
     res = _post(
         "sendDocument",
-        {"chat_id": CHANNEL_ID, "caption": caption[:1024],
+        {"chat_id": config.CHANNEL_ID, "caption": caption[:1024],
          "disable_notification": True},
         file_factory=_factory,
     )
@@ -280,7 +285,7 @@ def pin_message(message_id: int) -> bool:
     rights; a False here is survivable (restore falls back to a history scan)
     so this reports rather than raises."""
     try:
-        _post("pinChatMessage", {"chat_id": CHANNEL_ID,
+        _post("pinChatMessage", {"chat_id": config.CHANNEL_ID,
                                  "message_id": message_id,
                                  "disable_notification": True}, attempts=2)
         return True
@@ -294,7 +299,7 @@ def get_pinned() -> dict | None:
     manifest without MTProto — getChat is one of the few Bot API methods that
     hands back a message the bot did not just receive."""
     try:
-        chat = _post("getChat", {"chat_id": CHANNEL_ID}, attempts=2)
+        chat = _post("getChat", {"chat_id": config.CHANNEL_ID}, attempts=2)
     except TelegramError as e:
         vios_log(f"getChat failed: {str(e)[:140]}", "TG", "WARN")
         return None
@@ -319,7 +324,7 @@ def download_file(file_id: str, dest: str, progress=None) -> None:
         raise TelegramError("getFile returned no file_path")
     size = int(meta.get("file_size") or 0)
 
-    url = f"{API_ROOT}/file/bot{BOT_TOKEN}/{file_path}"
+    url = f"{API_ROOT}/file/bot{config.BOT_TOKEN}/{file_path}"
     tmp = dest + ".part"
     last = None
     for attempt in range(ATTEMPTS):
@@ -357,7 +362,7 @@ def probe() -> dict:
     at all, and can we see the channel? Run before an export so a missing admin
     right is a sentence in the UI rather than a failure 40 MB in."""
     out = {"ok": False, "bot": None, "channel": None, "error": None}
-    if not BOT_TOKEN:
+    if not config.BOT_TOKEN:
         out["error"] = "No bot token configured (VIOS_BOT_TOKEN)."
         return out
     try:
@@ -367,10 +372,10 @@ def probe() -> dict:
         out["error"] = str(e)
         return out
     try:
-        chat = _post("getChat", {"chat_id": CHANNEL_ID}, attempts=2)
-        out["channel"] = chat.get("title") or str(CHANNEL_ID)
+        chat = _post("getChat", {"chat_id": config.CHANNEL_ID}, attempts=2)
+        out["channel"] = chat.get("title") or str(config.CHANNEL_ID)
         out["ok"] = True
     except TelegramError as e:
-        out["error"] = (f"Bot @{out['bot']} cannot see channel {CHANNEL_ID}: "
+        out["error"] = (f"Bot @{out['bot']} cannot see channel {config.CHANNEL_ID}: "
                         f"{str(e)[:140]}. Add it to the channel as an admin.")
     return out

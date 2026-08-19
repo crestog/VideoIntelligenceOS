@@ -63,8 +63,12 @@ import subprocess
 import threading
 import time
 
-from config import (BASE_DIR, LAKE_DIR, DB_PATH, SQLITE_TIMEOUT, CHANNEL_ID,
-                    API_ID, API_HASH, BOT_TOKEN, missing_telegram_secrets,
+# The four Telegram credentials were imported here and never used — the upload
+# goes through tg_transport, which reads them itself. Dropped rather than
+# rewritten, because `from config import BOT_TOKEN` snapshots the value at import
+# and an unused snapshot is a trap waiting for the first person who needs one.
+from config import (BASE_DIR, LAKE_DIR, DB_PATH, SQLITE_TIMEOUT,
+                    missing_telegram_secrets,
                     OMNI_PG_DB, OMNI_PG_USER, OMNI_PG_PASSWORD, OMNI_PG_HOST)
 from logger import vios_log
 

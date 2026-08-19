@@ -179,8 +179,19 @@ class CaptureEngine:
                   speed: str | None = None) -> dict:
         """Accept settings from the admin form. Blank fields keep their value,
         so the operator can change the pace mid-week without re-typing a token.
+
+        Typed credentials are also bridged into `os.environ` (never disk) by
+        `creds.adopt`, because `self._tg` is read by the uploader and by nothing
+        else: `db_restore`, `tg_transport` and the harvester all read the
+        environment, and a token typed here used to be invisible to all three.
         """
         with self._lock:
+            # First, before the branch below that can reject a malformed channel
+            # id and take the three good credentials down with it.
+            if bot_token or channel_id or api_id or api_hash:
+                from vios.creds import adopt  # noqa: PLC0415
+                adopt({"bot_token": bot_token, "channel_id": channel_id,
+                       "api_id": api_id, "api_hash": api_hash})
             if bot_token or channel_id:
                 token = bot_token or (self._tg.token if self._tg else "")
                 chan = channel_id or (self._tg.channel if self._tg else None)

@@ -32,7 +32,7 @@ rather than anything about the network, the rows or a restart.
 
 Values here are obvious fakes. Nothing real is ever hardcoded in this repo.
 """
-import io, os, sys, types
+import io, os, sys, threading, types
 from urllib.error import HTTPError
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -684,3 +684,206 @@ print("   0 calls, 0 × 40 s timeouts — mirrors still written")
 
 print("\nCREDS OK — the names the user stored are the names the bridge asks "
       "for, and a sweep that fails now says which way it failed")
+
+
+# ── the credential that arrives late ──────────────────────────────────────
+# Everything above is about *finding* a credential. This half is about what
+# happens when one is found four minutes after the process that needs it
+# started, which is the whole difference between the throttle costing a minute
+# and costing a twelve-hour session.
+#
+# The old shape: `config.py` read the four values into module globals at import,
+# `missing_telegram_secrets()` answered from those globals, and every consumer
+# did `from config import BOT_TOKEN`. So a boot whose Phase 0 was throttled had
+# four empty strings frozen into six modules, and no later arrival — a recovery
+# sweep, a value typed into the Setup page — could reach any of them. The
+# harvester parked for an hour at a time, restore raised "Telegram is not
+# configured", and the remedy printed in the log was to restart the session.
+import importlib as _il
+
+print("\n== config reads the environment now, not at import ==")
+for _k in ("VIOS_BOT_TOKEN", "VIOS_CHANNEL_ID", "VIOS_API_ID", "VIOS_API_HASH",
+           "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_ID", "TELEGRAM_API_ID",
+           "TELEGRAM_API_HASH"):
+    os.environ.pop(_k, None)
+_cfg = _il.reload(config)
+assert len(_cfg.missing_telegram_secrets()) == 4, _cfg.missing_telegram_secrets()
+assert not _cfg.telegram_ready()
+assert _cfg.BOT_TOKEN == "" and _cfg.CHANNEL_ID == 0, "a default leaked in"
+
+# Nothing is re-imported, nothing is reloaded: this is what a recovery sweep or
+# a Setup-page submit does to the environment, four minutes in.
+os.environ["VIOS_BOT_TOKEN"] = "333:fake-late"
+os.environ["VIOS_CHANNEL_ID"] = "-1007777777777"
+os.environ["VIOS_API_ID"] = "333333"
+os.environ["VIOS_API_HASH"] = "fake-hash-late"
+assert _cfg.telegram_ready(), _cfg.missing_telegram_secrets()
+assert _cfg.BOT_TOKEN == "333:fake-late", _cfg.BOT_TOKEN
+assert _cfg.CHANNEL_ID == -1007777777777, _cfg.CHANNEL_ID
+assert _cfg.API_ID == 333333, _cfg.API_ID
+print("   four credentials arrived after import and config saw all four")
+
+# And `dir()` still lists them, so the Setup page's introspection and any
+# `hasattr` check keep working now that they are not globals.
+assert {"BOT_TOKEN", "CHANNEL_ID", "API_ID", "API_HASH"} <= set(dir(_cfg))
+try:
+    _cfg.NOT_A_SETTING
+except AttributeError:
+    pass
+else:
+    raise AssertionError("__getattr__ answers for names that do not exist")
+
+# Atlas is a reader and the channel is everything it reads, so it gets the same
+# treatment and the same test.
+os.environ["ATLAS_BOT_TOKEN"] = "444:fake-atlas-late"
+_ac = _il.reload(ac)
+assert _ac.telegram_ready(), _ac.missing_secrets()
+assert _ac.BOT_TOKEN == "444:fake-atlas-late", _ac.BOT_TOKEN
+print("   atlas/config.py too, and ATLAS_ still outranks VIOS_")
+
+print("\n== nothing snapshots a credential at import ==")
+# The structural half of the same guarantee. `config.BOT_TOKEN` is a live lookup
+# (PEP 562), but `from config import BOT_TOKEN` binds a copy and Python never
+# asks again — so one such line anywhere puts the frozen-value bug back, in a
+# form no runtime test above would notice. Read the imports instead.
+import re as _re
+
+_FROZEN = ("API_ID", "API_HASH", "BOT_TOKEN", "CHANNEL_ID")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+_offenders = []
+for _dir, _subs, _files in os.walk(_ROOT):
+    _subs[:] = [d for d in _subs
+                if d not in (".git", "__pycache__", "node_modules", ".venv")]
+    for _f in _files:
+        if not _f.endswith(".py"):
+            continue
+        _p = os.path.join(_dir, _f)
+        _src = io.open(_p, encoding="utf-8", errors="replace").read()
+        for _m in _re.finditer(r"^from\s+config\s+import\s+(\(.*?\)|.*)$",
+                               _src, _re.M | _re.S):
+            _names = {n.strip(" ()\n\t") for n in _m.group(1).split(",")}
+            _bad = _names & set(_FROZEN)
+            if _bad:
+                _offenders.append(f"{os.path.relpath(_p, _ROOT)}: "
+                                  f"{', '.join(sorted(_bad))}")
+assert not _offenders, ("a credential is bound at import again — read it as "
+                        "config.NAME:\n  " + "\n  ".join(_offenders))
+print(f"   scanned the tree: 0 modules bind {', '.join(_FROZEN)} at import")
+
+
+print("\n== typed credentials reach the whole process ==")
+# `configure()` used to keep them on the engine object, which the uploader reads
+# and nothing else does. db_restore, tg_transport, the harvester and Atlas all
+# read the environment, so four correct credentials typed into the Setup page
+# after a throttled boot still produced "Telegram is not configured" from
+# restore. `adopt` is the missing half.
+c = _fresh(None)                      # no Kaggle at all; typing is the only source
+_adopted = c.adopt({"bot_token": "555:typed", "channel_id": "-1006666666666",
+                    "api_id": "555555", "api_hash": "typed-hash"})
+assert set(_adopted.values()) == {"VIOS_BOT_TOKEN", "VIOS_CHANNEL_ID",
+                                  "VIOS_API_ID", "VIOS_API_HASH"}, _adopted
+assert _il.reload(config).telegram_ready()
+assert config.BOT_TOKEN == "555:typed", config.BOT_TOKEN
+print("   set", ", ".join(sorted(_adopted.values())), "— and config sees them")
+
+# Typed wins over what is already there. That is the point of typing it: the
+# stored row is wrong, or is for another channel, and this is the override.
+c.adopt({"bot_token": "666:corrected"})
+assert config.BOT_TOKEN == "666:corrected", config.BOT_TOKEN
+# But a blank field is not an instruction to forget one. The Setup form submits
+# every input, and three of them are usually empty because they have not changed.
+c.adopt({"bot_token": "", "channel_id": None, "api_hash": "   "})
+assert config.BOT_TOKEN == "666:corrected", "a blank field unset a credential"
+assert config.API_HASH == "typed-hash", "a whitespace field unset a credential"
+print("   an override replaces a value; a blank field leaves it alone")
+
+# And it does not claim to be a stored secret. ORIGIN_VAR answers "did my Kaggle
+# Secrets row get used", which is what tells the user whether this survives a
+# restart — a typed value saying yes would make the Setup page lie.
+assert "bot_token" not in os.environ.get(creds.ORIGIN_VAR, ""), \
+    "a typed credential claimed to have come from the store"
+assert c.adopt({"nonsense": "x"}) == {}, "adopted a field that does not exist"
+print("   typed is reported as typed, not as kaggle-secrets")
+
+
+print("\n== a recoverable failure is asked again, later ==")
+# Which failures time can fix, and which it cannot. Getting this wrong in either
+# direction costs something: a background thread re-asking a store that will
+# never answer is calls into a limiter that is already counting, and *not*
+# re-asking a 429 is the bug this whole file is about.
+assert creds.recoverable({"reason": creds.RATE_LIMIT})
+assert creds.recoverable({"reason": creds.UNREACHABLE})
+assert creds.recoverable({"reason": creds.BACKEND})
+for _settled in (creds.NO_MODULE, creds.NO_TOKEN, creds.NO_ACCESS, ""):
+    assert not creds.recoverable({"reason": _settled}), _settled
+assert not creds.recoverable(None)
+print("   throttled/unreachable/backend yes; no-module, no-token, no-access "
+      "and 'worked, found nothing' no")
+
+
+class _Healing:
+    """Throttles everything until `open` is set, then answers normally.
+
+    Kaggle's limiter, honestly: the rows never moved and the token was always
+    good — the account had read too many secrets in the last minute.
+    """
+
+    open = False
+
+    def get_secret(self, label):
+        ASKED.append(label)
+        if not _Healing.open:
+            _raise_masked(429, _TOO_MANY, msg="Too Many Requests")
+        if label not in STORE:
+            _raise_masked(404, _NO_ROW, msg="Not Found")
+        return STORE[label]
+
+
+_Healing.open = False
+c = _fresh(_Healing)
+_boot_report = c.read_kaggle()
+assert _boot_report["reason"] == creds.RATE_LIMIT, _boot_report["reason"]
+assert not _il.reload(config).telegram_ready(), "the throttled boot found some"
+
+# The limit clears while the session runs — which is what it does, in about a
+# minute, in a session that lasts twelve hours.
+_Healing.open = True
+_notes, _ready = [], []
+assert c.recover_later(report=_boot_report, on_note=_notes.append,
+                       on_ready=_ready.append), "declined to retry a 429"
+# One thread per process, ever. Two of these racing would double every call
+# against the limiter that caused the problem.
+assert not c.recover_later(report=_boot_report), "started a second retry thread"
+
+for _t in threading.enumerate():
+    if _t.name == "vios-creds-recover":
+        _t.join(20.0)
+        assert not _t.is_alive(), "the recovery thread never finished"
+
+assert _ready, f"recovered nothing; notes: {_notes}"
+_names = set(_ready[0].values())
+assert {"VIOS_BOT_TOKEN", "VIOS_CHANNEL_ID", "VIOS_API_ID",
+        "VIOS_API_HASH"} <= _names, _names
+assert _il.reload(config).telegram_ready(), config.missing_telegram_secrets()
+assert config.BOT_TOKEN == STORE["VIOS_TELEGRAM_BOT_TOKEN"], config.BOT_TOKEN
+# The verdict the boot left behind is corrected, so anything started after this
+# inherits "ok" rather than the throttle it has just recovered from.
+assert os.environ.get(creds.SWEPT_VAR) == "ok", os.environ.get(creds.SWEPT_VAR)
+# Names in the log, never values — the recovery lines go to the same Kaggle cell
+# output that outlives the session and gets pasted into bug reports.
+_blob = repr(_notes) + repr(_ready)
+for _v in STORE.values():
+    assert _v not in _blob, "a recovery line leaked a credential"
+assert "fake.jwt.value" not in _blob
+print(f"   retry {len(_notes) or 1} recovered every credential without a "
+      f"restart, and said so without printing one")
+
+# A settled failure buys no thread at all. A laptop has no kaggle_secrets module
+# and would otherwise pay twenty minutes of pointless wake-ups for it.
+c = _fresh(None)
+assert not c.recover_later(), "retried a failure that waiting cannot fix"
+print("   a laptop, and a session with nothing stored, start no thread")
+
+print("\nLATE-BINDING OK — a credential found after boot reaches the harvester, "
+      "the restore and the uploader without restarting anything")
+

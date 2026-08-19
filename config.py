@@ -259,30 +259,72 @@ def _int_secret(*names: str, default: int = 0) -> int:
         return default
 
 
-API_ID     = _int_secret('VIOS_API_ID', 'TELEGRAM_API_ID')
-API_HASH   = _secret('VIOS_API_HASH', 'TELEGRAM_API_HASH')
-BOT_TOKEN  = _secret('VIOS_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN')
-# No default. The channel id is not a key, but it is the address of somebody's
-# private archive, and this repo is public — a literal here ships one person's
-# channel to everyone who clones. It is also the failure that is hardest to
-# see: with a default, a misconfigured deployment does not stop, it quietly
-# reads and writes a channel that is not yours. Absent is louder than wrong.
-CHANNEL_ID = _int_secret('VIOS_CHANNEL_ID', 'TELEGRAM_CHANNEL_ID')
+# Read on every access, not once at import — which is the whole point of the
+# dictionary below and of the `__getattr__` under it.
+#
+# These four used to be module constants, evaluated the moment anything imported
+# `config`. That made a credential's absence permanent: `missing_telegram_secrets`
+# read a tuple of the *values* captured at import, so once it had answered "not
+# set" it answered "not set" for the life of the process no matter what happened
+# to the environment afterwards. A Kaggle Secrets store that rate-limited Phase 0
+# for sixty seconds therefore cost a twelve-hour session its harvester, its upload
+# bot and its restore — the limit cleared a minute later and nothing in the system
+# was capable of noticing, because nothing in the system ever looked again.
+#
+# No default, for either half of the pair. The token is a key. The channel id is
+# not, but it is the address of somebody's private archive and this repo is
+# public: a literal here ships one person's channel to everyone who clones, and
+# it is the quietest possible failure — with a default, a misconfigured
+# deployment does not stop, it reads and writes a channel that is not yours.
+# Absent is louder than wrong.
+#
+# Values keyed by attribute name; the last entry of each tuple is the name to
+# print when it is missing, which is the one a notebook would export.
+_TELEGRAM_ENV = {
+    'API_ID':     ('VIOS_API_ID', 'TELEGRAM_API_ID'),
+    'API_HASH':   ('VIOS_API_HASH', 'TELEGRAM_API_HASH'),
+    'BOT_TOKEN':  ('VIOS_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'),
+    'CHANNEL_ID': ('VIOS_CHANNEL_ID', 'TELEGRAM_CHANNEL_ID'),
+}
+_TELEGRAM_INT = ('API_ID', 'CHANNEL_ID')
 
-# Names as the launcher/Kaggle Secrets should provide them, for error messages.
-_TELEGRAM_SECRETS = (
-    ('API_ID', API_ID, 'TELEGRAM_API_ID'),
-    ('API_HASH', API_HASH, 'TELEGRAM_API_HASH'),
-    ('BOT_TOKEN', BOT_TOKEN, 'TELEGRAM_BOT_TOKEN'),
-    ('CHANNEL_ID', CHANNEL_ID, 'TELEGRAM_CHANNEL_ID'),
-)
+
+def __getattr__(name: str):
+    """PEP 562: `config.BOT_TOKEN` is a lookup, evaluated now.
+
+    Deliberately not module globals. A global would be assigned once at import
+    and every later read would see that one answer — which is the bug this
+    replaces, and a bug that would come straight back the first time somebody
+    added `BOT_TOKEN = ...` for convenience. There is nothing to assign, so
+    there is nothing to go stale.
+
+    The one thing this cannot fix is `from config import BOT_TOKEN`: that binds
+    the value into the importing module at import time and Python never asks
+    again. Credentials are read as `config.NAME` everywhere in this repository
+    for exactly that reason.
+    """
+    if name in _TELEGRAM_ENV:
+        names = _TELEGRAM_ENV[name]
+        return (_int_secret(*names) if name in _TELEGRAM_INT
+                else _secret(*names))
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list:
+    # `__getattr__` alone leaves these invisible to dir()/tab-completion.
+    return sorted(set(globals()) | set(_TELEGRAM_ENV))
 
 
 def missing_telegram_secrets() -> list:
-    """Which Telegram secrets are absent. Callers that need the bot check this
-    before constructing a Client; pyrogram's own failure for a blank token is
-    an opaque AuthKeyUnregistered several frames deep."""
-    return [env for _attr, val, env in _TELEGRAM_SECRETS if not val]
+    """Which Telegram secrets are absent, right now.
+
+    Callers that need the bot check this before constructing a Client; pyrogram's
+    own failure for a blank token is an opaque AuthKeyUnregistered several frames
+    deep. Recomputed per call, so a caller that finds credentials missing can ask
+    again in a minute and get a different — and true — answer.
+    """
+    return [names[-1] for attr, names in _TELEGRAM_ENV.items()
+            if not __getattr__(attr)]
 
 
 def telegram_ready() -> bool:

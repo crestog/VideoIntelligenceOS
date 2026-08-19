@@ -232,6 +232,13 @@ def _startup_restore(eng, say):
        worse than none. That reasoning is right, so the action moved and the
        check did not: this runs from the web process, where the services are
        already live, and still waits for them rather than assuming.
+    1b. **Wait for the credentials, but only if they are still coming.** Both
+       restores read the channel, and this whole phase is a one-shot: burning it
+       ninety seconds before a throttled Kaggle Secrets retry succeeds is how a
+       session ends up with an empty coverage table and reprocesses an archive it
+       already has bundles for. The wait is conditional on `creds.recoverable` —
+       a session with nothing stored waits zero seconds, because nothing is on
+       its way.
     2. **The v1 harvest database**, if it is empty. `db_restore.start_restore`
        is the same call the admin panel makes; it refuses to run beside an
        export and knows both schema versions. Only when `posts == 0` — a
@@ -250,10 +257,13 @@ def _startup_restore(eng, say):
     and therefore on the tab. Nothing here raises: a boot-time restore that
     fails must cost repeated work, never the session.
     """
-    out = {"waited": 0.0, "lake": {}, "shards": {}, "reconciled": {}}
+    out = {"waited": 0.0, "creds_waited": 0.0, "lake": {}, "shards": {},
+           "reconciled": {}}
 
     say("Waiting for the services to come up…")
     out["waited"] = _wait_for_services(say)
+
+    out["creds_waited"] = _wait_for_credentials(say)
 
     say("Checking the harvest database…")
     try:
@@ -288,6 +298,60 @@ def _startup_restore(eng, say):
         say(f"Reconcile failed — {out['reconciled']['error']}")
 
     return out
+
+
+def _wait_for_credentials(say, timeout: float = 330.0) -> float:
+    """Hold the restore while a recoverable credential failure is still healing.
+
+    Returns the seconds waited. Zero is the normal answer.
+
+    The restore is the one step here that cannot be retried cheaply: it is a
+    one-shot per session (`_autostart["started"]`), it reads the channel, and if
+    it runs without Telegram it reports "not configured" and the sweep then
+    reprocesses an archive whose evidence was sitting in a bundle the whole time.
+    Meanwhile `ui_server` may be four minutes into re-asking a Kaggle Secrets
+    store that answered HTTP 429 during Phase 0 — a limit that clears in about a
+    minute, in a session that lasts twelve hours.
+
+    So this waits, and the important part is when it does *not*:
+
+      * credentials already present → returns immediately;
+      * the sweep only ever failed to find rows, or this is not Kaggle at all →
+        returns immediately, because nothing is coming and the sweep should get
+        on with the work it does not need Telegram for;
+      * only a `recoverable` reason (throttled / unreachable / backend) buys the
+        wait, and only up to `timeout` — 330 s, which covers the first three
+        rungs of `creds._RECOVER_LADDER`.
+    """
+    try:
+        import config                              # noqa: PLC0415
+        from vios import creds                     # noqa: PLC0415
+    except Exception:                              # noqa: BLE001
+        return 0.0
+    if getattr(config, "telegram_ready", None) and config.telegram_ready():
+        return 0.0
+    try:
+        if not creds.recoverable(creds.kaggle_report()):
+            return 0.0
+    except Exception:                              # noqa: BLE001
+        return 0.0
+
+    say("Telegram credentials are still being re-read after a temporary Kaggle "
+        "Secrets failure — holding the restore rather than burning it.")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(5.0)
+        if config.telegram_ready():
+            waited = time.time() - t0
+            say(f"Credentials arrived after {int(waited)}s — restoring.")
+            return waited
+        left = int(timeout - (time.time() - t0))
+        if left % 60 < 5:
+            say(f"Still waiting for Telegram credentials ({left}s left before "
+                f"the restore goes ahead without them)…")
+    say("Credentials never arrived — restoring what can be restored without "
+        "the channel. Type them on the Setup page and press Restore.")
+    return time.time() - t0
 
 
 def _wait_for_services(say, timeout: float = 180.0) -> float:

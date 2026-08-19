@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
 import time
 from urllib.error import HTTPError
 
@@ -827,6 +828,162 @@ def mark_swept(report: dict | None = None) -> str:
     return verdict
 
 
+# ── asking again, later ───────────────────────────────────────────────────
+# Phase 0 is bounded on purpose: it blocks the boot, and a boot that waits
+# forever for a store is worse than one that starts without Telegram. But
+# "bounded" was implemented as "final", and those are different claims. A rate
+# limit clears in about a minute; the session it landed in lasts twelve hours.
+# Giving up at the 150-second mark and never asking again is how a one-minute
+# throttle cost a whole session its channel, its harvester and its restore.
+#
+# So the launcher's failure is not the last word. If the reason it failed is one
+# that time fixes — throttled, unreachable, a backend having a bad minute — a
+# daemon thread in the long-lived process asks again on a widening ladder, and
+# the moment the answer changes it writes the values into `os.environ` where
+# every late-binding reader in this process (see the note in config.py) picks
+# them up without a restart.
+#
+# What does *not* get retried is a settled answer. NO_MODULE means this is not
+# Kaggle. NO_TOKEN and NO_ACCESS mean the session cannot read the store at all,
+# which no amount of waiting changes. And a sweep that worked and found nothing
+# is an answer: the rows are not there, and a Kaggle session cannot see a row
+# attached after it started. Retrying any of those is a call against a store
+# that counts calls, in exchange for the same reply.
+_RECOVER_LADDER = (45.0, 90.0, 180.0, 360.0, 600.0)
+_RECOVER_STARTED = threading.Lock()
+_recovering = False
+
+
+def recoverable(report: dict | None) -> bool:
+    """Is this a failure that waiting could fix?
+
+    True only for the three reasons that describe the endpoint rather than the
+    rows: RATE_LIMIT, UNREACHABLE, BACKEND. A sweep with no reason at all
+    succeeded, however little it found, and there is nothing to recover.
+    """
+    if not report:
+        return False
+    return report.get("reason") in (RATE_LIMIT, UNREACHABLE, BACKEND)
+
+
+def recover_later(on_ready=None, on_note=None, report: dict | None = None) -> bool:
+    """Re-ask the store on a widening ladder, in the background. Returns whether
+    a thread was started.
+
+    `on_note(text)` gets one line per attempt, for the log. `on_ready(exported)`
+    is called once, with `export_to_env`'s `{field: env var}` — names only, never
+    values — the first time an attempt actually sets something. Both are called
+    from the recovery thread, so a caller that touches an event loop from them
+    has to hand the work over itself.
+
+    Bounded five ways, because the failure mode to avoid here is a background
+    thread quietly hammering a rate limiter for twelve hours:
+
+      * only for `recoverable` reasons;
+      * at most one thread per process, ever (`_recovering`);
+      * at most `len(_RECOVER_LADDER)` attempts, ~20 minutes end to end;
+      * it stops the moment the four required credentials are present, whoever
+        supplied them — the Setup page counts;
+      * daemon, so it can never hold the process open at shutdown.
+    """
+    global _recovering
+
+    rep = report if report is not None else kaggle_report()
+    if not recoverable(rep):
+        return False
+
+    with _RECOVER_STARTED:
+        if _recovering:
+            return False
+        _recovering = True
+
+    def note(text: str):
+        if on_note:
+            try:
+                on_note(text)
+            except Exception:                             # noqa: BLE001
+                pass
+
+    def satisfied() -> bool:
+        return all(
+            any(os.environ.get(lbl, "").strip() for lbl in labels(name))
+            for name in _REQUIRED
+        )
+
+    def loop():
+        for attempt, gap in enumerate(_RECOVER_LADDER, start=1):
+            time.sleep(gap)
+            if satisfied():
+                note("credentials arrived from elsewhere — recovery stands down")
+                return
+            try:
+                # force, or the SWEPT_VAR this process inherited from the boot
+                # would have it answer from the very failure it is recovering
+                # from. `mark_swept` after, so anything this process spawns
+                # later inherits the new verdict rather than the old one.
+                exported = export_to_env(force=True)
+                verdict = mark_swept(kaggle_report())
+            except Exception as exc:                      # noqa: BLE001
+                note(f"retry {attempt}/{len(_RECOVER_LADDER)} failed: "
+                     f"{type(exc).__name__}: {str(exc)[:120]}")
+                continue
+            if exported:
+                note(f"retry {attempt} recovered: "
+                     f"{', '.join(sorted(exported.values()))}")
+                if on_ready:
+                    try:
+                        on_ready(exported)
+                    except Exception:                     # noqa: BLE001
+                        pass
+                return
+            note(f"retry {attempt}/{len(_RECOVER_LADDER)}: store still says "
+                 f"{verdict}")
+        note("gave up re-asking Kaggle Secrets; type them on the Setup page "
+             "or re-run the launch cell")
+
+    threading.Thread(target=loop, name="vios-creds-recover",
+                     daemon=True).start()
+    return True
+
+
+def adopt(values: dict) -> dict:
+    """Bridge credentials typed into the interface to the whole process.
+
+    Returns `{field: env var}` for what it set — names, never values.
+
+    `configure()` on either engine used to keep typed credentials in that
+    engine's own state, which is enough for the uploader that reads them from
+    there and nothing else. `db_restore`, `tg_transport`, the harvester and
+    Atlas all read `os.environ`, so a user who typed four correct credentials
+    into the Setup page after a throttled boot still got "Telegram is not
+    configured" from restore. This is the missing half: typed values go where
+    every reader already looks.
+
+    Typed wins, so unlike `export_to_env` this overwrites what is there — that
+    is the point of typing it. It never *blanks* a variable, though: a form
+    submitted with three fields filled must not delete the fourth.
+
+    Not recorded in ORIGIN_VAR. That variable answers "did this come out of
+    Kaggle Secrets", the Setup page shows it as the source, and a typed value
+    claiming to be stored would make the Setup page lie about what survives a
+    restart.
+    """
+    exported = {}
+    for name, val in (values or {}).items():
+        if name not in FIELDS:
+            continue
+        val = str(val or "").strip()
+        if not val:
+            continue
+        canonical = FIELDS[name][0]
+        os.environ[canonical] = val
+        exported[name] = canonical
+        for label in MIRROR.get(name, ()):
+            os.environ[label] = val
+            exported[f"{name}:{label}"] = label
+    return exported
+
+
 def kaggle_advice(report: dict) -> list:
     """What to do about a sweep that came back empty, as printable lines.
 
@@ -1032,7 +1189,7 @@ def _from_file() -> dict:
             if k in FIELDS and v and str(v).strip()}
 
 
-def export_to_env() -> dict:
+def export_to_env(force: bool = False) -> dict:
     """Make Kaggle Secrets visible to code that reads only the environment.
 
     Returns `{field: env var}` for the variables this call actually set — the
@@ -1070,6 +1227,11 @@ def export_to_env() -> dict:
     Kaggle lookup carries a 40-second timeout, so a sweep for values that would
     be discarded anyway is minutes of boot spent to lose an argument it already
     lost.
+
+    `force=True` re-asks the store even though something in this session already
+    swept it — for `recover_later`, whose entire job is to ask again after a
+    throttle has had time to clear. It does not re-ask about credentials already
+    in the environment; those are answered, not throttled.
     """
     # What is already satisfied, decided before the sweep so the sweep can skip
     # it. `labels()` covers the canonical name and every alias, which is the same
@@ -1081,7 +1243,7 @@ def export_to_env() -> dict:
     ) + tuple(
         label for label in PASSTHROUGH if os.environ.get(label, "").strip()
     )
-    from_kaggle = read_kaggle(skip=satisfied)["values"]
+    from_kaggle = read_kaggle(skip=satisfied, force=force)["values"]
     exported = {}
     origin = {n for n in os.environ.get(ORIGIN_VAR, "").split(",") if n}
 

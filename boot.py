@@ -410,6 +410,15 @@ try:
             print(f"      Phase 0 hit a problem reading Kaggle Secrets "
                   f"[{_kr['reason']}] — see its advice above. The rows may "
                   f"well exist; this run could not read them.", flush=True)
+            # A bounded Phase 0 is not a verdict any more. If the reason is one
+            # that time fixes, the web process keeps asking on a widening ladder
+            # and every reader in it picks the answer up live — so this is a
+            # late start for the harvester, not a session without one.
+            if _creds.recoverable(_kr):
+                print("      This one clears itself. The web process re-asks the "
+                      "store for the next ~20 minutes and the harvester, the "
+                      "uploader and the restore all pick the answer up without "
+                      "a restart — watch for 🔑 [CREDS] below.", flush=True)
         else:
             print("      To enable channel harvesting and the upload bot, add these", flush=True)
             print("      as Kaggle Secrets (Add-ons → Secrets) and restart. Any of", flush=True)

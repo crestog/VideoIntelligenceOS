@@ -64,7 +64,7 @@ they have six different remedies and used to share one misleading sentence:
 | `Kaggle answered, and none of the N names … is stored` | The store works and is empty | Check the row exists **and its toggle is on for this notebook**, then restart the session |
 | `unreadable [no-access]` | Kaggle answered HTTP 401/403. If it refused *every* label the token is stale; if it refused some and answered others, those rows are not shared with this notebook | Restart the session, or switch the named rows on for this notebook. This is what "attached after the kernel started" looks like |
 | `unreadable [no-token]` | `KAGGLE_USER_SECRETS_TOKEN` is not in this process at all | Run `boot.py` from a notebook cell, not a Terminal or `nohup`; the variable is inherited, not global |
-| `unreadable [rate-limited]` | HTTP 429. Kaggle counts secret reads **per account** and this one has read too many too recently. The rows, the token and the network are all fine | Phase 0 already waited (up to 150 s) and the limit outlasted it. Wait a minute and re-run the cell. **Do not** restart the session — a new session starts by sweeping the store again. See below |
+| `unreadable [rate-limited]` | HTTP 429. Kaggle counts secret reads **per account** and this one has read too many too recently. The rows, the token and the network are all fine | Nothing, usually. Phase 0 waited up to 150 s and the limit outlasted it, but the web process keeps asking for another ~20 minutes and everything picks the answer up live — so the harvester starts late instead of not at all. **Do not** restart the session; a new session starts by sweeping the store again. See below |
 | `unreachable` | No answer and **no HTTP status behind it** — this one really is the transport | Settings → Internet → On |
 | `partly unreadable [backend]` | Some rows read, at least one errored | The named labels only; the rest are present |
 
@@ -122,8 +122,63 @@ no longer prints both about the same row.
 A throttle it rides out is one line in the log; a throttle it cannot is named,
 with the seconds it spent, and never blamed on your network.
 
-The remedy really is just the clock. Restarting the session is the one thing
-that makes it worse, since a fresh session begins by sweeping the store again.
+The remedy really is just the clock — and you no longer have to be the one
+holding it. See the next section.
+
+### A credential that arrives after boot
+
+Phase 0 is bounded on purpose: it blocks the boot, so its patience stops at two
+and a half minutes. That bound used to be a verdict. A 429 that outlived it left
+four empty strings frozen into six modules for the rest of a twelve-hour session
+— the harvester slept an hour at a time and never looked again, restore raised
+`Telegram is not configured`, and the only remedy in the log was *restart the
+notebook*, which begins by sweeping the same limiter.
+
+Nothing is frozen now, and there are three ways a credential can turn up late:
+
+* **The web process re-asks the store by itself.** Only for failures that time
+  fixes — `rate-limited`, `unreachable`, `backend` — and never for a sweep that
+  worked and found nothing, because a Kaggle session cannot see a row attached
+  after it started. Five attempts on a widening ladder (45 s, 90 s, 3 min, 6 min,
+  10 min), one thread per session, and it stops the moment the credentials are
+  present from any source. Watch for:
+
+  ```
+  🔑 [CREDS] Phase 0 hit a temporary Kaggle Secrets failure — re-asking in the background
+  🔑 [CREDS] retry 2 recovered: VIOS_API_HASH, VIOS_API_ID, VIOS_BOT_TOKEN, VIOS_CHANNEL_ID
+  🔑 [CREDS] now available to this process: … — the harvester and restore pick these up without a restart
+  ```
+
+* **You type them into the Setup page.** They now go into the process
+  environment as well as the engine that took the form, which is what makes them
+  visible to restore, to the uploader and to the harvester. Still never written
+  to disk, and still reported as *typed* rather than as a stored secret — that
+  distinction is how you know whether it survives a restart.
+
+* **The launch-cell bridge below**, which is the same thing done by hand.
+
+Three consumers wait rather than give up, so a late arrival is a late start and
+not a lost feature:
+
+| Waits | For how long | If nothing arrives |
+|---|---|---|
+| Ghost Worker (channel harvest) | Indefinitely, re-checking every 20 s, one `⏳` line per 10 min | The UI, CV pipeline and queues were never affected; it starts the moment credentials appear |
+| Autostart restore | Up to 330 s, and **only** if the failure was recoverable | Restores what does not need the channel, then says so. Press **Restore** on the tab afterwards |
+| Upload / export | Per call | `tg_transport` reads the token at call time, so the next attempt uses whatever is current |
+
+One thing does **not** recover: the v1 Telegram upload bot inside `omni_engine.py`.
+It is a separate process, its handlers are bound to a pyrogram client built at
+import, and `os.environ` does not cross a fork that has already happened — so it
+cannot see what the web process recovered. If Phase 0 was throttled and you want
+that bot, re-run the launch cell once the limit has cleared. Everything else
+(harvest, restore, export, Atlas) picks the credentials up without a restart.
+
+A session with nothing stored waits zero seconds anywhere — there is nothing on
+its way, and pretending otherwise would just delay the work that does not need
+Telegram.
+
+Restarting the session is still the one thing that makes a 429 worse, since a
+fresh session begins by sweeping the store again.
 
 If you re-run `boot.py` often, spend the reads once instead. Run this in the
 notebook **once per session**: it reads the store into the kernel's own
@@ -163,7 +218,9 @@ seconds before it.
 The line under a failure — `session: KAGGLE_USER_SECRETS_TOKEN=present/ABSENT …`
 — reports presence, never the token. `⚠️ [SECRETS] Telegram disabled — not set: …`
 still appears further down naming exactly which credentials are missing, and
-everything that does not need Telegram still runs.
+everything that does not need Telegram still runs. It says *disabled*, not
+*disabled for the session*: if the reason was a throttle, the line above it says
+so and the harvester is waiting.
 
 `setup.sh` installs Neo4j and Postgres for the older omniscient layer, which is
 about half the install time. If you only want the v2 planes (capture, process

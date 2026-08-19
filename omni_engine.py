@@ -33,7 +33,13 @@ import uuid as uuid_lib
 # disk. These libraries latch their cache paths at import time, so this import
 # order is load-bearing: reversing it puts ~19 GB of Omniscient weights back on
 # the 20 GB output quota, which is what caused "No space left on device".
-from config import (ARCHIVE_DIR, LAKE_DIR, API_ID, API_HASH, BOT_TOKEN,
+#
+# The four Telegram credentials are deliberately NOT in this list. They are read
+# as `config.API_ID` at the point of use: a `from config import BOT_TOKEN` binds
+# whatever was known at import, and this process starts while Phase 0 may still
+# be waiting out a rate limit, so the snapshot could be empty forever.
+import config
+from config import (ARCHIVE_DIR, LAKE_DIR,
                     QUEUE_OMNI_VISION, QUEUE_OMNI_ORACLE, OMNI_DEDUP_SET,
                     OMNI_DASHBOARD_PORT,
                     OMNI_MODE_OMNI, OMNI_MODE_BLITZ, OMNI_BLITZ_SAMPLE_FPS,
@@ -1418,7 +1424,8 @@ if TELEGRAM_MISSING:
     app = _DisabledBot(TELEGRAM_MISSING)
 else:
     app = Client(os.path.join(LAKE_DIR, "omni_bot"),
-                 api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+                 api_id=config.API_ID, api_hash=config.API_HASH,
+                 bot_token=config.BOT_TOKEN)
 
 pending_videos = {}
 
@@ -1883,8 +1890,18 @@ def main():
                     "for the processing engine.", "SUCCESS")
             else:
                 log(f"⚠️ Telegram bot disabled — missing {', '.join(TELEGRAM_MISSING)}.", "WARN")
-                log("   Set them as Kaggle Secrets and restart to enable uploads and "
-                    "bot search. Workers, dashboard and queues are unaffected.", "WARN")
+                # Deliberately not the "waits for them" line ui_server prints.
+                # This is a separate process: `app` is a pyrogram Client whose
+                # handlers are registered by decorator at import, so a credential
+                # that arrives now cannot be adopted without rebuilding it — and
+                # this process cannot see the web plane's recovered environment
+                # anyway, since `os.environ` does not cross a fork that already
+                # happened. The harvester, the restore and the uploader do
+                # recover live; this one bot needs the launch cell re-run.
+                log("   Workers, dashboard and queues are unaffected, and the "
+                    "harvester and restore recover on their own. This bot is a "
+                    "separate process: re-run the launch cell to enable it.",
+                    "WARN")
                 log("⚡ OMNISCIENT ENGINE RUNNING — queues hot, bot off.", "SUCCESS")
             asyncio.create_task(ui_updater_daemon())
             while True:

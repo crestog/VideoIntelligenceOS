@@ -77,26 +77,48 @@ def _int_secret(*names, default=0):
         return default
 
 
-API_ID    = _int_secret("ATLAS_API_ID", "VIOS_API_ID", "TELEGRAM_API_ID")
-API_HASH  = _secret("ATLAS_API_HASH", "VIOS_API_HASH", "TELEGRAM_API_HASH")
-BOT_TOKEN = _secret("ATLAS_BOT_TOKEN", "VIOS_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+# Read per access, not once at import. See the long note in the root config.py:
+# a frozen `BOT_TOKEN` makes a credential's absence permanent, and a Kaggle
+# Secrets store that throttles the launcher for a minute then costs the whole
+# session its channel. Atlas is a reader and the channel is everything it reads,
+# so this one has no cheaper failure mode than that.
+#
+# No default for the channel id either. Not a key, but it is the address of
+# somebody's private archive and this repo is public; a wrong-but-present id is
+# also the quietest way to fail, since Atlas would read a channel that is not
+# yours and report nothing wrong.
+_TELEGRAM_ENV = {
+    "API_ID":     ("ATLAS_API_ID", "VIOS_API_ID", "TELEGRAM_API_ID"),
+    "API_HASH":   ("ATLAS_API_HASH", "VIOS_API_HASH", "TELEGRAM_API_HASH"),
+    "BOT_TOKEN":  ("ATLAS_BOT_TOKEN", "VIOS_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
+    "CHANNEL_ID": ("ATLAS_CHANNEL_ID", "VIOS_CHANNEL_ID",
+                   "TELEGRAM_CHANNEL_ID"),
+}
+_TELEGRAM_INT = ("API_ID", "CHANNEL_ID")
 
-# No default. Not a key, but it is the address of somebody's private archive,
-# and this repo is public. A wrong-but-present channel id is also the quietest
-# way to fail: Atlas would read a channel that is not yours and report nothing
-# wrong. See the note in the root config.py.
-CHANNEL_ID = _int_secret("ATLAS_CHANNEL_ID", "VIOS_CHANNEL_ID",
-                         "TELEGRAM_CHANNEL_ID")
 
-_SECRET_NAMES = (("API_ID", API_ID, "TELEGRAM_API_ID"),
-                 ("API_HASH", API_HASH, "TELEGRAM_API_HASH"),
-                 ("BOT_TOKEN", BOT_TOKEN, "TELEGRAM_BOT_TOKEN"),
-                 ("CHANNEL_ID", CHANNEL_ID, "TELEGRAM_CHANNEL_ID"))
+def __getattr__(name: str):
+    """PEP 562: `config.BOT_TOKEN` is a lookup, evaluated now.
+
+    Not module globals, so there is nothing to go stale. `from config import
+    BOT_TOKEN` would still snapshot — every reader in this package uses
+    `config.NAME`, which is why this works.
+    """
+    if name in _TELEGRAM_ENV:
+        names = _TELEGRAM_ENV[name]
+        return (_int_secret(*names) if name in _TELEGRAM_INT
+                else _secret(*names))
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list:
+    return sorted(set(globals()) | set(_TELEGRAM_ENV))
 
 
 def missing_secrets() -> list:
-    """Which Telegram secrets are absent, by the name the launcher exports."""
-    return [env for _a, val, env in _SECRET_NAMES if not val]
+    """Which Telegram secrets are absent, right now, by the name to export."""
+    return [names[-1] for attr, names in _TELEGRAM_ENV.items()
+            if not __getattr__(attr)]
 
 
 def telegram_ready() -> bool:

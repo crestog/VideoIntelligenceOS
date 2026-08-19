@@ -154,8 +154,18 @@ for _noisy in ("pyrogram.session.session", "pyrogram.connection.connection",
     logging.getLogger(_noisy).addFilter(_RateLimitFilter())
 
 # --- CREDENTIALS (single source of truth: config.py, env-only) ---
-from config import (API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID,
-                    missing_telegram_secrets)
+# Read as `config.NAME`, never bound here. This module is imported seconds after
+# Phase 0, so a `from config import BOT_TOKEN` captured whatever a throttled
+# sweep had managed to find — which was nothing — and no later arrival could
+# change it. The harvester below now waits for them instead of parking, and that
+# only means anything if the lookup is live.
+import config
+from config import missing_telegram_secrets
+
+# How often anything in this process re-checks for credentials that were not
+# there at import. Cheap (dict lookups), so the number is chosen for how long a
+# user is willing to stare at a "waiting" line, not for cost.
+_CRED_POLL_INTERVAL = 20.0
 
 # --- DIRECTORY ROUTING (from config.py) ---
 SESSION_PATH = os.path.join(LAKE_DIR, 'bot_session')
@@ -392,22 +402,42 @@ async def background_downloader():
 
     # Without credentials pyrogram fails several frames deep with an opaque
     # auth error, and the watchdog then restarts this process forever. The web
-    # UI, the API and the frame pipeline do not need Telegram, so park the
-    # harvester instead of taking the server down with it.
+    # UI, the API and the frame pipeline do not need Telegram, so the harvester
+    # holds instead of taking the server down with it.
+    #
+    # It *holds*, though — it does not park. The old code slept an hour at a
+    # time and never looked again, so a sixty-second Kaggle Secrets rate limit
+    # during Phase 0 cost the whole twelve-hour session its channel: the
+    # credentials arrived four minutes later (recovery sweep, or typed into the
+    # Setup page) and nothing in this process was still asking. Poll instead.
+    # The check is four dict lookups against os.environ, so a 20 s cadence for
+    # an hour is free, and the wait is announced once rather than every round.
     absent = missing_telegram_secrets()
     if absent:
-        GLOBAL_STATUS = f"⚠️ Telegram disabled — missing {', '.join(absent)}"
-        custom_print(f"⚠️ Ghost Worker idle: {', '.join(absent)} not set.")
-        custom_print("   Add them as Kaggle Secrets and restart the notebook to "
-                     "resume channel harvesting. The UI and CV pipeline are unaffected.")
-        while True:
-            await asyncio.sleep(3600)
+        GLOBAL_STATUS = f"⚠️ Telegram disabled — waiting for {', '.join(absent)}"
+        custom_print(f"⚠️ Ghost Worker holding: {', '.join(absent)} not set yet.")
+        custom_print("   Add them as Kaggle Secrets, or type them on the Setup "
+                     "page — this will pick them up within 20s, no restart. "
+                     "The UI and CV pipeline are unaffected meanwhile.")
+        waited = 0.0
+        while absent:
+            await asyncio.sleep(_CRED_POLL_INTERVAL)
+            waited += _CRED_POLL_INTERVAL
+            absent = missing_telegram_secrets()
+            # One line every ten minutes: enough to show it is still alive,
+            # not enough to matter in a log the user is reading for errors.
+            if absent and waited % 600 < _CRED_POLL_INTERVAL:
+                custom_print(f"   ⏳ still waiting for {', '.join(absent)} "
+                             f"({int(waited // 60)}m)")
+        custom_print(f"✅ Telegram credentials arrived after "
+                     f"{int(waited)}s — starting channel harvest.")
+        GLOBAL_STATUS = "⏳ Ghost Worker starting..."
 
-    app_client = Client(SESSION_PATH, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    app_client = Client(SESSION_PATH, api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
     await app_client.start()
 
     try:
-        ping = await app_client.send_message(CHANNEL_ID, ".", disable_notification=True)
+        ping = await app_client.send_message(config.CHANNEL_ID, ".", disable_notification=True)
         latest_id = ping.id
         await ping.delete()
     except Exception:
@@ -415,19 +445,19 @@ async def background_downloader():
         amnesia_event = asyncio.Event()
         @app_client.on_message()
         async def handler(client, message):
-            if message.chat and message.chat.id == CHANNEL_ID: amnesia_event.set()
+            if message.chat and message.chat.id == config.CHANNEL_ID: amnesia_event.set()
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            payload = json.dumps({"chat_id": CHANNEL_ID, "text": ".", "disable_notification": True}).encode('utf-8')
+            url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
+            payload = json.dumps({"chat_id": config.CHANNEL_ID, "text": ".", "disable_notification": True}).encode('utf-8')
             req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
             urllib.request.urlopen(req)
             await asyncio.wait_for(amnesia_event.wait(), timeout=10.0)
-            ping = await app_client.send_message(CHANNEL_ID, ".", disable_notification=True)
+            ping = await app_client.send_message(config.CHANNEL_ID, ".", disable_notification=True)
             latest_id = ping.id
             await ping.delete()
         except Exception as e:
             GLOBAL_STATUS = "❌ Bot access denied."
-            custom_print(f"❌ Cannot reach channel {CHANNEL_ID}: {str(e)[:120]}")
+            custom_print(f"❌ Cannot reach channel {config.CHANNEL_ID}: {str(e)[:120]}")
             if "peer id invalid" in str(e).lower():
                 custom_print("   ↳ Telegram has not cached this channel for the bot. Fix: add the "
                              "bot to the channel AS AN ADMIN, then post any message there once. "
@@ -477,7 +507,7 @@ async def background_downloader():
             # for the ping.) The id it leaves behind is recorded in scanned_ids
             # immediately, so the gap never shows up as "missing" again.
             try:
-                ping = await app_client.send_message(CHANNEL_ID, ".", disable_notification=True)
+                ping = await app_client.send_message(config.CHANNEL_ID, ".", disable_notification=True)
                 latest_id = ping.id
                 await ping.delete()
             except FloodWait as e:
@@ -523,7 +553,7 @@ async def background_downloader():
                 GLOBAL_STATUS = (f"⚡ Scanning batch {batch_no}/{total_batches} "
                                  f"({found_videos} videos found)")
                 try:
-                    msgs = await app_client.get_messages(CHANNEL_ID, chunk)
+                    msgs = await app_client.get_messages(config.CHANNEL_ID, chunk)
                     if not isinstance(msgs, list): msgs = [msgs]
                     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
                         for msg in msgs:
@@ -620,7 +650,7 @@ async def background_downloader():
                 custom_print(f"⬇️ Downloading Video #{target_vid} ({target_cat_name})")
                 await asyncio.sleep(1.5)
                 try:
-                    msg = await app_client.get_messages(CHANNEL_ID, target_vid)
+                    msg = await app_client.get_messages(config.CHANNEL_ID, target_vid)
                     target_video = os.path.join(VIDEO_DIR, f"video_{target_vid}.mp4")
                     await app_client.download_media(msg, file_name=target_video)
                     await ensure_web_safe(target_video)
@@ -1395,6 +1425,31 @@ if __name__ == "__main__":
                     break
 
     threading.Thread(target=start_cloudflared, daemon=True).start()
+
+    # Ask Kaggle Secrets again, if Phase 0's failure was one that time fixes.
+    #
+    # This process is the right one to own that retry: it lives as long as the
+    # session, it is where the harvester waits, and it is the parent of nothing
+    # that needs the answer earlier. The launcher could not do it — Phase 0
+    # blocks the boot, so its patience is capped at two and a half minutes, and
+    # a 429 that outlives that used to be permanent for the session even though
+    # the limit clears in about a minute.
+    #
+    # Silent no-op unless the reason was RATE_LIMIT / UNREACHABLE / BACKEND, so
+    # a laptop (no kaggle_secrets module) and a session with nothing attached
+    # both cost nothing. See `creds.recoverable`.
+    try:
+        from vios import creds as _creds
+        if _creds.recover_later(
+                on_note=lambda t: custom_print(f"🔑 [CREDS] {t}"),
+                on_ready=lambda names: custom_print(
+                    f"🔑 [CREDS] now available to this process: "
+                    f"{', '.join(sorted(names.values()))} — the harvester and "
+                    f"restore pick these up without a restart")):
+            custom_print("🔑 [CREDS] Phase 0 hit a temporary Kaggle Secrets "
+                         "failure — re-asking in the background")
+    except Exception as e:
+        custom_print(f"⚠️ [CREDS] recovery could not be armed: {e}")
 
     # The processing plane starts itself. Everything the tab reported before
     # this line was accurate — nothing had ever started it, so a session left

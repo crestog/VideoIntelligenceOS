@@ -63,8 +63,16 @@ import subprocess
 import threading
 import time
 
-from config import (SCRATCH_DIR, DB_PATH, SQLITE_TIMEOUT, CHANNEL_ID,
-                    API_ID, API_HASH, BOT_TOKEN, missing_telegram_secrets,
+# The four credentials are read as `config.NAME` at each use site, never bound
+# here: `from config import BOT_TOKEN` snapshots the value at import and this
+# module is imported by the web process at startup, which is before a throttled
+# Phase 0 has any chance of being retried. That binding is why a restore said
+# "Telegram is not configured" for a whole session over a rate limit that cleared
+# in a minute. `missing_telegram_secrets` is a function and recomputes, so
+# importing it by name is safe and stays.
+import config
+from config import (SCRATCH_DIR, DB_PATH, SQLITE_TIMEOUT,
+                    missing_telegram_secrets,
                     OMNI_PG_DB, OMNI_PG_USER, OMNI_PG_PASSWORD, OMNI_PG_HOST)
 from db_export import BUNDLE_SCHEMA, EXPORT_SESSION, _sha256, _CHUNK, _mb
 from logger import vios_log
@@ -174,7 +182,7 @@ async def _scan_for_manifest(client, seq: str | None):
     _set(stage="Scanning channel", pct=6,
          detail=f"looking for {'bundle ' + seq if seq else 'the newest manifest'}")
 
-    ping = await client.send_message(CHANNEL_ID, ".", disable_notification=True)
+    ping = await client.send_message(config.CHANNEL_ID, ".", disable_notification=True)
     latest = ping.id
     try:
         await ping.delete()
@@ -187,7 +195,7 @@ async def _scan_for_manifest(client, seq: str | None):
     while hi >= floor:
         lo = max(floor, hi - _SCAN_BATCH + 1)
         try:
-            msgs = await client.get_messages(CHANNEL_ID, list(range(hi, lo - 1, -1)))
+            msgs = await client.get_messages(config.CHANNEL_ID, list(range(hi, lo - 1, -1)))
         except Exception as e:
             raise RuntimeError(f"Could not read the channel: {str(e)[:150]}")
         for msg in (msgs or []):
@@ -217,7 +225,7 @@ async def _read_manifest(client, work: str, seq: str | None = None) -> dict:
 
     if not seq:
         try:
-            chat = await client.get_chat(CHANNEL_ID)
+            chat = await client.get_chat(config.CHANNEL_ID)
             pinned = getattr(chat, "pinned_message", None)
             if pinned is not None and _is_manifest(pinned):
                 target = pinned
@@ -506,7 +514,7 @@ async def _download_parts(client, manifest: dict, work: str) -> dict:
 
         _set(stage=f"Downloading part {n}/{total}", pct=base,
              detail=f"{part['name']} · {mb:.0f} MB")
-        msg = await client.get_messages(CHANNEL_ID, part["message_id"])
+        msg = await client.get_messages(config.CHANNEL_ID, part["message_id"])
         if msg is None or getattr(msg, "document", None) is None:
             raise RuntimeError(
                 f"Part {part['name']} is missing from the channel "
@@ -671,8 +679,8 @@ async def _fetch_mtproto(mode: str, seq: str | None, work: str,
     # open for the life of the process and two Clients on one session file
     # fight over its SQLite lock. Export and restore never run together — the
     # admin routes refuse — so sharing one between them is fine.
-    client = Client(EXPORT_SESSION, api_id=API_ID, api_hash=API_HASH,
-                    bot_token=BOT_TOKEN)
+    client = Client(EXPORT_SESSION, api_id=config.API_ID, api_hash=config.API_HASH,
+                    bot_token=config.BOT_TOKEN)
     await client.start()
     try:
         if manifest is None:
