@@ -41,7 +41,7 @@ print(f"engine wrote {intake.shard_name(sid)} — {stats['claims']} claims, "
       f"{stats['vectors']} vectors, {stats['bytes']}b")
 
 # ── from here on, only Atlas ──────────────────────────────────────────────
-from atlas import ingest, tgchannel, reflect, index, search
+from atlas import identity, index, ingest, reflect, search, tgchannel
 
 MSG = {"message_id": 5150, "date": 1754700000,
        "caption": f"vios evidence · {sid}\n3 claims, 1 vectors",
@@ -223,5 +223,42 @@ hits = search.search(conn, "rest it under foil", limit=3).get("results") or []
 print(f'   "rest it under foil" -> {hits[0]["video_key"] if hits else None}')
 assert hits and hits[0]["video_key"] == "REEL1", hits
 assert conn.execute("SELECT COUNT(*) FROM video").fetchone()[0] == 1
+
+# ── and it survives the *next* rebuild, which is where it used to die ──────
+# `identity.rebuild` empties `video_alias` and re-derives it, on purpose — a
+# stale weak alias must not outrank a new strong one forever. But the row that
+# taught it "9001 is REEL1" was the legacy shard's `video` row, and that row is
+# deliberately never written, so there was nothing left to re-derive it from.
+#
+# It passed above only by accident: REEL1 arrived with no `msg_id`, so `_enrich`
+# filled the blank with the legacy shard's 9001 and the fact survived inside the
+# `video` row. Give REEL1 the message id the capture plane would have given it —
+# a different number, which `_enrich` would never overwrite — and the accident is
+# gone. What holds it now is `video_message`, a record rather than a derivation.
+print("\n== the alias survives a rebuild ==")
+conn.execute("UPDATE video SET msg_id=? WHERE video_key=?", (5150, "REEL1"))
+conn.commit()
+msgs = identity.messages_for(conn, "REEL1")
+print("   video_message:", msgs)
+assert 9001 in [m["msg_id"] for m in msgs], msgs
+
+index.rebuild(conn, embed=False)
+again = conn.execute(
+    "SELECT video_key FROM video_alias WHERE alias='9001'").fetchone()
+print("   after rebuild, alias 9001 ->", again[0] if again else None)
+assert again and again[0] == "REEL1", "the rehomed alias did not survive"
+hits = search.search(conn, "rest it under foil", limit=3).get("results") or []
+print(f'   "rest it under foil" -> {hits[0]["video_key"] if hits else None}')
+assert hits and hits[0]["video_key"] == "REEL1", hits
+
+rep = identity.audit(conn)
+print("   audit:", {k: rep[k] for k in ("ok", "videos", "aliases", "messages",
+                                        "reuploads", "unresolved")})
+assert rep["messages"] >= 2, rep          # 5150 from the row, 9001 from the shard
+assert rep["reuploads"] == 1, rep         # one reel, two messages — not a duplicate
+card = conn.execute(
+    "SELECT msg_id, messages FROM video_index WHERE video_key='REEL1'").fetchone()
+print("   card msg_id:", card[0], " messages:", card[1])
+assert json.loads(card[1]) == [5150, 9001], card[1]
 
 print("\nIMPORTER OK — Atlas reads the GPU plane's shards on its own")

@@ -34,13 +34,21 @@ THE RULES, which are what stop it recurring
        module is here.
     3. A collection is not an identity. One reel saved into three collections is
        one row in `video` and three in `video_collection`.
-    4. Ambiguity is recorded, never guessed. Two keys claiming one alias lands in
+    4. A message id is not an identity either, and one video has more than one.
+       The channel holds the old harvest's upload *and* the capture plane's, so
+       "which message held this reel" is a set, and it lives in `video_message`.
+       It is a **record**, not a derivation: the fact that message 10 held this
+       reel arrives once, inside a shard whose `video` row is then deliberately
+       discarded, and nothing can re-derive it afterwards. Learned only as an
+       alias it died at the next rebuild, and every claim spelled `10` left the
+       index with it.
+    5. Ambiguity is recorded, never guessed. Two keys claiming one alias lands in
        `identity_conflict`, and both keys are left exactly as they were.
-    5. Byte-identical content under two different permalinks is two videos, not
+    6. Byte-identical content under two different permalinks is two videos, not
        one. The permalink is the identity; the shared bytes are a fact about
        them, recorded in `video_twin` so the interface can say "you saved this
        twice" and the engine can copy evidence instead of recomputing it.
-    6. `audit()` runs at every index build and its violations are shown in the
+    7. `audit()` runs at every index build and its violations are shown in the
        interface, not written to a log. An invariant nobody looks at is a
        comment.
 
@@ -120,6 +128,29 @@ _DDL = (
     "  first_seen REAL)",
     "CREATE INDEX IF NOT EXISTS video_alias_key ON video_alias(video_key)",
 
+    # Every channel message this video has ever occupied, one row each.
+    # `video.msg_id` is one column and the channel is not: reel `DZDNyKgv70R` was
+    # uploaded twice, so the old harvest recorded message 10 and the capture
+    # ledger recorded 40, and a single column can only hold one of them. The same
+    # squeeze `video_collection` exists to undo, one field over.
+    #
+    # This is a *record*, which is why `rebuild` does not clear it — the same
+    # reason `video_twin` and `identity_conflict` survive. It has to be, because
+    # of the one case that has no other witness: a shard an older build wrote
+    # names its video by message id and carries the permalink beside it, so
+    # `ingest._canonical_video_rows` rehomes the row onto the shortcode and then
+    # that row is deliberately *not* written. Learned as an alias, "10 is this
+    # reel" lasted until the next index build and was then dropped, taking every
+    # claim keyed `10` out of the index with it. Recorded here, it is a seed for
+    # every rebuild after it.
+    "CREATE TABLE IF NOT EXISTS video_message ("
+    "  video_key TEXT NOT NULL,"
+    "  msg_id INTEGER NOT NULL,"
+    "  source TEXT,"
+    "  first_seen REAL,"
+    "  PRIMARY KEY (video_key, msg_id))",
+    "CREATE INDEX IF NOT EXISTS video_message_msg ON video_message(msg_id)",
+
     # One reel, many collections. Separate table rather than a column so a
     # second import adds memberships without rewriting the video, and so
     # "in three collections" can never be mistaken for "three videos".
@@ -143,7 +174,7 @@ _DDL = (
     "  at REAL,"
     "  PRIMARY KEY (alias, video_key, other_key))",
 
-    # Byte-identical content under two permalinks. Not a merge — see rule 5.
+    # Byte-identical content under two permalinks. Not a merge — see rule 6.
     "CREATE TABLE IF NOT EXISTS video_twin ("
     "  video_key TEXT NOT NULL,"
     "  twin_key TEXT NOT NULL,"
@@ -166,8 +197,8 @@ _DDL = (
 
 # Tables Atlas owns and a shard may never land on. Kept here as well as in
 # reflect so this module is the one thing to read when adding an identity table.
-OWNED = ("video_alias", "video_collection", "identity_conflict", "video_twin",
-         "media_hash")
+OWNED = ("video_alias", "video_message", "video_collection",
+         "identity_conflict", "video_twin", "media_hash")
 
 
 def ensure(conn: sqlite3.Connection) -> None:
@@ -361,6 +392,51 @@ def forget(conn: sqlite3.Connection, alias) -> int:
     cur = conn.execute("DELETE FROM video_alias WHERE alias=? AND kind<>?",
                        (str(alias), KIND_SELF))
     return cur.rowcount or 0
+
+
+def note_message(conn: sqlite3.Connection, video_key, msg_id,
+                 source: str = "") -> int:
+    """Record that this video occupies a channel message. Returns 1 if new.
+
+    Every witness that knows a message id calls this, so the set is complete
+    rather than whatever the `video` row's one column happened to keep. Idempotent
+    on `(video_key, msg_id)`, and deliberately not on `msg_id` alone: two videos
+    claiming one message is a real conflict, but it is not this function's to
+    judge — `learn` sees the same pair through `_seed_from_messages` and records
+    it in `identity_conflict` there, once, in the one place that already does it.
+
+    Refuses a non-canonical `video_key` for the same reason `learn` does. A table
+    of message ids keyed by a message id would be the defect writing down its own
+    excuse.
+    """
+    k = str(video_key or "").strip()
+    if not looks_canonical(k):
+        return 0
+    try:
+        n = int(msg_id)
+    except (TypeError, ValueError):
+        return 0
+    if n <= 0:
+        return 0
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO video_message(video_key, msg_id, source, "
+        "first_seen) VALUES (?,?,?,?)", (k, n, source or "", time.time()))
+    return cur.rowcount or 0
+
+
+def messages_for(conn: sqlite3.Connection, video_key: str) -> list:
+    """Every message this video sits at, newest record first. For the drill-down.
+
+    Two entries is not a duplicate and the interface should say so: it means the
+    same reel was uploaded to the channel twice, and both copies play.
+    """
+    try:
+        return [{"msg_id": int(r[0]), "source": str(r[1] or "")}
+                for r in conn.execute(
+                    "SELECT msg_id, source FROM video_message "
+                    "WHERE video_key=? ORDER BY msg_id", (video_key,))]
+    except sqlite3.Error:
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -589,6 +665,13 @@ def _seed_from_video(conn: sqlite3.Connection, stats: dict) -> set:
         if vk not in keys:
             continue
         cap = _capture_meta(d.get("meta"))
+        # Recorded before the aliases are derived from it, so the set of messages
+        # this video occupies is never smaller than what the column can hold.
+        for value, why in ((d.get("msg_id"), "video.msg_id"),
+                           (cap.get("msg_id"), "meta.capture.msg_id"),
+                           (cap.get("record_msg_id"),
+                            "meta.capture.record_msg_id")):
+            note_message(conn, vk, value, why)
         for alias, kind in spellings(
                 vk, msg_id=d.get("msg_id") or cap.get("msg_id"),
                 record_msg_id=cap.get("record_msg_id"), url=d.get("url")):
@@ -598,6 +681,45 @@ def _seed_from_video(conn: sqlite3.Connection, stats: dict) -> set:
             stats[got] = stats.get(got, 0) + 1
     stats["canonical_keys"] = len(keys)
     return keys
+
+
+def _seed_from_messages(conn: sqlite3.Connection, keys: set,
+                        stats: dict) -> int:
+    """Pass 1b — the messages a video was recorded at, including the lost ones.
+
+    Runs immediately after `video` and before the ledger because it is the same
+    strength of evidence: it *is* `video.msg_id`, plus the message ids that
+    column could not hold. Pass 1 wrote most of these rows itself a moment ago,
+    so most of this pass is corroboration; the rows that matter are the ones no
+    other witness still has, which is why the table is not cleared by `rebuild`.
+
+    A message whose video no longer has a `video` row is skipped rather than
+    stubbed. `_adopt_orphans` is the pass that decides whether an unidentifiable
+    thing deserves a stub, and it has the evidence to weigh; this one does not.
+    """
+    if not keys:
+        return 0
+    learned = 0
+    try:
+        rows = conn.execute(
+            "SELECT video_key, msg_id, source FROM video_message "
+            "ORDER BY video_key, msg_id").fetchall()
+    except sqlite3.Error:
+        return 0
+    for vk, msg_id, source in rows:
+        k = str(vk or "").strip()
+        if k not in keys:
+            continue
+        for alias, kind in spellings(k, msg_id=msg_id):
+            if alias in keys and alias != k:
+                continue
+            got = learn(conn, alias, k, kind,
+                        f"video_message ({source})" if source
+                        else "video_message")
+            stats[got] = stats.get(got, 0) + 1
+            learned += (got == "ok")
+    stats["from_messages"] = learned
+    return learned
 
 
 def _seed_from_ledger(conn: sqlite3.Connection, keys: set, ledger_path: str,
@@ -642,6 +764,8 @@ def _seed_from_ledger(conn: sqlite3.Connection, keys: set, ledger_path: str,
             pass
         if k not in keys:
             continue              # a reel the archive holds no evidence for
+        note_message(conn, k, msg_id, "capture_ledger")
+        note_message(conn, k, record_id, "capture_ledger record")
         for alias, kind in spellings(k, msg_id=msg_id, record_msg_id=record_id,
                                      url=url):
             if alias in keys and alias != k:
@@ -702,7 +826,7 @@ def _seed_from_content(conn: sqlite3.Connection, keys: set, media_dir: str,
     for, and it is how `8` was shown to be a second upload of message `38`
     rather than a thirty-first video.
 
-    Two outcomes, and keeping them apart is rule 5:
+    Two outcomes, and keeping them apart is rule 6:
 
       one canonical key in the group → every other stem is an alias of it. The
           same reel was written to disk twice under two names.
@@ -919,8 +1043,12 @@ def rebuild(conn: sqlite3.Connection, media_dir: str = "",
 
     Learned aliases are dropped first and rebuilt, because the passes are ordered
     by strength of evidence and a stale weak alias would otherwise outrank a new
-    strong one forever. `identity_conflict` and `video_twin` are *not* cleared —
-    they are findings, not cache.
+    strong one forever. `identity_conflict`, `video_twin` and `video_message` are
+    *not* cleared — the first two are findings and the third is a record of what
+    arrived, and none of the three is derivable from the tables this rebuilds
+    from. `video_message` is what makes dropping the alias table safe: a message
+    id learned from a shard survives in it, so the pass order can stay strict
+    without the strict order costing evidence.
     """
     ensure(conn)
     stats = {"ok": 0, "known": 0, "conflict": 0, "rejected": 0,
@@ -928,12 +1056,15 @@ def rebuild(conn: sqlite3.Connection, media_dir: str = "",
              "video_rows_not_canonical": []}
     conn.execute("DELETE FROM video_alias")
     keys = _seed_from_video(conn, stats)
+    _seed_from_messages(conn, keys, stats)
     ledger_map = _seed_from_ledger(conn, keys, ledger_path, stats)
     _seed_from_content(conn, keys, media_dir, stats)
     _adopt_orphans(conn, keys, ledger_map, stats)
     stats["aliases"] = conn.execute(
         "SELECT COUNT(*) FROM video_alias").fetchone()[0]
     stats["videos"] = len(canonical_keys(conn))
+    stats["messages"] = conn.execute(
+        "SELECT COUNT(*) FROM video_message").fetchone()[0]
     stats["conflicts_open"] = conn.execute(
         "SELECT COUNT(*) FROM identity_conflict").fetchone()[0]
     if commit:
@@ -955,7 +1086,8 @@ def absorb(conn: sqlite3.Connection, rows) -> dict:
     re-reading them from SQLite would only be slower and less complete.
     """
     ensure(conn)
-    out = {"videos": 0, "aliases": 0, "collections": 0, "refused": 0}
+    out = {"videos": 0, "aliases": 0, "collections": 0, "messages": 0,
+           "refused": 0}
     rows = [r for r in (rows or []) if isinstance(r, dict)]
     fresh = set()
     for r in rows:
@@ -975,6 +1107,11 @@ def absorb(conn: sqlite3.Connection, rows) -> dict:
             continue
         out["videos"] += 1
         cap = _capture_meta(r.get("meta"))
+        for value, why in ((r.get("msg_id"), "shard video.msg_id"),
+                           (cap.get("msg_id"), "shard meta.capture.msg_id"),
+                           (cap.get("record_msg_id"),
+                            "shard meta.capture.record_msg_id")):
+            out["messages"] += note_message(conn, vk, value, why)
         for alias, kind in spellings(
                 vk, msg_id=r.get("msg_id") or cap.get("msg_id"),
                 record_msg_id=cap.get("record_msg_id"), url=r.get("url")):
@@ -1120,22 +1257,34 @@ def twins_for(conn: sqlite3.Connection, video_key: str) -> list:
 
 
 def bulk(conn: sqlite3.Connection) -> dict:
-    """{video_key: {aliases, collections, twins}} in three queries.
+    """{video_key: {aliases, messages, collections, twins}} in four queries.
 
     For the index build, which needs all of it for every video and must not do
     ninety round trips to get it.
+
+    `messages` is kept apart from `aliases` because they answer different
+    questions. `aliases` is every string that has ever meant this video —
+    `10`, `tg10`, `msg_10`, `frames_10` — which is what a resolver needs and what
+    no person wants to read. `messages` is `[10, 40]`: the two places in the
+    channel this reel actually sits, which is the sentence a card can show.
     """
     out = {}
 
     def slot(k):
-        return out.setdefault(str(k), {"aliases": [], "collections": [],
-                                       "twins": []})
+        return out.setdefault(str(k), {"aliases": [], "messages": [],
+                                       "collections": [], "twins": []})
 
     try:
         for a, k, kind in conn.execute(
                 "SELECT alias, video_key, kind FROM video_alias WHERE kind<>?",
                 (KIND_SELF,)):
             slot(k)["aliases"].append(str(a))
+    except sqlite3.Error:
+        pass
+    try:
+        for k, n in conn.execute(
+                "SELECT video_key, msg_id FROM video_message ORDER BY msg_id"):
+            slot(k)["messages"].append(int(n))
     except sqlite3.Error:
         pass
     try:
@@ -1155,7 +1304,7 @@ def bulk(conn: sqlite3.Connection) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# THE AUDIT — rule 6
+# THE AUDIT — rule 7
 # ══════════════════════════════════════════════════════════════════════════
 def audit(conn: sqlite3.Connection) -> dict:
     """Measure the invariant: every key in every table resolves to a video.
@@ -1216,11 +1365,25 @@ def audit(conn: sqlite3.Connection) -> dict:
     except sqlite3.Error:
         pass
 
+    # Videos the channel holds more than one copy of. Not a fault and not a
+    # duplicate — it is one reel uploaded twice — but it is the number that used
+    # to *become* a duplicate, so it is worth showing rather than inferring.
+    reuploads = 0
+    try:
+        reuploads = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT video_key FROM video_message "
+            "GROUP BY video_key HAVING COUNT(*) > 1)").fetchone()[0] or 0
+    except sqlite3.Error:
+        pass
+
     return {"ok": not bad_total and not conflicts,
             "videos": len(keys), "stubs": stubs,
             "real": len(keys) - stubs,
             "aliases": conn.execute(
                 "SELECT COUNT(*) FROM video_alias").fetchone()[0],
+            "messages": conn.execute(
+                "SELECT COUNT(*) FROM video_message").fetchone()[0],
+            "reuploads": int(reuploads),
             "unresolved": bad_total,
             "not_video": advisory_total,
             "conflicts": conflicts,

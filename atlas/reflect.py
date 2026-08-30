@@ -126,7 +126,7 @@ _SOURCE_HINTS = (
 # builds its index from it. `coverage` is here because it is the processing
 # plane's work table — it says what ran, which means nothing to a search index.
 #
-# The five `identity` tables are here for the strongest reason of all: they are
+# The six `identity` tables are here for the strongest reason of all: they are
 # what decides which video a row belongs to. If a shard could land on
 # `video_alias`, an import would be able to rewrite identity, and the one place
 # that answers "are these two strings the same video?" would take dictation from
@@ -134,11 +134,15 @@ _SOURCE_HINTS = (
 # `identity.rebuild` from `video`, the ledger and the media hashes, and by
 # nothing else. `media_hash` is a cache of expensive digests; `identity_conflict`
 # and `video_twin` are findings, and a search index has no use for either.
+# `video_message` is the one that is neither derived nor a finding — it records
+# which channel messages carried a video, which is a set, and it is the seed
+# `rebuild` reads rather than a table it rewrites. Indexing it would put a bare
+# message id into search as prose.
 _ATLAS_OWN = {"moments", "moments_fts", "bundles", "atlas_meta", "ingest_log",
               "video_index", "graph_nodes", "graph_edges", "parts",
               "vec_payload", "coverage",
-              "video_alias", "video_collection", "identity_conflict",
-              "video_twin", "media_hash"}
+              "video_alias", "video_message", "video_collection",
+              "identity_conflict", "video_twin", "media_hash"}
 
 _FTS_SHADOW = re.compile(r"_(data|idx|content|docsize|config)$")
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")

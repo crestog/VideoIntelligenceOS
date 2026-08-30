@@ -778,6 +778,11 @@ def _canonical_video_rows(conn: sqlite3.Connection, rows: list) -> tuple:
     rehomes those from the same alias map, so what is lost is a duplicate video
     row, which is the thing being prevented.
 
+    Both facts a rehoming teaches outlive this function, in two places on
+    purpose: the old spelling as an alias, and the message id behind it in
+    `video_message`. The second is what a later `identity.rebuild` re-seeds the
+    first from — see the comment at the `note_message` call.
+
     Returns `(rows, rehomed, refused)`.
     """
     # `learn` writes, so the tables have to exist — on a fresh atlas.db this runs
@@ -801,6 +806,18 @@ def _canonical_video_rows(conn: sqlite3.Connection, rows: list) -> tuple:
         # how this shard — and every other one written by that build — names the
         # video, and the next import should not have to re-derive it.
         identity.learn(conn, vk, true_key, identity.KIND_MSG, "shard video")
+        # And the fact underneath the alias is worth *recording*, because an
+        # alias is derived and this is not. `identity.rebuild` clears
+        # `video_alias` on purpose, then re-seeds it from the `video` rows — and
+        # the row this loop just rehomed is deliberately never written, so there
+        # is nothing left to re-derive `10 → DZDNyKgv70R` from. Learned only as
+        # an alias it survived until the next index build and no further, taking
+        # every claim spelled `10` out of the index with it, permanently:
+        # `imported_seqs` means the shard that knew never arrives twice.
+        # `video_message` is read by `rebuild`, not rewritten by it.
+        identity.note_message(conn, true_key,
+                              r.get("msg_id") or identity.msg_id_in(vk),
+                              "shard video")
         out.append(row)
         rehomed += 1
     return out, rehomed, refused
@@ -929,10 +946,11 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
     # spellings, no map, and a UI counting spellings.
     if videos:
         got = identity.absorb(conn, videos)
-        if got["aliases"] or got["collections"]:
+        if got["aliases"] or got["collections"] or got["messages"]:
             merged["identity"] = got["aliases"]
             log(f"{seq} identity — {got['videos']} video(s), "
                 f"{got['aliases']} alias(es), {got['collections']} membership(s)"
+                + (f", {got['messages']} message(s)" if got["messages"] else "")
                 + (f", {got['refused']} refused" if got["refused"] else ""))
         elif got["refused"]:
             dropped.append(f"video ×{got['refused']} (key is not an identity)")

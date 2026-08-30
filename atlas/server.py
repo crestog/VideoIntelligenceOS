@@ -817,6 +817,14 @@ def api_library(limit: int = 40, offset: int = 0, sort: str = "recent",
             r["sources"] = json.loads(r.get("sources") or "{}")
         except (ValueError, TypeError):
             r["sources"] = {}
+        # Same decode as the detail route, for the same reason: a grid card shows
+        # its collection chips and its "also at message 10" line from these, and
+        # a list is the shape to show them in.
+        for name in ("aliases", "messages", "collections", "twin_of"):
+            try:
+                r[name] = json.loads(r.get(name) or "null") or []
+            except (ValueError, TypeError):
+                r[name] = []
         r["has_file"] = r.get("video_key") in resident
         if needle_l:
             # Which half of the OR above put this row here. The library says so
@@ -873,6 +881,16 @@ def api_video(video_key: str, full: bool = True):
             meta["sources"] = json.loads(meta.get("sources") or "{}")
         except (ValueError, TypeError):
             meta["sources"] = {}
+        # The identity columns hold JSON text because SQLite has no list type.
+        # Decoded here, once, rather than in every client: a card saying "also at
+        # message 10" should receive `[10, 40]`, not a string to parse. A
+        # malformed or empty value degrades to `[]` instead of throwing inside
+        # whatever is rendering the page.
+        for name in ("aliases", "messages", "collections", "twin_of"):
+            try:
+                meta[name] = json.loads(meta.get(name) or "null") or []
+            except (ValueError, TypeError):
+                meta[name] = []
         meta["has_file"] = media.resident(meta.get("local_path"), key)
         meta.pop("local_path", None)
 

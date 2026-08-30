@@ -571,6 +571,34 @@ def _build(db_path: str, method: str = "auto") -> None:
 # ══════════════════════════════════════════════════════════════════════════
 # READING THE MAP
 # ══════════════════════════════════════════════════════════════════════════
+def _cur(conn: sqlite3.Connection):
+    """A cursor that yields `sqlite3.Row`, without touching the connection.
+
+    Every reader below names its columns — `r["video_key"]`, `dict(row)`,
+    `"_c" in r.keys()` — and none of that works on a plain tuple. The builder
+    above gets away with the same style because it opens its own connection and
+    sets `row_factory` on it (line 455); the readers are handed the one Atlas
+    keeps per thread in `server.db()`, and `ingest.connect()` deliberately
+    leaves that factory-less. Almost every other atlas.db reader is written for
+    tuples — `reflect.columns` builds its dicts from `r[1]`/`r[2]` — so flipping
+    the shared connection here would change the shape of rows under readers that
+    never asked for it. `vsearch.frame_rows` hit this first and settled it: set
+    the factory on the cursor.
+
+    This was not a cosmetic difference. Before this helper existed, eight of the
+    nine functions in this section raised `TypeError: tuple indices must be
+    integers` against any database with rows in it, which is every `/api/map/*`
+    route — the whole Data tab. It read as working only because a map needs the
+    encoder, the encoder needs torch, and the machine this was tested on has
+    neither, so `built()` was False and the readers returned early. `axes` and
+    `scatter` need no encoder at all; `axes` failed even on an empty database,
+    because `COUNT`/`MIN`/`MAX` return a row whether or not the table has any.
+    """
+    cur = conn.cursor()
+    cur.row_factory = sqlite3.Row
+    return cur
+
+
 def built(conn: sqlite3.Connection) -> bool:
     try:
         return bool(conn.execute(
@@ -589,7 +617,7 @@ def meta(conn: sqlite3.Connection, level: str = "video") -> dict:
          "terms": json.loads(r["terms"] or "[]"), "size": int(r["size"] or 0),
          "videos": int(r["videos"] or 0),
          "cx": float(r["cx"] or 0), "cy": float(r["cy"] or 0)}
-        for r in conn.execute(
+        for r in _cur(conn).execute(
             "SELECT * FROM map_cluster WHERE level=? ORDER BY size DESC",
             (level,)).fetchall()]
     n = conn.execute("SELECT COUNT(*) FROM map_point WHERE level=?",
@@ -618,7 +646,7 @@ def points_binary(conn: sqlite3.Connection, level: str = "video") -> bytes:
     """
     import struct
     level = "moment" if str(level) == "moment" else "video"
-    rows = conn.execute(
+    rows = _cur(conn).execute(
         "SELECT x, y, cluster FROM map_point WHERE level=? ORDER BY rowid",
         (level,)).fetchall()
     out = bytearray()
@@ -631,7 +659,7 @@ def points_binary(conn: sqlite3.Connection, level: str = "video") -> bytes:
 def refs(conn: sqlite3.Connection, level: str = "video") -> dict:
     """The ref for every point, in the same order as `points_binary`."""
     level = "moment" if str(level) == "moment" else "video"
-    rows = conn.execute(
+    rows = _cur(conn).execute(
         "SELECT ref, video_key, t_start FROM map_point WHERE level=? "
         "ORDER BY rowid", (level,)).fetchall()
     return {"ok": True, "level": level, "count": len(rows),
@@ -646,7 +674,7 @@ def region(conn: sqlite3.Connection, level: str, x0: float, y0: float,
     level = "moment" if str(level) == "moment" else "video"
     lo_x, hi_x = min(x0, x1), max(x0, x1)
     lo_y, hi_y = min(y0, y1), max(y0, y1)
-    rows = conn.execute(
+    rows = _cur(conn).execute(
         "SELECT p.ref, p.video_key, p.t_start, p.cluster, p.source,"
         "       v.title, v.creator, v.duration, v.moment_count "
         "FROM map_point p LEFT JOIN video_index v ON v.video_key = p.video_key "
@@ -672,22 +700,22 @@ def point(conn: sqlite3.Connection, level: str, ref: str) -> dict:
     text, the model that produced it, and the second it happens at.
     """
     level = "moment" if str(level) == "moment" else "video"
-    row = conn.execute(
+    row = _cur(conn).execute(
         "SELECT * FROM map_point WHERE level=? AND ref=?",
         (level, str(ref))).fetchone()
     if not row:
         return {"ok": False, "note": "no such point"}
 
     key = row["video_key"]
-    video = conn.execute("SELECT * FROM video_index WHERE video_key=?",
-                         (key,)).fetchone()
+    video = _cur(conn).execute("SELECT * FROM video_index WHERE video_key=?",
+                               (key,)).fetchone()
     out = {"ok": True, "level": level, "ref": str(ref), "video_key": key,
            "x": float(row["x"]), "y": float(row["y"]),
            "cluster": int(row["cluster"] or 0),
            "t_start": row["t_start"], "source": row["source"],
            "video": dict(video) if video else {}}
 
-    cl = conn.execute(
+    cl = _cur(conn).execute(
         "SELECT * FROM map_cluster WHERE level=? AND cluster=?",
         (level, int(row["cluster"] or 0))).fetchone()
     if cl:
@@ -697,7 +725,7 @@ def point(conn: sqlite3.Connection, level: str, ref: str) -> dict:
                                "videos": int(cl["videos"] or 0)}
 
     if level == "moment":
-        m = conn.execute(
+        m = _cur(conn).execute(
             "SELECT id, video_key, t_start, t_end, source, src_table, weight,"
             "       text FROM moments WHERE id=?", (int(ref),)).fetchone()
         if m:
@@ -706,7 +734,7 @@ def point(conn: sqlite3.Connection, level: str, ref: str) -> dict:
             # verifiable rather than merely displayed.
             out["sql"] = f"SELECT * FROM moments WHERE id = {int(ref)};"
     else:
-        out["moments"] = [dict(r) for r in conn.execute(
+        out["moments"] = [dict(r) for r in _cur(conn).execute(
             "SELECT id, t_start, t_end, source, text FROM moments "
             "WHERE video_key=? ORDER BY COALESCE(t_start, 0) LIMIT 40",
             (key,)).fetchall()]
@@ -719,13 +747,13 @@ def cluster_detail(conn: sqlite3.Connection, level: str, cluster: int,
                    limit: int = 30) -> dict:
     """One cluster: what names it, and the videos most central to it."""
     level = "moment" if str(level) == "moment" else "video"
-    cl = conn.execute("SELECT * FROM map_cluster WHERE level=? AND cluster=?",
-                      (level, int(cluster))).fetchone()
+    cl = _cur(conn).execute("SELECT * FROM map_cluster WHERE level=? AND cluster=?",
+                            (level, int(cluster))).fetchone()
     if not cl:
         return {"ok": False, "note": "no such cluster"}
     # Ranked by distance from the cluster centre: the most typical members
     # first, which is what "show me this group" should mean.
-    rows = conn.execute(
+    rows = _cur(conn).execute(
         "SELECT p.video_key, p.ref, p.t_start,"
         "       ((p.x-?)*(p.x-?) + (p.y-?)*(p.y-?)) d,"
         "       v.title, v.creator, v.duration, v.moment_count "
@@ -768,7 +796,7 @@ def axes(conn: sqlite3.Connection) -> dict:
         name = col["name"]
         if name in _AXIS_SKIP or not reflect._is_numeric(col):
             continue
-        row = conn.execute(
+        row = _cur(conn).execute(
             f"SELECT COUNT({reflect._q(name)}) n, MIN({reflect._q(name)}) lo,"
             f"       MAX({reflect._q(name)}) hi FROM video_index").fetchone()
         if not row or not row["n"] or row["lo"] is None:
@@ -809,7 +837,7 @@ def scatter(conn: sqlite3.Connection, x: str, y: str, colour: str = "cluster",
     elif colour in cols:
         pick = f", v.{reflect._q(colour)} AS _c"
 
-    rows = conn.execute(
+    rows = _cur(conn).execute(
         f"SELECT v.video_key, v.title, v.creator, v.category, v.duration,"
         f"       v.moment_count, {qx} AS _x, {qy} AS _y{pick} "
         f"FROM video_index v {join}"

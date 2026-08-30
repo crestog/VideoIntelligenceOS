@@ -94,6 +94,11 @@ _MOMENT_DDL = (
     # admit "also message 38" instead of quietly becoming a second video; and
     # `collections` is the many-to-many, flattened here for display only — the
     # queryable copy lives in `video_collection`.
+    #
+    # `messages` is the readable half of `aliases`. A card that wants to say
+    # "also at message 10" should not have to guess which of `10`, `tg10`,
+    # `msg_10` and `frames_10` was a message id; `[10, 40]` is the answer, and
+    # `msg_id` alone cannot hold it because a reel uploaded twice sits at two.
     "CREATE TABLE IF NOT EXISTS video_index ("
     "  video_key TEXT PRIMARY KEY,"
     "  msg_id INTEGER,"
@@ -118,6 +123,7 @@ _MOMENT_DDL = (
     "  shortcode TEXT,"
     "  url TEXT,"
     "  aliases TEXT,"
+    "  messages TEXT,"
     "  collections TEXT,"
     "  twin_of TEXT,"
     "  is_stub INTEGER)",
@@ -172,6 +178,7 @@ _LOCK = threading.RLock()
 # thing you can read.
 _VIDEO_INDEX_ADDED = (
     ("shortcode", "TEXT"), ("url", "TEXT"), ("aliases", "TEXT"),
+    ("messages", "TEXT"),
     ("collections", "TEXT"), ("twin_of", "TEXT"), ("is_stub", "INTEGER"),
 )
 
@@ -735,7 +742,9 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
             f", {report['unresolved']} unresolved"
             + (f", {len(report['conflicts'])} conflict(s)"
                if report["conflicts"] else "")
-            + (f", {report['twins']} twin(s)" if report["twins"] else ""))
+            + (f", {report['twins']} twin(s)" if report["twins"] else "")
+            + (f", {report['reuploads']} re-upload(s)"
+               if report.get("reuploads") else ""))
         if not report["ok"]:
             for t in report["tables"]:
                 if not t["ok"]:
@@ -880,7 +889,7 @@ def _build_video_index(conn: sqlite3.Connection, per_video: dict) -> None:
             f"out: {', '.join(sorted(dropped)[:6])}")
 
     ident = identity.bulk(conn)
-    _blank = {"aliases": [], "collections": [], "twins": []}
+    _blank = {"aliases": [], "messages": [], "collections": [], "twins": []}
 
     # A resolved key may have arrived under several spellings, and each of them
     # carries its own share of the evidence. They are folded together here, so
@@ -948,6 +957,7 @@ def _build_video_index(conn: sqlite3.Connection, per_video: dict) -> None:
             "" if identity.is_upload(vk) else vk,
             identity.canonical_url(vk),
             json.dumps(sorted(ids["aliases"])),
+            json.dumps(sorted(ids["messages"])),
             json.dumps(sorted(ids["collections"])),
             json.dumps(sorted(ids["twins"])) if ids["twins"] else "",
             1 if identity.is_stub(conn, vk) else 0))
@@ -955,9 +965,9 @@ def _build_video_index(conn: sqlite3.Connection, per_video: dict) -> None:
         "INSERT OR REPLACE INTO video_index(video_key, msg_id, title, caption, "
         "creator, category, duration, width, height, fps, size_mb, likes, "
         "created_at, local_path, poster, moment_count, sources, has_speech, "
-        "has_narrative, text_len, shortcode, url, aliases, collections, "
-        "twin_of, is_stub) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        "has_narrative, text_len, shortcode, url, aliases, messages, "
+        "collections, twin_of, is_stub) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     conn.commit()
 
 
