@@ -43,6 +43,7 @@ still see the data, you just cannot search text Atlas could not identify as text
 """
 
 import hashlib
+import json
 import re
 import sqlite3
 
@@ -416,6 +417,28 @@ _LEXICAL = re.compile(r"[A-Za-z]{3,}")
 _HEX_DUMP = re.compile(r"^(?:[0-9a-fA-F]{2})+$")
 _HEX_DUMP_MIN = 32
 
+# A serialized record stored in a TEXT column. `video.meta` holds the capture
+# plane's own bookkeeping — `{"capture": {"msg_id": 30, "file_id": "BAACAgUA…",
+# "collections": [...], "likes": 134272}}` — and every test above calls it
+# language, because "capture", "collections" and "file" are words. Indexed, all
+# thirty videos gain a passage whose text is a Telegram file handle and a list of
+# internal field names, and `artifact.meta` adds two hundred and eighteen more
+# made of byte counts.
+#
+# Nothing is lost by dropping them. What is worth searching inside these blobs is
+# already promoted out of JSON and into somewhere that can be queried — the
+# collections into `video_collection`, the message ids into `video_message`, the
+# likes into a column of their own — which is what makes the leftover structure
+# safe to refuse rather than a gap to work around.
+#
+# A mapping and a list are not the same thing here, which is the whole reason the
+# test is written on the shape rather than on "is it JSON". `frame_notes.objects`
+# is `[{"label": "dog", "conf": 0.75}, {"label": "bed", "conf": 0.69}]`, 2,399
+# rows of it, and it is the evidence behind "show me the one with the dog".
+# `index.clean_text` already unwraps a list into `dog, bed` — labels kept, keys
+# and scores dropped — so a list is content that arrived in a container, while a
+# mapping is the container itself.
+
 
 def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
     """`content_columns` narrowed to the ones whose *data* reads like language.
@@ -449,6 +472,18 @@ def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
     rather than being one, which is another 1,909. Together those two were 69% of
     this archive's index.
 
+    A fifth test drops the last of the machine writing: a column holding
+    serialized records. `video.meta` is one JSON object per video and
+    `artifact.meta` is 218 more, and a JSON object passes every test above
+    because its keys are words — so thirty videos each gained a passage made of a
+    Telegram file handle and a list of field names. It is written on the mapping
+    and not on JSON in general, because a JSON *list* is content in a container:
+    `frame_notes.objects` holds 2,399 arrays of `{"label": …, "conf": …}` and
+    `index.clean_text` unwraps each into `dog, bed`. Measured on the working
+    archive, the test drops exactly those 248 rows of structure and keeps every
+    column a person or a detector wrote: captions, transcripts, claims, creator
+    names, titles, object labels.
+
     Every test is about the data or the shape of the table, so no table is named
     here. Additive: `content_columns` and its other callers are untouched.
     """
@@ -466,6 +501,14 @@ def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
         if not vals:
             keep.append(name)
             continue
+        # A column of serialized records goes before the word test, because a
+        # JSON object passes the word test — its keys are words. Half the sample
+        # rather than all of it: one row whose caption happens to be valid JSON
+        # should not disqualify a real caption column, and a column a program
+        # serializes is serialized in every row.
+        records = sum(1 for v in vals if _is_record(v))
+        if records * 2 >= len(vals):
+            continue
         lexical = sum(1 for v in vals
                       if _LEXICAL.search(v) and not _is_hex_dump(v))
         need = 1 if len(vals) <= 4 else max(2, int(0.25 * len(vals)))
@@ -480,6 +523,33 @@ def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
 def _is_hex_dump(value: str) -> bool:
     v = (value or "").strip()
     return len(v) >= _HEX_DUMP_MIN and bool(_HEX_DUMP.match(v))
+
+
+def _is_record(value: str) -> bool:
+    """True for a value that is a serialized record — a JSON *object*.
+
+    A mapping is the machine's own vocabulary. Its top level is field names, so
+    `{"capture": {…}, "file_id": "BAAC…"}` reads as words that describe the
+    schema rather than words about the video.
+
+    A JSON array is deliberately not a record. `[{"label": "dog", "conf": 0.75}]`
+    is a list of observations, and the indexer unwraps one into `dog, bed` before
+    it becomes a passage. Refusing arrays here as well would have cost this
+    archive 2,399 rows of object detections to save 248 rows of structure — and
+    an array that holds no words after unwrapping (a JSON float buffer, say)
+    yields an empty passage there and so costs nothing here.
+
+    Both halves of the test matter. The bracket check alone would catch a caption
+    that opens with `{`, and `json.loads` alone accepts `"42"` and a bare quoted
+    string, neither of which is a record.
+    """
+    v = (value or "").strip()
+    if len(v) < 2 or v[0] != "{" or v[-1] != "}":
+        return False
+    try:
+        return isinstance(json.loads(v), dict)
+    except (ValueError, TypeError):
+        return False
 
 
 # The label half of a name/value pair. A table that has both is a key-value
