@@ -197,6 +197,27 @@ eq(round(span, 3), 6.0, "span counts the seconds it was true, not the gap")
 # whole reel orange. That is the defect this constant fixes.
 yes(index.FACT_GAP_S < index.MERGE_GAP_S, "a fact is not a subtitle line")
 
+# An instant is evidence of presence, not of duration. One reel in this archive
+# samples colour frame by frame and flickers red/orange for eighteen seconds:
+# forty instantaneous orange glimpses, 3.9s of orange in a 21.8s reel. Widening
+# each glimpse to POINT_WIDTH_S for the *coverage* measure read that reel as 78%
+# orange and ranked it above reels that were orange throughout.
+points = index.build_facts([(t, t, "orange", 0.8) for t in (3.5, 4.0, 4.6, 7.2)])
+eq(len(points), 1, "one moment")
+eq(points[0][3], 0.0, "instants cover no measured seconds")
+yes(points[0][1] - points[0][0] >= index.POINT_WIDTH_S,
+    "but the moment still has a window somebody can click")
+eq(index._prominence(points[0][3], 21.8), 1.0,
+   "so an instant gets presence and no prominence")
+
+# A measured span is still measured, and mixing the two counts only the seconds.
+mixed = index.build_facts([(0.0, 2.0, "orange", 0.8), (2.5, 2.5, "orange", 0.8)])
+eq(round(mixed[0][3], 3), 2.0, "the instant adds nothing to the two seconds")
+
+eq(index._union_seconds([(0.0, 2.0), (1.0, 3.0), (10.0, 11.0)]), 4.0,
+   "the union, counted once")
+eq(index._union_seconds([]), 0.0, "nothing covers nothing")
+
 # Overlapping observations of the same fact are one span, not two.
 span = index.build_facts([(0.0, 5.0, "person", None),
                           (2.0, 7.0, "person", None)])[0][3]

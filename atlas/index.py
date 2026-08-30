@@ -414,6 +414,25 @@ def build_passages(rows: list) -> list:
     return out
 
 
+def _union_seconds(spans) -> float:
+    """Seconds covered by these intervals, each second counted once.
+
+    Sightings of one fact overlap (two passes see the same shot) and repeat (a
+    colour holds across four shots in a row). Neither should make a reel more
+    orange than it was, so the answer is the measure of the union, not the sum.
+    """
+    total, c_a, c_b = 0.0, None, None
+    for a, b in sorted(spans):
+        if c_b is None:
+            c_a, c_b = a, b
+        elif a <= c_b:
+            c_b = max(c_b, b)
+        else:
+            total += c_b - c_a
+            c_a, c_b = a, b
+    return total + (c_b - c_a) if c_b is not None else 0.0
+
+
 def build_facts(rows: list) -> list:
     """Shape written measurements into moments. Returns [(t0, t1, text, span, conf)].
 
@@ -432,7 +451,9 @@ def build_facts(rows: list) -> list:
 
     `span` is separately the number of seconds the fact was actually *true*: the
     union of its sightings, so overlapping observations are not counted twice and
-    the gaps between runs are not counted at all. The caller turns it into weight
+    the gaps between runs are not counted at all. An instantaneous sighting adds
+    nothing to it: it is evidence of presence, not of duration. The caller turns
+    it into weight
     (`_prominence`), which is the only place the difference between a reel that is
     orange and a reel with an orange shot in it can be recorded — the text of the
     two is identical.
@@ -453,10 +474,19 @@ def build_facts(rows: list) -> list:
         if not text:
             continue
         a, b = _as_float(t0), _as_float(t1)
+        # Two questions, two widths. *Placement* wants a window somebody can
+        # click, so a zero-length sighting is widened to one. *Coverage* must not
+        # be, because an instantaneous observation says a fact was true at that
+        # moment and says nothing about how long it stayed true. Sharing a single
+        # width is what let a frame-by-frame colour sampler call a reel 78%
+        # orange when orange held 17.7% of it — forty instantaneous glimpses
+        # between red frames, each credited with two and a half seconds nobody
+        # measured.
+        held = b if (a is not None and b is not None and b > a) else a
         if a is not None and (b is None or b <= a):
             b = a + POINT_WIDTH_S
         slot = by_text.setdefault(text, {"spans": [], "conf": None})
-        slot["spans"].append((a, b))
+        slot["spans"].append((a, b, held))
         if conf is not None:
             slot["conf"] = (conf if slot["conf"] is None
                             else max(slot["conf"], conf))
@@ -471,22 +501,15 @@ def build_facts(rows: list) -> list:
             out.append((None, None, text, 0.0, conf))
             continue
 
-        covered = 0.0          # seconds the fact held, counted once
-        runs = []              # near-touching sightings, joined for playback
-        c_a, c_b = timed[0]    # the open interval of the union
-        r_a, r_b = timed[0]    # the open run
-        for a, b in timed[1:]:
-            if a <= c_b:
-                c_b = max(c_b, b)
-            else:
-                covered += c_b - c_a
-                c_a, c_b = a, b
+        covered = _union_seconds((a, h) for a, _b, h in timed)
+        runs = []                        # sightings joined for playback
+        r_a, r_b = timed[0][0], timed[0][1]
+        for a, b, _h in timed[1:]:
             if a - r_b <= FACT_GAP_S:
                 r_b = max(r_b, b)
             else:
                 runs.append((r_a, r_b))
                 r_a, r_b = a, b
-        covered += c_b - c_a
         runs.append((r_a, r_b))
 
         best = max(runs, key=lambda r: r[1] - r[0])
