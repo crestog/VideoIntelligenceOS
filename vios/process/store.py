@@ -68,7 +68,27 @@ import time
 
 from . import CHANNELS, SCHEMA_VERSION
 
+# The identity law, imported rather than restated. `atlas/identity.py` is where
+# the three legal shapes of a video key are written down, and it is pure stdlib
+# with no config and no side effects — importing it costs two module loads.
+#
+# The direction looks backwards (the engine importing the reader's package) and
+# is deliberate: the alternative is a second copy of the rule inside this plane,
+# and two copies of "what is a video key" drifting apart is precisely the defect
+# this import exists to end. `atlas` is importable exactly when `vios` is, since
+# they are sibling packages in one repository, so this adds no new way to fail.
+from atlas import identity
+
 _CHANNEL_SET = frozenset(CHANNELS)
+
+
+class NotAnIdentity(ValueError):
+    """A row named a video by something that is not a video's identity.
+
+    A `ValueError` subclass on purpose: the shard replay already treats those as
+    a skippable bad record, so an older `except` clause keeps working while the
+    counter below can tell a refused identity apart from a torn line.
+    """
 
 # Shard schema versions this build can replay. The reason the list grows rather
 # than moves: the channel holds the only copy of every earlier session's work, so
@@ -530,13 +550,24 @@ class Store:
         return other
 
     # ── videos ──────────────────────────────────────────────────────────
-    def add_video(self, video_key: str, **fields) -> None:
+    def add_video(self, video_key: str, **fields) -> bool:
         """Register a video. Idempotent; later calls fill in blanks only.
 
         Blanks-only matters: `probe` learns the duration, the capture record
         knows the uploader, and neither should clobber the other's column
         because it happened to run second.
+
+        Returns False, having written nothing, if the key is not shaped like an
+        identity. This table is the identity table — a key exists because there
+        is a row here — so this is the one door through which a new video enters
+        the archive, and it is the right place to refuse a name that is not one.
+        A bare `10` is a Telegram message id, `frames_8` is a working directory,
+        and adopting either as an identity is exactly how an archive of thirty
+        videos came to report sixty-two. The caller counts the refusal and says
+        so; raising would abort a sweep over one bad row, which is worse.
         """
+        if not identity.looks_canonical(video_key):
+            return False
         cols = ("url", "uploader", "duration", "width", "height", "fps",
                 "has_audio", "bytes", "sha256", "msg_id", "taken_at", "shots",
                 "meta")
@@ -566,6 +597,7 @@ class Store:
                 self.conn.execute(
                     f"UPDATE video SET {','.join(sets)} WHERE video_key=?", args)
         self.conn.commit()
+        return True
 
     def update_video(self, video_key: str, **fields) -> int:
         """Overwrite columns on an existing video. The one caller is `probe`.
@@ -617,6 +649,70 @@ class Store:
     def video_keys(self) -> list:
         return [r[0] for r in
                 self.conn.execute("SELECT video_key FROM video ORDER BY video_key")]
+
+    def video_key_for_msg(self, msg_id) -> str:
+        """The video that lives at this Telegram message id, or "".
+
+        The store already knows the answer to "what is message 38?" — `msg_id`
+        is filled in for every row the capture ledger synced — so a producer
+        holding nothing but a number can resolve it here instead of adopting the
+        number as a name. Ambiguity resolves to nothing rather than to a guess:
+        two rows on one message id means the archive is wrong about something
+        more important than this lookup.
+        """
+        try:
+            n = int(msg_id)
+        except (TypeError, ValueError):
+            return ""
+        if n <= 0:
+            return ""
+        rows = self.conn.execute(
+            "SELECT video_key FROM video WHERE msg_id=? LIMIT 2", (n,)).fetchall()
+        return str(rows[0][0]) if len(rows) == 1 else ""
+
+    def video_key_for_sha(self, sha256: str) -> str:
+        """The video whose bytes hash to this, or "".
+
+        Same shape of question as `video_key_for_msg` and the same refusal to
+        guess. Two videos sharing a digest is a twin pair — two permalinks over
+        one file — and picking either one of them here would be arbitrary.
+        """
+        s = str(sha256 or "").strip().lower()
+        if len(s) < 32:
+            return ""
+        rows = self.conn.execute(
+            "SELECT video_key FROM video WHERE lower(sha256)=? LIMIT 2",
+            (s,)).fetchall()
+        return str(rows[0][0]) if len(rows) == 1 else ""
+
+    def rehome_key(self, value, msg_aliases: dict | None = None) -> str:
+        """The identity a legacy spelling meant, or "" when nothing can say.
+
+        Refusing a bad name is right for a *new* write — nothing is lost, because
+        the caller still holds the file and can resolve it properly. It is wrong
+        for a shard already in the channel: those are permanent, an older build
+        wrote some of them naming videos by Telegram message id, and dropping
+        their claims would throw away transcripts that cost GPU hours to earn
+        while the video they describe sits right there under its shortcode.
+
+        So the restore path resolves before it refuses, the same way
+        `atlas.identity` rehomes evidence rows onto the key its alias map knows.
+        Two witnesses, strongest first: this database's own `video.msg_id`, then
+        the capture ledger's view of the channel passed in as `{msg_id: key}`.
+        Both refuse to guess — `video_key_for_msg` drops a message id claimed by
+        two rows, and `_ledger_index` drops one claimed by two keys.
+
+        Never a mint. A spelling this cannot resolve is refused, because minting
+        an identity for a message id is the defect itself.
+        """
+        n = identity.msg_id_in(value)
+        if n <= 0:
+            return ""
+        key = self.video_key_for_msg(n)
+        if not key and msg_aliases:
+            key = str(msg_aliases.get(n) or msg_aliases.get(str(n)) or "")
+        return key if identity.looks_canonical(key) else ""
+
 
     # ── shots ───────────────────────────────────────────────────────────
     def set_shots(self, video_key: str, shots: list, detector: str) -> int:
@@ -1225,17 +1321,25 @@ class Store:
         """
         cols = ",".join(_COVERAGE_COLS)
         rows = []
-        for r in self.conn.execute(
+        try:
+            cur = self.conn.execute(
                 f"SELECT {cols} FROM coverage "
                 f"WHERE state IN ('done','skipped','failed') "
-                f"AND video_key IN {keys} ORDER BY component, video_key", span):
+                f"AND video_key IN {keys} ORDER BY component, video_key", span)
+        except sqlite3.OperationalError:
+            # No `coverage` table: this database has never had a `Coverage` on
+            # it, so nothing has been *done* and there is nothing to ship. Not
+            # created here — an export is a read, and a store that only ever
+            # exported should not grow a table because it did.
+            return rows
+        for r in cur:
             d = dict(r)
             if d.get("last_error"):
                 d["last_error"] = str(d["last_error"])[:500]
             rows.append(d)
         return rows
 
-    def import_shard(self, path: str) -> dict:
+    def import_shard(self, path: str, msg_aliases: dict | None = None) -> dict:
         """Replay a shard into this database. Idempotent by uid.
 
         This is the restore path: ten accounts each push shards to the channel,
@@ -1257,10 +1361,22 @@ class Store:
         channel, which is why it is correct there; "import this one shard into an
         empty database and expect a complete database" was never a supported
         reading and is less true now than it was.
+
+        Records naming a video by something that is not an identity are resolved
+        if the archive can say what they meant and counted under `refused` if it
+        cannot. The channel is permanent, so a shard an older build wrote under a
+        Telegram message id will still be replayed years from now — and importing
+        it *as a video* is how the duplicate would come back after being fixed.
+        So the message id is looked up (`rehome_key`) and its evidence lands on
+        the shortcode it always belonged to, counted under `rehomed`; only a
+        spelling nothing can resolve is dropped. `msg_aliases` is the capture
+        ledger's `{msg_id: video_key}` view, optional and only consulted when
+        this database's own `video` table cannot answer.
         """
         counts = {"claim": 0, "vector": 0, "video": 0, "shot": 0,
                   "observer": 0, "artifact": 0, "frame_vector": 0,
                   "frame_metric": 0, "coverage": 0, "skipped": 0}
+        refused = rehomed = 0
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             header = json.loads(fh.readline() or "{}")
             if header.get("_") != "vios-evidence-shard":
@@ -1289,14 +1405,47 @@ class Store:
                 if t not in counts:
                     continue
                 try:
-                    self._replay(t, rec)
+                    if self._replay(t, rec, msg_aliases):
+                        rehomed += 1
                     counts[t] += 1
+                except NotAnIdentity:
+                    refused += 1
                 except (sqlite3.Error, ValueError, KeyError):
                     counts["skipped"] += 1
         self.conn.commit()
+        if refused:
+            # Added after the loop, never before: the loop uses `counts` as the
+            # set of record types it knows, and neither of these is one.
+            counts["refused"] = refused
+        if rehomed:
+            counts["rehomed"] = rehomed
         return counts
 
-    def _replay(self, t: str, rec: dict) -> None:
+    def _replay(self, t: str, rec: dict, msg_aliases: dict | None = None) -> bool:
+        """Land one shard record. True when its key had to be rehomed first.
+
+        One guard for every record type that names a video, rather than one per
+        branch below. `video` is the identity table and the others reference it,
+        so a spelling refused here cannot arrive by a side door — and a claim
+        replayed under a name with no `video` row is an orphan, which is the same
+        defect wearing a different table's clothes.
+
+        A rehomed `video` record lands as a no-op: `INSERT OR IGNORE` against a
+        row that already exists, which is exactly right. The archive already has
+        that video under its identity — that is *how* the spelling resolved — and
+        the record's own fields describe the same video, so there is nothing to
+        add and nothing to overwrite.
+        """
+        rehomed = False
+        if "video_key" in rec and not identity.looks_canonical(rec["video_key"]):
+            spelling = str(rec["video_key"])
+            true_key = self.rehome_key(spelling, msg_aliases)
+            if not true_key:
+                raise NotAnIdentity(
+                    f"{t} record names {spelling[:40]!r}, "
+                    f"which is not a video identity")
+            rec["video_key"] = true_key
+            rehomed = True
         if t == "observer":
             self.conn.execute(
                 "INSERT OR IGNORE INTO observer(observer_id,component,model,"
@@ -1383,6 +1532,7 @@ class Store:
                  rec.get("meta", "{}"), rec.get("created_at", time.time())))
         elif t == "coverage":
             self._replay_coverage(rec)
+        return rehomed
 
     def _replay_coverage(self, rec: dict) -> None:
         """Land one coverage row, more-advanced-state-wins.

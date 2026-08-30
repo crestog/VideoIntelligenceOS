@@ -943,18 +943,33 @@ class ProcessEngine:
             if os.path.exists(self.ledger_path) else {"seen": 0}
         # A folder that was configured but never adopted is picked up here, so
         # "point the engine at a folder and press Start" is one step, not two.
-        adopted = 0
+        # The ledger goes in with it: a file named `10.mp4` is a Telegram message
+        # id, and the ledger is what turns that back into the reel's shortcode
+        # instead of adopting the number as a second identity for a video the
+        # sync above already registered.
+        adopted, merged = 0, 0
         for d in self.video_dirs:
             if os.path.isdir(d):
                 try:
-                    adopted += intake.adopt_folder(self.store, d).get("added", 0)
+                    got = intake.adopt_folder(self.store, d,
+                                              ledger_path=self.ledger_path)
+                    adopted += got.get("added", 0)
+                    merged += got.get("merged", 0)
+                    if got.get("merged") or got.get("refused"):
+                        self._log(
+                            f"folder {d}: {got.get('added', 0)} adopted, "
+                            f"{got.get('merged', 0)} recognised as videos "
+                            f"already here, {got.get('refused', 0)} refused "
+                            f"— by {got.get('by', {})}")
                 except Exception as exc:
                     self._log(f"folder {d}: {type(exc).__name__}: {exc}", "warn")
         have = len(self.store.video_keys())
         ok("Videos to process", have > 0,
            f"{have} in the evidence store, {synced.get('seen', 0)} uploaded in "
            f"the capture ledger"
-           + (f", {adopted} adopted from disk" if adopted else "") if have else
+           + (f", {adopted} adopted from disk" if adopted else "")
+           + (f", {merged} folder file(s) matched to videos already here"
+              if merged else "") if have else
            f"nothing yet — capture some reels first, point this at an existing "
            f"ledger ({self.ledger_path}), or give it a folder of videos",
            block=True)
@@ -1240,12 +1255,24 @@ class ProcessEngine:
                 on_progress=lambda seen, head, n: setattr(
                     self, "message",
                     f"Replaying shards — {seen}/{head} messages, {n} imported"),
-                should_stop=self._stopping)
+                should_stop=self._stopping,
+                ledger_path=self.ledger_path)
             self._shards_at = time.time()
             self._log(f"Shards: {got.get('imported', 0)} imported, "
                       f"{got.get('skipped', 0)} already held, "
                       f"{got.get('claims', 0)} claims recovered"
                       + (f" — {got['reason']}" if got.get("reason") else ""))
+            # Said out loud because it is the archive's own history arriving: an
+            # older build named some videos after Telegram message ids, and this
+            # is the count of evidence rows put back under the shortcode they
+            # describe. `refused` is what nothing could place.
+            if got.get("rehomed"):
+                self._log(f"Shards: {got['rehomed']} record(s) rehomed onto the "
+                          f"video's real identity")
+            if got.get("refused"):
+                self._log(f"Shards: {got['refused']} record(s) refused — the key "
+                          f"is not a video identity and nothing could resolve it",
+                          "warn")
             for e in got.get("errors", [])[:5]:
                 self._log(f"shard: {e}", "warn")
         elif self.restore_on_start and self._shards_at:
@@ -4124,7 +4151,9 @@ class ProcessEngine:
     def sync_now(self) -> dict:
         got = intake.sync(self.store, self.ledger_path)
         self._log(f"Sync: {got.get('added', 0)} new videos of "
-                  f"{got.get('seen', 0)} uploaded")
+                  f"{got.get('seen', 0)} uploaded"
+                  + (f", {got['refused']} ledger row(s) refused — the key is "
+                     f"not a video identity" if got.get("refused") else ""))
         return got
 
     # ── reconcile: what the channel already answered ─────────────────────
@@ -4265,13 +4294,21 @@ class ProcessEngine:
             raise ValueError("Give the folder that holds the videos.")
         if not os.path.isdir(folder):
             raise ValueError(f"No folder at {folder}.")
-        got = intake.adopt_folder(self.store, folder)
+        got = intake.adopt_folder(self.store, folder,
+                                  ledger_path=self.ledger_path)
         with self._lock:
             if folder not in self.video_dirs:
                 self.video_dirs.append(folder)
         self._cov = None                  # the partition counts just changed
+        # What was merged is more interesting than what was added: it is the
+        # answer to "did pointing this at my downloads folder just duplicate my
+        # archive?", and the answer is now no, with the count to show it.
         self._log(f"Folder: {got.get('added', 0)} new videos of "
-                  f"{got.get('seen', 0)} files in {folder}")
+                  f"{got.get('seen', 0)} files in {folder}"
+                  + (f", {got['merged']} already here under another filename"
+                     if got.get("merged") else "")
+                  + (f", {got['refused']} unreadable"
+                     if got.get("refused") else ""))
         return got
 
     def video_detail(self, key: str) -> dict:

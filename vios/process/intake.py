@@ -30,12 +30,20 @@ client.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import threading
 import time
+
+# The identity law. Imported, not restated — see the note over the same import
+# in `store.py`. What this module needs from it is the shape test and the two
+# key-minting helpers, so that a file arriving from a folder is named the way
+# every reader already expects to find it.
+from atlas import identity
 
 # 20 MB — the Bot API's download ceiling. Reels are 2–8 MB, so this path
 # carries most of the archive; the ones it refuses are the three-minute ones.
@@ -82,7 +90,8 @@ def sync(store, ledger_path: str, limit: int = 0) -> dict:
     alongside everything else rather than being a second-class category that
     only the library tab knows about.
     """
-    out = {"seen": 0, "added": 0, "uploads": 0, "ledger": ledger_path}
+    out = {"seen": 0, "added": 0, "uploads": 0, "refused": 0,
+           "ledger": ledger_path}
     if not os.path.exists(ledger_path):
         out["reason"] = "no capture ledger yet"
         return out
@@ -109,6 +118,14 @@ def sync(store, ledger_path: str, limit: int = 0) -> dict:
         for r in conn.execute(sql):
             out["seen"] += 1
             key = r["key"]
+            if not identity.looks_canonical(key):
+                # The ledger mints shortcodes and `up_<msg_id>`, so this is
+                # unreachable for a ledger this build wrote. It is here because
+                # the ledger is also rebuilt by scanning the channel, and a
+                # caption that lost its permalink is one bad parse away from
+                # offering a bare number as a key. Counted, not adopted.
+                out["refused"] += 1
+                continue
             upload = _is_upload_key(key)
             cols = sorted(collections.get(key, []))
             if upload and UPLOAD_COLLECTION not in cols:
@@ -213,7 +230,160 @@ def capture_head(video: dict) -> dict:
     return head if isinstance(head, dict) else {}
 
 
-def adopt_folder(store, folder: str, limit: int = 0) -> dict:
+def _sha256(path: str) -> str:
+    """The file's digest, read in chunks. Mirrors `capture/fetch._sha256`."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def resolve_stem(store, stem: str, path: str, ledger: dict = None,
+                 known=None) -> tuple:
+    """What video is this file? Returns (video_key, how, evidence, digest).
+
+    `digest` is the file's sha256 when the answer needed one and "" when it did
+    not — a name that resolved by itself is not worth reading five megabytes to
+    confirm, and the one that did resolve by bytes should not be hashed twice.
+
+    A filename is not an identity, and this is the function that stops one from
+    becoming one. Five answers, strongest first:
+
+      key         the stem already *is* an identity — `up_4471`, a `file_` key,
+                  or a key the store or the ledger already knows. A folder of
+                  capture-engine output merges with the rows it came from
+                  instead of duplicating them, which is why this is first.
+      shortcode   the stem is shaped like an Instagram shortcode: 10–12
+                  characters of base64 with at least one letter. Narrower than
+                  `looks_canonical` on purpose — `IMG_20240513_112233` passes
+                  that and is a camera's filename, not a permalink.
+      msg_id      `10.mp4`, `tg38.mp4`, `frames_8` — a *location*, not a name.
+                  The store knows what lives at message 10 and so does the
+                  ledger; ask, and use the answer.
+      content     the bytes are already in the archive under some other name.
+      minted      none of the above: `file_<digest16>`, derived from the bytes,
+                  so the same file adopted twice under two names is one video.
+
+    The last two are the point. The old code took the stem, sanitised it, and
+    adopted it — so a folder of files named after Telegram message ids minted
+    thirty-two numeric identities beside the thirty real shortcodes they were
+    already filed under. There is no stem this function returns a bare number
+    for, and no filename it invents a second identity from.
+    """
+    stem = str(stem or "").strip()
+    safe = _safe(stem)
+    ledger = ledger or {}
+    if identity.is_upload(safe) or identity.is_local(safe):
+        return safe, "key", f"filename {stem} is a key", ""
+    if safe and (safe in (known or ()) or ledger.get(("key", safe))):
+        return safe, "key", f"filename {stem} is a video already here", ""
+
+    # A message id, however it was spelled: `10`, `tg38`, `msg_40`, `frames_8`.
+    # `atlas.identity` owns the list of spellings, because it is the same list it
+    # refuses as identities — read here as what they actually are.
+    n = identity.msg_id_in(safe)
+    if n:
+        hit = store.video_key_for_msg(n)
+        if hit:
+            return hit, "msg_id", f"filename {stem} is message {n}", ""
+        hit = str(ledger.get(("msg", n)) or "")
+        if hit:
+            return hit, "msg_id", f"capture ledger: message {n}", ""
+    elif _SHORTCODE_STEM.match(safe):
+        return safe, "shortcode", f"filename {stem} is a shortcode", ""
+
+    digest = _sha256(path)
+    if not digest:
+        return "", "unreadable", f"could not read {path}", ""
+    hit = store.video_key_for_sha(digest)
+    if hit:
+        return hit, "content", f"same bytes as {hit}", digest
+    hit = str(ledger.get(("sha", digest)) or "")
+    if hit:
+        return hit, "content", f"capture ledger: same bytes as {hit}", digest
+    return identity.local_key(digest), "minted", f"sha256 of {stem}", digest
+
+
+# 10–12 characters of Instagram's alphabet with at least one letter. A run of
+# digits that long is a numeric id, not a shortcode, and is read as one above.
+_SHORTCODE_STEM = re.compile(
+    r"^(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{10,12}$")
+
+
+def _ledger_index(ledger_path: str) -> dict:
+    """`{("key", k): k, ("msg", id): k, ("sha", digest): k}` from the ledger.
+
+    Read-only and optional, exactly like `sync`'s connection: a machine that
+    adopted a folder may have no ledger at all, and the store's own `msg_id` and
+    `sha256` columns answer most of the question anyway. Ambiguity is dropped
+    rather than guessed — a message id or a digest claimed by two keys resolves
+    to nothing, and the file falls through to its own `file_` identity.
+    """
+    if not ledger_path or not os.path.exists(ledger_path):
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True,
+                               timeout=15.0)
+    except sqlite3.Error:
+        return {}
+    seen: dict = {}
+    doubled: set = set()
+    try:
+        for row in conn.execute("SELECT key, msg_id, record_msg_id, sha256 "
+                                "FROM item WHERE key IS NOT NULL"):
+            key = str(row[0] or "").strip()
+            if not identity.looks_canonical(key):
+                continue
+            marks = [("key", key)]
+            for value in (row[1], row[2]):
+                try:
+                    n = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    marks.append(("msg", n))
+            if row[3]:
+                marks.append(("sha", str(row[3]).strip().lower()))
+            for mark in marks:
+                if seen.setdefault(mark, key) != key:
+                    doubled.add(mark)
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    for mark in doubled:
+        seen.pop(mark, None)
+    return seen
+
+
+def _remember_path(store, video_key: str, path: str) -> bool:
+    """Record where a local copy of an already-known video is sitting.
+
+    `add_video` fills blanks only, which is right for two sources that each know
+    part of the truth and wrong here: a row synced from the ledger already has a
+    `meta`, so a blanks-only write would drop the path and `Source.ensure` would
+    keep going to the network for a file that is on the disk. Read, merge, write
+    — and nothing else in `meta` is touched.
+    """
+    row = store.video(video_key) or {}
+    try:
+        meta = json.loads(row.get("meta") or "{}")
+    except (TypeError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    if meta.get("local_path") == path:
+        return False
+    meta["local_path"] = path
+    return bool(store.update_video(video_key, meta=meta))
+
+
+def adopt_folder(store, folder: str, limit: int = 0,
+                 ledger_path: str = "") -> dict:
     """Register every video file in a folder as a processable row.
 
     The capture ledger is one way videos arrive; a folder is the other. A
@@ -224,8 +394,15 @@ def adopt_folder(store, folder: str, limit: int = 0) -> dict:
 
     The row records its own path, so `Source.ensure` finds it with no network
     at all. Idempotent by key, so re-running after adding files is safe.
+
+    Every file's identity goes through `resolve_stem`, which is why pointing
+    this at the same archive twice — once as shortcodes, once as message-id
+    filenames — cannot produce two videos. `by` in the report says which
+    evidence answered, per file, so an operator can see what was merged instead
+    of being handed a number.
     """
-    out = {"seen": 0, "added": 0, "folder": folder}
+    out = {"seen": 0, "added": 0, "folder": folder,
+           "by": {}, "merged": 0, "refused": 0}
     if not os.path.isdir(folder):
         out["reason"] = f"no folder at {folder}"
         return out
@@ -243,6 +420,7 @@ def adopt_folder(store, folder: str, limit: int = 0) -> dict:
     if limit:
         found = found[:limit]
 
+    ledger = _ledger_index(ledger_path)
     for path in found:
         out["seen"] += 1
         try:
@@ -256,16 +434,34 @@ def adopt_folder(store, folder: str, limit: int = 0) -> dict:
             out["too_small"] = out.get("too_small", 0) + 1
             continue
         stem = os.path.splitext(os.path.basename(path))[0]
-        # A file named after its shortcode keeps its identity, so a folder of
-        # capture-engine output merges with the ledger rows instead of
-        # duplicating them.
-        key = _safe(stem) or f"file{out['seen']:06d}"
-        if key in known:
+        key, how, evidence, digest = resolve_stem(store, stem, path, ledger,
+                                                  known)
+        if not key:
+            out["refused"] += 1
             continue
-        store.add_video(video_key=key, url="", uploader="", duration=None,
-                        width=None, height=None, bytes=size, taken_at=None,
-                        meta={"capture": {}, "local_path": path,
-                              "origin": "folder"})
+        out["by"][how] = out["by"].get(how, 0) + 1
+        if key in known:
+            if how in ("msg_id", "content"):
+                out["merged"] += 1
+            _remember_path(store, key, path)
+            continue
+        if not store.add_video(
+                video_key=key, url="", uploader="", duration=None,
+                width=None, height=None, bytes=size, taken_at=None,
+                # The digest goes in when the identity was derived from it,
+                # which is what makes the *next* file with these bytes resolve
+                # by content instead of re-deriving the same key from scratch —
+                # and what lets the twin sweep see two permalinks over one file.
+                sha256=(digest or None),
+                meta={"capture": {}, "local_path": path, "origin": "folder",
+                      "named_by": how, "filename": stem,
+                      "evidence": evidence}):
+            # Unreachable by construction — `resolve_stem` returns an identity
+            # or nothing — and counted rather than asserted, because the store
+            # refusing a key it was handed is a fact worth seeing if the two
+            # ever disagree.
+            out["refused"] += 1
+            continue
         known.add(key)
         out["added"] += 1
     return out
@@ -677,7 +873,8 @@ def shard_id_from_name(name: str) -> str:
 
 
 def restore_shards(store, tg, channel: Channel, on_progress=None,
-                   should_stop=None, batch: int = 200) -> dict:
+                   should_stop=None, batch: int = 200,
+                   ledger_path: str = "") -> dict:
     """Replay every evidence shard in the channel that this database lacks.
 
     The first thing a fresh session should do. Ten accounts push shards; any
@@ -685,9 +882,15 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
     `import_shard` is idempotent by uid and order-independent. A shard already
     named in the local `shard` table is not downloaded again — which is what
     makes running this at every startup cheap rather than a full re-import.
+
+    `ledger_path` is optional and read once, not per shard. It answers "which
+    reel is message 38?" for a shard an older build wrote under message ids
+    before the `video` table has anything to answer with — which on a fresh
+    restore is every shard, since the `video` rows arrive inside the shards
+    themselves.
     """
     out = {"found": 0, "imported": 0, "skipped": 0, "claims": 0, "vectors": 0,
-           "coverage": 0, "errors": []}
+           "coverage": 0, "refused": 0, "rehomed": 0, "errors": []}
     if not (channel and channel.ready):
         out["reason"] = channel.reason if channel else "no MTProto session"
         return out
@@ -703,6 +906,10 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
         return out
 
     have = {r["shard_id"] for r in store.shards()}
+    # Flattened once: `{msg_id: video_key}` is all `import_shard` needs, and
+    # opening the ledger per shard would be 76 connections for one dictionary.
+    msg_aliases = {mark[1]: key for mark, key in _ledger_index(ledger_path).items()
+                   if mark[0] == "msg"}
     tmpdir = os.path.join(os.path.dirname(os.path.abspath(store.path)),
                           "_shards")
     os.makedirs(tmpdir, exist_ok=True)
@@ -725,7 +932,7 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
                 out["errors"].append(f"{sid}: download failed")
                 continue
             try:
-                counts = store.import_shard(path)
+                counts = store.import_shard(path, msg_aliases)
                 out["imported"] += 1
                 out["claims"] += counts.get("claim", 0)
                 out["vectors"] += counts.get("vector", 0)
@@ -733,6 +940,15 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
                 # between a restored session that knows what it has already done
                 # and one that re-earns three hours of it.
                 out["coverage"] += counts.get("coverage", 0)
+                # Two numbers about identity, and the pair is the story. A shard
+                # an older build wrote under a Telegram message id gets its
+                # evidence rehomed onto the shortcode that message carried;
+                # `refused` is what not even the ledger could place. Both belong
+                # in the report rather than in a log nobody opens: this is the
+                # only place a restore can say "this archive used to name videos
+                # two different ways, and here is what became of it".
+                out["rehomed"] += counts.get("rehomed", 0)
+                out["refused"] += counts.get("refused", 0)
                 store.note_shard(sid, "restored", int(msg.id),
                                  {"claims": counts.get("claim", 0),
                                   "vectors": counts.get("vector", 0),

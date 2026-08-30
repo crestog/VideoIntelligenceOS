@@ -829,7 +829,8 @@ def intake_restore(eng, say):
     return intake.restore_shards(
         eng.store, eng._tg, eng._channel,
         on_progress=lambda seen, head, n: say(
-            f"{seen}/{head} messages scanned · {n} shards imported"))
+            f"{seen}/{head} messages scanned · {n} shards imported"),
+        ledger_path=eng.ledger_path)
 
 
 @process_router.post("/api/process/adopt")

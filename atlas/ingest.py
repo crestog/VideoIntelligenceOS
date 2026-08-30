@@ -53,7 +53,7 @@ import sqlite3
 import threading
 import time
 
-from . import config, pgdump, reflect, tgchannel
+from . import config, identity, pgdump, reflect, tgchannel
 from .tgchannel import log
 
 # ── Progress, readable from the API while a scan is running ───────────────
@@ -755,6 +755,57 @@ def _import_payloads(conn: sqlite3.Connection, kind: str, rows: list) -> dict:
     return out
 
 
+def _canonical_video_rows(conn: sqlite3.Connection, rows: list) -> tuple:
+    """The shard's `video` rows, with legacy spellings rehomed or dropped.
+
+    `identity.absorb` runs *after* the insert loop and only learns — so without
+    this, a shard an older build wrote under a Telegram message id would land a
+    second `video` row in atlas.db keyed `10`, absorb would refuse it, and the
+    row would sit there being counted by everything that counts videos. That is
+    the 62-over-30 defect arriving through the rebuild door instead of the
+    folder one, and refusing it at read time is not the same as never writing it.
+
+    Resolved by the strongest witness the row itself carries, then by what the
+    archive already learned:
+
+      url          the permalink is *in the row*. A `video_key` of `10` beside
+                   `https://instagram.com/reel/DZDNyKgv70R/` is not ambiguous.
+      alias map    `identity.resolve` — earlier shards' good rows taught it that
+                   message 38 is `DZDNyKgv70R`, and `absorb` keeps teaching it.
+
+    A row neither can place is dropped rather than adopted. Its evidence still
+    arrives: claims travel under their own `video_key` and `_adopt_orphans`
+    rehomes those from the same alias map, so what is lost is a duplicate video
+    row, which is the thing being prevented.
+
+    Returns `(rows, rehomed, refused)`.
+    """
+    # `learn` writes, so the tables have to exist — on a fresh atlas.db this runs
+    # before anything else has called it. Idempotent DDL, and `absorb` calls it
+    # again a few lines later for the same reason.
+    identity.ensure(conn)
+    out, rehomed, refused = [], 0, 0
+    for r in rows:
+        vk = str(r.get("video_key") or "").strip()
+        if identity.looks_canonical(vk):
+            out.append(r)
+            continue
+        true_key = identity.key_from_url(r.get("url")) or \
+            identity.resolve(conn, vk)
+        if not identity.looks_canonical(true_key):
+            refused += 1
+            continue
+        row = dict(r)
+        row["video_key"] = true_key
+        # The spelling that just got rehomed is worth keeping as an alias: it is
+        # how this shard — and every other one written by that build — names the
+        # video, and the next import should not have to re-derive it.
+        identity.learn(conn, vk, true_key, identity.KIND_MSG, "shard video")
+        out.append(row)
+        rehomed += 1
+    return out, rehomed, refused
+
+
 def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
     """Download one evidence shard and replay it into atlas.db."""
     seq = "shard:" + tgchannel.shard_seq(info)
@@ -778,6 +829,18 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
     _set(detail=f"{seq} — replaying {rows_in} row(s)")
     merged, dropped = {}, []
 
+    # Identity before insertion, for the one table that *is* identity. `tables`
+    # itself is left alone: it is what the shard holds, and the bundle row
+    # records that rather than what this run chose to keep.
+    videos = tables.get("video") or []
+    if videos:
+        videos, vk_rehomed, vk_refused = _canonical_video_rows(conn, videos)
+        if vk_rehomed:
+            merged["identity:rehomed"] = vk_rehomed
+        if vk_refused:
+            dropped.append(f"video ×{vk_refused} (key is not an identity and "
+                           f"nothing could resolve it)")
+
     # Payloads first, and by name rather than by shape. The generic loop below
     # still drops these columns as opaque — correctly, for what it is building —
     # so this is the one place the bytes are kept, and it has to run whether or
@@ -795,6 +858,14 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
                            + (f" ({got['error']})" if got.get("error") else ""))
 
     for table, rows in tables.items():
+        if table == "video":
+            # The rehomed list, not the shard's own. `continue` rather than
+            # falling through when it is empty: the generic skip below reports
+            # every skip as "(reserved name)", and the reason here is already in
+            # `dropped` with the count.
+            rows = videos
+            if not rows:
+                continue
         if not rows or reflect._norm(table) in reflect._ATLAS_OWN or \
                 reflect._FTS_SHADOW.search(table.lower()):
             # Atlas's own tables are not a landing zone. A shard that happened
@@ -849,6 +920,23 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
             _enrich(conn, table, cols, keys, rows)
 
     conn.commit()
+
+    # Identity, settled the moment the evidence lands. The shard's `video` rows
+    # carry the shortcode, the message id and the saved collections, which is
+    # everything needed to know that the `claim` rows arriving beside them under
+    # `38` belong to `DZDNyKgv70R`. Learned here rather than only at index time
+    # so the archive is never briefly in the state that produced the defect: two
+    # spellings, no map, and a UI counting spellings.
+    if videos:
+        got = identity.absorb(conn, videos)
+        if got["aliases"] or got["collections"]:
+            merged["identity"] = got["aliases"]
+            log(f"{seq} identity — {got['videos']} video(s), "
+                f"{got['aliases']} alias(es), {got['collections']} membership(s)"
+                + (f", {got['refused']} refused" if got["refused"] else ""))
+        elif got["refused"]:
+            dropped.append(f"video ×{got['refused']} (key is not an identity)")
+
     # `counts` is what the shard *holds*, not what this run happened to add.
     # A bundle's row records its manifest's counts for the same reason: the
     # Sources tab is answering "what arrived in this file", and a shard imported

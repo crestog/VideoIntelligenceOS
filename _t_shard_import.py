@@ -177,4 +177,51 @@ for m in conn.execute("SELECT video_key,t_start,t_end,source,text FROM moments "
     print("     ", m)
 assert not missing, f"claim text that reached no moment: {missing}"
 
+# ── a shard an older build wrote, naming videos by message id ────────────
+# Hand-written, because the engine can no longer produce one: `add_video` and
+# `_replay` refuse a non-identity key. The channel still holds shards from
+# before that, so this is the rebuild door, tested from the outside.
+print("\n== legacy spellings ==")
+import gzip
+sid3 = f"{intake.site_id(st)}-0003"
+shard3 = os.path.join(BASE, intake.shard_name(sid3))
+legacy = [
+    {"_": "vios-evidence-shard", "schema": 3, "component": "gpu", "at": 1.0},
+    # the permalink is in the row, so the message id is not ambiguous
+    {"t": "video", "video_key": "9001", "url": "https://instagram.com/p/REEL1/",
+     "msg_id": 9001, "bytes": 5_000_000, "added_at": 1.0, "meta": "{}"},
+    {"t": "claim", "uid": "legacy-1", "video_key": "9001", "shot_idx": 1,
+     "t0": 4.0, "t1": 9.5, "channel": "speech", "kind": "transcript",
+     "value": "rest it under foil for five minutes", "observer_id": oid,
+     "created_at": 1.0},
+    # nothing in the row and nothing in the alias map can place this one
+    {"t": "video", "video_key": "4242", "url": "", "msg_id": 4242,
+     "bytes": 1_000, "added_at": 1.0, "meta": "{}"},
+]
+with gzip.open(shard3, "wt", encoding="utf-8") as fh:
+    for r in legacy:
+        fh.write(json.dumps(r) + "\n")
+tgchannel.fetch_document = lambda i, dest: bool(shutil.copyfile(shard3, dest)) or True
+info3 = dict(info, file_name=intake.shard_name(sid3),
+             caption=f"vios evidence · {sid3}", message_id=5152)
+r3 = ingest.import_shard(info3, conn, BASE)
+print("  ", r3)
+vids = [r[0] for r in conn.execute("SELECT video_key FROM video ORDER BY video_key")]
+print("   videos after the legacy shard:", vids)
+assert vids == ["REEL1"], f"a message id became a video: {vids}"
+assert r3["rows"].get("identity:rehomed") == 1, r3["rows"]
+note = [b["note"] for b in ingest.bundle_rows(conn) if b["seq"] == f"shard:{sid3}"][0]
+print("   note:", note)
+assert "not an identity" in note, note
+alias = conn.execute(
+    "SELECT video_key FROM video_alias WHERE alias='9001'").fetchone()
+print("   alias 9001 ->", alias[0] if alias else None)
+assert alias and alias[0] == "REEL1", alias
+# and the evidence that arrived under the old spelling reads as the video's own
+index.rebuild(conn, embed=False)
+hits = search.search(conn, "rest it under foil", limit=3).get("results") or []
+print(f'   "rest it under foil" -> {hits[0]["video_key"] if hits else None}')
+assert hits and hits[0]["video_key"] == "REEL1", hits
+assert conn.execute("SELECT COUNT(*) FROM video").fetchone()[0] == 1
+
 print("\nIMPORTER OK — Atlas reads the GPU plane's shards on its own")

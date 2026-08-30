@@ -31,6 +31,14 @@ duration, caption, creator, poster path and per-source moment counts for each
 video. Result cards need all of it, and doing those joins per query is the
 difference between a 15 ms search and a 300 ms one.
 
+**One video, one row, decided before anything is read.** Every key that arrives
+here is resolved through `atlas.identity` first, and `identity.refresh` runs at
+the top of `rebuild`. This is the rule that stops the archive counting the same
+reel twice: the passages a video's transcript produced under `DZDNyKgv70R` and
+the ones its frame notes produced under `38` land on one row, because the map
+that says those are the same post is built before the first `SELECT`. The keys
+this file writes come from `identity.canonical_keys` and nowhere else.
+
 Nothing here names a source table. The list comes from `reflect.text_sources()`,
 so a column added upstream shows up as searchable moments on the next build.
 """
@@ -44,7 +52,7 @@ import threading
 import time
 import uuid
 
-from . import config, reflect
+from . import config, identity, reflect
 from .tgchannel import log
 
 # ── Passage shaping ───────────────────────────────────────────────────────
@@ -79,6 +87,13 @@ _MOMENT_DDL = (
     "CREATE INDEX IF NOT EXISTS moments_by_source ON moments(source)",
 
     # One row per video: everything a result card shows, precomputed.
+    #
+    # The identity columns at the end are not decoration. `shortcode` and `url`
+    # are what makes a card provably about *one* Instagram post; `aliases` says
+    # which other spellings of that post the archive has seen, so a card can
+    # admit "also message 38" instead of quietly becoming a second video; and
+    # `collections` is the many-to-many, flattened here for display only — the
+    # queryable copy lives in `video_collection`.
     "CREATE TABLE IF NOT EXISTS video_index ("
     "  video_key TEXT PRIMARY KEY,"
     "  msg_id INTEGER,"
@@ -99,7 +114,13 @@ _MOMENT_DDL = (
     "  sources TEXT,"
     "  has_speech INTEGER,"
     "  has_narrative INTEGER,"
-    "  text_len INTEGER)",
+    "  text_len INTEGER,"
+    "  shortcode TEXT,"
+    "  url TEXT,"
+    "  aliases TEXT,"
+    "  collections TEXT,"
+    "  twin_of TEXT,"
+    "  is_stub INTEGER)",
 
     "CREATE INDEX IF NOT EXISTS video_by_created ON video_index(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS video_by_moments ON video_index(moment_count DESC)",
@@ -143,6 +164,38 @@ _FTS_DDL = (
 )
 
 _LOCK = threading.RLock()
+
+# Columns added to `video_index` after it shipped. `CREATE TABLE IF NOT EXISTS`
+# is a no-op on an existing table, so a database built before identity existed
+# would keep the old twenty columns and every write below would fail on the
+# first unknown name. Listed here rather than inferred so the migration is a
+# thing you can read.
+_VIDEO_INDEX_ADDED = (
+    ("shortcode", "TEXT"), ("url", "TEXT"), ("aliases", "TEXT"),
+    ("collections", "TEXT"), ("twin_of", "TEXT"), ("is_stub", "INTEGER"),
+)
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns) -> int:
+    """Add missing columns to an existing table. Idempotent."""
+    try:
+        have = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+    except sqlite3.Error:
+        return 0
+    if not have:
+        return 0
+    added = 0
+    for name, decl in columns:
+        if name in have:
+            continue
+        try:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {decl}')
+            added += 1
+        except sqlite3.Error as e:
+            log(f"could not add {table}.{name}: {e}")
+    return added
+
+
 _STATE = {
     "phase": "idle",        # idle | reading | writing | fts | embedding | done | error
     "detail": "",
@@ -186,6 +239,13 @@ def clean_text(value) -> str:
     the CV worker stored them. Indexed raw, the brackets and quotes become
     tokens and a search for `person` competes with punctuation. Unwrapping them
     into words is the difference between object labels helping and hurting.
+
+    Opaque handles are removed for the mirror-image reason. The legacy harvest
+    wrote Telegram file_ids into `categories.name`, so a category passage reads
+    `BAACAgUAAyEGAAMBCGCQ-wADEmp3oIU2fPqhaznC2nu0-W1-RulYAAK…, liked posts` — 80
+    characters no query will ever contain, tokenised into a dozen nonsense terms
+    that dilute every score in the table they came from. They are dropped rather
+    than the whole cell, because the rest of that cell is real.
     """
     if value is None:
         return ""
@@ -205,6 +265,10 @@ def clean_text(value) -> str:
         except (ValueError, TypeError):
             pass
 
+    if _OPAQUE.search(s):
+        s = _OPAQUE.sub(" ", s)
+        s = re.sub(r"\s*,\s*,+", ", ", s).strip(" ,")
+
     s = _WS.sub(" ", s).strip()
     if len(s) > MAX_CHARS:
         s = s[:MAX_CHARS].rsplit(" ", 1)[0]
@@ -212,6 +276,14 @@ def clean_text(value) -> str:
     if len(s) < 2 or s.isdigit():
         return ""
     return s
+
+
+# A base64-ish run long enough, and mixed enough, to be a machine handle: 24+
+# characters from the base64url alphabet carrying at least one digit and one
+# capital. No word, name or sentence reaches that shape.
+_OPAQUE = re.compile(
+    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9_-]{24,})"
+    r"(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{24,}")
 
 
 def _flatten_json(obj, depth: int = 0) -> str:
@@ -277,11 +349,6 @@ def build_passages(rows: list) -> list:
 
     out = []
 
-    # Untimed text for a video is one passage per distinct string; merging
-    # captions from different rows would invent sentences nobody wrote.
-    for text in untimed:
-        out.append((None, None, text))
-
     timed.sort(key=lambda r: (r[0], r[1]))
     buf = []          # [(a, b, text)] pending merge
     buf_chars = 0
@@ -311,6 +378,23 @@ def build_passages(rows: list) -> list:
         if buf_chars >= TARGET_CHARS:
             flush()
     flush()
+
+    # Untimed text for a video is one passage per distinct string; merging
+    # captions from different rows would invent sentences nobody wrote.
+    #
+    # Emitted last, and the same string is dropped outright when a placed passage
+    # already carries it. Both halves of that matter because `moments` is
+    # `UNIQUE(video_key, source, text_hash)` and the writer is `INSERT OR IGNORE`,
+    # so of two identical texts the *first* one inserted is the one that survives
+    # — and while this loop ran first, the survivor was always the copy that
+    # cannot seek. It is not a hypothetical: a shot-scoped motion reading and the
+    # whole-reel reading of the same pass both say `gentle`, one of them at
+    # 0.0–95.0s and one of them nowhere, and the timeline got the second.
+    placed = {text for _, _, text in out}
+    for text in untimed:
+        if text not in placed:
+            out.append((None, None, text))
+
     return out
 
 
@@ -321,6 +405,8 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
     """Create the moment tables. Returns True if FTS5 is usable."""
     for ddl in _MOMENT_DDL:
         conn.execute(ddl)
+    _add_columns(conn, "video_index", _VIDEO_INDEX_ADDED)
+    identity.ensure(conn)
     # `rebuild` records its fingerprint in atlas_meta on the last four
     # statements it runs. That table belongs to the ingest path, so a database
     # that reached the indexer without going through a bundle import — a folder
@@ -625,14 +711,38 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
     hundred thousand rows of text, it rebuilds in seconds, and incremental
     updates against a schema that can change underneath you are how indexes
     drift out of sync with their source. Cheap and always correct beats clever.
+
+    Identity is settled *first*, before a single source row is read. That
+    ordering is the fix for the duplication defect, not a tidiness preference:
+    `_collect` and `_video_metadata` both reduce their keys through
+    `reflect.normalize_key`, and until the alias map is installed that function
+    can only see what is in the characters of a string. Nothing in `38` says it
+    is `DZDNyKgv70R`, so with the map built afterwards the passages of one reel
+    split across two rows and Home counted 62 videos where there are 30.
     """
     if _STATE["running"]:
         return {"ok": False, "note": "an index build is already running"}
     _set(phase="reading", running=True, error="", started_at=time.time(),
-         finished_at=0.0, moments=0, videos=0, detail="reading sources")
+         finished_at=0.0, moments=0, videos=0, detail="resolving identity")
 
     try:
         has_fts = ensure_schema(conn)
+
+        ident = identity.refresh(conn, media_dir=getattr(config, "MEDIA_DIR", ""),
+                                 ledger_path=getattr(config, "LEDGER_PATH", ""))
+        report = ident["audit"]
+        log(f"identity — {report['videos']} video(s), {report['aliases']} alias(es)"
+            f", {report['unresolved']} unresolved"
+            + (f", {len(report['conflicts'])} conflict(s)"
+               if report["conflicts"] else "")
+            + (f", {report['twins']} twin(s)" if report["twins"] else ""))
+        if not report["ok"]:
+            for t in report["tables"]:
+                if not t["ok"]:
+                    log(f"  {t['table']}.{t['column']} — {t['unresolved']} key(s) "
+                        f"name no video, e.g. {', '.join(t['examples'])}")
+        _set(detail="reading sources")
+
         buckets = _collect(conn)
 
         _set(phase="writing", detail="building passages")
@@ -646,9 +756,24 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
                 has_fts = ensure_schema(conn)
 
         weights = config.SOURCE_WEIGHT
+        # A moment belongs to a video. If the key a source row carries names no
+        # video even after identity has resolved it, there is nothing for the
+        # passage to be *about*: no card to show it on, no file to play, no
+        # duration to seek within. Those rows used to be written anyway, which is
+        # how `moments` came to hold nine hundred keys for thirty videos — most
+        # of them channel message ids from a scan log.
+        #
+        # Guarded on a non-empty canonical set for the same reason
+        # `_build_video_index` is: an archive with no `video` table has no set to
+        # check against, and dropping everything would be worse than keeping it.
+        canonical = identity.canonical_keys(conn)
         rows_out = []
         per_video = {}
+        orphaned = {}
         for (vk, source), bucket in buckets.items():
+            if canonical and vk not in canonical:
+                orphaned[vk] = orphaned.get(vk, 0) + len(bucket["rows"])
+                continue
             w = weights.get(source, 1.0)
             for t0, t1, text in build_passages(bucket["rows"]):
                 rows_out.append((vk, t0, t1, source, bucket["table"], w,
@@ -656,6 +781,11 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
                 slot = per_video.setdefault(vk, {"sources": {}, "chars": 0})
                 slot["sources"][source] = slot["sources"].get(source, 0) + 1
                 slot["chars"] += len(text)
+        if orphaned:
+            log(f"skipped {sum(orphaned.values())} row(s) under "
+                f"{len(orphaned)} key(s) that name no video: "
+                + ", ".join(sorted(orphaned)[:6])
+                + (" …" if len(orphaned) > 6 else ""))
 
         _set(detail=f"writing {len(rows_out)} passage(s)")
         conn.executemany(
@@ -721,20 +851,91 @@ def _build_video_index(conn: sqlite3.Connection, per_video: dict) -> None:
             "SELECT video_key, MAX(t_end) FROM moments GROUP BY video_key"):
         spans[vk] = t_end
 
-    keys = set(per_video) | set(meta)
+    # The keys of this table are the archive's videos, and the only thing
+    # entitled to say what those are is `identity`. Taking the union of whatever
+    # `_collect` and `_video_metadata` happened to produce is what put 62 rows
+    # here: `moments` had a row under `38` and another under `DZDNyKgv70R`, both
+    # spellings landed in the union, and Home counted the spellings.
+    #
+    # Now the union is *resolved* and then intersected with the canonical set.
+    # Anything left over is evidence naming a video that has no `video` row —
+    # which identity already tried to adopt, so reaching here means it is
+    # genuinely unidentifiable, and a card for it would be a card for nothing.
+    canonical = identity.canonical_keys(conn)
+    res = identity.Resolver(conn)
+    keys, dropped = set(), {}
+    for raw in set(per_video) | set(meta) | set(spans):
+        vk = res(raw) or raw
+        # An archive with no `video` table at all — a bare legacy lake, or a
+        # restore that has not replayed its shards yet — has no canonical set to
+        # check against. Filtering on an empty set would produce an empty index,
+        # so in that case every resolved key stands. Better a card that might be
+        # a duplicate than no cards.
+        if not canonical or vk in canonical:
+            keys.add(vk)
+        else:
+            dropped[raw] = vk
+    if dropped:
+        log(f"video_index — {len(dropped)} key(s) named no video and were left "
+            f"out: {', '.join(sorted(dropped)[:6])}")
+
+    ident = identity.bulk(conn)
+    _blank = {"aliases": [], "collections": [], "twins": []}
+
+    # A resolved key may have arrived under several spellings, and each of them
+    # carries its own share of the evidence. They are folded together here, so
+    # a video whose transcript came in as `38` and whose narrative came in as
+    # its shortcode gets one row with the sum of both, not two rows with half
+    # each and not one row that silently keeps whichever was read last.
+    folded_meta, folded_counts = {}, {}
+    for raw, m in meta.items():
+        vk = res(raw) or raw
+        slot = folded_meta.setdefault(vk, {})
+        for k, v in m.items():
+            if v not in (None, "") and slot.get(k) in (None, ""):
+                slot[k] = v
+    for raw, p in per_video.items():
+        vk = res(raw) or raw
+        slot = folded_counts.setdefault(vk, {"sources": {}, "chars": 0})
+        for s, n in p["sources"].items():
+            slot["sources"][s] = slot["sources"].get(s, 0) + n
+        slot["chars"] += p["chars"]
+
+    # `msg_id` says where in the channel this video's file is, and on that one
+    # question the capture plane outranks the legacy harvest. Both know a number
+    # for the same reel, and they are not always the same number: reel
+    # `DZDNyKgv70R` was uploaded twice, so the harvest recorded message 10 and
+    # the capture ledger recorded 40. Either plays, but only the ledger's is the
+    # one the manifest, the `parts` rows and the clip routes were built around,
+    # so a card holding the other silently loses instant playback.
+    authoritative = {}
+    try:
+        for k, mid in conn.execute(
+                "SELECT video_key, msg_id FROM video "
+                "WHERE msg_id IS NOT NULL"):
+            authoritative[res(k) or str(k)] = mid
+    except sqlite3.Error:
+        pass
+
     conn.execute("DELETE FROM video_index")
     rows = []
     for vk in keys:
-        m = meta.get(vk, {})
-        p = per_video.get(vk, {"sources": {}, "chars": 0})
+        m = folded_meta.get(vk, {})
+        p = folded_counts.get(vk, {"sources": {}, "chars": 0})
         srcs = p["sources"]
         duration = _as_float(m.get("duration"))
         if not duration:
             # No metadata row for this video, but its moments know how far in
             # they go. A ribbon needs a length; this is the honest lower bound.
             duration = _as_float(spans.get(vk)) or 0.0
+        # `msg_id` is where the video *is*, not what it is called. The old
+        # fallback `_int(vk)` was the same conflation one level down: it read a
+        # numeric key as a message id, which is exactly how a message id came to
+        # be used as an identity in the first place.
+        ids = ident.get(vk) or _blank
         rows.append((
-            vk, _int(m.get("msg_id")) or _int(vk), m.get("title"),
+            vk, _int(authoritative.get(vk)) or _int(m.get("msg_id")),
+            m.get("title"),
             m.get("caption"), m.get("creator"), m.get("category"),
             duration, _int(m.get("width")), _int(m.get("height")),
             _as_float(m.get("fps")), _as_float(m.get("size_mb")),
@@ -743,13 +944,20 @@ def _build_video_index(conn: sqlite3.Connection, per_video: dict) -> None:
             sum(srcs.values()), json.dumps(srcs),
             1 if srcs.get("speech") else 0,
             1 if srcs.get("narrative") else 0,
-            p["chars"]))
+            p["chars"],
+            "" if identity.is_upload(vk) else vk,
+            identity.canonical_url(vk),
+            json.dumps(sorted(ids["aliases"])),
+            json.dumps(sorted(ids["collections"])),
+            json.dumps(sorted(ids["twins"])) if ids["twins"] else "",
+            1 if identity.is_stub(conn, vk) else 0))
     conn.executemany(
         "INSERT OR REPLACE INTO video_index(video_key, msg_id, title, caption, "
         "creator, category, duration, width, height, fps, size_mb, likes, "
         "created_at, local_path, poster, moment_count, sources, has_speech, "
-        "has_narrative, text_len) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        "has_narrative, text_len, shortcode, url, aliases, collections, "
+        "twin_of, is_stub) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     conn.commit()
 
 

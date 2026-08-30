@@ -125,9 +125,20 @@ _SOURCE_HINTS = (
 # is written by `ingest`'s payload lane and read only by the image search that
 # builds its index from it. `coverage` is here because it is the processing
 # plane's work table — it says what ran, which means nothing to a search index.
+#
+# The five `identity` tables are here for the strongest reason of all: they are
+# what decides which video a row belongs to. If a shard could land on
+# `video_alias`, an import would be able to rewrite identity, and the one place
+# that answers "are these two strings the same video?" would take dictation from
+# the data it is supposed to be judging. They are derived by
+# `identity.rebuild` from `video`, the ledger and the media hashes, and by
+# nothing else. `media_hash` is a cache of expensive digests; `identity_conflict`
+# and `video_twin` are findings, and a search index has no use for either.
 _ATLAS_OWN = {"moments", "moments_fts", "bundles", "atlas_meta", "ingest_log",
               "video_index", "graph_nodes", "graph_edges", "parts",
-              "vec_payload", "coverage"}
+              "vec_payload", "coverage",
+              "video_alias", "video_collection", "identity_conflict",
+              "video_twin", "media_hash"}
 
 _FTS_SHADOW = re.compile(r"_(data|idx|content|docsize|config)$")
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
@@ -393,6 +404,14 @@ def _q(name: str) -> str:
 # an axis label. Three is the shortest that excludes "e+05", "id" and "0.5".
 _LEXICAL = re.compile(r"[A-Za-z]{3,}")
 
+# A float array that was hex-encoded before being stored as TEXT. It passes the
+# word test above — `0000d0410ad70bc2` is nothing but letters and digits, and
+# `d041` reads as a word — which is how 1,315 buffers of raw float32 came to be
+# indexed as searchable passages. Even length, hex only, and long enough that no
+# real word or identifier reaches it.
+_HEX_DUMP = re.compile(r"^(?:[0-9a-fA-F]{2})+$")
+_HEX_DUMP_MIN = 32
+
 
 def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
     """`content_columns` narrowed to the ones whose *data* reads like language.
@@ -409,8 +428,25 @@ def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
     passages either way), and a short enum like `"float32"` reads as lexical. It
     drops number dumps, not anything a person wrote.
 
-    Additive: `content_columns` and its other callers are untouched, and the
-    rule is about the data, so no table is named here either.
+    A second test drops the opposite failure: a column of real words that is a
+    *label*, not prose. `scan_seen.verdict` holds five strings —
+    "uninteresting", "absent", "shard", "asset", "bundle" — across 934 rows.
+    Every word test calls that language, and it is: it is just not a passage.
+    Indexed, it puts 934 identical moments into search, repeats the same text
+    across dozens of videos, and inflates every card's moment count with rows
+    that say nothing about what is in the video. That is the "same narrative
+    repeated across a lot of videos" complaint, arriving through reflection. The
+    rule is a closed vocabulary: few distinct values, each repeated many times.
+
+    Two narrower tests catch what the first two miss. A hex-encoded float buffer
+    reads as words — `0000d0410ad70bc2` is letters and digits — so 1,315 of them
+    were indexed as prose; and the label half of a name/value pair
+    (`frame_metric.name` beside `frame_metric.values_`) names a measurement
+    rather than being one, which is another 1,909. Together those two were 69% of
+    this archive's index.
+
+    Every test is about the data or the shape of the table, so no table is named
+    here. Additive: `content_columns` and its other callers are untouched.
     """
     keep = []
     for name in content_columns(cols):
@@ -426,11 +462,67 @@ def prose_columns(conn: sqlite3.Connection, table: str, cols: list) -> list:
         if not vals:
             keep.append(name)
             continue
-        lexical = sum(1 for v in vals if _LEXICAL.search(v))
+        lexical = sum(1 for v in vals
+                      if _LEXICAL.search(v) and not _is_hex_dump(v))
         need = 1 if len(vals) <= 4 else max(2, int(0.25 * len(vals)))
-        if lexical >= need:
-            keep.append(name)
+        if lexical < need:
+            continue
+        if _is_field_name(name, cols) or _is_label_column(conn, table, name):
+            continue
+        keep.append(name)
     return keep
+
+
+def _is_hex_dump(value: str) -> bool:
+    v = (value or "").strip()
+    return len(v) >= _HEX_DUMP_MIN and bool(_HEX_DUMP.match(v))
+
+
+# The label half of a name/value pair. A table that has both is a key-value
+# store by construction, and its label column holds the *name of a measurement*
+# rather than a measurement: `frame_metric` says `sharpness` in `name` and the
+# reading itself in `values_`. Indexed as prose that is 1,909 passages saying
+# "sharpness" and "clap:laughter", repeated identically across every video.
+#
+# The pair is what makes this safe. `claim.value` is statistically identical to
+# `frame_metric.name` — 165 distinct short strings over 5,923 rows for the visual
+# channel, "person" and "potted plant" — and it is exactly what someone searches
+# for, so no rule based on cardinality or length can separate them. The
+# difference is structural: `value` *is* the observation, `name` merely says which
+# observation it was.
+_FIELD_NAMES = {"name", "metric", "field", "param", "parameter", "attr",
+                "attribute", "property", "measure", "measurement", "stat"}
+_VALUE_NAMES = {"value", "values", "values_", "val", "vals", "num", "number",
+                "amount", "score", "reading", "readings", "magnitude"}
+
+
+def _is_field_name(name: str, cols: list) -> bool:
+    if _norm(name) not in {_norm(n) for n in _FIELD_NAMES}:
+        return False
+    others = {_norm(c["name"]) for c in cols if c["name"] != name}
+    return bool(others & {_norm(n) for n in _VALUE_NAMES})
+
+
+# A text column with at most this many distinct values, each repeated at least
+# this many times on average, is a status or category label rather than prose.
+# Both numbers are deliberately conservative: a genuine caption column in an
+# archive this size has hundreds of distinct values, and one with eight would
+# have to be eight captions repeated two hundred times each to be caught.
+LABEL_MAX_DISTINCT = 8
+LABEL_MIN_REPEAT = 25
+
+
+def _is_label_column(conn: sqlite3.Connection, table: str, name: str) -> bool:
+    try:
+        rows, distinct = conn.execute(
+            f"SELECT COUNT(*), COUNT(DISTINCT t.{_q(name)}) FROM {_q(table)} t "
+            f"WHERE t.{_q(name)} IS NOT NULL "
+            f"AND TRIM(t.{_q(name)}) <> ''").fetchone()
+    except sqlite3.Error:
+        return False
+    if not distinct or distinct > LABEL_MAX_DISTINCT:
+        return False
+    return rows >= distinct * LABEL_MIN_REPEAT
 
 
 def text_sources(conn: sqlite3.Connection) -> list:
@@ -570,6 +662,27 @@ _KEY_NAMESPACE = re.compile(r"^vios[:=]", re.I)
 # and the asset manifests land under the spelling the reader never asks for.
 _PREFIXED_NUMBER = re.compile(r"^(?:tg|msg|id|up)[_:-]?(\d+)$", re.I)
 
+# The alias map, installed by `atlas.identity.install`. Empty until it is, and an
+# empty map means this function behaves exactly as it did before identity existed
+# — which is what makes it safe to call from a database that has no alias table.
+#
+# This hook is the whole reason the identity fix reaches old code. Eleven call
+# sites normalise a key through this function; none of them knows about aliases,
+# and none of them can opt out. Putting the map here rather than at each caller
+# is the difference between a fix and eleven fixes, one of which gets missed.
+_ALIASES: dict = {}
+
+
+def set_aliases(mapping) -> int:
+    """Install {spelling: canonical_key}. Replaces any previous map."""
+    global _ALIASES
+    _ALIASES = dict(mapping or {})
+    return len(_ALIASES)
+
+
+def alias_map() -> dict:
+    return _ALIASES
+
 
 def normalize_key(value) -> str:
     """Reduce any spelling of a video's identity to one canonical form.
@@ -585,16 +698,27 @@ def normalize_key(value) -> str:
     unrelated reels merge into one video and their moments interleave. A
     shortcode is returned whole, and case-sensitively: Instagram's alphabet is
     base64-ish, so `Abc` and `aBc` are different posts.
+
+    The string rules below cannot bridge the two *generations* of this archive:
+    nothing in the characters of `38` says it is the reel `DZDNyKgv70R`, so for
+    four weeks it was two videos. That fact is recorded, not derivable, and it
+    arrives through `set_aliases` — consulted first here, and consulted again
+    after the string rules have run, so `tg38` resolves through `38`.
     """
     if value is None:
         return ""
     if isinstance(value, (int, float)):
-        return str(int(value))
+        value = str(int(value))
     s = str(value).strip()
     if not s:
         return ""
+    if _ALIASES:
+        hit = _ALIASES.get(s)
+        if hit:
+            return hit
     s = _KEY_NAMESPACE.sub("", s, count=1).strip()
-    if _ALL_DIGITS.match(s):
-        return s
-    m = _PREFIXED_NUMBER.match(s)
-    return m.group(1) if m else s
+    if not _ALL_DIGITS.match(s):
+        m = _PREFIXED_NUMBER.match(s)
+        if m:
+            s = m.group(1)
+    return _ALIASES.get(s, s) if _ALIASES else s

@@ -50,6 +50,19 @@ VIDEO_CACHE  = os.path.join(CACHE_DIR, "video")
 POSTER_CACHE = os.path.join(CACHE_DIR, "poster")
 WEB_DIR      = os.path.join(_HERE, "web")
 
+# Where the capture plane put the files, and where it wrote its ledger. Atlas
+# does not own either one — it reads them, read-only, to settle identity: the
+# ledger is the only place that records "message 38 is the reel DZDNyKgv70R",
+# and the media folder is where two byte-identical files under different names
+# can be caught by hashing them. Both are optional; on Kaggle after a restore
+# there may be no ledger at all, and identity then falls back to what the
+# `video` rows themselves say. Overridable because the desktop app keeps its
+# data in one folder and Kaggle keeps it in three.
+MEDIA_DIR    = os.environ.get("ATLAS_MEDIA_DIR") or os.path.join(
+    ATLAS_HOME, "media")
+LEDGER_PATH  = os.environ.get("ATLAS_LEDGER_PATH") or os.path.join(
+    ATLAS_HOME, "capture_ledger.db")
+
 for _d in (ATLAS_HOME, BUNDLE_DIR, SESSION_DIR, VIDEO_CACHE, POSTER_CACHE,
            FRAME_VEC_DIR):
     os.makedirs(_d, exist_ok=True)
