@@ -261,4 +261,78 @@ card = conn.execute(
 print("   card msg_id:", card[0], " messages:", card[1])
 assert json.loads(card[1]) == [5150, 9001], card[1]
 
+# ── collections: one reel on several shelves, and a filter that says so ────
+# The requirement this guards is a sentence: one video might be in two or more
+# collections I have saved, and that must not make it two videos. So the shelves
+# arrive the way production sends them — inside `video.meta.capture.collections`,
+# in the same `video` row every shard already carries, with no new record type —
+# and a second video exists so that a filter has something to exclude.
+print("\n== collections: one reel, several shelves ==")
+sid4 = f"{intake.site_id(st)}-0004"
+shard4 = os.path.join(BASE, intake.shard_name(sid4))
+second = [
+    {"_": "vios-evidence-shard", "schema": 3, "component": "gpu", "at": 1.0},
+    {"t": "video", "video_key": "REEL2", "url": "https://instagram.com/p/REEL2/",
+     "msg_id": 5160, "bytes": 2_000_000, "added_at": 1.0,
+     "meta": json.dumps({"capture": {"collections": ["desserts", "dinners"]}})},
+    {"t": "claim", "uid": "c-tart", "video_key": "REEL2", "shot_idx": 0,
+     "t0": 0.0, "t1": 6.0, "channel": "speech", "kind": "transcript",
+     "value": "today we are making a chocolate tart", "observer_id": oid,
+     "created_at": 1.0},
+]
+with gzip.open(shard4, "wt", encoding="utf-8") as fh:
+    for r in second:
+        fh.write(json.dumps(r) + "\n")
+tgchannel.fetch_document = lambda i, dest: bool(shutil.copyfile(shard4, dest)) or True
+info4 = dict(info, file_name=intake.shard_name(sid4),
+             caption=f"vios evidence · {sid4}", message_id=5153)
+r4 = ingest.import_shard(info4, conn, BASE)
+print("  ", r4)
+assert r4["ok"], r4
+# REEL1's shelves the other way in: the ledger's API, which is what a capture
+# machine calls. Additive on purpose — a label is never removed by a refresh.
+identity.set_collections(conn, "REEL1", ["steak", "dinners"], "test")
+conn.commit()
+index.rebuild(conn, embed=False)
+
+shelves = {v: identity.collections_for(conn, v) for v in ("REEL1", "REEL2")}
+print("   shelves:", shelves)
+assert shelves == {"REEL1": ["dinners", "steak"],
+                   "REEL2": ["desserts", "dinners"]}, shelves
+counts = {c["name"]: c["videos"] for c in identity.collection_counts(conn)}
+print("   facet  :", counts)
+assert counts == {"dinners": 2, "desserts": 1, "steak": 1}, counts
+s = search.stats(conn)
+print("   stats  :", {k: s[k] for k in ("videos", "collections", "memberships")})
+# Two videos and four filings: the numbers differing *is* the squeeze working.
+assert (s["videos"], s["collections"], s["memberships"]) == (2, 3, 4), s
+
+wide = search.search(conn, "today we are making", limit=10)
+assert {r["video_key"] for r in wide["results"]} == {"REEL1", "REEL2"}, wide
+narrow = search.search(conn, "today we are making", collection="steak", limit=10)
+print(f'   "today we are making" -> {[r["video_key"] for r in wide["results"]]}'
+      f'   in steak -> {[r["video_key"] for r in narrow["results"]]}')
+assert [r["video_key"] for r in narrow["results"]] == ["REEL1"], narrow
+# Filtered after grouping, so the row keeps the score it had unfiltered and the
+# UI can say "1 of 2, narrowed by your filters" without lying about the query.
+assert (narrow["matched"], narrow["total"]) == (2, 1), narrow
+w1 = [r for r in wide["results"] if r["video_key"] == "REEL1"][0]
+assert narrow["results"][0]["score"] == w1["score"], (narrow, wide)
+# One video answers to both of its shelves, and to none of the others.
+for shelf in ("steak", "dinners"):
+    got = search.search(conn, "today we are making", collection=shelf, limit=10)
+    assert any(r["video_key"] == "REEL1" for r in got["results"]), shelf
+off = search.search(conn, "today we are making", collection="desserts", limit=10)
+assert [r["video_key"] for r in off["results"]] == ["REEL2"], off
+# The chips count filings over the matched pool, and the active one keeps its
+# own count so it can be switched back off.
+fac = {f["value"]: f["count"] for f in wide["facets"]["collections"]}
+print("   chips  :", fac)
+assert fac == counts, (fac, counts)
+assert {f["value"]: f["count"]
+        for f in narrow["facets"]["collections"]} == fac, narrow["facets"]
+# And every result carries its own identity, so a card never asks a second time.
+assert narrow["results"][0]["collections"] == ["dinners", "steak"], narrow
+assert narrow["results"][0]["messages"] == [5150, 9001], narrow
+
 print("\nIMPORTER OK — Atlas reads the GPU plane's shards on its own")

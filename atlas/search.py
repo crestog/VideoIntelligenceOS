@@ -50,6 +50,7 @@ video's score is its best moment plus a damped contribution from the rest —
 so corroborating evidence helps, but a video cannot win on volume alone.
 """
 
+import json
 import math
 import re
 import sqlite3
@@ -349,10 +350,34 @@ SORTS = ("relevance", "recent", "oldest", "longest", "shortest",
          "liked", "matches")
 
 
+def _id_list(value) -> list:
+    """Decode one of `video_index`'s identity columns into a list.
+
+    `aliases`, `messages`, `collections` and `twin_of` are JSON text, because
+    SQLite has no list type and one video legitimately has several of each — two
+    saved collections, two channel messages. Every reader wants the list and
+    none of them should have to be careful, so a NULL, an empty string, a `"[]"`
+    and a value some older build wrote as a bare string all come back as a list
+    rather than as an exception thrown halfway through building a page.
+    """
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if not value:
+        return []
+    try:
+        got = json.loads(value)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(got, list):
+        return got
+    return [got] if got else []
+
+
 def search(conn: sqlite3.Connection, query: str, limit: int = 24,
            offset: int = 0, sources: list = None, video_key: str = None,
            candidates: int = None, sort: str = "relevance",
            creator: str = None, category: str = None,
+           collection: str = None,
            min_dur: float = None, max_dur: float = None,
            min_hits: int = None) -> dict:
     """Run a hybrid search and return grouped video results.
@@ -371,6 +396,12 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
     change which moments compete, so "the best matches, from this creator"
     and "the best matches from this creator" would quietly differ. Every
     result carries the same score it would have had unfiltered.
+
+    `collection` is one of those filters and belongs with them for a reason of
+    its own. A saved collection is a property of the *video*, not of the passage
+    that matched, and a video sits in as many of them as the person filed it
+    under — so it narrows the grouped results and never the moments, and the
+    same video answers "steak" and "dinners" without being two videos.
     """
     t0 = time.perf_counter()
     query = (query or "").strip()
@@ -379,7 +410,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
                 "took_ms": 0, "mode": "empty"}
 
     cache_key = (query, limit, offset, tuple(sources or ()), video_key,
-                 sort, creator, category, min_dur, max_dur, min_hits)
+                 sort, creator, category, collection, min_dur, max_dur,
+                 min_hits)
     with _CACHE_LOCK:
         hit = _CACHE.get(cache_key)
         if hit is not None:
@@ -466,6 +498,11 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
             return False
         if category and (m.get("category") or "") != category:
             return False
+        # Membership, not equality: this is the one filter whose column holds a
+        # set, and "in my steak collection" has to stay true for a video that is
+        # also in three others.
+        if collection and collection not in _id_list(m.get("collections")):
+            return False
         dur = float(m.get("duration") or 0.0)
         # A video whose duration was never probed has 0.0, which is not the
         # same as "shorter than the floor" — excluding it would hide real
@@ -517,13 +554,21 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
     # would return nothing is worse than offering no filter. Counted before
     # `_keep` so the chip that is currently active still shows its own count
     # and can be switched off.
-    facets = {"creators": {}, "categories": {}}
+    facets = {"creators": {}, "categories": {}, "collections": {}}
     for vkey in per_video:
         m = meta.get(vkey, {})
         for field, col in (("creators", "creator"), ("categories", "category")):
             val = (m.get(col) or "").strip()
             if val:
                 facets[field][val] = facets[field].get(val, 0) + 1
+        # One video counts once in each collection it is filed under, so the
+        # counts here sum to more than the number of videos. That is the honest
+        # number for this chip: "steak 6" means six of these results are in
+        # steak, and clicking it leaves six.
+        for name in _id_list(m.get("collections")):
+            val = str(name).strip()
+            if val:
+                facets["collections"][val] = facets["collections"].get(val, 0) + 1
     facets = {
         field: [{"value": v, "count": c}
                 for v, c in sorted(vals.items(), key=lambda kv: (-kv[1], kv[0]))[:14]]
@@ -552,6 +597,16 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
             "created_at": m.get("created_at"),
             "msg_id": m.get("msg_id"),
             "poster": m.get("poster"),
+            # Decoded here rather than in the client, and on every result rather
+            # than only in the detail route: the chips a card shows — which
+            # collections this is filed under, whether it is a twin, which
+            # messages carried it — are the same facts wherever the card appears,
+            # and a card that shows them only after a click is a card that lies
+            # about the archive twice.
+            "aliases": _id_list(m.get("aliases")),
+            "messages": _id_list(m.get("messages")),
+            "collections": _id_list(m.get("collections")),
+            "twin_of": _id_list(m.get("twin_of")),
             "has_file": media.resident(m.get("local_path"), vkey),
             "moment_count": m.get("moment_count") or len(slot["moments"]),
             "hit_count": len(slot["moments"]),
@@ -570,6 +625,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
         "matched": len(per_video),
         "facets": facets,
         "filters": {"creator": creator, "category": category,
+                    "collection": collection,
                     "min_dur": min_dur, "max_dur": max_dur,
                     "min_hits": min_hits,
                     "sources": list(sources or ())},
@@ -714,6 +770,12 @@ def similar(conn: sqlite3.Connection, video_key: str, limit: int = 12) -> list:
                     "title": m.get("title") or f"Video {vk}",
                     "duration": m.get("duration"), "poster": m.get("poster"),
                     "creator": m.get("creator"),
+                    # A byte-identical twin is the most similar video there is,
+                    # so this rail is exactly where one shows up unannounced.
+                    # Saying so is the difference between "why is this here
+                    # twice" and "this is the same footage".
+                    "collections": _id_list(m.get("collections")),
+                    "twin_of": _id_list(m.get("twin_of")),
                     "moment_count": m.get("moment_count")})
     return out
 
@@ -754,4 +816,11 @@ def stats(conn: sqlite3.Connection) -> dict:
         "seconds": one("SELECT COALESCE(SUM(duration), 0) FROM video_index"),
         "creators": one("SELECT COUNT(DISTINCT creator) FROM video_index "
                         "WHERE creator IS NOT NULL AND creator <> ''"),
+        # Counted from the membership table rather than from the cards, because
+        # this is the number that says the squeeze is being handled: `videos`
+        # counts videos and `memberships` counts filings, and the two differing
+        # is one video in several collections working correctly, not a duplicate.
+        "collections": one("SELECT COUNT(DISTINCT collection) "
+                           "FROM video_collection"),
+        "memberships": one("SELECT COUNT(*) FROM video_collection"),
     }

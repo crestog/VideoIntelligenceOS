@@ -35,8 +35,8 @@ from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
-from . import (config, graph, index, ingest, maps, media, reflect, roadmap,
-               search, vsearch)
+from . import (config, graph, identity, index, ingest, maps, media, reflect,
+               roadmap, search, vsearch)
 from .tgchannel import log, recent_log
 
 BOOT_T0 = time.time()
@@ -546,6 +546,7 @@ def api_search(q: str = Query("", description="natural language query"),
                limit: int = 24, offset: int = 0, source: str = "",
                video: str = "", prefetch: bool = True,
                sort: str = "relevance", creator: str = "", category: str = "",
+               collection: str = "",
                min_dur: float = None, max_dur: float = None,
                min_hits: int = None):
     """The moment search.
@@ -565,6 +566,7 @@ def api_search(q: str = Query("", description="natural language query"),
     out = search.search(conn, q, limit=limit, offset=offset, sources=sources,
                         video_key=video or None, sort=sort,
                         creator=creator or None, category=category or None,
+                        collection=collection or None,
                         min_dur=min_dur, max_dur=max_dur, min_hits=min_hits)
     if prefetch and out.get("results"):
         media.prefetch_async(config.DB_PATH,
@@ -762,7 +764,7 @@ def _keys_matching(conn: sqlite3.Connection, q: str, cap: int = 800) -> list:
 @app.get("/api/library")
 def api_library(limit: int = 40, offset: int = 0, sort: str = "recent",
                 creator: str = "", category: str = "", has: str = "",
-                q: str = ""):
+                collection: str = "", q: str = ""):
     """Browse every video, with the filters the data actually supports."""
     conn = db()
     where, args = [], []
@@ -772,6 +774,16 @@ def api_library(limit: int = 40, offset: int = 0, sort: str = "recent",
     if category:
         where.append("category = ?")
         args.append(category)
+    if collection:
+        # Asked of the membership table, not of the card's `collections` column.
+        # The column is JSON and a `LIKE '%steak%'` over it would also match a
+        # collection called "steak dinners", which is a different shelf. The
+        # subquery is an index seek on `video_collection(collection)` and it is
+        # exact, so a video in five collections is found by any of the five and
+        # counted once.
+        where.append("video_key IN (SELECT video_key FROM video_collection "
+                     "WHERE collection = ?)")
+        args.append(collection)
     if has == "speech":
         where.append("has_speech = 1")
     elif has == "narrative":
@@ -854,10 +866,63 @@ def api_facets():
             return []
 
     stats = search.stats(conn)
+    # Collections come from the membership table, so the count is filings and
+    # not videos — a video in two collections is counted by both, which is what
+    # a shelf label means. Kept beside creators and categories because the
+    # interface treats all three the same way: a chip that narrows, never a
+    # chip that hides a video from itself.
+    collections = [{"value": c["name"], "count": c["videos"]}
+                   for c in identity.collection_counts(conn)]
     return {"creators": top("creator"), "categories": top("category"),
+            "collections": collections,
             "sources": stats.get("by_source", {}),
             "totals": {"videos": stats.get("videos", 0),
-                       "moments": stats.get("moments", 0)}}
+                       "moments": stats.get("moments", 0),
+                       "collections": stats.get("collections", 0),
+                       "memberships": stats.get("memberships", 0)}}
+
+
+@app.post("/api/collections/add")
+def api_collections_add(collection: str = "", keys: str = ""):
+    """File one or more reels under a saved collection.
+
+    Additive by contract, which is `set_collections`'s rule and not this route's
+    convenience: a label is a statement that this reel belongs somewhere, and a
+    later refresh from the capture ledger must not silently unsay it. There is
+    deliberately no remove here — taking a reel off a shelf is a different
+    decision from adding it to one, and it needs its own explicit door.
+
+    Only keys the archive already knows are accepted. A membership for a key that
+    is not a video is exactly the kind of row that turned thirty reels into
+    sixty-two names, so it is refused at the edge rather than resolved later.
+    """
+    name = (collection or "").strip()
+    wanted = [k.strip() for k in (keys or "").split(",") if k.strip()]
+    if not name or not wanted:
+        return JSONResponse({"ok": False, "error": "collection and keys required"},
+                            status_code=400)
+    conn = db()
+    identity.ensure(conn)
+    known = {r[0] for r in conn.execute(
+        "SELECT video_key FROM video_index")} if wanted else set()
+    unknown = [k for k in wanted if k not in known]
+    filed = [k for k in wanted if k in known]
+    added = 0
+    for key in filed:
+        added += identity.set_collections(conn, key, [name], "desktop")
+        # `video_index` is the card table and `collections` is derived into it, so
+        # the rows just touched are re-derived now rather than left stale until
+        # the next full rebuild. The chip has to appear on the card that was
+        # selected, or the action reads as having failed.
+        conn.execute("UPDATE video_index SET collections = ? WHERE video_key = ?",
+                     (json.dumps(identity.collections_for(conn, key)), key))
+    conn.commit()
+    # The filter reads from this data and the results are cached by their filter
+    # set, so a stale entry would answer "not in steak" for a reel just filed
+    # there.
+    search.clear_cache()
+    return {"ok": True, "collection": name, "videos": len(filed),
+            "added": added, "unknown": unknown}
 
 
 # ── one video, everything known about it ──────────────────────────────────
