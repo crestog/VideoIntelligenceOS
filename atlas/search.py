@@ -158,6 +158,11 @@ _STOP = {
     "show", "find", "me", "get", "search", "video", "videos", "clip",
     "clips", "moment", "moments", "where", "when", "what", "who", "which",
     "someone", "something", "anyone", "anything", "some", "any", "all",
+    # "the orange one" is how a person names a reel, and `one` is the only word
+    # in it that carries no meaning. Porter also stems it to `on`, so left in the
+    # relaxed query it matches `typing on a keyboard` and `in the key of G#
+    # minor` — rare stems, high IDF, so the junk outranks the orange.
+    "one", "ones",
 }
 
 
@@ -202,6 +207,17 @@ def _lexical(conn: sqlite3.Connection, query: str, limit: int) -> list:
     reasonable number of hits. A strict AND is the most precise thing available
     and usually enough; falling back only when it is not means a specific query
     stays specific.
+
+    Ordered by BM25 **scaled by the moment's weight**, not by BM25 alone, and
+    that detail decides whether a colour query answers properly. Fusion keeps
+    ranks and throws scores away, so when a hundred moments hold the identical
+    string `the dominant colour is orange` their BM25 scores tie and the order
+    among them is whatever rowid order the index happened to produce — arbitrary
+    noise, promoted to a rank, and larger than any signal applied afterwards.
+    Weight is where the index recorded which of those reels was *mostly* orange
+    (`index._prominence`), so it has to enter here, before ranks are taken, or it
+    cannot be heard at all. `bm25()` is negative and better is more negative, so
+    a heavier moment sorts earlier by multiplication.
     """
     if not query.strip():
         return []
@@ -214,7 +230,8 @@ def _lexical(conn: sqlite3.Connection, query: str, limit: int) -> list:
                 "SELECT m.id FROM moments_fts f "
                 "JOIN moments m ON m.id = f.rowid "
                 "WHERE moments_fts MATCH ? "
-                "ORDER BY bm25(moments_fts) LIMIT ?",
+                "ORDER BY bm25(moments_fts) * MAX(COALESCE(m.weight, 1.0), 0.05)"
+                " LIMIT ?",
                 (fts, limit)).fetchall()
         except sqlite3.Error as e:
             # No fts5 in this build, or a query shape it dislikes.
@@ -245,15 +262,23 @@ def _lexical_mode(conn: sqlite3.Connection, query: str, mode: str,
         return []
     try:
         rows = conn.execute(
-            "SELECT f.rowid FROM moments_fts f WHERE moments_fts MATCH ? "
-            "ORDER BY bm25(moments_fts) LIMIT ?", (fts, limit)).fetchall()
+            "SELECT m.id FROM moments_fts f "
+            "JOIN moments m ON m.id = f.rowid "
+            "WHERE moments_fts MATCH ? "
+            "ORDER BY bm25(moments_fts) * MAX(COALESCE(m.weight, 1.0), 0.05)"
+            " LIMIT ?", (fts, limit)).fetchall()
     except sqlite3.Error:
         return []
     return [(int(r[0]), i + 1) for i, r in enumerate(rows)]
 
 
 def _like_fallback(conn: sqlite3.Connection, query: str, limit: int) -> list:
-    """Last resort when fts5 is absent. Slow and unranked, but not nothing."""
+    """Last resort when fts5 is absent. Slow and unranked, but not nothing.
+
+    "Unranked" means no relevance: LIKE cannot tell a match from a better match.
+    The order is by weight, which at least puts the prominent evidence first
+    rather than whichever row was inserted first.
+    """
     tokens = [t for t in _TOKEN.findall(query) if t.lower() not in _STOP][:4]
     if not tokens:
         return []
@@ -261,7 +286,8 @@ def _like_fallback(conn: sqlite3.Connection, query: str, limit: int) -> list:
     args = [f"%{t}%" for t in tokens] + [limit]
     try:
         rows = conn.execute(
-            f"SELECT id FROM moments WHERE {where} LIMIT ?", args).fetchall()
+            f"SELECT id FROM moments WHERE {where} "
+            f"ORDER BY weight DESC LIMIT ?", args).fetchall()
     except sqlite3.Error:
         return []
     return [(int(r[0]), i + 1) for i, r in enumerate(rows)]

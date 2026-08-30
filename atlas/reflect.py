@@ -324,6 +324,24 @@ _ROW_SOURCE_COLUMNS = ("channel", "source")
 _KNOWN_SOURCES = frozenset({"narrative", "speech", "visual", "ocr", "caption",
                             "meta", "audio", "concept", "style"})
 
+# A column that names *what was measured* in each row, as opposed to which
+# observer measured it. `claim.kind` holds `dominant_colour`, `camera_move`,
+# `object`; the value column beside it holds `orange`, `pan right`, `person`.
+# Neither half is searchable alone — a passage reading `orange` never answers
+# "orange colour" — so a spec that finds one of these carries it through to the
+# indexer, which writes the pair into a sentence.
+_KIND_COLUMNS = ("kind", "metric", "measure", "attribute", "property", "field")
+# A kind is a label from a closed vocabulary. Eighty of them is a rich pass set;
+# eight hundred distinct values is a free-text column that happens to be called
+# `field`, and writing `field <a whole sentence> is` would be nonsense.
+_KIND_MAX_DISTINCT = 400
+_KIND_MAX_WORDS = 4
+
+# How sure the observer was. A pass that reports its own uncertainty is telling
+# the truth about itself, and an index that ignores it ranks a 0.0003 guess like
+# a measurement. Read alongside the kind so the indexer can weight by it.
+_CONFIDENCE_COLUMNS = ("confidence", "conf", "score", "probability", "prob")
+
 
 def _row_source_labels(conn, table: str, cols: list):
     """(column, [values]) when a table labels its own rows, else None.
@@ -349,6 +367,62 @@ def _row_source_labels(conn, table: str, cols: list):
         vals = [str(v) for v in vals if str(v).strip()]
         if vals and all(v in _KNOWN_SOURCES for v in vals):
             return name, sorted(set(vals))
+    return None
+
+
+def kind_column(conn, table: str, cols: list, skip=()):
+    """The column naming what each row measured, or None.
+
+    Judged from the data for the same reason `_row_source_labels` is: a pass
+    that starts recording a new kind next month should become searchable on the
+    next build, and that only holds if nothing here is a list of kinds. What is
+    checked is the *shape* of the column — a closed vocabulary of short labels —
+    not which words are in it.
+    """
+    by_norm = {_norm(c["name"]): c["name"] for c in cols}
+    for want in _KIND_COLUMNS:
+        name = by_norm.get(want)
+        if not name or name in skip:
+            continue
+        try:
+            vals = [r[0] for r in conn.execute(
+                f"SELECT DISTINCT {_q(name)} FROM {_q(table)} "
+                f"WHERE {_q(name)} IS NOT NULL LIMIT {_KIND_MAX_DISTINCT + 1}")]
+        except sqlite3.Error:
+            continue
+        vals = [str(v).strip() for v in vals if str(v).strip()]
+        if not vals or len(vals) > _KIND_MAX_DISTINCT:
+            continue
+        if all(len(v.split()) <= _KIND_MAX_WORDS for v in vals):
+            return name
+    return None
+
+
+def confidence_column(conn, table: str, cols: list, skip=()):
+    """The column holding how sure each row is, or None.
+
+    Checked against the data, not the name, because `score` is as likely to hold
+    a like count as a probability. A column qualifies only if every value it
+    holds is a number in 0..1 — anything outside that is a different quantity
+    wearing the same word, and scaling a rank by it would be arbitrary.
+    """
+    by_norm = {_norm(c["name"]): c["name"] for c in cols}
+    for want in _CONFIDENCE_COLUMNS:
+        name = by_norm.get(want)
+        if not name or name in skip:
+            continue
+        try:
+            lo, hi, bad = conn.execute(
+                f"SELECT MIN({_q(name)}), MAX({_q(name)}), "
+                f"SUM(CASE WHEN typeof({_q(name)}) NOT IN "
+                f"     ('integer','real','null') THEN 1 ELSE 0 END) "
+                f"FROM {_q(table)}").fetchone()
+        except sqlite3.Error:
+            continue
+        if bad or lo is None:
+            continue
+        if 0.0 <= float(lo) and float(hi) <= 1.0:
+            return name
     return None
 
 
@@ -606,6 +680,15 @@ def text_sources(conn: sqlite3.Connection) -> list:
     `sql` on each spec, which always yields exactly four columns:
     (key, start, end, text). Adding a table to the bundle adds rows to search;
     dropping one removes them; neither is a code change.
+
+    One documented extension to that contract: a spec whose `kind` is set yields
+    **six** columns — (key, start, end, text, kind, confidence) — because a table
+    that names its own measurements is not prose and must not be indexed as
+    prose. `orange` and `dominant_colour` are one fact in two columns and only
+    the pair is searchable, and `0.0003` is the observer saying it did not really
+    see the thing at all. The indexer writes the pair into a sentence and ranks
+    it by how sure the row was; see `atlas.phrase`. `confidence` is `NULL` when
+    the table has no such column, so the row shape does not vary.
     """
     specs = []
     for table in tables(conn):
@@ -618,10 +701,17 @@ def text_sources(conn: sqlite3.Connection) -> list:
         start, end = time_columns(cols)
         s_expr = f"t.{_q(start)}" if start else "NULL"
         e_expr = f"t.{_q(end)}" if end else "NULL"
+        labels = _row_source_labels(conn, table, cols)
 
         for text_col in prose_columns(conn, table, cols):
+            taken = {key, text_col, start, end, labels[0] if labels else ""}
+            kind = kind_column(conn, table, cols, skip=taken)
+            conf = (confidence_column(conn, table, cols, skip=taken | {kind})
+                    if kind else None)
+            extra = (f", t.{_q(kind)}, " + (f"t.{_q(conf)}" if conf else "NULL")
+                     if kind else "")
             base = (f"SELECT t.{_q(key)}, {s_expr}, {e_expr}, "
-                    f"t.{_q(text_col)} FROM {_q(table)} t "
+                    f"t.{_q(text_col)}{extra} FROM {_q(table)} t "
                     f"WHERE t.{_q(text_col)} IS NOT NULL "
                     f"AND TRIM(t.{_q(text_col)}) <> ''")
 
@@ -630,13 +720,13 @@ def text_sources(conn: sqlite3.Connection) -> list:
             # caption in a single `claim` table separated by `channel`; one
             # spec for the whole table would label all of them alike, and a
             # transcript would then be weighted like a filename.
-            labels = _row_source_labels(conn, table, cols)
             if labels:
                 col, values = labels
                 for val in values:
                     specs.append({
                         "table": table, "key": key, "start": start, "end": end,
                         "text": text_col, "source": val, "via": None,
+                        "kind": kind, "conf": conf,
                         "sql": base + f" AND t.{_q(col)} = '{val}'",
                     })
                 continue
@@ -644,7 +734,7 @@ def text_sources(conn: sqlite3.Connection) -> list:
             specs.append({
                 "table": table, "key": key, "start": start, "end": end,
                 "text": text_col, "source": source_label(table, text_col),
-                "via": None,
+                "via": None, "kind": kind, "conf": conf,
                 "sql": base,
             })
 
@@ -664,6 +754,7 @@ def text_sources(conn: sqlite3.Connection) -> list:
                     "text": text_col,
                     "source": source_label(link["table"], text_col),
                     "via": f'{table}.{link["local"]}',
+                    "kind": None, "conf": None,
                     "sql": (f"SELECT t.{_q(key)}, NULL, NULL, d.{_q(text_col)} "
                             f"FROM {_q(table)} t "
                             f"JOIN {_q(link['table'])} d "

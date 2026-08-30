@@ -45,6 +45,7 @@ so a column added upstream shows up as searchable moments on the next build.
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -52,7 +53,7 @@ import threading
 import time
 import uuid
 
-from . import config, identity, reflect
+from . import config, identity, phrase, reflect
 from .tgchannel import log
 
 # ── Passage shaping ───────────────────────────────────────────────────────
@@ -66,6 +67,14 @@ MAX_CHARS = 900
 MERGE_GAP_S = 14.0
 # A row longer than this is already a passage; never merge it into a neighbour.
 STANDALONE_CHARS = 180
+# Two sightings of the same fact join into one run only if they very nearly
+# touch. Per-shot claims tile the timeline — one shot's end is the next shot's
+# start — so consecutive shots showing the same thing have a gap near zero, and
+# anything larger means something else was on screen in between. `MERGE_GAP_S`
+# is fourteen seconds because two subtitle lines that far apart are still one
+# thought; applied to a measurement it invents a thirty-second orange run out of
+# two orange shots at either end of a reel.
+FACT_GAP_S = 1.0
 # A point-in-time row (a frame note) is given this much width so it can be
 # played and so overlap logic has something to work with.
 POINT_WIDTH_S = 2.5
@@ -405,6 +414,133 @@ def build_passages(rows: list) -> list:
     return out
 
 
+def build_facts(rows: list) -> list:
+    """Shape written measurements into moments. Returns [(t0, t1, text, span, conf)].
+
+    A fact is not prose and must not be merged like prose. `the dominant colour
+    is orange` and `camera pan right` are two different questions about the same
+    second, and gluing them produces a passage that answers neither — that string
+    is exactly what search was matching everything against before this existed.
+
+    So facts group by their own text and never by adjacency. Within one text,
+    consecutive shots that repeat it become **one** moment spanning them: a colour
+    that holds four shots in a row is one moment across all four, not four
+    identical ones. `FACT_GAP_S` and not `MERGE_GAP_S` decides "in a row", because
+    the second is a prose constant — at fourteen seconds of slack, two orange
+    shots at opposite ends of a reel become one thirty-second orange run, and the
+    weight that follows would call that reel entirely orange.
+
+    `span` is separately the number of seconds the fact was actually *true*: the
+    union of its sightings, so overlapping observations are not counted twice and
+    the gaps between runs are not counted at all. The caller turns it into weight
+    (`_prominence`), which is the only place the difference between a reel that is
+    orange and a reel with an orange shot in it can be recorded — the text of the
+    two is identical.
+
+    `conf` is the *best* sighting's confidence, not the average. The question a
+    rank has to answer is whether this reel is a real answer, and one clear
+    sighting settles that; averaging would punish a fact for also having been
+    guessed at weakly somewhere else in the same reel.
+
+    Only the longest run of a repeated fact is emitted. `moments` is
+    `UNIQUE(video_key, source, text_hash)` and the writer is `INSERT OR IGNORE`,
+    so a second run of `person` in the same video could never be stored anyway;
+    choosing the longest makes the survivor the best example of the fact rather
+    than the earliest sighting of it.
+    """
+    by_text = {}
+    for t0, t1, text, conf in rows:
+        if not text:
+            continue
+        a, b = _as_float(t0), _as_float(t1)
+        if a is not None and (b is None or b <= a):
+            b = a + POINT_WIDTH_S
+        slot = by_text.setdefault(text, {"spans": [], "conf": None})
+        slot["spans"].append((a, b))
+        if conf is not None:
+            slot["conf"] = (conf if slot["conf"] is None
+                            else max(slot["conf"], conf))
+
+    out = []
+    for text, slot in by_text.items():
+        conf = slot["conf"]
+        timed = sorted(s for s in slot["spans"] if s[0] is not None)
+        if not timed:
+            # A video-level rollup — `spoken in Hindi`, `music-led`. It is true
+            # of the whole reel, so it gets no position rather than a false one.
+            out.append((None, None, text, 0.0, conf))
+            continue
+
+        covered = 0.0          # seconds the fact held, counted once
+        runs = []              # near-touching sightings, joined for playback
+        c_a, c_b = timed[0]    # the open interval of the union
+        r_a, r_b = timed[0]    # the open run
+        for a, b in timed[1:]:
+            if a <= c_b:
+                c_b = max(c_b, b)
+            else:
+                covered += c_b - c_a
+                c_a, c_b = a, b
+            if a - r_b <= FACT_GAP_S:
+                r_b = max(r_b, b)
+            else:
+                runs.append((r_a, r_b))
+                r_a, r_b = a, b
+        covered += c_b - c_a
+        runs.append((r_a, r_b))
+
+        best = max(runs, key=lambda r: r[1] - r[0])
+        out.append((best[0], best[1], text, covered, conf))
+
+    out.sort(key=lambda r: (r[0] is None, r[0] or 0.0))
+    return out
+
+
+def _prominence(span: float, duration: float = 0.0) -> float:
+    """Weight multiplier for how much of a video a fact accounted for.
+
+    Share of the reel, not seconds of it. Ten seconds of orange in a fifteen
+    second reel is *an orange reel*; the same ten seconds in a ninety second one
+    is a shot that happened to be orange, and somebody who remembers "the orange
+    one" means the first. Absolute seconds cannot tell those apart, which is why
+    this needs the duration.
+
+    Presence still counts for something — a single orange cut is a true answer to
+    "which reel had orange in it" — so the floor is 1.0 and the ceiling is 1.6.
+    It tilts the ranking rather than deciding it.
+    """
+    if span <= 0:
+        return 1.0
+    if duration and duration > 0:
+        share = min(1.0, span / float(duration))
+    else:
+        # No duration on record. A minute stands in for a reel, on a log curve
+        # so that the difference between two seconds and twenty still shows.
+        share = min(1.0, math.log1p(span) / math.log1p(60.0))
+    return 1.0 + 0.6 * share
+
+
+def _certainty(conf) -> float:
+    """Weight multiplier for how sure the observer was. 0.5 at the floor, 1.0 at 1.
+
+    A measurement and a guess should not rank alike. `dominant_colour` is arrived
+    at by counting pixels and is recorded at 0.8; `sound_event` is a zero-shot
+    tagger whose whole label set lands near 0.57, and it is the reason twenty-seven
+    of thirty reels claim laughter. Halving the weakest and leaving the certain
+    untouched puts the measured facts above the guessed ones without hiding the
+    guesses, which matters because a weak audio tag is still the only handle
+    somebody has on a reel with no speech and no text.
+
+    Never below 0.5: a fact that survived `phrase.FLOOR` is a claim the archive is
+    making, and a claim that ranks at zero may as well not have been stored.
+    A missing confidence means the pass does not report one, not that it is
+    unsure, so it scores as certain.
+    """
+    if conf is None:
+        return 1.0
+    return 0.5 + 0.5 * max(0.0, min(1.0, float(conf)))
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # THE BUILD
 # ══════════════════════════════════════════════════════════════════════════
@@ -580,12 +716,167 @@ def keys_with_clips(conn: sqlite3.Connection) -> set:
         return set()
 
 
+# A label list wearing a prose column. `frame_notes.description` holds real
+# sentences for some videos — "The video starts with a cow lying on a bed" — and
+# for others it holds `3× cow, person`, which is the object detector's output that
+# happened to be written to the description field. Merged as prose those become
+# `person person person 3× cow, person 3× cow, person 5× cow`, and a search for
+# `dog` then ranks a reel of cows above a reel of dogs on term frequency alone.
+#
+# The two are told apart by function words, which is the one thing a label list
+# never has. `a cow lying on a bed` contains `a` and `on`; `cow, person` contains
+# nothing but nouns. Sentence punctuation settles the rest.
+_FUNCTION = frozenset("""
+a an the and or of in on at to for with by from is are was were am be been
+being this that these those it its his her their our my your as but if then
+than there here into onto over under about not no while when where who which
+he she they them we you i has have had do does did will would can could
+""".split())
+_LABELISH = re.compile(r"^[\w×\s,'’\-/&+]+$", re.UNICODE)
+_COUNT_PREFIX = re.compile(r"^\s*\d+\s*[×x]\s*", re.I)
+
+
+def _labels(value) -> list:
+    """`[(label, confidence)]` if this cell is a detector's label list, else [].
+
+    The CV worker stored one row per frame holding
+    `[{"label": "dog", "conf": 0.75}, {"label": "bed", "conf": 0.69}]`, and read
+    as prose those rows merge into `cow dog, cow dog, cow cow, cow, person,
+    person` — the same concatenation defect `phrase` was written to end, arriving
+    through a different table. Each label is a sighting of a thing, so each one
+    becomes its own fact and collapses across the run of frames that saw it.
+
+    The confidences come along because they are the whole reason to trust one
+    label over another, and because a fact path that has them can rank with them.
+    """
+    if not isinstance(value, str):
+        return []          # not a cell this handles
+    s = value.strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        return _json_labels(s)
+    return _bare_labels(s)
+
+
+def _json_labels(s: str) -> list:
+    try:
+        rows = json.loads(s)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for item in rows:
+        if isinstance(item, str):
+            label, conf = item, None
+        elif isinstance(item, dict):
+            label = item.get("label") or item.get("name") or item.get("class")
+            conf = item.get("conf", item.get("confidence", item.get("score")))
+        else:
+            return []          # a shape this does not understand: leave it alone
+        label = str(label or "").strip()
+        if not label or len(label.split()) > 4:
+            return []          # sentences in a list are prose, not labels
+        try:
+            conf = None if conf is None else float(conf)
+        except (TypeError, ValueError):
+            conf = None
+        out.append((label.lower(), conf))
+    return out
+
+
+def _bare_labels(s: str) -> list:
+    """`3× cow, person` → [('cow', None), ('person', None)]. Prose → []."""
+    if len(s) > 120 or not _LABELISH.match(s):
+        return []
+    words = [w.strip("'’-/&+").lower() for w in s.replace(",", " ").split()]
+    if any(w in _FUNCTION for w in words if w):
+        return []
+    out = []
+    for part in s.split(","):
+        part = _COUNT_PREFIX.sub("", part).strip(" '’-/&+")
+        pieces = part.split()
+        # A count marker on its own (`3×`) is the detector saying how many, and
+        # the label it counted is the next part along.
+        if not pieces or all(p.strip("×x").isdigit() or not p.strip("×x")
+                             for p in pieces):
+            continue
+        if len(pieces) > 3 or len(part) < 2:
+            return []
+        out.append((" ".join(pieces).lower(), None))
+    if not out or len(out) > 8:
+        return []
+    return out
+
+
+# How much of a column has to look like labels before the column is treated as
+# labels, and how many cells have to exist before the question is worth asking.
+_LABEL_SHARE = 0.6
+_LABEL_SAMPLE = 500
+_LABEL_MIN = 20
+
+
+def _label_column(conn: sqlite3.Connection, spec: dict) -> bool:
+    """Is this column a detector's label list rather than language?
+
+    Asked of the column and not of the cell, because the cell cannot answer it.
+    `조용히` is a word somebody said and `cow` is a thing a model saw, and they are
+    the same shape; what separates them is the company they keep. This archive's
+    `frame_notes.description` is label-shaped in every cell that says anything at
+    all, and `transcripts.text` in nine per cent of them — a wide enough gap that
+    one sample settles it.
+
+    It matters because the two want opposite handling. A short transcript line
+    must merge with the line after it, since half a sentence in each is one thing
+    somebody said; a short label must *not* merge with the next frame's label,
+    which is how `cow, person` became `person person person 3× cow, person`.
+
+    Named nowhere and hard-coded nowhere: a table added upstream is asked the same
+    question on the next build.
+    """
+    try:
+        cur = conn.execute(spec["sql"])
+    except sqlite3.Error:
+        return False
+    try:
+        rows = cur.fetchmany(_LABEL_SAMPLE)
+    except sqlite3.Error:
+        return False
+    finally:
+        cur.close()
+    considered = labelish = 0
+    for row in rows:
+        cell = row[3]
+        if not isinstance(cell, str) or not cell.strip():
+            continue
+        if phrase.is_absence(cell):
+            continue          # a sentinel is neither language nor a label
+        considered += 1
+        if _labels(cell):
+            labelish += 1
+    if considered < _LABEL_MIN:
+        return False
+    return labelish / considered >= _LABEL_SHARE
+
+
 def _collect(conn: sqlite3.Connection) -> dict:
-    """Read every text source into {(video_key, source): {rows, table}}.
+    """Read every text source into {(video_key, source): {rows, facts, table}}.
 
     Grouped by video and source because that is the unit passages merge within:
     two consecutive subtitle lines belong together, a subtitle line and an OCR
     hit at the same second do not.
+
+    `rows` and `facts` are kept apart because they are shaped differently. A row
+    is language somebody produced and merges with its neighbours; a fact is a
+    measurement written into a statement by `atlas.phrase` and merges only with
+    other sightings of the same fact. Mixing them is the defect this split
+    fixes — thirty-six measurements in one passage under one timestamp.
+
+    Two tables can feed one bucket — the modern `claim` pass and the legacy
+    `frame_notes` both see objects — and that is deliberate: `build_facts` groups
+    facts by their text, so the same label from two observers becomes one moment
+    covering the union of what they saw rather than two competing copies.
     """
     buckets = {}
     specs = reflect.text_sources(conn)
@@ -601,24 +892,65 @@ def _collect(conn: sqlite3.Connection) -> dict:
             continue
 
         source = spec["source"]
+        measured = bool(spec.get("kind"))
+        as_labels = not measured and _label_column(conn, spec)
         n = 0
+        refused = 0
         while True:
             batch = cur.fetchmany(5000)
             if not batch:
                 break
-            for key, t0, t1, raw in batch:
+            for row in batch:
+                key, t0, t1, raw = row[0], row[1], row[2], row[3]
                 vk = reflect.normalize_key(key)
                 if not vk:
                     continue
-                text = clean_text(raw)
+                if measured:
+                    conf = _as_float(row[5])
+                    form = phrase.written(row[4], raw, conf)
+                    if form is None:
+                        refused += 1     # structure, a number, a bare guess
+                        continue
+                    kind, text = form
+                    if kind == "prose":
+                        text = clean_text(text)
+                    facts = []
+                else:
+                    facts = ([(lab, c) for lab, c in _labels(raw)
+                              if c is None or c >= phrase.FLOOR]
+                             if as_labels else [])
+                    conf, kind, text = None, "prose", "" if facts else raw
+                    if text and phrase.is_absence(text):
+                        # `no salient objects or text detected`. Indexed, it puts
+                        # the words on the reels proven not to have the things.
+                        refused += 1
+                        continue
+                    text = clean_text(text)
+                if facts:
+                    b = buckets.setdefault((vk, source),
+                                           {"rows": [], "facts": [],
+                                            "table": spec["table"]})
+                    for lab, c in facts:
+                        b["facts"].append((t0, t1, lab, c))
+                        n += 1
+                    continue
                 if not text:
                     continue
-                b = buckets.setdefault((vk, source),
-                                       {"rows": [], "table": spec["table"]})
-                b["rows"].append((t0, t1, text))
+                b = buckets.setdefault((vk, source), {"rows": [], "facts": [],
+                                                      "table": spec["table"]})
+                if kind == "fact":
+                    b["facts"].append((t0, t1, text, conf))
+                else:
+                    # Prose keeps no confidence. A passage is several rows merged
+                    # and they did not agree on one, and a transcript's own
+                    # uncertainty is already reported as its own claim — see
+                    # `agreement` and `language_uncertain`, both indexed as
+                    # sentences a person can read.
+                    b["rows"].append((t0, t1, text))
                 n += 1
-        if n:
-            log(f"  {spec['table']}.{spec['text']} → {n} row(s) as {source}")
+        if n or refused:
+            log(f"  {spec['table']}.{spec['text']} → {n} row(s) as {source}"
+                + (f", {refused} kept out of the text index" if refused else ""))
     return buckets
 
 
@@ -776,16 +1108,33 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
         # `_build_video_index` is: an archive with no `video` table has no set to
         # check against, and dropping everything would be worse than keeping it.
         canonical = identity.canonical_keys(conn)
+        # Read once here rather than inside `_build_video_index`, because the
+        # moment loop needs durations too: how much of a reel a fact accounted
+        # for is what separates an orange reel from a reel with an orange shot.
+        meta = _video_metadata(conn)
         rows_out = []
         per_video = {}
         orphaned = {}
         for (vk, source), bucket in buckets.items():
             if canonical and vk not in canonical:
-                orphaned[vk] = orphaned.get(vk, 0) + len(bucket["rows"])
+                orphaned[vk] = orphaned.get(vk, 0) + (len(bucket["rows"])
+                                                      + len(bucket["facts"]))
                 continue
             w = weights.get(source, 1.0)
-            for t0, t1, text in build_passages(bucket["rows"]):
-                rows_out.append((vk, t0, t1, source, bucket["table"], w,
+            dur = _as_float((meta.get(vk) or {}).get("duration")) or 0.0
+            # Prose keeps its source weight. A fact's is scaled by how much of
+            # the video it accounted for and how sure the pass was, which is the
+            # only place either can enter: the text of `the dominant colour is
+            # orange` is identical whether it held one cut or the whole reel, and
+            # identical whether it was counted or guessed.
+            shaped = [(t0, t1, text, w)
+                      for t0, t1, text in build_passages(bucket["rows"])]
+            shaped += [(t0, t1, text,
+                        w * _prominence(span, dur) * _certainty(conf))
+                       for t0, t1, text, span, conf in
+                       build_facts(bucket["facts"])]
+            for t0, t1, text, weight in shaped:
+                rows_out.append((vk, t0, t1, source, bucket["table"], weight,
                                  text, _hash(text)))
                 slot = per_video.setdefault(vk, {"sources": {}, "chars": 0})
                 slot["sources"][source] = slot["sources"].get(source, 0) + 1
@@ -815,7 +1164,7 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
         _set(lexical_ready=True)
 
         _set(phase="writing", detail="summarising videos")
-        _build_video_index(conn, per_video)
+        _build_video_index(conn, per_video, meta)
         _set(videos=conn.execute(
             "SELECT COUNT(*) FROM video_index").fetchone()[0])
 
@@ -853,8 +1202,12 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
     return result
 
 
-def _build_video_index(conn: sqlite3.Connection, per_video: dict) -> None:
-    meta = _video_metadata(conn)
+def _build_video_index(conn: sqlite3.Connection, per_video: dict,
+                       meta: dict = None) -> None:
+    # `rebuild` has already read this for the moment weights and passes it in.
+    # Re-reading would be a second pass over every legacy table for an answer
+    # that cannot have changed since — nothing between there and here writes.
+    meta = _video_metadata(conn) if meta is None else meta
     spans = {}
     for vk, t_end in conn.execute(
             "SELECT video_key, MAX(t_end) FROM moments GROUP BY video_key"):
