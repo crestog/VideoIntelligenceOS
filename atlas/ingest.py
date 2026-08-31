@@ -370,7 +370,15 @@ def _add_missing(conn: sqlite3.Connection, dst: str, _payload: str,
                  src: str) -> None:
     """Widen a destination table to fit a newer snapshot's extra columns."""
     have = {r[1] for r in conn.execute(f'PRAGMA table_info("{dst}")')}
-    for r in conn.execute(f'PRAGMA src.table_info("{src}")'):
+    # Materialised for the same reason as identity.py's collections pass: an
+    # ALTER issued inside a stepping cursor is a read-to-write promotion, which
+    # SQLite refuses with SQLITE_BUSY_SNAPSHOT — "database is locked" — as soon
+    # as another connection has committed since this PRAGMA opened. Here the
+    # refusal is worse than a loud failure, because `except sqlite3.Error: pass`
+    # below turns it into a destination table that is silently one column
+    # narrower than the snapshot it just imported, and every value in that
+    # column is dropped by the INSERT with nothing logged.
+    for r in conn.execute(f'PRAGMA src.table_info("{src}")').fetchall():
         name, decl = r[1], (r[2] or "TEXT")
         if name in have:
             continue

@@ -99,10 +99,10 @@ def _index_if_stale(conn: sqlite3.Connection, force: bool = False) -> bool:
     # is — `_index_if_due` spends its pending count on the strength of this
     # answer — and a failed build writes no `index_fingerprint`, so the guard
     # above cannot recover it either: the rows would land, go unindexed, and the
-    # next boot would agree there was nothing to do. `database is locked` during
-    # `DELETE FROM moments` is the way this actually happened. Raising is what
-    # gives the pending count back and lets the next shard, or the end-of-scan
-    # flush, try again.
+    # next boot would agree there was nothing to do. `database is locked` inside
+    # `identity.refresh`'s collections pass (identity.py:1181, fixed there) is
+    # the way this actually happened. Raising is what gives the pending count
+    # back and lets the next shard, or the end-of-scan flush, try again.
     if result.get("ok") is False:
         raise IndexBuildFailed(str(result.get("note") or "index build failed"))
     # The graph is derived from the same schema the index just read, so the

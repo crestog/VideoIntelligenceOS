@@ -1179,7 +1179,23 @@ def rebuild_collections(conn: sqlite3.Connection, ledger_path: str = "",
     res = Resolver(conn)
 
     if _has(conn, "video") and "meta" in _cols(conn, "video"):
-        for vk, meta in conn.execute("SELECT video_key, meta FROM video"):
+        # `.fetchall()` is the fix for `index build failed — OperationalError:
+        # database is locked`, and it is not about holding a lock too long.
+        # Writing through a cursor that is still stepping asks SQLite to promote
+        # a read transaction to a write one, and it refuses that outright —
+        # SQLITE_BUSY_SNAPSHOT, message "database is locked" — the instant any
+        # other connection has committed since this SELECT opened its snapshot.
+        # It refuses *immediately*, without calling the busy handler, so
+        # `busy_timeout=60000` (ingest.py:153) never gets a say. The other
+        # connection is the `atlas-map` thread the previous index build spawned
+        # (maps.py:482, seven commits at maps.py:553-585), which is still
+        # committing while this one starts. Measured on this configuration: the
+        # loop fails at row 0 after 0.000 s without `.fetchall()` and writes
+        # every row with it. Reading the keys up front costs one list of tens of
+        # rows and makes the INSERT below its transaction's first statement, so
+        # it gets a real BEGIN and waits like every other writer.
+        for vk, meta in conn.execute(
+                "SELECT video_key, meta FROM video").fetchall():
             names = _capture_meta(meta).get("collections")
             if names:
                 out["from_meta"] += set_collections(

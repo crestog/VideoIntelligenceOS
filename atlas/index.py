@@ -1339,10 +1339,33 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
         result = {"ok": True, "moments": total, "videos": _STATE["videos"],
                   "fts": has_fts, "build_id": build_id}
     except Exception as e:
+        # Roll back before anything else. A build that dies mid-statement can
+        # leave this connection inside a transaction — measured: after a refused
+        # read-to-write promotion, `in_transaction` is True and *every*
+        # subsequent write on it fails with the same "database is locked" until
+        # a rollback. This connection is the shard importer's own (ingest.py:1123
+        # hands the same object to `on_bundle` at :1235), so without this one
+        # failed build takes the rest of the scan's imports with it. There is no
+        # other `rollback()` in the package, which is why it is spelled out here.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        # Which phase died, not just that one did. The handler used to overwrite
+        # `detail` with a constant, and the boot log then read `index build
+        # failed — OperationalError: database is locked` with nothing to say
+        # where: the first guess was `DELETE FROM moments`, and the statement was
+        # actually `identity.refresh`'s collections pass, which runs before a
+        # single moment row is touched. Carrying the detail across is what makes
+        # the next one diagnosable from the log alone.
+        was = _STATE.get("detail") or _STATE.get("phase") or ""
+        note = f"{type(e).__name__}: {e}"
         _set(phase="error", running=False, finished_at=time.time(),
-             error=f"{type(e).__name__}: {e}", detail="index build failed")
-        log(f"index build failed — {type(e).__name__}: {e}")
-        return {"ok": False, "note": f"{type(e).__name__}: {e}"}
+             error=note, detail=f"index build failed while {was}" if was
+             else "index build failed")
+        log(f"index build failed while {was} — {note}" if was
+            else f"index build failed — {note}")
+        return {"ok": False, "note": f"{note} (while {was})" if was else note}
 
     if embed:
         start_embedding(conn_path=config.DB_PATH, build_id=build_id)
