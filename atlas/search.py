@@ -305,8 +305,18 @@ def _dense(query: str, limit: int) -> list:
     if vecs is None or not len(vecs):
         return []
 
+    # `get_encoder` is called outside the encode `try` below because it used to
+    # be inside nothing at all, and a loader that raised took the whole request
+    # with it — this is the one dense call site that runs inside an HTTP handler.
+    # `index._embed_all` guards the same call for the same reason. A host that
+    # cannot load a model is a lexical-only site, not a 500.
     from .encoder import get_encoder
-    enc = get_encoder()
+    try:
+        enc = get_encoder()
+    except Exception as e:                                 # noqa: BLE001
+        log(f"dense search skipped — encoder unavailable "
+            f"({type(e).__name__}: {e})")
+        return []
     if enc is None:
         return []
     try:

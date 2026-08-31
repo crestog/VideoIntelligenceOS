@@ -30,10 +30,10 @@ harvester encodes incrementally on a warm GPU. Small keeps a cold start to
 seconds, keeps the resident matrix under a few hundred MB, and the accuracy gap
 is largely closed by fusing with BM25 anyway.
 
-Everything degrades rather than fails: if torch is missing, if the weights will
-not download, if there is no GPU — `get_encoder()` returns None, the dense index
-is skipped, and search runs lexically. A slower search is a working site; an
-exception at import is not.
+Everything degrades rather than fails: if torch is missing, if torch is present
+but the host refuses to load it, if the weights will not download, if there is no
+GPU — `get_encoder()` returns None, the dense index is skipped, and search runs
+lexically. A slower search is a working site; an exception at import is not.
 """
 
 import os
@@ -162,10 +162,25 @@ def get_encoder():
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+        # Guarded against `Exception`, not `ImportError`, and the two clauses say
+        # different things on purpose. Torch can be installed and *forbidden*:
+        # under Windows Smart App Control its unsigned DLLs raise `OSError:
+        # [WinError 4551] An Application Control policy has blocked this file`
+        # while loading, which no `ImportError` clause catches. With the narrower
+        # guard, installing torch on such a host turned a graceful "no encoder"
+        # into an unhandled exception out of `search._dense`. Absent is a pip
+        # install; refused is a signing policy that no reinstall of torch will
+        # satisfy — so which one it is belongs in the message, and neither one
+        # belongs in the response status.
         try:
             import torch
         except ImportError as e:
             _ERROR = f"torch missing ({e})"
+            log(f"encoder unavailable — {_ERROR}; search will be lexical only")
+            return None
+        except Exception as e:                             # noqa: BLE001
+            _ERROR = (f"torch present but unusable — {type(e).__name__}: "
+                      f"{str(e)[:160]}")
             log(f"encoder unavailable — {_ERROR}; search will be lexical only")
             return None
 

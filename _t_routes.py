@@ -71,6 +71,59 @@ for path in GETS:
     else:
         print(f"   {r.status_code}  {path}")
 
+print("\n== the dense lane, on a host that refuses to load a model ==")
+# A parameter-free GET never reaches `search._dense`: it needs `q`, and `_dense`
+# returns early unless a vector matrix is resident. Both were true above, which
+# is why the sweep passed while the dense path was broken.
+#
+# The defect: `encoder.get_encoder` guarded `import torch` with `except
+# ImportError`. Torch can be installed and *forbidden* — under Windows Smart App
+# Control its unsigned DLLs raise `OSError: [WinError 4551] An Application
+# Control policy has blocked this file` — so on such a host the OSError left
+# `get_encoder`, left `_dense` (which called it outside its own try), and left
+# the request as a 500. Absent and refused are different facts and neither is a
+# 500.
+#
+# The matrix is injected rather than built, the way `_t_vsearch.py` installs its
+# resident index: that is the state the function actually reads, and building it
+# for real would need a working encoder — the one thing this host cannot have.
+import numpy as np
+from atlas import encoder as _enc, search as _search
+
+with _search._VEC_LOCK:
+    _search._VECTORS = np.eye(4, dtype="float32")
+    _search._VEC_IDS = np.arange(4, dtype="int64")
+_enc._ENCODER, _enc._TRIED, _enc._ERROR = None, False, ""
+
+try:
+    r = c.get("/atlas/api/search", params={"q": "cooking pasta", "limit": 3})
+    print(f"   {r.status_code}  /atlas/api/search?q=cooking+pasta")
+    if r.status_code >= 500:
+        bad.append(("/atlas/api/search?q=", r.status_code, r.text[:160]))
+except Exception as e:
+    print(f"   RAISED  /atlas/api/search: {type(e).__name__}: {e}")
+    bad.append(("/atlas/api/search?q=", "raised", f"{type(e).__name__}: {e}"[:120]))
+
+# And the loader itself, which needs its own reset: `get_encoder` sets `_TRIED`
+# *before* the import it is guarding, so the first caller to hit a broken host
+# eats the exception and every caller after it gets the memoised None. At boot
+# that first caller is `index._embed_all`, which has always guarded it — which is
+# exactly why the narrow guard survived so long. Reset here or this assertion
+# reads a cached answer and proves nothing.
+_enc._ENCODER, _enc._TRIED, _enc._ERROR = None, False, ""
+try:
+    got = _enc.get_encoder()
+    print(f"   get_encoder -> {'an encoder' if got else 'None'}; "
+          f"reason: {(_enc.error() or 'none needed')[:80]}")
+    if got is None and not _enc.error():
+        bad.append(("encoder.get_encoder", "silent", "declined without saying why"))
+except Exception as e:
+    print(f"   RAISED  encoder.get_encoder: {type(e).__name__}: {e}")
+    bad.append(("encoder.get_encoder", "raised", f"{type(e).__name__}: {e}"[:120]))
+
+with _search._VEC_LOCK:
+    _search._VECTORS = _search._VEC_IDS = None
+
 print("\n== result ==")
 if bad:
     for b in bad:
