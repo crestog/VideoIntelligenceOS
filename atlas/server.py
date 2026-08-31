@@ -70,6 +70,10 @@ def db() -> sqlite3.Connection:
 # ══════════════════════════════════════════════════════════════════════════
 # BOOT
 # ══════════════════════════════════════════════════════════════════════════
+class IndexBuildFailed(RuntimeError):
+    """`index.rebuild` reported a failure rather than raising one."""
+
+
 def _index_if_stale(conn: sqlite3.Connection, force: bool = False) -> bool:
     """Rebuild the moment index when the data or the schema has moved.
 
@@ -86,12 +90,93 @@ def _index_if_stale(conn: sqlite3.Connection, force: bool = False) -> bool:
     if not force and have and stored == current:
         return False
     _boot_set(phase="indexing", detail="building the moment index")
-    index.rebuild(conn, embed=True)
+    result = index.rebuild(conn, embed=True) or {}
+    # A failed rebuild is a return value here, not an exception: `index.rebuild`
+    # catches everything and answers `{"ok": False, "note": ...}`, and its
+    # re-entrancy guard answers the same shape when a build is already running.
+    # This used to be discarded and `True` returned regardless, which is only
+    # harmless if nobody is keeping a record that work is outstanding. Something
+    # is — `_index_if_due` spends its pending count on the strength of this
+    # answer — and a failed build writes no `index_fingerprint`, so the guard
+    # above cannot recover it either: the rows would land, go unindexed, and the
+    # next boot would agree there was nothing to do. `database is locked` during
+    # `DELETE FROM moments` is the way this actually happened. Raising is what
+    # gives the pending count back and lets the next shard, or the end-of-scan
+    # flush, try again.
+    if result.get("ok") is False:
+        raise IndexBuildFailed(str(result.get("note") or "index build failed"))
     # The graph is derived from the same schema the index just read, so the
     # moment it can go stale is the moment the index does. Rebuilding it here
     # rather than on demand is what keeps opening the Graph tab instant.
     _rebuild_graph(conn)
     return True
+
+
+_INDEX_LOCK = threading.Lock()
+_INDEX_PENDING = 0
+_INDEX_LAST = 0.0
+_INDEX_MIN_GAP = float(os.environ.get("ATLAS_INDEX_MIN_GAP", "45"))
+
+
+def _index_if_due(conn: sqlite3.Connection, added: int = 0,
+                  force: bool = False) -> bool:
+    """`_index_if_stale`, but not once per shard during a cold scan.
+
+    A rebuild is whole-archive: `DELETE FROM moments`, a full re-INSERT, an FTS5
+    delete-all-rebuild-optimize, a graph derivation, and a dense re-embed of
+    every passage — then, downstream of the embed, a fresh UMAP projection. The
+    per-import callback used to call it directly with `force=bool(added)`, and in
+    a cold scan every shard adds rows, so the brake was never applied. 82 imports
+    ran it about 76 times and threw 75 of those away, spending essentially the
+    whole 488-second boot to arrive at 1,895 passages. The log said so on every
+    pass — `dense vectors discarded — a newer index build superseded this one` is
+    the embed thread finding a newer `index_build_id` stamped in meta and
+    correctly refusing to write vectors keyed to `moments.id`s that the next
+    DELETE already reassigned.
+
+    `added` was not a sufficient brake for a second reason either: it sums the
+    whole `merged` dict `import_shard` returns, which also carries `identity` and
+    `vec:<kind>` counts, so an import that moved no passage-bearing row at all
+    could still force a full rebuild.
+
+    So the policy lives here instead, and it is deliberately the same shape and
+    the same 45 seconds as `vsearch.build_if_due`, which already had this problem
+    and solved it — note the two sit two lines apart in `after_bundle`, and only
+    the image index was debounced. The first build still happens immediately, so
+    the intent that made the per-import call worth having in the first place
+    survives: the first shard is searchable while the rest are still downloading.
+
+    `force` is the end-of-scan flush and it is not optional. `_index_if_stale`
+    skips when the schema fingerprint has not moved, and `reflect.fingerprint`
+    hashes the schema's *shape* only — tables and columns, nothing else. A scan
+    that imported eighty shards of rows into existing columns leaves it
+    unchanged, so a debounce without the forced flush would have left every one
+    of those rows out of the index and looked like a very fast boot.
+
+    Anything that routes a live, open-ended import through here needs the same
+    flush at the end of it, or rows land, go unindexed, and the next boot's
+    fingerprint check agrees there is nothing to do.
+    """
+    global _INDEX_PENDING, _INDEX_LAST
+    with _INDEX_LOCK:
+        _INDEX_PENDING += max(int(added or 0), 0)
+        if not _INDEX_PENDING and not force:
+            return False
+        first = _INDEX_LAST == 0.0
+        if not force and not first \
+                and (time.time() - _INDEX_LAST) < _INDEX_MIN_GAP:
+            return False
+        pending, _INDEX_PENDING = _INDEX_PENDING, 0
+        _INDEX_LAST = time.time()
+    try:
+        return _index_if_stale(conn, force=bool(pending))
+    except Exception:
+        # The pending count is the only record that work is outstanding, and
+        # zeroing it above already spent it. Put it back so the next call — or
+        # the forced flush at the end of the scan — still knows to build.
+        with _INDEX_LOCK:
+            _INDEX_PENDING += pending
+        raise
 
 
 def _rebuild_graph(conn: sqlite3.Connection) -> None:
@@ -159,16 +244,15 @@ def _boot() -> None:
             # Re-index after each bundle rather than only at the end, so the
             # first bundle is searchable while the rest are still downloading.
             #
-            # Only when the import actually carried rows, though. A forced
-            # rebuild is a DELETE of every moment, a full re-INSERT, an FTS5
-            # rebuild, a graph derivation and a dense re-embed of every passage;
-            # doing that for a shard whose tables were all already held is
-            # minutes of work that cannot change a single row. `force=False`
-            # still rebuilds when the schema fingerprint moved, so a bundle
-            # carrying a new column is picked up either way.
+            # `_index_if_due` owns how often that is worth doing. This used to
+            # call `_index_if_stale` with `force=bool(added)`, on the theory that
+            # rows-landed was a brake — but in a cold scan every shard lands
+            # rows, so it braked nothing and the whole archive was re-indexed
+            # once per shard. The image index two lines below already had the
+            # debounce this needed.
             added = sum(int(v or 0) for v in (result.get("rows") or {}).values())
             try:
-                _index_if_stale(bundle_conn, force=bool(added))
+                _index_if_due(bundle_conn, added)
             except Exception as e:
                 log(f"index after bundle {result.get('seq')} failed — {e}")
             # And the image index, on its own debounce. A shard that carried no
@@ -182,8 +266,12 @@ def _boot() -> None:
 
         ingest.scan_and_import(full=True, on_bundle=after_bundle)
 
+    # The end-of-scan flush, and it has to be forced. Whatever the debounce was
+    # still holding is indexed here, and `_index_if_stale`'s own fingerprint
+    # check cannot be relied on to notice: it hashes the schema's shape, and a
+    # scan that imported rows into existing columns does not move it.
     try:
-        _index_if_stale(conn)
+        _index_if_due(conn, force=True)
     except Exception as e:
         log(f"index build failed — {type(e).__name__}: {e}")
         _boot_set(error=f"{type(e).__name__}: {e}")
@@ -509,7 +597,16 @@ def rescan(full: bool = True, max_messages: int = 0) -> bool:
         return False
 
     def after(conn, result):
-        # Forced only when rows actually landed — see `after_bundle` in _boot().
+        # Deliberately not `_index_if_due`, unlike `after_bundle` in `_boot()`.
+        # `scan_in_background` hands `scan_and_import` to a thread and returns
+        # (ingest.scan_in_background), so there is no completion hook and nowhere
+        # to put the forced flush a debounce depends on. Debouncing here would
+        # leave the tail of a live scan unindexed until the next boot — and since
+        # `reflect.fingerprint` only moves when the *schema* does, "the next boot"
+        # would agree there was nothing to build. This is also the path the
+        # debounce was never needed on: a live rescan is roughly one shard a
+        # minute, not a hundred back to back, which is the same reason
+        # `vsearch.build_if_due` gives for being safe when called from here.
         added = sum(int(v or 0) for v in (result.get("rows") or {}).values())
         try:
             _index_if_stale(conn, force=bool(added))
