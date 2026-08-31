@@ -428,14 +428,78 @@ def state() -> dict:
                         "device": config.VSEARCH_DEVICE,
                         "loaded": _ENCODER is not None,
                         "tried": _ENC_TRIED,
+                        # Which route answered, and what it can do. The two are
+                        # not equivalent: the ONNX fallback carries the text
+                        # tower only, so "loaded" is true while an uploaded
+                        # image still cannot be encoded. A screen that shows
+                        # only "loaded" would offer a mode that cannot run.
+                        "runtime": ("torch" if isinstance(_ENCODER, _Clip)
+                                    else "onnx" if isinstance(_ENCODER, _Onnx)
+                                    else ""),
+                        "can_text": _ENCODER is not None,
+                        "can_image": isinstance(_ENCODER, _Clip),
                         "error": _ENC_ERROR},
             "query_space": "clip",
         }
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# THE QUERY ENCODER — CLIP, both towers, on the CPU
+# THE QUERY ENCODER — CLIP, through torch where it runs and ONNX where it cannot
 # ══════════════════════════════════════════════════════════════════════════
+class _Onnx:
+    """CLIP's text tower, as a graph, with no torch anywhere beneath it.
+
+    Exists because torch is not always *allowed* to run. On a Windows host with
+    Smart App Control enforced, `import torch` raises an Application Control
+    error — its DLLs are unsigned, and the policy has no exception list. ONNX
+    Runtime is signed, `tokenizers` is signed, and between them that is the whole
+    text tower, so the search that "needs a model" needs no torch.
+
+    Two details are load-bearing and neither is obvious:
+
+    * **The graph pools at the EOS position itself.** It takes `input_ids` alone —
+      no attention mask — and finds where the sentence ends with an argmax over
+      the ids, which works because CLIP's EOS is the highest id in its
+      vocabulary. So padding is unnecessary, and it is also harmless: measured,
+      padding to 77 with EOS gives a vector identical to the unpadded one to the
+      last bit, because argmax takes the *first* maximum. This encodes one query
+      at a time and does not pad.
+
+    * **The output must be `text_embeds`.** CLIP ViT-L/14 has `hidden_size` 768
+      and `projection_dim` 768, so a pooled hidden state and a projected
+      embedding are indistinguishable by shape — and only the projected one lives
+      in the space the image tower wrote. Checked by name at load, because
+      getting this wrong produces a search that ranks confidently in a space
+      nothing else occupies.
+    """
+
+    def __init__(self, sess, tok, out: str):
+        self.sess, self.tok, self.out = sess, tok, out
+
+    def text(self, query: str):
+        import numpy as np
+        # Guard the *text*, not the token ids. CLIP's post-processor always wraps
+        # the sequence in `<|startoftext|>`/`<|endoftext|>`, so an empty phrase
+        # still tokenises to two ids and still produces a perfectly well-formed
+        # vector — one that points at whatever "nothing" means in this space and
+        # would return two dozen arbitrary frames as if they matched.
+        if not (query or "").strip():
+            raise ValueError("the query is empty")
+        ids = self.tok.encode(query).ids[:77]
+        v = self.sess.run([self.out],
+                          {"input_ids": np.asarray([ids], dtype=np.int64)})[0]
+        v = np.asarray(v, dtype=np.float32).reshape(-1)
+        n = float(np.linalg.norm(v))
+        return v / n if n else v
+
+    def image(self, data: bytes):
+        # The vision tower is a separate 1.16 GB export and is not fetched. Say
+        # so, rather than failing somewhere further down with a shape error.
+        raise RuntimeError(
+            "the ONNX fallback carries the text tower only — searching by an "
+            "uploaded image needs torch, or the vision tower export")
+
+
 class _Clip:
     """CLIP's two towers behind one object. Returns L2-normalised float32."""
 
@@ -467,11 +531,109 @@ class _Clip:
                 .cpu().float().numpy()
 
 
+def _load_torch():
+    """CLIP through torch — both towers. Returns `(encoder, reason)`.
+
+    The import is guarded against `Exception`, not `ImportError`, and that is not
+    defensive padding. An installed-but-forbidden torch raises `OSError:
+    [WinError 4551] An Application Control policy has blocked this file` while
+    loading its DLLs, which an `ImportError` clause does not catch — so the
+    narrower guard turned a missing model into a 500 on a machine where torch was
+    present and blocked. The difference between "absent" and "refused" belongs in
+    the message, not in whether the request survives.
+    """
+    try:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+    except ImportError as exc:
+        return None, f"torch/transformers missing ({exc})"
+    except Exception as exc:                           # noqa: BLE001
+        return None, f"torch present but unusable — {type(exc).__name__}: " \
+                     f"{str(exc)[:160]}"
+
+    device = config.VSEARCH_DEVICE
+    if device.startswith("cuda") and not (
+            getattr(torch, "cuda", None) and torch.cuda.is_available()):
+        device = "cpu"
+    if device == "cpu":
+        try:
+            torch.set_num_threads(max(2, (os.cpu_count() or 4) - 1))
+        except Exception:                              # noqa: BLE001
+            pass
+
+    t0 = time.time()
+    try:
+        model = CLIPModel.from_pretrained(config.VSEARCH_MODEL).eval().to(device)
+        proc = CLIPProcessor.from_pretrained(config.VSEARCH_MODEL)
+    except Exception as exc:                           # noqa: BLE001
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+    log(f"image query encoder ready — {config.VSEARCH_MODEL} on {device} "
+        f"in {time.time() - t0:.0f}s")
+    return _Clip(model, proc, device), ""
+
+
+def _load_onnx():
+    """The same checkpoint's text tower, as a graph. Returns `(encoder, reason)`.
+
+    Deliberately reaches past transformers for the tokenizer. On the host this
+    fallback exists for, transformers is installed and entirely unusable:
+    attribute access on its lazy module resolves through torch, so
+    `transformers.AutoTokenizer` raises the same Application Control error the
+    model classes do. `CLIPTokenizerFast` is also gone in transformers 5.x. But
+    `tokenizer.json` *is* the whole tokenizer — merges, vocabulary, and the
+    post-processor that wraps the sequence in `<|startoftext|>`/`<|endoftext|>` —
+    and the `tokenizers` extension that reads it loads fine. Fewer moving parts,
+    and none of them torch.
+    """
+    try:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+    except ImportError as exc:
+        return None, f"onnxruntime/tokenizers missing ({exc})"
+    except Exception as exc:                           # noqa: BLE001
+        return None, f"onnxruntime unusable — {type(exc).__name__}: " \
+                     f"{str(exc)[:160]}"
+
+    t0 = time.time()
+    try:
+        from huggingface_hub import hf_hub_download
+        # The tokenizer comes from the checkpoint the *index* was built with, so
+        # a wrong ONNX repo cannot quietly bring its own vocabulary along.
+        tok_path = hf_hub_download(config.VSEARCH_MODEL, "tokenizer.json")
+        graph = hf_hub_download(config.VSEARCH_ONNX_REPO,
+                                config.VSEARCH_ONNX_TEXT)
+    except Exception as exc:                           # noqa: BLE001
+        return None, f"text tower unavailable — {type(exc).__name__}: " \
+                     f"{str(exc)[:160]}"
+
+    try:
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+        so.intra_op_num_threads = max(2, (os.cpu_count() or 4) - 1)
+        sess = ort.InferenceSession(graph, so,
+                                    providers=["CPUExecutionProvider"])
+        tok = Tokenizer.from_file(tok_path)
+    except Exception as exc:                           # noqa: BLE001
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+    names = [o.name for o in sess.get_outputs()]
+    if "text_embeds" not in names:
+        # Refuse rather than pool something plausible. An unprojected vector
+        # normalises and ranks exactly like a real one; the failure would show up
+        # as bad results, not as an error, and nobody would know where to look.
+        return None, ("that ONNX export has no `text_embeds` output "
+                      f"(got {names}) — it is not a projected text tower")
+
+    log(f"image query encoder ready — {config.VSEARCH_ONNX_REPO} text tower "
+        f"via onnxruntime in {time.time() - t0:.0f}s (no torch)")
+    return _Onnx(sess, tok, "text_embeds"), ""
+
+
 def get_encoder():
     """Load CLIP once, on first use. Returns None if it cannot be had.
 
     Mirrors `encoder.get_encoder` — module singleton, tried-once, logs and
-    degrades rather than raising — with two departures, both forced:
+    degrades rather than raising — with three departures, all forced:
 
     * It pins **CPU** by default. The processing plane owns both cards for the
       whole session, and a query encoder that takes VRAM is how a GPU worker dies
@@ -479,6 +641,12 @@ def get_encoder():
       search box.
     * It loads on the first query rather than at import, so a session that only
       ever uses mode 1 — which needs no model at all — never pays the 1.7 GB.
+    * It falls back from torch to an ONNX text tower. Both towers are wanted
+      where torch runs; where torch is *forbidden* — Smart App Control, which
+      blocks unsigned DLLs and cannot be switched off without reinstalling
+      Windows — the text tower alone still answers the query people actually
+      type. Order matters: torch first, because it is the only one of the two
+      that can also encode an uploaded image.
     """
     global _ENCODER, _ENC_TRIED, _ENC_ERROR
     with _ENC_LOCK:
@@ -495,38 +663,20 @@ def get_encoder():
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-        try:
-            import torch
-            from transformers import CLIPModel, CLIPProcessor
-        except ImportError as exc:
-            _ENC_ERROR = f"torch/transformers missing ({exc})"
-            log(f"image query encoder unavailable — {_ENC_ERROR}. Frame-to-frame "
-                f"search still works; it needs no model.")
-            return None
+        why = []
+        for name, loader in (("torch", _load_torch), ("onnx", _load_onnx)):
+            enc, reason = loader()
+            if enc is not None:
+                _ENCODER = enc
+                return _ENCODER
+            why.append(f"{name}: {reason}")
+            log(f"image query encoder — {name} route unavailable: {reason}")
 
-        device = config.VSEARCH_DEVICE
-        if device.startswith("cuda") and not (
-                getattr(torch, "cuda", None) and torch.cuda.is_available()):
-            device = "cpu"
-        if device == "cpu":
-            try:
-                torch.set_num_threads(max(2, (os.cpu_count() or 4) - 1))
-            except Exception:                          # noqa: BLE001
-                pass
+        # Both reasons, because "no encoder" sends people to the wrong problem.
+        # A blocked torch and a missing download need opposite fixes.
+        _ENC_ERROR = "; ".join(why)
+        return None
 
-        t0 = time.time()
-        try:
-            model = CLIPModel.from_pretrained(config.VSEARCH_MODEL).eval() \
-                .to(device)
-            proc = CLIPProcessor.from_pretrained(config.VSEARCH_MODEL)
-        except Exception as exc:                       # noqa: BLE001
-            _ENC_ERROR = f"{type(exc).__name__}: {str(exc)[:200]}"
-            log(f"image query encoder failed to load — {_ENC_ERROR}")
-            return None
-        _ENCODER = _Clip(model, proc, device)
-        log(f"image query encoder ready — {config.VSEARCH_MODEL} on {device} "
-            f"in {time.time() - t0:.0f}s")
-        return _ENCODER
 
 
 def warm() -> bool:
@@ -876,6 +1026,13 @@ def search_image(conn: sqlite3.Connection, data: bytes,
     enc = get_encoder()
     if enc is None:
         return {"hits": [], "reason": _ENC_ERROR or "no query encoder"}
+    if isinstance(enc, _Onnx):
+        # An encoder is loaded and this mode still cannot run, which no wording
+        # about reading the image would convey. The text tower is 472 MB and the
+        # vision tower 1.16 GB; only the first is fetched.
+        return {"hits": [], "reason": "this host has the text tower only — "
+                                      "searching by an uploaded image needs "
+                                      "torch, which cannot run here"}
     try:
         q = enc.image(data)
     except Exception as exc:                           # noqa: BLE001

@@ -201,6 +201,35 @@ VSEARCH_DEVICE     = os.environ.get("ATLAS_VSEARCH_DEVICE", "cpu").lower()
 # How many videos the coarse pass promotes to the frame-exact re-rank.
 VSEARCH_CANDIDATES = int(os.environ.get("ATLAS_VSEARCH_CANDIDATES", "24"))
 
+# The same checkpoint's text tower, exported to ONNX — the fallback for hosts
+# where torch cannot run at all.
+#
+# This is not a performance option. On the laptop that reads these archives,
+# Windows Smart App Control is enforced, and seven of the nine DLLs shipped in
+# `torch/lib` are unsigned, including the 291 MB core. Importing torch there
+# raises `OSError: [WinError 4551] An Application Control policy has blocked this
+# file`. No older release fixes it — PyTorch has never signed its Windows
+# binaries — and the policy has no user allowlist, so the only way to make torch
+# run is to turn SAC off, which cannot be undone without reinstalling Windows.
+# ONNX Runtime is signed and loads, so the way past it is to stop needing torch.
+#
+# **It must be an export of `VSEARCH_MODEL` and not merely a CLIP.** CLIP's two
+# towers share a space only because they were trained together; a text tower from
+# a different run scores frames at chance while looking like it works, because
+# the vectors still normalise and still rank. Measured against 5,923 YOLO object
+# claims used as an answer key, this export reaches 21.2% precision at 24 against
+# a 4.03% base rate — 5.3x chance across twelve labels, none below it — which is
+# the evidence that the towers match. Change one of these two names and that
+# check has to be re-run.
+#
+# Only the text tower is fetched: 472 MB against 1.63 GB for the pair, on a host
+# with about 1 GB of free RAM. The image tower is a separate 1.16 GB file, so
+# `search_image` stays torch-only until something needs it.
+VSEARCH_ONNX_REPO  = os.environ.get("ATLAS_VSEARCH_ONNX_REPO",
+                                    "Xenova/clip-vit-large-patch14")
+VSEARCH_ONNX_TEXT  = os.environ.get("ATLAS_VSEARCH_ONNX_TEXT",
+                                    "onnx/text_model.onnx")
+
 # Relative trust in each kind of evidence. Qwen's narrative is a model looking
 # at the video and describing it, so it outranks an object list; OCR is exact
 # but often noise from a watermark. These are multipliers on the fused score.

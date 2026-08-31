@@ -38,6 +38,23 @@ def yes(cond, what):
     ok += 1
 
 
+def close(got, want, what, tol=1e-6):
+    global ok
+    assert abs(got - want) <= tol, f"{what}: got {got!r}, want {want!r}"
+    ok += 1
+
+
+def raises(fn, what):
+    """A guard that must refuse, rather than return something plausible."""
+    global ok
+    try:
+        got = fn()
+    except Exception:                                  # noqa: BLE001
+        ok += 1
+        return
+    raise AssertionError(f"{what}: returned {got!r} instead of raising")
+
+
 def resident(clusters, stride=1, space="t"):
     """Install a resident index built from `{video_key: (n_frames, cosine)}`.
 
@@ -227,6 +244,86 @@ eq([i for _k, i, _s in nofps], [0, 45, 90, 135, 180],
 eq(vsearch._spread(run, FPS, 7, gap_s=0, per_video=0), run[:7],
    "with the spread disabled the list passes straight through")
 eq(vsearch._spread([], FPS, 24), [], "an empty ranking spreads to nothing")
+
+# ── The encoder, and what happens when the host will not run one ──────────
+#
+# These assertions exist because of a real regression. `get_encoder` used to
+# guard the torch import with `except ImportError`, which is the wrong shape of
+# guard: torch can be *installed and forbidden*. Under Windows Smart App Control
+# its unsigned DLLs raise `OSError: [WinError 4551] An Application Control policy
+# has blocked this file` — not an ImportError — so on that host installing torch
+# turned a graceful "no encoder" into an unhandled exception out of a search
+# request. Absent and refused are different facts; neither should be a 500.
+#
+# Nothing here loads a model or touches the network. The point is the routing and
+# the reporting, which is what was broken.
+
+
+class _FakeSess:
+    def __init__(self, names):
+        self._names = names
+
+    def get_outputs(self):
+        return [type("O", (), {"name": n})() for n in self._names]
+
+    def run(self, _out, feed):
+        # One row, 768 wide, so `text()` can be exercised without 472 MB.
+        ids = feed["input_ids"]
+        eq(ids.dtype, np.int64, "the graph is fed int64 ids")
+        eq(ids.shape[0], 1, "one query at a time")
+        return [np.full((1, 768), 3.0, dtype=np.float32)]
+
+
+class _FakeTok:
+    def encode(self, text):
+        return type("E", (), {"ids": [49406] + [1] * len(text.split()) + [49407]})()
+
+
+onnx = vsearch._Onnx(_FakeSess(["text_embeds"]), _FakeTok(), "text_embeds")
+v = onnx.text("a red sports car")
+eq(v.shape, (768,), "the text tower returns one flat vector")
+close(float(np.linalg.norm(v)), 1.0, "and it is L2-normalised, like every "
+                                     "vector the index is compared against")
+raises(lambda: onnx.text(""), "an empty query is refused rather than encoded")
+
+# Mode 2 through the ONNX route must fail loudly at the encoder, not silently
+# produce a text-shaped vector that would be searched against the image space.
+raises(lambda: onnx.image(b"\x89PNG"),
+       "the text-only fallback refuses to encode an image")
+
+# An encoder being loaded is not the same as every mode working. A screen that
+# reads only `loaded` would offer an upload button that cannot answer.
+try:
+    vsearch._ENCODER, vsearch._ENC_TRIED = onnx, True
+    enc = vsearch.state()["encoder"]
+    eq(enc["runtime"], "onnx", "state names the route that answered")
+    yes(enc["loaded"] and enc["can_text"], "text queries can run")
+    eq(enc["can_image"], False, "and uploads are reported as unavailable")
+finally:
+    vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, False, ""
+
+# A blocked torch and a missing download need opposite fixes, so a failure to
+# load must not collapse to one sentence. Both loaders are replaced here; the
+# real ones are what this is standing in for.
+try:
+    real = (vsearch._load_torch, vsearch._load_onnx)
+    vsearch._load_torch = lambda: (None, "torch present but unusable — OSError")
+    vsearch._load_onnx = lambda: (None, "onnxruntime/tokenizers missing")
+    eq(vsearch.get_encoder(), None, "no route means no encoder, and no raise")
+    yes("torch" in vsearch._ENC_ERROR and "onnx" in vsearch._ENC_ERROR,
+        "and the reason names both routes, not just the last one tried")
+finally:
+    vsearch._load_torch, vsearch._load_onnx = real
+    vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, False, ""
+
+# The real torch loader, on whatever host this runs. It must return a pair and
+# never raise — the assertion holds where torch works, where it is absent, and
+# where it is installed and blocked, which is the case that broke.
+got = vsearch._load_torch()
+eq(len(got), 2, "the torch loader reports a pair, never an exception")
+yes(got[0] is not None or bool(got[1]),
+    "and when it declines it says why")
+vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, False, ""
 
 with vsearch._LOCK:
     for s in ("t", "t2", "t3"):
