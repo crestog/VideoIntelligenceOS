@@ -47,6 +47,12 @@ gallery-dl
 # the rest. So a failed install costs you passes, not the session.
 scenedetect                 # shot boundaries — the atomic unit everything else indexes against
 librosa                     # tempo, key, loudness
+# librosa asks for numba>=0.61.0, so a plain install resolves it to the newest
+# numba there is — and the image's preinstalled cuml-cu12/cudf-cu12 both cap it
+# at <0.62. pip installed 0.67.0 anyway and printed a dependency-conflict wall
+# at the top of every session while quietly leaving RAPIDS unusable. 0.61.x is
+# the one range that satisfies librosa and the image at the same time.
+numba>=0.61,<0.62
 soundfile                   # wav io for the audio passes
 yake                        # keyphrases, statistical rather than prompted
 pyannote.audio              # diarisation; also needs an accepted licence + HF token
