@@ -42,3 +42,14 @@ dump.rdb
 *.sqlite3
 *.session
 *.session-journal
+
+# The local data home, when ATLAS_DATA is unset and _paths() falls back to a
+# repo-relative directory. It is rebuildable from the channel and it is large:
+# a run of vsearch.build() on thirty reels put 238 MB of frame matrices here,
+# and only the *.db patterns above stood between that and a commit. So ignore
+# the directory *and* the matrix extensions, because the fallback path is not
+# the only place they can land.
+atlas_data/
+*.vec
+*.ids
+*.vec.json

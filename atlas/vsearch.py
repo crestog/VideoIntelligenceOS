@@ -506,28 +506,53 @@ def warm() -> bool:
 # SEARCH
 # ══════════════════════════════════════════════════════════════════════════
 def _coarse(space: str, q, np, limit: int) -> list:
-    """Video keys ranked by their best strided frame. Returns `[(key, score)]`."""
+    """Video keys ranked by their best strided frame. Returns `[(key, score)]`.
+
+    Every reel is scored, and that is the whole of this function.
+
+    Taking the best N frames overall and grouping them by reel sounds like the
+    same thing and is not, because frames inside one reel are near-duplicates of
+    each other. A reel that matches well does not contribute one high score, it
+    contributes hundreds of nearly identical ones, and they crowd out reels that
+    match slightly less well. Measured on this archive: the top 1,536 of 32,302
+    frames came from **nine** reels of thirty. The other twenty-one never
+    reached `_exact`, so they could not be returned at any rank, however well
+    they matched — the shortlist was not narrowing the search, it was deciding
+    it.
+
+    A segmented maximum gives each reel its own best frame in one pass, which is
+    what "rank the videos" meant all along. It is also cheaper than the sort it
+    replaces (0.35 ms against 0.95 ms here) and stays negligible against the
+    matmul above it: 6.7 ms at a million frames, where the matmul is ~240 ms.
+
+    `np.maximum.at` is the *unbuffered* form and is required. The buffered
+    `best[ordv] = np.maximum(best[ordv], sims)` reads every slot before writing
+    any, so among frames sharing a reel only the last one counts.
+    """
     with _LOCK:
         res = _RESIDENT.get(space)
     if not res or not len(res["ids"]):
         return []
     if len(q) != res["dim"]:
         return []
-    sims = res["vecs"] @ q.astype(np.float32)
-    take = min(len(sims), max(limit * 64, 512))
-    top = np.argpartition(-sims, take - 1)[:take] if len(sims) > take \
-        else np.arange(len(sims))
-    best: dict = {}
     videos = res["videos"]
-    for i in top:
-        ordv = int(res["ids"][i]) >> 32
-        if ordv >= len(videos):
-            continue
-        key = videos[ordv]
-        s = float(sims[i])
-        if s > best.get(key, -2.0):
-            best[key] = s
-    return sorted(best.items(), key=lambda kv: -kv[1])[:limit]
+    if not videos:
+        return []
+    sims = res["vecs"] @ q.astype(np.float32)
+    # A frame id carries its reel's ordinal in the high word.
+    ordv = res["ids"].astype(np.int64) >> 32
+    keep = ordv < len(videos)
+    if not keep.all():
+        # A payload naming a reel this index never resolved is skipped rather
+        # than fatal, exactly as the old row-at-a-time loop skipped it.
+        ordv, sims = ordv[keep], sims[keep]
+    if not len(sims):
+        return []
+    # Below every real cosine, so a reel with no surviving frame stays out.
+    best = np.full(len(videos), -2.0, dtype=np.float32)
+    np.maximum.at(best, ordv, sims)
+    return [(videos[int(i)], float(best[int(i)]))
+            for i in np.argsort(-best)[:limit] if best[int(i)] > -2.0]
 
 
 def _exact(conn, space: str, q, np, keys: list, limit: int) -> list:
@@ -614,6 +639,48 @@ def _shape(conn, space: str, hits: list) -> list:
     return out
 
 
+def _resident_hits(space: str, q, np, limit: int, exclude_key: str):
+    """Frame-exact hits straight from an unstrided resident matrix, or `None`.
+
+    `_exact` exists to make a *strided* index give an unstrided answer: the
+    coarse pass narrows to a shortlist of reels, and the full-rate rows for
+    those reels are re-read from `vec_payload` because the resident matrix threw
+    most of them away. When nothing was strided away, that second read fetches
+    and decompresses the very vectors `_coarse` just multiplied.
+
+    The cost is not theoretical. Widening the shortlist from nine reels to
+    twenty-three took a query from 110 ms to 700 ms on this archive, and every
+    one of those milliseconds re-read RAM-resident data. So an unstrided index
+    answers from the matrix, and `_exact` keeps the job it was written for.
+
+    Returns `None` — not `[]` — when this path does not apply, so that "the
+    index is strided" stays distinguishable from "nothing matched".
+    """
+    with _LOCK:
+        res = _RESIDENT.get(space)
+    if not res or res.get("stride", 1) != 1 or not len(res["ids"]):
+        return None
+    ids, videos = res["ids"], res["videos"]
+    sims = res["vecs"] @ q.astype(np.float32)
+    ordv = ids.astype(np.int64) >> 32
+    keep = ordv < len(videos)
+    if exclude_key:
+        try:
+            keep = keep & (ordv != videos.index(exclude_key))
+        except ValueError:
+            pass                      # not in this index, so nothing to drop
+    if not keep.all():
+        sims, ordv, ids = sims[keep], ordv[keep], ids[keep]
+    if not len(sims):
+        return []
+    n = min(len(sims), max(int(limit), 1))
+    top = (np.argpartition(-sims, n - 1)[:n] if len(sims) > n
+           else np.arange(len(sims)))
+    top = top[np.argsort(-sims[top])]
+    return [(videos[int(ordv[i])], int(ids[i] & 0xFFFFFFFF), float(sims[i]))
+            for i in top]
+
+
 def search_vector(conn: sqlite3.Connection, q, space: str,
                   limit: int = 40, exclude_key: str = "") -> dict:
     """Rank frames against a query vector already in `space`."""
@@ -628,6 +695,21 @@ def search_vector(conn: sqlite3.Connection, q, space: str,
     if n == 0:
         return {"hits": [], "reason": "the query vector is empty"}
     q = q / n
+
+    hits = _resident_hits(space, q, np, limit, exclude_key)
+    if hits is not None:
+        # Every reel in the index was compared frame by frame, so the count
+        # reported is the truth and not the size of a shortlist.
+        with _LOCK:
+            res = _RESIDENT.get(space) or {}
+        seen = len(res.get("videos") or ())
+        if exclude_key and exclude_key in (res.get("videos") or ()):
+            seen -= 1
+        if not hits:
+            return {"hits": [], "space": space, "searched_videos": seen,
+                    "reason": "nothing in this space resembles it"}
+        return {"hits": _shape(conn, space, hits), "space": space,
+                "searched_videos": seen}
 
     shortlist = [k for k, _s in _coarse(space, q, np,
                                         config.VSEARCH_CANDIDATES)
