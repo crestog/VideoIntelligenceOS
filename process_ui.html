@@ -513,6 +513,10 @@ details.step .in{padding:15px 16px 18px}
           <div class="stat concept"><div class="n" id="dVectors">0</div><div class="k">vectors</div></div>
           <div class="stat"><div class="n" id="dObservers">0</div><div class="k">observers</div></div>
           <div class="stat"><div class="n" id="dPending">0</div><div class="k">unpublished</div></div>
+          <!-- Written to a file and never sent. Separate from "unpublished",
+               which is rows not yet exported: this is a file that exists only on
+               a Kaggle disk. Non-zero means evidence is about to be lost. -->
+          <div class="stat"><div class="n" id="dHeld">0</div><div class="k">held locally</div></div>
           <div class="stat"><div class="n" id="dDisk">—</div><div class="k">scratch free</div></div>
           <div class="stat"><div class="n" id="dFetch">—</div><div class="k">fetched</div></div>
         </div>
@@ -1051,6 +1055,12 @@ function render(s){
   $('#dVectors').textContent = num(store.vectors);
   $('#dObservers').textContent = num(store.observers);
   $('#dPending').textContent = num((s.shards || {}).pending);
+  // Held shards read red rather than grey. A held shard is not a slow shard: the
+  // watermark has already moved past its rows, so nothing will export them
+  // again, and the file goes when the session does.
+  const held = (s.shards || {}).held || 0;
+  $('#dHeld').textContent = num(held);
+  $('#dHeld').parentElement.className = held ? 'stat bad' : 'stat';
   renderReconcile(s);
   $('#dDisk').textContent = s.disk_free_mb ? (s.disk_free_mb/1024).toFixed(0) + ' GB' : '—';
   const src = s.source || {};
@@ -1489,11 +1499,17 @@ async function loadDb(){
   </tr>`).join('') : '<tr><td colspan="4" class="skel">None yet.</td></tr>';
 
   const sh = await get('/api/process/shards');
+  // A shard with no message id is not "local", it is held: the watermark has
+  // already moved past its rows, so this file is the only copy of them and it
+  // goes when the session does. The attempt count is how far the retry got.
+  const heldCell = x => x.msg_id ? esc(x.msg_id)
+    : `<span style="color:var(--bad)">held`
+      + (x.attempts > 1 ? ' &times;' + num(x.attempts) : '') + `</span>`;
   $('#tShards').innerHTML = (sh.ok && sh.shards.length) ? sh.shards.slice().reverse().map(x => `<tr>
     <td class="mono">${esc(x.shard_id)}</td><td class="mono">${esc(x.component || '')}</td>
     <td class="mono r">${num(x.claims)}</td><td class="mono r">${num(x.vectors)}</td>
     <td class="mono r">${mb(x.bytes)}</td>
-    <td class="mono r">${x.msg_id ? esc(x.msg_id) : '<span style="color:var(--warn)">local</span>'}</td>
+    <td class="mono r">${heldCell(x)}</td>
   </tr>`).join('') : '<tr><td colspan="6" class="skel">None yet.</td></tr>';
 }
 $('#bRefreshVids').onclick = loadDb;

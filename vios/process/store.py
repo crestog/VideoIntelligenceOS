@@ -60,6 +60,7 @@ import array
 import bisect
 import gzip
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -271,7 +272,9 @@ CREATE TABLE IF NOT EXISTS shard (
     bytes       INTEGER,
     lo_id       INTEGER,          -- claim.id range covered, for the watermark
     hi_id       INTEGER,
-    created_at  REAL
+    created_at  REAL,
+    path        TEXT,             -- on-disk file, while msg_id IS NULL
+    attempts    INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -311,6 +314,14 @@ END;
 MIGRATIONS = (
     ("claim", "frame_idx", "INTEGER"),
     ("claim", "frame_hi", "INTEGER"),
+    # Where a shard's file is, and how many times sending it has been tried.
+    # A row with `msg_id IS NULL` used to be a note that the file existed
+    # somewhere; nothing recorded where, so nothing could ever send it again,
+    # and a 50 MB shard rejected with `Request Entity Too Large` was evidence
+    # lost the moment the Kaggle session's disk went away. `held_shards()`
+    # reads these two.
+    ("shard", "path", "TEXT"),
+    ("shard", "attempts", "INTEGER DEFAULT 0"),
 )
 
 # Built after the migration, for the same reason.
@@ -1192,7 +1203,8 @@ class Store:
                      lo_vec: int = 0, hi_vec: int = 0,
                      component: str = "",
                      lo_fvec: int = 0, hi_fvec: int = 0,
-                     lo_fmet: int = 0, hi_fmet: int = 0) -> dict:
+                     lo_fmet: int = 0, hi_fmet: int = 0,
+                     budget_bytes: int = 0) -> dict:
         """Write claims and vectors in an id range to a gzipped JSONL file.
 
         Why a range and not "everything since a timestamp": ids are assigned by
@@ -1219,29 +1231,135 @@ class Store:
         that had been *learned* and nothing about what had been *done*, so it
         re-attempted three hours of work whose evidence it was already holding.
         Only settled rows go: see `_settled_coverage`.
+
+        `budget_bytes` bounds the **compressed** file. Past it the export stops
+        mid-range and reports the ids it actually reached, so the caller advances
+        its watermark to the cut rather than past the rows it did not ship. The
+        measured failure it exists for: `Shard bce94897-0001 not uploaded:
+        Request Entity Too Large`, where `_publish` advanced all four watermarks
+        anyway (it reads them back out of these stats) and the Kaggle session's
+        disk went away with the file still on it. Zero means unbounded, which is
+        every caller that is not publishing to Telegram.
+
+        Two things are outside the budget and the caller must leave room for
+        them: the last evidence row written before the cut was noticed (bounded
+        by one row — see `full()`), and the whole `coverage` section, which
+        travels intact because a partial one would let a restored database
+        re-earn work it is already holding. Both are small; `SHARD_BUDGET_BYTES`
+        sits 10 MB under the Bot API's 50 MB refusal for them.
         """
         hi_id = hi_id or self.max_claim_id()
         hi_vec = hi_vec or self.max_vector_id()
         hi_fvec = hi_fvec or self.max_frame_vector_id()
         hi_fmet = hi_fmet or self.max_frame_metric_id()
 
+        stats = self._write_shard(path, component, lo_id, hi_id, lo_vec, hi_vec,
+                                  lo_fvec, hi_fvec, lo_fmet, hi_fmet,
+                                  budget_bytes, spill_from=())
+        if not stats["cut"]:
+            return stats
+
+        # Written once more, and only on the path that ran out of budget. The
+        # header names the range the file covers and the first pass could not
+        # know where it would stop, so leaving it would ship a file claiming rows
+        # it does not contain — and `note_shard` would record that claim in the
+        # `shard` table. The rewrite also drops from the coverage section every
+        # video whose evidence spilled past the cut: coverage travels in
+        # whatever state it is in *now*, so a `done` row shipped here beside half
+        # its claims is the one shape `import_shard` warns about, and the shard
+        # carrying the other half is exactly the shard that might be the one to
+        # fail. It re-ships with that remainder, minutes later, at no cost.
+        cut = (stats["hi_id"], stats["hi_vec"], stats["hi_fvec"],
+               stats["hi_fmet"])
+        stats = self._write_shard(path, component, lo_id, cut[0], lo_vec, cut[1],
+                                  lo_fvec, cut[2], lo_fmet, cut[3],
+                                  0, spill_from=cut)
+        stats["cut"] = True
+        stats["want"] = {"hi_id": hi_id, "hi_vec": hi_vec,
+                         "hi_fvec": hi_fvec, "hi_fmet": hi_fmet}
+        return stats
+
+    # The most uncompressed output to write between probes of the real
+    # compressed size while there is still room. `full()` probes sooner than this
+    # as the budget approaches, so this bounds the cost of the flush, not the
+    # accuracy of the cut.
+    PROBE_EVERY = 2 * 1024 * 1024
+
+    def _write_shard(self, path: str, component: str,
+                     lo_id: int, hi_id: int, lo_vec: int, hi_vec: int,
+                     lo_fvec: int, hi_fvec: int, lo_fmet: int, hi_fmet: int,
+                     budget_bytes: int, spill_from: tuple) -> dict:
+        """One pass of the writer. Returns what it actually wrote.
+
+        The size accounting is per row and exact rather than estimated from
+        `length(data)`: the JSON line is measured as it is written, and the
+        compressed total is read from the underlying file handle. A vector row's
+        blob becomes hex, which doubles it and then gzips back down by a factor
+        this code cannot predict for arbitrary float32 — an estimate would have
+        to be wrong in one of the two directions, and being wrong high wastes
+        half the channel's allowance on every shard.
+        """
+        span = (lo_id, hi_id, lo_vec, hi_vec, lo_fvec, hi_fvec,
+                lo_fmet, hi_fmet)
         # The set of videos this shard touches, from any side.
         keys = ("(SELECT video_key FROM claim WHERE id>? AND id<=? "
                 "UNION SELECT video_key FROM vector WHERE id>? AND id<=? "
                 "UNION SELECT video_key FROM frame_vector WHERE id>? AND id<=? "
                 "UNION SELECT video_key FROM frame_metric WHERE id>? AND id<=?)")
-        span = (lo_id, hi_id, lo_vec, hi_vec, lo_fvec, hi_fvec,
-                lo_fmet, hi_fmet)
 
         n_claims = n_vectors = n_fvec = n_fmet = n_cov = 0
-        with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as fh:
-            fh.write(json.dumps({
-                "_": "vios-evidence-shard", "schema": SCHEMA_VERSION,
-                "component": component, "lo_id": lo_id, "hi_id": hi_id,
-                "lo_vec": lo_vec, "hi_vec": hi_vec,
-                "lo_fvec": lo_fvec, "hi_fvec": hi_fvec,
-                "lo_fmet": lo_fmet, "hi_fmet": hi_fmet,
-                "at": time.time()}) + "\n")
+        at_id, at_vec, at_fvec, at_fmet = lo_id, lo_vec, lo_fvec, lo_fmet
+        cut = False
+        wrote = 0                       # evidence rows written, for `full`
+        loose = 0                       # uncompressed bytes since the last probe
+        tight = 0                       # compressed bytes as of the last probe
+
+        raw = open(path, "wb")
+        gz = gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6)
+        fh = io.TextIOWrapper(gz, encoding="utf-8", write_through=True)
+
+        def emit(obj) -> None:
+            nonlocal loose
+            line = json.dumps(obj, ensure_ascii=False) + "\n"
+            fh.write(line)
+            loose += len(line.encode("utf-8"))
+
+        def full() -> bool:
+            """True once the compressed file has reached the budget.
+
+            The probe is a `Z_SYNC_FLUSH`, so it is not done per row while there
+            is plenty of room — but `tight + loose` is an upper bound on the true
+            compressed size (gzip does not expand data by any meaningful amount),
+            so the moment that bound touches the budget the probe becomes exact,
+            and near the limit it happens after every row. The overshoot is
+            therefore one row, not one probe interval, without paying for a flush
+            per row across the whole file.
+
+            Never true before a single evidence row has been written, however
+            small the budget or however large the prologue. The watermark the
+            caller advances is derived from the rows that shipped, so a shard
+            that ships none advances nothing and the next publish tick produces
+            the same shard again — a stall, which is worse than the 413 this is
+            here to prevent. One oversize row is a bounded, visible failure; a
+            loop is not.
+            """
+            nonlocal loose, tight
+            if not budget_bytes or not wrote:
+                return False
+            if loose and (tight + loose >= budget_bytes
+                          or loose >= self.PROBE_EVERY):
+                fh.flush()
+                gz.flush()              # Z_SYNC_FLUSH — what is written is out
+                tight, loose = raw.tell(), 0
+            return tight >= budget_bytes
+
+        try:
+            emit({"_": "vios-evidence-shard", "schema": SCHEMA_VERSION,
+                  "component": component, "lo_id": lo_id, "hi_id": hi_id,
+                  "lo_vec": lo_vec, "hi_vec": hi_vec,
+                  "lo_fvec": lo_fvec, "hi_fvec": hi_fvec,
+                  "lo_fmet": lo_fmet, "hi_fmet": hi_fmet,
+                  "at": time.time()})
 
             for r in self.conn.execute(
                     "SELECT * FROM observer WHERE observer_id IN ("
@@ -1250,61 +1368,93 @@ class Store:
                     " UNION SELECT observer_id FROM frame_vector WHERE id>? AND id<=?"
                     " UNION SELECT observer_id FROM frame_metric WHERE id>? AND id<=?)",
                     span):
-                fh.write(json.dumps({"t": "observer", **dict(r)},
-                                    ensure_ascii=False) + "\n")
+                emit({"t": "observer", **dict(r)})
             for table in ("video", "shot", "artifact"):
                 for r in self.conn.execute(
                         f"SELECT * FROM {table} WHERE video_key IN {keys}", span):
-                    fh.write(json.dumps({"t": table, **dict(r)},
-                                        ensure_ascii=False) + "\n")
+                    emit({"t": table, **dict(r)})
+
+            # Claims first, and the budget checked before each row rather than
+            # after: the cut must never overshoot, and a burst of per-frame
+            # vectors must never be what stops the cheap, dense, high-value rows
+            # from travelling.
             for r in self.conn.execute(
                     "SELECT * FROM claim WHERE id>? AND id<=? ORDER BY id",
                     (lo_id, hi_id)):
+                if full():
+                    cut = True
+                    break
                 d = dict(r)
-                d.pop("id", None)
-                fh.write(json.dumps({"t": "claim", **d}, ensure_ascii=False) + "\n")
+                at_id = d.pop("id")
+                emit({"t": "claim", **d})
                 n_claims += 1
+                wrote += 1
             for r in self.conn.execute(
                     "SELECT * FROM vector WHERE id>? AND id<=? ORDER BY id",
                     (lo_vec, hi_vec)):
+                if full():
+                    cut = True
+                    break
                 d = dict(r)
-                d.pop("id", None)
+                at_vec = d.pop("id")
                 d["data"] = d["data"].hex()
-                fh.write(json.dumps({"t": "vector", **d}) + "\n")
+                emit({"t": "vector", **d})
                 n_vectors += 1
+                wrote += 1
             for r in self.conn.execute(
                     "SELECT * FROM frame_vector WHERE id>? AND id<=? ORDER BY id",
                     (lo_fvec, hi_fvec)):
+                if full():
+                    cut = True
+                    break
                 d = dict(r)
-                d.pop("id", None)
+                at_fvec = d.pop("id")
                 d["frames"] = d["frames"].hex()
                 d["data"] = d["data"].hex()
-                fh.write(json.dumps({"t": "frame_vector", **d}) + "\n")
+                emit({"t": "frame_vector", **d})
                 n_fvec += 1
+                wrote += 1
             for r in self.conn.execute(
                     "SELECT * FROM frame_metric WHERE id>? AND id<=? ORDER BY id",
                     (lo_fmet, hi_fmet)):
+                if full():
+                    cut = True
+                    break
                 d = dict(r)
-                d.pop("id", None)
+                at_fmet = d.pop("id")
                 d["frames"] = d["frames"].hex()
                 d["values_"] = d["values_"].hex()
-                fh.write(json.dumps({"t": "frame_metric", **d}) + "\n")
+                emit({"t": "frame_metric", **d})
                 n_fmet += 1
-            for d in self._settled_coverage(keys, span):
-                fh.write(json.dumps({"t": "coverage", **d},
-                                    ensure_ascii=False) + "\n")
-                n_cov += 1
+                wrote += 1
 
+            # Unbudgeted, deliberately: coverage is what stops a restored
+            # database from re-earning work whose evidence it is already holding,
+            # and it is small — thirty components over a cohort of videos, with
+            # `last_error` already clipped to 500 characters. The caller's
+            # reserve below the hard cap is what pays for it.
+            for d in self._settled_coverage(keys, span, spill_from):
+                emit({"t": "coverage", **d})
+                n_cov += 1
+        finally:
+            fh.close()
+            gz.close()
+            raw.close()
+
+        if not cut:
+            at_id, at_vec = hi_id, hi_vec
+            at_fvec, at_fmet = hi_fvec, hi_fmet
         return {"path": path, "claims": n_claims, "vectors": n_vectors,
                 "frame_vectors": n_fvec, "frame_metrics": n_fmet,
                 "coverage": n_cov,
-                "lo_id": lo_id, "hi_id": hi_id,
-                "lo_vec": lo_vec, "hi_vec": hi_vec,
-                "lo_fvec": lo_fvec, "hi_fvec": hi_fvec,
-                "lo_fmet": lo_fmet, "hi_fmet": hi_fmet,
-                "bytes": os.path.getsize(path)}
+                "lo_id": lo_id, "hi_id": at_id,
+                "lo_vec": lo_vec, "hi_vec": at_vec,
+                "lo_fvec": lo_fvec, "hi_fvec": at_fvec,
+                "lo_fmet": lo_fmet, "hi_fmet": at_fmet,
+                "cut": cut, "want": {}, "bytes": os.path.getsize(path)}
 
-    def _settled_coverage(self, keys: str, span: tuple) -> list:
+    def _settled_coverage(self, keys: str, span: tuple,
+                          spill_from: tuple = ()) -> list:
         """The coverage rows worth shipping, for the videos in this shard.
 
         Only `done`, `skipped` and `failed`. A `queued` row carries no
@@ -1318,6 +1468,17 @@ class Store:
         larger than the evidence it travels with; 500 characters is the whole of
         every message this codebase raises, because `SkipPass` and the runners
         already clip theirs to 200.
+
+        `spill_from` is the four ids a budgeted export stopped at. Any video with
+        evidence above one of them is left out entirely: its `done` row would
+        arrive here beside only part of the claims it is asserting, which is the
+        one shape the `import_shard` docstring below calls out as unsupported —
+        and it would arrive that way not because someone hand-picked shards but
+        because the engine cut one. Leaving the row out costs nothing: the shard
+        carrying the remainder re-reads coverage minutes later and ships it then,
+        and until it does the target simply re-derives a `queued` row it will
+        satisfy from the evidence that did arrive. Over-exclusion is therefore
+        self-correcting, and under-exclusion is not.
         """
         cols = ",".join(_COVERAGE_COLS)
         rows = []
@@ -1332,12 +1493,31 @@ class Store:
             # created here — an export is a read, and a store that only ever
             # exported should not grow a table because it did.
             return rows
+        spilled = self._spilled_keys(spill_from) if spill_from else frozenset()
         for r in cur:
             d = dict(r)
+            if d["video_key"] in spilled:
+                continue
             if d.get("last_error"):
                 d["last_error"] = str(d["last_error"])[:500]
             rows.append(d)
         return rows
+
+    def _spilled_keys(self, cut: tuple) -> frozenset:
+        """Videos with evidence above a cut, in any of the four tables.
+
+        Unbounded above on purpose: the question is not "which rows are in the
+        next shard" (that depends on where the *next* cut falls, which is not
+        known yet) but "which videos are, right now, only partly described by
+        this file".
+        """
+        at_id, at_vec, at_fvec, at_fmet = cut
+        return frozenset(r[0] for r in self.conn.execute(
+            "SELECT video_key FROM claim WHERE id>? "
+            "UNION SELECT video_key FROM vector WHERE id>? "
+            "UNION SELECT video_key FROM frame_vector WHERE id>? "
+            "UNION SELECT video_key FROM frame_metric WHERE id>?",
+            (at_id, at_vec, at_fvec, at_fmet)))
 
     def import_shard(self, path: str, msg_aliases: dict | None = None) -> dict:
         """Replay a shard into this database. Idempotent by uid.
@@ -1608,17 +1788,71 @@ class Store:
 
     def note_shard(self, shard_id: str, component: str, msg_id: int | None,
                    stats: dict) -> None:
+        """Record a shard. `msg_id is None` means exported but not published.
+
+        The path is kept for exactly that case. `_publish` advances its
+        watermarks off `stats` whether or not the send succeeded — deliberately,
+        so a rejected shard does not re-export the same rows forever — which
+        means a held shard is the *only* copy of its evidence, and until this
+        column existed nothing knew which file that was.
+        """
         self.conn.execute(
             "INSERT OR REPLACE INTO shard(shard_id,component,msg_id,claims,"
-            "vectors,bytes,lo_id,hi_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            "vectors,bytes,lo_id,hi_id,created_at,path,attempts) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT attempts FROM shard "
+            "WHERE shard_id=?),0)+?)",
             (shard_id, component, msg_id, stats.get("claims", 0),
              stats.get("vectors", 0), stats.get("bytes", 0),
-             stats.get("lo_id", 0), stats.get("hi_id", 0), time.time()))
+             stats.get("lo_id", 0), stats.get("hi_id", 0), time.time(),
+             None if msg_id else stats.get("path") or None,
+             shard_id, 1))
         self.conn.commit()
 
     def shards(self) -> list:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM shard ORDER BY created_at")]
+
+    def held_shards(self, limit: int = 8, max_attempts: int = 0) -> list:
+        """Shards that were written and never published, oldest first.
+
+        Filtered on the file still being there, because the caller cannot do
+        anything with a row naming a path that a fresh session's empty `/kaggle`
+        does not have — and a restore that ran `import_shard` over the channel
+        would replay one of those rows without its file existing at all.
+
+        `max_attempts` drops the ones already retried that many times. Done in
+        SQL rather than by the caller so that a shard which has run out of tries
+        cannot occupy a slot: it is the oldest row, so a caller filtering after
+        `LIMIT` would fetch it forever and never see the held shard behind it.
+        """
+        sql = ("SELECT * FROM shard WHERE msg_id IS NULL AND path IS NOT NULL "
+               + ("AND COALESCE(attempts,0) < ? " if max_attempts else "")
+               + "ORDER BY created_at LIMIT ?")
+        args = ((int(max_attempts), int(limit)) if max_attempts
+                else (int(limit),))
+        out = []
+        for r in self.conn.execute(sql, args):
+            d = dict(r)
+            if os.path.exists(d["path"]):
+                out.append(d)
+        return out
+
+    def mark_shard_sent(self, shard_id: str, msg_id: int) -> None:
+        """A held shard finally went. Clear the path; the channel has it now."""
+        self.conn.execute(
+            "UPDATE shard SET msg_id=?, path=NULL WHERE shard_id=?",
+            (int(msg_id), shard_id))
+        self.conn.commit()
+
+    def held_shard_failed(self, shard_id: str) -> int:
+        """One more send attempt spent on a held shard. Returns the new count."""
+        self.conn.execute(
+            "UPDATE shard SET attempts=COALESCE(attempts,0)+1 WHERE shard_id=?",
+            (shard_id,))
+        self.conn.commit()
+        r = self.conn.execute("SELECT attempts FROM shard WHERE shard_id=?",
+                              (shard_id,)).fetchone()
+        return int(r["attempts"] or 0) if r else 0
 
     # ── housekeeping ────────────────────────────────────────────────────
     def max_claim_id(self) -> int:

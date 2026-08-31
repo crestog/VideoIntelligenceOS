@@ -106,6 +106,35 @@ PUBLISH_TICK_SECONDS = 10.0
 # it is split rather than lost. 45 leaves room for the multipart envelope.
 STAGE_PART_BYTES = 45 * 1024 * 1024
 
+# One evidence shard, same cap and a wider margin. Measured: `Shard
+# bce94897-0001 not uploaded: Request Entity Too Large`, after which `_publish`
+# advanced all four watermarks off the export's own stats and nothing ever sent
+# that file again — so a 413 was permanent evidence loss the moment the Kaggle
+# session's disk went away. `upload.call` does not retry it either, correctly: a
+# 4xx whose body is HTML rather than JSON is the request's fault, and sending the
+# same bytes again would fail the same way.
+#
+# 40 rather than 45 because a shard has two costs a stage part does not. The
+# coverage section is written *after* the budget stops applying (it is what stops
+# a restored database from re-earning finished work, so it must travel whole),
+# and the size is probed every `Store.PROBE_EVERY` of uncompressed output rather
+# than per row, so the cut can overshoot by up to one probe interval's worth of
+# compressed output. Both are small; 5 MB of headroom is enough for either to be
+# wrong by a lot. The remaining margin under 50 also matters for time: the
+# uploader's `READ_TIMEOUT` is 180 s, and a Kaggle notebook's upstream is not
+# fast.
+SHARD_BUDGET_BYTES = 40 * 1024 * 1024
+
+# How many held shards to re-offer per publish tick, and how many send attempts
+# one shard is worth before it is left alone. A held shard is the only copy of
+# its evidence, so it is retried — but a rejection that is about the file rather
+# than the network will not change, and re-sending 40 MB every ten seconds for
+# the rest of a session costs the bandwidth the *next* shard needs. After this
+# many the row keeps its path and stays in the status panel's `held` count, which
+# is what makes the loss visible instead of silent.
+HELD_SHARD_PER_TICK = 3
+HELD_SHARD_ATTEMPTS = 6
+
 # Bundle file naming. Kept distinct from `intake.SHARD_PREFIX` on purpose: a
 # restore walking the channel must be able to tell a replayable delta from a
 # whole-database snapshot by filename alone, because downloading the wrong one
@@ -3178,8 +3207,10 @@ class ProcessEngine:
 
         Best effort by design. A session with no bot token still produces a
         complete local database, and a shard that fails to upload stays on disk
-        with its watermark unmoved, so the next attempt includes it rather than
-        losing it.
+        with its path recorded, so `_retry_held` re-offers it on later ticks
+        rather than losing it. The watermark still advances past it — see the
+        comment at the advance — so the retry is the whole of the recovery, and
+        `held_shards()` is what makes an unrecovered one visible.
 
         Runs under `_pub_lock` from start to finish, so the read of the watermark,
         the export against it and the write that advances it are one operation
@@ -3193,6 +3224,7 @@ class ProcessEngine:
         """
         store = store or self.store
         with self._pub_lock:
+            self._retry_held(store)
             lo_id = int(store.get_meta("shard_lo_id", "0") or 0)
             lo_vec = int(store.get_meta("shard_lo_vec", "0") or 0)
             # Per-frame rows are watermarked separately for the same reason
@@ -3224,7 +3256,8 @@ class ProcessEngine:
             try:
                 stats = store.export_shard(path, lo_id, hi_id, lo_vec, hi_vec,
                                            note, lo_fvec, hi_fvec,
-                                           lo_fmet, hi_fmet)
+                                           lo_fmet, hi_fmet,
+                                           budget_bytes=SHARD_BUDGET_BYTES)
             except Exception as exc:
                 self._log(f"Shard export failed: {type(exc).__name__}: {exc}",
                           "error")
@@ -3254,9 +3287,20 @@ class ProcessEngine:
                               f"{type(exc).__name__}: {exc}", "warn")
 
             store.note_shard(sid, note, msg_id, stats)
-            # Only advance the watermark once the rows are safely in a file.
-            # If the upload failed the shard is still on local disk and still
-            # counted, which is the honest state: exported, not yet published.
+            # Only advance the watermark once the rows are safely in a file, and
+            # only over the rows that are actually *in* it — `stats["hi_*"]` is
+            # where the export stopped, not where it was asked to stop, so a
+            # shard cut at `SHARD_BUDGET_BYTES` leaves the remainder queued for
+            # the next one instead of stepping over it.
+            #
+            # The advance happens even when the upload failed, which is the part
+            # that used to lose evidence: the file is the only copy, and this
+            # docstring's promise that "the next attempt includes it" was never
+            # true. `_retry_held` above is what makes it true — the row keeps its
+            # path and gets re-offered every tick until it goes or runs out of
+            # attempts. Not advancing instead would be worse: the same rows would
+            # be re-exported into a bigger file every time, and a channel that is
+            # merely slow today would never catch up.
             store.set_meta("shard_lo_id", str(stats["hi_id"]))
             store.set_meta("shard_lo_vec", str(stats["hi_vec"]))
             store.set_meta("shard_lo_fvec", str(stats["hi_fvec"]))
@@ -3268,6 +3312,21 @@ class ProcessEngine:
                 self.since_publish = 0
                 self.last_publish = time.time()
                 self.session["shards"] += 1
+                if stats.get("cut"):
+                    # There is more behind this shard, and `_publish_due` gates
+                    # on `since_publish > 0`. Left at zero the remainder would
+                    # wait for the next video to finish — which, on a stage that
+                    # has just written its last frame vectors, is never.
+                    #
+                    # `last_publish = 0` reads as "no publish yet" in
+                    # `_publish_due`, so the age gate returns True and the next
+                    # publisher tick (≤ PUBLISH_TICK_SECONDS) takes the
+                    # remainder rather than waiting out PUBLISH_MIN_SECONDS. That
+                    # floor exists to stop a fast cohort filling the channel with
+                    # tiny files; a shard that just hit a 40 MB cut is the
+                    # opposite case, and the upload itself is the rate limit.
+                    self.since_publish = 1
+                    self.last_publish = 0.0
             self._log(f"Shard {sid}: {stats['claims']} claims, "
                       f"{stats['vectors']} vectors, "
                       f"{stats['frame_vectors']} frame-vector rows, "
@@ -3276,9 +3335,67 @@ class ProcessEngine:
                       f"{stats['bytes'] / 1024:.0f} KB"
                       + (f" → message {msg_id}" if msg_id else
                          " (held locally — no upload)"))
+            if stats.get("cut"):
+                want = stats.get("want") or {}
+                self._log(
+                    f"Shard {sid} cut at "
+                    f"{SHARD_BUDGET_BYTES / 1024 / 1024:.0f} MB — claims to "
+                    f"{stats['hi_id']}/{want.get('hi_id', stats['hi_id'])}, "
+                    f"vectors to {stats['hi_vec']}/"
+                    f"{want.get('hi_vec', stats['hi_vec'])}, frame vectors to "
+                    f"{stats['hi_fvec']}/{want.get('hi_fvec', stats['hi_fvec'])}"
+                    f", frame metrics to {stats['hi_fmet']}/"
+                    f"{want.get('hi_fmet', stats['hi_fmet'])}; the rest "
+                    f"publishes next tick", "info")
             if msg_id is None and self._tg and self._tg.token:
                 return ""
             return sid
+
+    def _retry_held(self, store: Store) -> int:
+        """Re-offer shards that were written and never published.
+
+        Called at the top of every `_publish`, under `_pub_lock`, before the new
+        export — a held shard is older evidence than anything about to be
+        written, and the channel is read back in `created_at` order on restore.
+
+        Returns the number that went. Best effort in the same sense as the rest
+        of this method: nothing here can fail a session.
+        """
+        if not (self._tg and self._tg.token):
+            return 0
+        try:
+            held = store.held_shards(HELD_SHARD_PER_TICK, HELD_SHARD_ATTEMPTS)
+        except Exception:
+            return 0                        # pre-migration database; nothing held
+        sent = 0
+        for row in held:
+            sid, path = row["shard_id"], row["path"]
+            tries = int(row.get("attempts") or 0)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            caption = (f"vios evidence · {sid} (held, attempt {tries + 1})\n"
+                       f"{row.get('claims', 0)} claims, "
+                       f"{row.get('vectors', 0)} vectors\nworker "
+                       f"{self.index + 1}/{self.partitions} · "
+                       f"{row.get('component') or 'retry'}")
+            try:
+                res = self._tg.send_document(
+                    path, caption, file_name=intake.shard_name(sid))
+                store.mark_shard_sent(sid, int(res.get("message_id") or 0))
+                sent += 1
+                self._log(f"Held shard {sid} went up on attempt {tries + 1} "
+                          f"({size / 1024:.0f} KB) → message "
+                          f"{res.get('message_id')}")
+            except Exception as exc:
+                n = store.held_shard_failed(sid)
+                # One line per attempt, at `warn`, because the alternative is a
+                # session that quietly ends with megabytes of evidence on a disk
+                # that is about to be deleted. The count is in the message so
+                # the last one before the cap is recognisable as the last one.
+                self._log(f"Held shard {sid} still not uploaded "
+                          f"({size / 1024:.0f} KB, attempt {n} of "
+                          f"{HELD_SHARD_ATTEMPTS}): {type(exc).__name__}: "
+                          f"{exc}", "warn")
+        return sent
 
     # ── the publisher thread ─────────────────────────────────────────────
     #
@@ -4131,6 +4248,13 @@ class ProcessEngine:
                        "last": shards[-1] if shards else None,
                        "published": self.session["shards"],
                        "last_at": self.last_publish,
+                       # Written, never published, file still on disk. Distinct
+                       # from `pending` above, which is rows not yet exported:
+                       # this is bytes that exist only inside a Kaggle session
+                       # and will not survive it. Any number here other than zero
+                       # is evidence about to be lost.
+                       "held": sum(1 for s in shards
+                                   if not s.get("msg_id") and s.get("path")),
                        "pending": pending},
             "stages": stages,
             # What the last reconcile spared. Sits next to `shards` because the
