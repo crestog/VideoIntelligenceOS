@@ -29,6 +29,15 @@ What this pins:
   7. A held shard keeps its path, is handed back by `held_shards()`, stops being
      handed back once sent or once out of attempts, and is counted by the status
      panel.
+  8. A shard the channel has taken does not stay on the disk. Nothing used to
+     remove one: `mark_shard_sent` clears the `path` column without touching the
+     file, `_publish` never unlinked its upload, and `intake.evict` walks
+     `cache_dir` for working *directories* — so `shard_dir` was outside every
+     mechanism the engine has for disk pressure. Measured in this archive:
+     74 shard files over nine sessions, all 74 published, 248.7 MB, of which
+     135.8 MB was the one session that cut 30. And under the floor `_publish`
+     defers instead of discarding, because a held shard is the only copy of rows
+     the watermark has stepped over.
 
 Run from the repo root: python _t_shard_size.py
 """
@@ -42,6 +51,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
@@ -446,6 +456,176 @@ def test_held_shards():
     st.conn.close()
 
 
+# ── 8. a shard the channel has taken does not stay on the disk ───────────
+def _bare_engine(shard_dir, store):
+    """The few attributes the shard-file methods touch, and nothing else.
+
+    Built by binding the real functions onto a stand-in rather than by
+    constructing a `ProcessEngine`, because the code under test is then the code
+    that ships: none of these three methods reads anything a real engine would
+    have to probe a GPU or a channel for.
+    """
+    from vios.process.engine import ProcessEngine
+
+    class Bare:
+        def __init__(self):
+            self.shard_dir = shard_dir
+            self.store = store
+            self.disk_floor_mb = 4_000
+            self.index, self.partitions = 0, 1
+            self.session = {"shards": 0}
+            self.last_publish = 0.0
+            self.since_publish = 7
+            self._tg = None
+            self._lock = threading.RLock()
+            self._pub_lock = threading.RLock()
+            self.logs = []
+
+        def _log(self, text, level="info"):
+            self.logs.append((level, str(text)))
+
+        def _retry_held(self, store):
+            return 0
+
+        def said(self, needle):
+            return [t for _, t in self.logs if needle in t]
+
+    for name in ("_drop_shard_file", "_reclaim_shards", "_publish"):
+        setattr(Bare, name, getattr(ProcessEngine, name))
+    return Bare()
+
+
+def _put(shard_dir, name, size=2048):
+    p = os.path.join(shard_dir, name)
+    with open(p, "wb") as f:
+        f.write(os.urandom(size))
+    return p
+
+
+def test_published_shard_is_not_kept():
+    from vios.process import intake
+
+    st, d = fresh_store(videos=2, claims_each=5, spaces=1, metrics=1)
+    shard_dir = os.path.join(d, "shards")
+    os.makedirs(shard_dir, exist_ok=True)
+    eng = _bare_engine(shard_dir, st)
+
+    # Four files in one directory: a published shard, a held one, a stage
+    # bundle and one of its parts. Exactly one of them is redundant.
+    up = _put(shard_dir, intake.shard_name("SITE-0001"))
+    held = _put(shard_dir, intake.shard_name("SITE-0002"))
+    bundle = _put(shard_dir, "vios-stage-SITE-language-0001.tar.gz")
+    part = _put(shard_dir, "vios-stage-SITE-language-0001.tar.gz.part000")
+    stats = st.export_shard(os.path.join(d, "probe.jsonl.gz"), component="all")
+    st.note_shard("SITE-0001", "all", 5001, stats)
+    st.note_shard("SITE-0002", "all", None, {**stats, "path": held})
+
+    n = eng._drop_shard_file(up, "SITE-0001")
+    check("_drop_shard_file reports the bytes it freed", n == 2048, str(n))
+    check("and the file is gone", not os.path.exists(up))
+    check("a file that is not there frees nothing and says nothing",
+          eng._drop_shard_file(up, "SITE-0001") == 0 and not eng.logs,
+          str(eng.logs))
+
+    _put(shard_dir, intake.shard_name("SITE-0001"), 4096)
+    back = eng._reclaim_shards()
+    check("the sweep collects a shard whose row carries a message id",
+          back["removed"] == 1 and back["bytes"] == 4096, str(back))
+    check("and leaves the held one, which is the only copy of its rows",
+          os.path.exists(held))
+    check("and does not touch a stage bundle or one of its parts",
+          os.path.exists(bundle) and os.path.exists(part),
+          "matched by name against published rows, not by looking shard-shaped")
+    check("running it again is a no-op",
+          eng._reclaim_shards()["removed"] == 0)
+
+    n_held, held_bytes = st.held_shard_bytes()
+    check("held_shard_bytes measures the file, not the export column",
+          (n_held, held_bytes) == (1, 2048),
+          f"{n_held} file(s), {held_bytes} bytes on disk; the column says "
+          f"{stats['bytes']}, which is what the export produced")
+
+    # ── under the floor, defer; and defer without deleting anything ─────
+    real_free = intake.free_mb
+    intake.free_mb = lambda _p: 10          # MB, far under the 4,000 floor
+    keys = ("shard_lo_id", "shard_lo_vec", "shard_lo_fvec", "shard_lo_fmet",
+            "shard_seq")
+    try:
+        eng.logs.clear()
+        before = {k: st.get_meta(k, "0") for k in keys}
+        out = eng._publish("floor-test")
+        check("under the floor no shard is written", out == "", repr(out))
+        check("and no watermark moved",
+              before == {k: st.get_meta(k, "0") for k in keys},
+              str(before))
+        check("and the rows are still counted as unpublished",
+              eng.since_publish == 7, str(eng.since_publish))
+        check("the clock moved, so the warning is not repeated every tick",
+              eng.last_publish > 0)
+        said = eng.said("Shard deferred")
+        check("the line names the floor and what is holding the disk",
+              said and "4000 MB floor" in said[0]
+              and "1 held shard(s)" in said[0], str(said))
+        check("and says the evidence is still safe, because it is",
+              said and "watermark has not moved" in said[0], str(said))
+        check("nothing was deleted to make room",
+              os.path.exists(held),
+              "the opposite trade from a stage bundle: no rebuild exists")
+        check("and no new shard file was written either",
+              sorted(f for f in os.listdir(shard_dir)
+                     if f.startswith(intake.SHARD_PREFIX))
+              == [os.path.basename(held)],
+              str(sorted(os.listdir(shard_dir))))
+    finally:
+        intake.free_mb = real_free
+
+    # ── no channel: the file stays, because it is the only copy ─────────
+    eng.logs.clear()
+    sid = eng._publish("no-channel")
+    kept = os.path.join(shard_dir, intake.shard_name(sid))
+    check("with room but no channel a shard is still exported", bool(sid),
+          str(sid))
+    check("and its file stays on the disk", os.path.exists(kept))
+    check("which is what `held_shards` then offers",
+          [h["shard_id"] for h in st.held_shards()] == ["SITE-0002", sid],
+          str([h["shard_id"] for h in st.held_shards()]))
+
+    # ── with a channel: it goes up, and then it goes away ──────────────
+    class FakeTg:
+        token, channel = "x", "@c"
+
+        def __init__(self):
+            self.sent = []
+
+        def send_document(self, path, caption, file_name=None):
+            self.sent.append((os.path.basename(path), os.path.getsize(path)))
+            return {"message_id": 7007}
+
+    obs = st.observer("caption", "test-model", "r1")
+    st.add_claims("REEL00", obs, [{"channel": "caption", "kind": "line",
+                                   "shot_idx": 0, "ordinal": 99,
+                                   "value": "one more row to publish"}])
+    eng._tg = FakeTg()
+    eng.logs.clear()
+    sid2 = eng._publish("published")
+    check("a shard with room and a channel is published", bool(sid2),
+          str(sid2))
+    check("the uploader was handed a real file",
+          len(eng._tg.sent) == 1 and eng._tg.sent[0][1] > 0,
+          str(eng._tg.sent))
+    check("and the local copy is gone once the row carries its message id",
+          not os.path.exists(os.path.join(shard_dir,
+                                          intake.shard_name(sid2))),
+          "135.8 MB of these used to sit here for the rest of the session")
+    row = [s for s in st.shards() if s["shard_id"] == sid2][0]
+    check("the row is what makes deleting it safe",
+          row["msg_id"] == 7007 and not row["path"], str(row))
+    check("and the two held files are untouched by any of it",
+          os.path.exists(held) and os.path.exists(kept),
+          "neither of them is in the channel")
+    st.conn.close()
+
+
 # ── the engine's side of it, on the source ───────────────────────────────
 def test_engine_wiring():
     src = open("vios/process/engine.py", encoding="utf-8").read()
@@ -463,8 +643,21 @@ def test_engine_wiring():
           and "self.since_publish = 1" in src,
           "otherwise the remainder waits for a video that may never come")
     check("the status panel counts held shards", '"held": sum(' in src)
+    check("and how much disk they are", '"held_mb": round(' in src)
+    check("a published shard's file is dropped after the watermark, not before",
+          src.find("store.checkpoint()\n\n            # Only now is the local")
+          < src.find("self._drop_shard_file(path, sid)"),
+          "the row is what makes the file redundant, so the row goes first")
+    check("the floor is checked before a 40 MB copy is written",
+          src.find("free = intake.free_mb(self.shard_dir)")
+          < src.find("budget_bytes=SHARD_BUDGET_BYTES"))
+    check("and it defers rather than discarding held evidence",
+          "Shard deferred" in src and "_discard" not in src.split(
+              "Shard deferred")[0].rsplit("def _publish", 1)[-1],
+          "no delete between the floor check and the deferral")
     ui = open("process_ui.html", encoding="utf-8").read()
     check("and the tab shows the count", "dHeld" in ui and "held locally" in ui)
+    check("with the megabytes beside it", "held_mb" in ui)
 
 
 def main():
@@ -480,6 +673,8 @@ def main():
     test_unbudgeted_is_unchanged()
     print("a held shard is findable, retryable and countable")
     test_held_shards()
+    print("a shard the channel has taken does not stay on the disk")
+    test_published_shard_is_not_kept()
     print("the engine's side of it")
     test_engine_wiring()
 
@@ -490,8 +685,9 @@ def main():
         print(f"FAILED: {len(FAILS)} — " + "; ".join(FAILS))
         return 1
     print("SHARD SIZE OK — a shard is cut before the channel refuses it, the "
-          "watermark advances only over what shipped, and a held file is "
-          "retried and counted instead of quietly dying with the session")
+          "watermark advances only over what shipped, a held file is retried "
+          "and counted instead of quietly dying with the session, and a "
+          "published one is deleted instead of holding the disk until it does")
     return 0
 
 

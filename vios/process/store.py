@@ -1838,11 +1838,36 @@ class Store:
         return out
 
     def mark_shard_sent(self, shard_id: str, msg_id: int) -> None:
-        """A held shard finally went. Clear the path; the channel has it now."""
+        """A held shard finally went. Clear the path; the channel has it now.
+
+        The *file* is the engine's to remove, and `_retry_held` does it on the
+        far side of this commit. Deliberately not from here: a crash between the
+        two should leave a redundant file for the next sweep to collect, not a
+        row that has forgotten where its only copy was.
+        """
         self.conn.execute(
             "UPDATE shard SET msg_id=?, path=NULL WHERE shard_id=?",
             (int(msg_id), shard_id))
         self.conn.commit()
+
+    def held_shard_bytes(self) -> tuple:
+        """How many shard files are still only on this disk, and how big.
+
+        Filesystem truth rather than the `bytes` column, because the one caller
+        is deciding about disk pressure and that column records what the export
+        produced, not what is still sitting there. Bounded by the number of held
+        rows, and only asked for when something is already wrong.
+        """
+        n = total = 0
+        for r in self.conn.execute(
+                "SELECT path FROM shard WHERE msg_id IS NULL "
+                "AND path IS NOT NULL"):
+            try:
+                total += os.path.getsize(r["path"])
+            except OSError:
+                continue
+            n += 1
+        return n, total
 
     def held_shard_failed(self, shard_id: str) -> int:
         """One more send attempt spent on a held shard. Returns the new count."""

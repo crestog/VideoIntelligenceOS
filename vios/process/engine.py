@@ -132,6 +132,12 @@ SHARD_BUDGET_BYTES = 40 * 1024 * 1024
 # the rest of a session costs the bandwidth the *next* shard needs. After this
 # many the row keeps its path and stays in the status panel's `held` count, which
 # is what makes the loss visible instead of silent.
+#
+# It also keeps its 40 MB. That is the deliberate half of the trade — the file is
+# the evidence — but it means a channel that is refusing everything accumulates
+# held bytes with no ceiling, so `_publish` checks the disk floor before writing
+# the next one and defers instead. `held_mb` in the status payload is the number
+# to watch: it is what the deferral will be about.
 HELD_SHARD_PER_TICK = 3
 HELD_SHARD_ATTEMPTS = 6
 
@@ -207,6 +213,19 @@ VRAM_HEADROOM_MB = 384
 # Working-directory cache. Proxy plus frames plus wav is 8–20 MB per reel, so
 # 12 GB holds roughly a thousand — a whole cohort's worth for most partitions.
 CACHE_BUDGET_MB = 12_000
+
+# Never let free space fall under this. Four places read it, and they are four
+# because each owns bytes the others cannot see: the startup check (a disk that
+# is already full before any work), `intake.evict` (working directories, the only
+# thing that grows per video), `_mark_stage_pending` (a held snapshot, which it
+# discards because the database can rebuild one) and `_publish` (which defers the
+# next shard rather than discarding anything, because a shard the watermark has
+# stepped over is the only copy of its rows).
+#
+# `shard_dir` was outside all of them until `_reclaim_shards` existed. It is not
+# a cache — nothing rebuilds a shard — so eviction never applied, and a published
+# file therefore lived as long as the session: 74 of them across the nine
+# sessions in this archive, 248.7 MB, every one already in the channel.
 DISK_FLOOR_MB = 4_000
 
 IDLE_POLL_SECONDS = 90
@@ -1014,11 +1033,22 @@ class ProcessEngine:
            block=True)
 
         # ── hardware ─────────────────────────────────────────────────────
+        # Before the disk is measured, give back what is provably redundant.
+        # Kaggle's working directory survives a kernel restart, so a resumed
+        # session inherits every shard file the run before it left behind — and
+        # until `_drop_shard_file` existed that was all of them, published or not.
+        back = self._reclaim_shards()
+        if back["removed"]:
+            self._log(f"Reclaimed {back['bytes'] / 1048576:.1f} MB from "
+                      f"{back['removed']} shard file(s) the channel already has")
         res = resources.probe(self.cache_dir)
         self.resources = res
         ok("Hardware", True, resources.describe(res))
         ok("Scratch disk", res["disk_free_mb"] > self.disk_floor_mb,
-           f"{res['disk_free_mb'] / 1024:.1f} GB free on {self.cache_dir}")
+           f"{res['disk_free_mb'] / 1024:.1f} GB free on {self.cache_dir}"
+           + (f", {back['bytes'] / 1048576:.1f} MB of it reclaimed from "
+              f"{back['removed']} published shard(s)" if back["removed"]
+              else ""))
 
         # ── selection ────────────────────────────────────────────────────
         sel = list(self.selected)
@@ -3212,6 +3242,12 @@ class ProcessEngine:
         comment at the advance — so the retry is the whole of the recovery, and
         `held_shards()` is what makes an unrecovered one visible.
 
+        A shard that *does* upload no longer stays on disk. It used to, for the
+        length of the session, because nothing here and nothing in `store` ever
+        unlinked it — see `_reclaim_shards`. And under `DISK_FLOOR_MB` this method
+        writes nothing at all: the rows are already durable in the evidence
+        database, so it defers rather than adding a copy there is no room for.
+
         Runs under `_pub_lock` from start to finish, so the read of the watermark,
         the export against it and the write that advances it are one operation
         even though three threads can reach this method. `_lock` is taken only
@@ -3242,6 +3278,54 @@ class ProcessEngine:
                     and hi_fvec <= lo_fvec and hi_fmet <= lo_fmet):
                 with self._lock:
                     self.since_publish = 0
+                return ""
+
+            # There are rows. Before writing a 40 MB copy of them, check there is
+            # room for one — and reclaim before deciding, because the likeliest
+            # thing occupying this directory is the engine's own published
+            # shards.
+            #
+            # A shard is a copy made for transport; the rows themselves are
+            # already durable in the evidence database, which is on this same
+            # disk and still has to grow. So under the floor the answer is to
+            # wait and say so: the watermark has not moved, the rows are still
+            # queued, and the next tick tries again.
+            #
+            # Deliberately the opposite trade from `_mark_stage_pending`, which
+            # *discards* held bytes under this same floor. A stage bundle is a
+            # snapshot that can be rebuilt from the database; a held shard is the
+            # only copy of rows the watermark has stepped over, so deleting one to
+            # make room is the single thing this engine must not do. The pressure
+            # is relieved by not making more, and the line below names how much of
+            # it is held evidence so an operator can tell which problem this is.
+            free = intake.free_mb(self.shard_dir)
+            if free and free < self.disk_floor_mb:
+                back = self._reclaim_shards(store)
+                if back["removed"]:
+                    self._log(f"Reclaimed {back['bytes'] / 1048576:.1f} MB "
+                              f"from {back['removed']} shard file(s) the "
+                              f"channel already has")
+                free = intake.free_mb(self.shard_dir)
+            if free and free < self.disk_floor_mb:
+                try:
+                    n_held, held_bytes = store.held_shard_bytes()
+                except Exception:               # noqa: BLE001
+                    n_held, held_bytes = 0, 0
+                with self._lock:
+                    # Reads as "just published" to `_publish_due`, so the retry
+                    # waits out PUBLISH_MIN_SECONDS rather than repeating this
+                    # line every ten seconds. `since_publish` is left alone: the
+                    # rows are still unpublished and the next attempt must know.
+                    self.last_publish = time.time()
+                self._log(
+                    f"Shard deferred — {free} MB free on {self.shard_dir} is "
+                    f"under the {self.disk_floor_mb} MB floor"
+                    + (f", with {n_held} held shard(s) "
+                       f"({held_bytes / 1048576:.1f} MB) the channel has not "
+                       f"taken" if n_held else "")
+                    + ". The rows stay in the evidence database and the "
+                      "watermark has not moved, so nothing is lost unless the "
+                      "session ends here.", "warn")
                 return ""
 
             # The quick early return is the common case for a cohort that
@@ -3307,6 +3391,16 @@ class ProcessEngine:
             store.set_meta("shard_lo_fmet", str(stats["hi_fmet"]))
             store.set_meta("shard_seq", str(seq))
             store.checkpoint()
+
+            # Only now is the local copy scratch: the row carries its message id
+            # and the four watermarks past it are committed. Same order and the
+            # same reason as `_finish_stage`. Without this line the file stayed in
+            # `shard_dir` for the rest of the session with nothing that would ever
+            # read it again — 30 of them, 135.8 MB, in the busiest session this
+            # archive holds, and no mechanism in the engine looks at this
+            # directory at all.
+            if msg_id:
+                self._drop_shard_file(path, sid)
 
             with self._lock:
                 self.since_publish = 0
@@ -3382,6 +3476,10 @@ class ProcessEngine:
                     path, caption, file_name=intake.shard_name(sid))
                 store.mark_shard_sent(sid, int(res.get("message_id") or 0))
                 sent += 1
+                # The row has let go of the path; this lets go of the bytes. They
+                # were kept only because the file was the sole copy of rows the
+                # watermark had already stepped over, and it is not any more.
+                self._drop_shard_file(path, sid)
                 self._log(f"Held shard {sid} went up on attempt {tries + 1} "
                           f"({size / 1024:.0f} KB) → message "
                           f"{res.get('message_id')}")
@@ -3396,6 +3494,67 @@ class ProcessEngine:
                           f"{HELD_SHARD_ATTEMPTS}): {type(exc).__name__}: "
                           f"{exc}", "warn")
         return sent
+
+    def _drop_shard_file(self, path: str, sid: str = "") -> int:
+        """Delete a shard file the channel has taken. Returns bytes freed.
+
+        Only ever called on the far side of the write that records the message
+        id — the same order `_finish_stage` uses, for the same reason. The row is
+        what makes the file redundant, so the row goes first; losing the process
+        in between costs a duplicate file that the next sweep collects, and doing
+        it the other way round costs the evidence.
+        """
+        try:
+            n = os.path.getsize(path)
+        except OSError:
+            return 0
+        try:
+            os.remove(path)
+        except OSError as exc:
+            self._log(f"Shard {sid or os.path.basename(path)} is in the channel "
+                      f"but its local copy could not be removed: {exc}", "warn")
+            return 0
+        return n
+
+    def _reclaim_shards(self, store: Store | None = None) -> dict:
+        """Delete every shard file whose row says the channel already has it.
+
+        Not a cache and not an optimisation: each of these is a second copy of
+        evidence that is in the channel *and* in the evidence database beside it,
+        and nothing in this engine will read one again. Until this existed
+        nothing deleted them at all. `mark_shard_sent` clears the `path` column
+        without touching the file, `_publish` never unlinked what it had just
+        uploaded, and `intake.evict` walks `cache_dir` for working *directories*
+        — so `shard_dir` sat outside every mechanism the engine has for disk
+        pressure, and a published shard was permanent for the length of the
+        session. Measured in this archive's own record: 74 shard files across
+        nine sessions, every one of them published, 248.7 MB in total, of which
+        135.8 MB was the single session that cut 30.
+
+        Matched by name against published rows rather than by looking for
+        anything shard-shaped, so a held shard, a stage bundle, a `.partNNN` and
+        whatever a later version writes into this directory are all untouchable
+        by construction. Kaggle's working directory outlives a kernel restart and
+        the evidence database sits beside these files, so a resumed session
+        inherits both the rows and the files; this is what reconciles them.
+        """
+        store = store or self.store
+        out = {"removed": 0, "bytes": 0}
+        try:
+            rows = store.shards()
+        except Exception:                       # noqa: BLE001
+            return out                          # pre-migration; nothing to match
+        for row in rows:
+            if not row.get("msg_id"):
+                continue
+            n = self._drop_shard_file(
+                os.path.join(self.shard_dir,
+                             intake.shard_name(row["shard_id"])),
+                row["shard_id"])
+            if n:
+                out["removed"] += 1
+                out["bytes"] += n
+        return out
 
     # ── the publisher thread ─────────────────────────────────────────────
     #
@@ -4255,6 +4414,14 @@ class ProcessEngine:
                        # is evidence about to be lost.
                        "held": sum(1 for s in shards
                                    if not s.get("msg_id") and s.get("path")),
+                       # …and how much disk that is. The count on its own says a
+                       # session will lose *something*; the bytes say whether it
+                       # is a rounding error or the run. Read off the recorded
+                       # column rather than the filesystem, because this endpoint
+                       # is polled and must not stat once per shard to answer.
+                       "held_mb": round(sum(s.get("bytes") or 0 for s in shards
+                                            if not s.get("msg_id")
+                                            and s.get("path")) / 1048576.0, 1),
                        "pending": pending},
             "stages": stages,
             # What the last reconcile spared. Sits next to `shards` because the

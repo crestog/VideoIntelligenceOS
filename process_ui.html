@@ -1058,8 +1058,14 @@ function render(s){
   // Held shards read red rather than grey. A held shard is not a slow shard: the
   // watermark has already moved past its rows, so nothing will export them
   // again, and the file goes when the session does.
-  const held = (s.shards || {}).held || 0;
+  //
+  // The size is on the label because the count alone does not say how much is at
+  // stake — one held shard is up to 40 MB of evidence, and a growing figure here
+  // is also what defers the next publish once the disk is under its floor.
+  const held = (s.shards || {}).held || 0, heldMb = (s.shards || {}).held_mb || 0;
   $('#dHeld').textContent = num(held);
+  $('#dHeld').nextElementSibling.textContent =
+    held && heldMb ? 'held locally · ' + heldMb + ' MB' : 'held locally';
   $('#dHeld').parentElement.className = held ? 'stat bad' : 'stat';
   renderReconcile(s);
   $('#dDisk').textContent = s.disk_free_mb ? (s.disk_free_mb/1024).toFixed(0) + ' GB' : '—';
