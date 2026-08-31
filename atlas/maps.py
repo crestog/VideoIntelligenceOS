@@ -73,6 +73,17 @@ from .tgchannel import log
 FIT_SAMPLE = int(os.environ.get("ATLAS_MAP_FIT_SAMPLE", "25000"))
 EXTEND_K = 12               # neighbours used to place an out-of-sample point
 
+# Below this many points, neither manifold method has anything to fit. UMAP's
+# spectral initialiser needs a connected k-NN graph and t-SNE needs perplexity
+# strictly under the sample count; a couple of dozen vectors satisfy neither.
+# What came back was a random layout wearing a projection's name, and the log
+# said so every single rebuild — `n_neighbors is larger than the dataset size;
+# truncating to N` followed by `Spectral initialisation failed! ... Falling back
+# to random initialisation!`. PCA has no floor, is deterministic, and at this
+# size is genuinely the better view, so a small archive gets an honest map.
+MANIFOLD_FLOOR = 32
+UMAP_NEIGHBOURS = 15
+
 # Cluster count scales with the archive: too few and everything is "video",
 # too many and the legend is unreadable. sqrt(n/2) is the standard rule of
 # thumb, clamped to a range a person can actually scan.
@@ -212,6 +223,12 @@ def _extend(np, fit_vecs, fit_xy, rest_vecs, k=EXTEND_K, block=2048):
 def _project(np, mat, want: str = "auto"):
     """(xy, method_name). Best available of UMAP → t-SNE → PCA."""
     n = len(mat)
+    # An explicit `method=umap` from the refit endpoint is a comparison the
+    # caller asked for, so it still runs (with clamped parameters below). It is
+    # only the automatic choice that declines to pretend.
+    if want == "auto" and n < MANIFOLD_FLOOR:
+        _set(detail=f"PCA over {n} vector(s) — too few to fit a manifold")
+        return _pca2(np, mat), "pca"
     fit_idx = None
     if n > FIT_SAMPLE:
         rng = np.random.default_rng(0)        # seeded: a rebuild is reproducible
@@ -222,8 +239,15 @@ def _project(np, mat, want: str = "auto"):
         try:
             import umap                                  # noqa: PLC0415
             _set(detail=f"UMAP over {len(sub)} vector(s)")
-            red = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.12,
-                            metric="cosine", random_state=0, verbose=False)
+            # Clamped rather than left at 15: UMAP truncates a too-large
+            # neighbourhood itself but warns on the way through, and the
+            # truncation is what disconnects the graph and kills the spectral
+            # init. Asking for a neighbourhood the data can supply is quieter
+            # and gives the initialiser something to work with.
+            neighbours = max(2, min(UMAP_NEIGHBOURS, len(sub) - 1))
+            red = umap.UMAP(n_components=2, n_neighbors=neighbours,
+                            min_dist=0.12, metric="cosine", random_state=0,
+                            verbose=False)
             xy_sub = red.fit_transform(sub).astype("float32")
             if fit_idx is None:
                 return xy_sub, "umap"
@@ -251,7 +275,11 @@ def _project(np, mat, want: str = "auto"):
         try:
             from sklearn.manifold import TSNE            # noqa: PLC0415
             _set(detail=f"t-SNE over {len(sub)} vector(s)")
+            # sklearn requires perplexity < n_samples and raises otherwise, so
+            # the floor of 5 is not safe on its own — on a handful of vectors
+            # t-SNE was the second thing to fail, not the fallback.
             per = max(5.0, min(40.0, len(sub) / 100.0))
+            per = min(per, max(2.0, len(sub) - 1.0))
             red = TSNE(n_components=2, perplexity=per, metric="cosine",
                        init="pca", random_state=0, n_iter=750)
             xy_sub = red.fit_transform(sub).astype("float32")
@@ -483,6 +511,12 @@ def _build(db_path: str, method: str = "auto") -> None:
 
         k = int(max(MIN_CLUSTERS,
                     min(MAX_CLUSTERS, round(math.sqrt(len(vecs) / 2.0)))))
+        # MIN_CLUSTERS is a readability floor, not a promise the data can keep:
+        # a four-passage archive asked MiniBatchKMeans for six groups, which
+        # raises, and the numpy fallback then seeded six centres from four
+        # points and labelled them arbitrarily. Never ask for more groups than
+        # there are things to group.
+        k = max(1, min(k, len(vecs)))
         _set(phase="clustering", detail=f"finding {k} group(s) of meaning")
         labels = _kmeans(np, xy, vecs, k)
         named = _label_clusters([r["text"] for r in picked], labels, k)
