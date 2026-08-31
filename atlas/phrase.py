@@ -80,6 +80,32 @@ PROSE = frozenset({
     "agreement", "contested", "language_uncertain",
 })
 
+# ── Narrated ──────────────────────────────────────────────────────────────
+# A sentence a model was asked for, or a screen's own words joined together.
+# These are prose, but not trusted with their own shape the way PROSE is: a
+# model asked for a description can answer `{}` or `none`, and that has to stay
+# refused. The one guard they are exempt from is `_leads_with_number`.
+#
+# Written for the failure that is coming rather than one that happened. This
+# archive holds ZERO rows of any kind below — the VLM passes named two model ids
+# that do not exist and produced no claims at all, so nothing here has ever been
+# refused. The moment those passes work, `_leads_with_number` starts refusing
+# `2 people at a table`, `3 seconds of silence, then the reveal`, `50% OFF ·
+# TODAY ONLY` — described scenes and on-screen text, refused by the predicate
+# written to refuse `24.08s average shot length`. A description that opens with a
+# count is the most ordinary thing a describer writes, and it is exactly the
+# evidence a person searches by.
+NARRATED = frozenset({
+    # Per-shot description (language.py:397-405).
+    "shot_description", "subject", "setting", "action",
+    # Narrative structure, one per video or one per beat (language.py:527-562,
+    # 961-985; cloud.py:755-777).
+    "premise", "hook", "turn", "payoff", "beat",
+    "why_it_works", "hook_why", "weakness", "critique", "audience",
+    # The screen's own words, joined (signal.py:992).
+    "hook_text",
+})
+
 # ── Written ───────────────────────────────────────────────────────────────
 # `{v}` is the measured value. The template's whole job is to put the question
 # into the passage beside the answer: `medium` is unsearchable, `medium shot` is
@@ -230,8 +256,15 @@ def written(kind, value, confidence=None):
     # `50% of cuts land on a beat` — six words, so length alone would send it
     # down the prose path and straight past the guard that exists to stop it.
     # Every kind that is not declared prose gets its shape checked first.
-    if (_is_structure(value) or _is_number(value) or _leads_with_number(value)
-            or is_absence(value)):
+    #
+    # `_leads_with_number` is the one predicate a NARRATED kind is excused from,
+    # and only that one. Structure, a bare number and an absence sentinel still
+    # refuse it, because those are what a model returns when it has nothing —
+    # whereas a leading digit is what a describer returns when it has something
+    # to count. Exempting the whole guard by adding these kinds to PROSE would
+    # have indexed `{}` verbatim.
+    if (_is_structure(value) or _is_number(value) or is_absence(value)
+            or (_leads_with_number(value) and kind not in NARRATED)):
         return None
 
     template = WRITTEN.get(kind)

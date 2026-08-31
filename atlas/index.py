@@ -1015,7 +1015,19 @@ def _collect(conn: sqlite3.Connection) -> dict:
         measured = bool(spec.get("kind"))
         as_labels = not measured and _label_column(conn, spec)
         n = 0
-        refused = 0
+        # Tallied per kind, not as a bare total. The total on its own was read as
+        # data loss and sent somebody looking for a defect: `claim.value → 4918
+        # row(s) as style, 5937 kept out of the text index` says a majority of
+        # the channel went missing. Measured against the archive that printed it,
+        # the 5937 is `freeze` 5334 — one distinct value across every frozen span
+        # of every reel — plus `palette` 494 JSON swatch arrays and 109 per-video
+        # readings that open with a digit. The ocr line's 73 are `text_region`
+        # rectangles, one per `text` claim, whose words that claim already
+        # indexes. Every one of them is a correct refusal and every one is still
+        # in `claim`, where the Data tab, the graph and the numeric filters read
+        # it. A refusal count with no kind beside it cannot be told apart from a
+        # defect, so this names the three biggest.
+        refused = {}
         while True:
             batch = cur.fetchmany(5000)
             if not batch:
@@ -1034,7 +1046,8 @@ def _collect(conn: sqlite3.Connection) -> dict:
                     measure = (row[4] or "").strip().lower()
                     form = phrase.written(row[4], raw, conf)
                     if form is None:
-                        refused += 1     # structure, a number, a bare guess
+                        # structure, a number, a bare guess
+                        refused[measure] = refused.get(measure, 0) + 1
                         continue
                     kind, text = form
                     if kind == "prose":
@@ -1052,7 +1065,9 @@ def _collect(conn: sqlite3.Connection) -> dict:
                     if text and phrase.is_absence(text):
                         # `no salient objects or text detected`. Indexed, it puts
                         # the words on the reels proven not to have the things.
-                        refused += 1
+                        # Keyed by the reason rather than by `measure`: this
+                        # branch has one, and the column is already in the line.
+                        refused["an absence"] = refused.get("an absence", 0) + 1
                         continue
                     text = clean_text(text)
                 if facts:
@@ -1078,8 +1093,11 @@ def _collect(conn: sqlite3.Connection) -> dict:
                     b["rows"].append((t0, t1, text))
                 n += 1
         if n or refused:
+            out = sum(refused.values())
+            top = ", ".join(f"{k or 'unnamed'} {c}" for k, c in
+                            sorted(refused.items(), key=lambda kv: -kv[1])[:3])
             log(f"  {spec['table']}.{spec['text']} → {n} row(s) as {source}"
-                + (f", {refused} kept out of the text index" if refused else ""))
+                + (f", {out} kept out of the text index ({top})" if out else ""))
     return buckets
 
 

@@ -91,6 +91,43 @@ eq(phrase.written("agreement", "95% agreement with the primary transcript"),
    ("prose", "95% agreement with the primary transcript"),
    "provenance is written as a sentence already")
 
+# ── A description may count things ───────────────────────────────────────
+# The reading guard above refuses a leading digit, which is right for `24.08s
+# average shot length` and wrong for a described scene: counting what is in the
+# frame is the most ordinary thing a describer writes, and it is exactly what a
+# person searches by. NARRATED kinds are excused from that one predicate.
+eq(phrase.written("subject", "2 people at a table", 0.7),
+   ("prose", "2 people at a table"), "a described scene may count what is in it")
+eq(phrase.written("shot_description", "3 seconds of silence, then the reveal", 0.75),
+   ("prose", "3 seconds of silence, then the reveal"), "so may a shot description")
+eq(phrase.written("hook_text", "50% OFF · TODAY ONLY"),
+   ("prose", "50% OFF · TODAY ONLY"), "and so may the screen's own words")
+eq(phrase.written("premise", "2 minutes to a better omelette", 0.8),
+   ("prose", "2 minutes to a better omelette"), "and a premise")
+
+# Excused from that predicate and no other. Structure, a bare number and an
+# absence sentinel are what a model returns when it has nothing to say, so they
+# stay refused under exactly these kinds — which is why NARRATED is its own set
+# and not more names in PROSE.
+eq(phrase.written("subject", "{}", 0.7), None, "an empty object is not a subject")
+eq(phrase.written("beat", "42", 0.65), None, "a bare number is not a beat")
+eq(phrase.written("setting", "none", 0.7), None, "a shrug is not a setting")
+eq(phrase.written("action", "no action detected", 0.7), None, "nor is a negation")
+
+# The exemption is by name, so a reading that happens to be long or wordy does
+# not acquire it: `asl` and `hook_cuts` above are still refused, and this is the
+# assertion that pins the two sets apart rather than trusting the ordering.
+yes(not (phrase.NARRATED & {"asl", "hook_cuts", "tempo", "cut_on_beat",
+                            "shot_count", "speech_rate"}),
+    "no reading kind is narrated")
+yes(not (phrase.NARRATED & phrase.REFUSED),
+    "and nothing narrated is refused outright")
+
+# Strictly additive: a narrated value that never needed the exemption takes the
+# same path it took before the set existed.
+eq(phrase.written("subject", "chef in kitchen", 0.7),
+   ("fact", "subject chef in kitchen"), "a short label is unchanged by NARRATED")
+
 # ── A guess below the floor is not a claim ───────────────────────────────
 eq(phrase.written("object", "bicycle", 0.0003), None,
    "a 0.03% object is a false answer, and a false answer beats no answer only "
