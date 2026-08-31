@@ -87,11 +87,23 @@ print("\n== the dense lane, on a host that refuses to load a model ==")
 # The matrix is injected rather than built, the way `_t_vsearch.py` installs its
 # resident index: that is the state the function actually reads, and building it
 # for real would need a working encoder — the one thing this host cannot have.
+#
+# It is `EMBED_DIM` wide, not the `np.eye(4)` it used to be. Four columns only
+# ever worked on a host that could not load a model, because such a host returns
+# from `_dense` before the matmul. Run the same file on a host where torch *does*
+# load and the encoder produced a 384-d query against a 4-wide matrix, which is
+# `ValueError: matmul: Input operand 1 has a mismatch in its core dimension 0
+# (size 384 is different from 4)` raised straight out of the handler — a 500 on
+# the one route the site is, found by running this test on the laptop rather than
+# on Kaggle. `_dense` now checks the width and falls back to lexical, and the
+# fixture is the right shape so this assertion means the same thing on both
+# kinds of host.
 import numpy as np
-from atlas import encoder as _enc, search as _search
+from atlas import config as _cfg, encoder as _enc, search as _search
 
+_DIM = int(_cfg.EMBED_DIM)
 with _search._VEC_LOCK:
-    _search._VECTORS = np.eye(4, dtype="float32")
+    _search._VECTORS = np.eye(4, _DIM, dtype="float32")
     _search._VEC_IDS = np.arange(4, dtype="int64")
 _enc._ENCODER, _enc._TRIED, _enc._ERROR = None, False, ""
 
@@ -103,6 +115,28 @@ try:
 except Exception as e:
     print(f"   RAISED  /atlas/api/search: {type(e).__name__}: {e}")
     bad.append(("/atlas/api/search?q=", "raised", f"{type(e).__name__}: {e}"[:120]))
+
+# A mismatched index is the other half of the same fault, and the one that
+# actually happened on Kaggle: the run rebuilt the dense index ~76 times, so a
+# file from an earlier encoder outliving the one now loaded is not hypothetical.
+# The route must answer lexically, not 500.
+with _search._VEC_LOCK:
+    _search._VECTORS = np.eye(4, max(2, _DIM - 1), dtype="float32")
+    _search._VEC_IDS = np.arange(4, dtype="int64")
+try:
+    r = c.get("/atlas/api/search", params={"q": "cooking pasta", "limit": 3})
+    print(f"   {r.status_code}  /atlas/api/search?q=... with a {_DIM - 1}d index")
+    if r.status_code >= 500:
+        bad.append(("/atlas/api/search mismatched dim", r.status_code,
+                    r.text[:160]))
+except Exception as e:
+    print(f"   RAISED  /atlas/api/search (mismatched dim): "
+          f"{type(e).__name__}: {e}")
+    bad.append(("/atlas/api/search mismatched dim", "raised",
+                f"{type(e).__name__}: {e}"[:120]))
+with _search._VEC_LOCK:
+    _search._VECTORS = np.eye(4, _DIM, dtype="float32")
+    _search._VEC_IDS = np.arange(4, dtype="int64")
 
 # And the loader itself, which needs its own reset: `get_encoder` sets `_TRIED`
 # *before* the import it is guarding, so the first caller to hit a broken host

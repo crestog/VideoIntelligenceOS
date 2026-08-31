@@ -114,6 +114,19 @@ def reload_vectors(expect: str = "") -> bool:
             log(f"vector/id length mismatch ({len(vecs)} vs {len(ids)}) — "
                 f"ignoring the dense index")
             return False
+        # The width has to match the encoder that will be asked to query it.
+        # `dim` comes from the index metadata, so a file written by a different
+        # model reshapes perfectly happily and only fails later, as
+        # `ValueError: matmul: Input operand 1 has a mismatch in its core
+        # dimension` raised straight out of the search handler — a 500 on the
+        # one route the whole site is. Refusing it here instead means
+        # `dense_ready()` reports false, the UI says `semantic —` honestly, and
+        # search runs lexically until the index is rebuilt with this encoder.
+        if dim != config.EMBED_DIM:
+            log(f"dense index ignored — its vectors are {dim}d but this "
+                f"encoder produces {config.EMBED_DIM}d; rebuild the index to "
+                f"use it")
+            return False
     except (OSError, ValueError) as e:
         log(f"could not load vectors — {type(e).__name__}: {e}")
         return False
@@ -327,6 +340,18 @@ def _dense(query: str, limit: int) -> list:
         return []
 
     # Both sides are unit length, so the dot product is the cosine.
+    # Checked rather than assumed: the loader above refuses a mismatched width,
+    # but the matrix can also be installed directly (the map and vsearch paths
+    # do it, and so do the tests), and the encoder can be replaced after a load.
+    # An unchecked `@` on disagreeing widths raises `ValueError: matmul: Input
+    # operand 1 has a mismatch in its core dimension` out of the HTTP handler,
+    # which is a 500 on the only route that matters. Lexical results are the
+    # right answer here for the same reason they are when no model will load.
+    if vecs.ndim != 2 or vecs.shape[1] != q.shape[0]:
+        log(f"dense search skipped — the resident index is "
+            f"{'x'.join(str(n) for n in vecs.shape)} but the query is "
+            f"{q.shape[0]}d; rebuild the index with this encoder")
+        return []
     sims = vecs @ q
     k = min(limit, len(sims))
     if k <= 0:
