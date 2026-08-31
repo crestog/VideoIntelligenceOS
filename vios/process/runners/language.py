@@ -143,49 +143,153 @@ def _shot_span(entry, allowed: set) -> tuple:
 # The shared vision-language model
 # ══════════════════════════════════════════════════════════════════════════
 
+# Every id below was checked to exist on the Hub before it was written here.
+# The one that used to be in the registry — `Qwen/Qwen3-VL-8B-Instruct-AWQ` —
+# never did, and could not: Qwen published AWQ for the 30B MoE and FP8 for the
+# 8B dense model, and no AWQ of the 8B at all. So `describe`, `narrate` and
+# `style-read` raised `OSError: ... is not a valid model identifier` on every
+# video of every session, and the whole visual, narrative and style side of the
+# database was empty while the run reported itself as finished. An id is not the
+# kind of thing to guess at, and the second entry of each pair is the official
+# full-precision repo — quantised on the way in — so a rename or a withdrawal
+# upstream costs a longer download rather than an empty channel.
+_MODEL_ALTERNATES = {
+    "unsloth/Qwen3-VL-8B-Instruct-bnb-4bit": ("Qwen/Qwen3-VL-8B-Instruct",),
+    "unsloth/Qwen3-4B-Instruct-2507-bnb-4bit": ("Qwen/Qwen3-4B-Instruct-2507",),
+}
+
+# Ids the Hub has already said it does not have, this process. A missing model
+# is permanent and global: no retry, no later video and no second card will make
+# an id nobody published resolve. Without this the engine paid a fresh round
+# trip to huggingface.co to be told the same thing once per video per card —
+# twenty times, in the session that prompted this — and each one read like a new
+# problem in the log. Remembering it costs a set and turns the second failure
+# onward into an instant one carrying the same sentence.
+_MISSING_MODELS: set = set()
+
+
+def _model_missing(exc: Exception) -> bool:
+    """True when the fault is "there is no such repo", not "it would not load".
+
+    Kept apart from every other load error because the two want opposite
+    handling: a model that OOMs may well load once another lane releases its
+    card, and a model that does not exist will not.
+    """
+    if type(exc).__name__ in ("RepositoryNotFoundError", "GatedRepoError"):
+        return True
+    text = str(exc)
+    return ("is not a valid model identifier" in text
+            or "Repository Not Found" in text
+            or ("404 Client Error" in text and "huggingface.co" in text))
+
+
+def _four_bit(compute_dtype):
+    """NF4, with the compute dtype this card actually has.
+
+    The pre-quantised repos carry their own `quantization_config` in
+    `config.json`, and unsloth's declares `bnb_4bit_compute_dtype: bfloat16`.
+    Inheriting that on a T4 is the exact bug ARCHITECTURE.md already documents:
+    Turing has no bf16 tensor cores, and bitsandbytes selects its 4-bit kernel
+    path off the compute dtype, so the load either errors or lands on an
+    emulated path several times slower than the fp16 it should have used.
+    Passing an explicit config overrides the file's, which is why this is built
+    even for a repo that is already quantised.
+    """
+    try:
+        from transformers import BitsAndBytesConfig  # noqa: PLC0415
+    except Exception:                                # noqa: BLE001
+        return None
+    try:
+        return BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype)
+    except Exception:                                # noqa: BLE001
+        return None
+
+
 def _vlm(job: Job) -> dict:
-    """Qwen3-VL 8B AWQ, cached under the weights key the three passes share.
+    """Qwen3-VL 8B in 4-bit NF4, cached under the weights key three passes share.
 
     Three components — describe, narrate, style-read — declare the same
     `weights`, so the cohort packer counted 6.2 GB once and the cache loads it
     once. Loading it per component would need 18.6 GB on a card that has 15.
 
-    The class chain exists because Qwen3-VL's transformers class name has moved
-    with the library version, and a Kaggle image is whatever it is on the day.
-    Failing over is cheaper than pinning transformers and discovering the pin
-    is wrong twelve hours into a session.
+    Two nested chains, and they fail over for different reasons. The class chain
+    exists because Qwen3-VL's transformers class name has moved with the library
+    version and a Kaggle image is whatever it is on the day. The id chain exists
+    because the registry's model id was wrong for an entire archive's worth of
+    sessions and nothing in the engine was in a position to notice — a load
+    fault is a per-video failure, so a configuration error arrived thirty times
+    wearing thirty different videos' names.
     """
     comp = job.component
     device, dtype = device_and_dtype(job.resources)
+    candidates = (comp.model, *_MODEL_ALTERNATES.get(comp.model, ()))
 
     def loader():
         import torch  # noqa: PLC0415
         import transformers  # noqa: PLC0415
         from transformers import AutoProcessor  # noqa: PLC0415
 
-        kwargs = {"torch_dtype": torch_dtype(dtype) if device == "cuda"
-                  else torch.float32, "trust_remote_code": True}
+        want = torch_dtype(dtype) if device == "cuda" else torch.float32
+        kwargs = {"torch_dtype": want, "trust_remote_code": True}
         if device == "cuda":
             kwargs["device_map"] = "auto"
-        last = None
-        for name in ("Qwen3VLForConditionalGeneration",
-                     "AutoModelForImageTextToText",
-                     "Qwen2_5_VLForConditionalGeneration",
-                     "AutoModelForVision2Seq", "AutoModelForCausalLM"):
-            cls = getattr(transformers, name, None)
-            if cls is None:
+            quant = _four_bit(want)
+            if quant is not None:
+                kwargs["quantization_config"] = quant
+
+        # Ordered oldest-first only in the sense that `AutoModelForVision2Seq`
+        # is deprecated for removal in transformers v5 and warns on every use;
+        # `AutoModelForImageTextToText` is the name that supersedes it, and sits
+        # ahead of it here so the warning is only reached on an image too old to
+        # have the replacement.
+        classes = ("Qwen3VLForConditionalGeneration",
+                   "AutoModelForImageTextToText",
+                   "Qwen2_5_VLForConditionalGeneration",
+                   "AutoModelForVision2Seq", "AutoModelForCausalLM")
+        tried, missing = [], []
+        for model_id in candidates:
+            if model_id in _MISSING_MODELS:
+                missing.append(f"{model_id} (already known absent)")
                 continue
-            try:
-                model = cls.from_pretrained(comp.model, **kwargs)
-                model.eval()
-                proc = AutoProcessor.from_pretrained(comp.model,
-                                                     trust_remote_code=True)
-                return {"model": model, "processor": proc, "device": device,
-                        "loaded_with": name}
-            except Exception as exc:      # noqa: BLE001 — try the next class
-                last = exc
-        raise RuntimeError(f"no transformers class could load {comp.model}: "
-                           f"{type(last).__name__}: {last}")
+            gone = False
+            for name in classes:
+                cls = getattr(transformers, name, None)
+                if cls is None:
+                    continue
+                try:
+                    model = cls.from_pretrained(model_id, **kwargs)
+                    model.eval()
+                    proc = AutoProcessor.from_pretrained(
+                        model_id, trust_remote_code=True)
+                    return {"model": model, "processor": proc, "device": device,
+                            "loaded_with": name, "model_id": model_id}
+                except Exception as exc:  # noqa: BLE001 — try the next class
+                    if _model_missing(exc):
+                        # No class will conjure a repo that is not there, so
+                        # stop walking them and move to the next id.
+                        _MISSING_MODELS.add(model_id)
+                        missing.append(f"{model_id} ({type(exc).__name__})")
+                        gone = True
+                        break
+                    tried.append(f"{model_id} via {name}: "
+                                 f"{type(exc).__name__}: {str(exc)[:160]}")
+            if gone:
+                continue
+
+        if missing and not tried:
+            # Every candidate came back "no such repo". That is a fault in this
+            # file, not on the machine, and saying so is the difference between
+            # an operator editing a model id and an operator buying a bigger GPU.
+            raise RuntimeError(
+                f"{comp.id}: no such model on the Hub — tried "
+                + "; ".join(missing)
+                + ". This is a configuration fault, not a hardware one: the id "
+                  "in vios/process/registry.py needs correcting.")
+        detail = "; ".join(tried + missing) or "no transformers class available"
+        raise RuntimeError(f"{comp.id}: could not load a VLM — {detail}")
 
     return job.cache.get(comp.load_key, loader)
 

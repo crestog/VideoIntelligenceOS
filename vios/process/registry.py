@@ -710,23 +710,33 @@ _PERCEPTION = [
 # and it is asked in shot indices.
 # ══════════════════════════════════════════════════════════════════════════
 
-_VLM = "qwen3-vl-8b-awq"
+_VLM = "qwen3-vl-8b-nf4"
+
+# Checked against the Hub, which the id this replaced never was. `describe`,
+# `narrate` and `style-read` all named `Qwen/Qwen3-VL-8B-Instruct-AWQ`, a repo
+# that does not exist and never did — Qwen shipped AWQ for the 30B MoE and FP8
+# for the 8B dense model, and FP8 needs Ada or Hopper, so on a Turing T4 neither
+# was ever the answer. 4-bit NF4 is: it is what `omni_models.py` already uses for
+# the Qwen2.5-VL oracle on this same hardware, and the runner overrides the
+# repo's declared bf16 compute dtype because a T4 has no bf16 path.
+_VLM_ID = "unsloth/Qwen3-VL-8B-Instruct-bnb-4bit"
 
 _LANGUAGE = [
     Component(
         id="describe", title="Describe shots", stage=STAGE_LANGUAGE, family="vlm",
         wave=WAVE_SPINE,
         channel="visual",
-        summary="Qwen3-VL 8B AWQ: what is physically present, shot by shot.",
+        summary="Qwen3-VL 8B (4-bit): what is physically present, shot by shot.",
         detail=(
             "Literal description only — objects, people, setting, action, text "
             "position. No interpretation, no intent, no timestamps. The model "
             "receives the keyframes of a bounded range of shots and answers "
             "about shot 3, not about 00:07, because it is not able to know what "
             "00:07 is and will invent it if asked."),
-        model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
-        device="gpu", vram_mb=6200, disk_mb=6000, seconds=18.0, ram_mb=3072,
-        needs=("keyframes", "shots"), requires=("transformers", "torch"),
+        model=_VLM_ID, weights=_VLM, quant="nf4",
+        device="gpu", vram_mb=6200, disk_mb=7400, seconds=18.0, ram_mb=3072,
+        needs=("keyframes", "shots"),
+        requires=("transformers", "torch", "bitsandbytes"),
         kinds=("shot_description", "subject", "setting", "action"),
         params={"max_shots_per_call": 6, "max_new_tokens": 320,
                 "temperature": 0.2},
@@ -743,14 +753,14 @@ _LANGUAGE = [
             "This is the pass whose output most directly serves script writing "
             "and pattern recognition, and it is deliberately last, because it "
             "reads everything the earlier passes produced."),
-        model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
+        model=_VLM_ID, weights=_VLM, quant="nf4",
         device="gpu", vram_mb=6200, disk_mb=0, seconds=20.0, ram_mb=3072,
         needs=("describe", "transcribe", "ocr", "loudness", "cuts"),
         # `describe` is the subject; the rest enrich the prompt. narrate carries
         # its own truthful guard — "nothing was said, written or captioned" —
         # so an OCR engine that could not start must not delete this pass.
         soft=("transcribe", "ocr", "loudness", "cuts"),
-        requires=("transformers", "torch"),
+        requires=("transformers", "torch", "bitsandbytes"),
         kinds=("hook", "beat", "turn", "payoff", "premise", "why_it_works",
                "weakness"),
         params={"max_new_tokens": 700, "temperature": 0.3},
@@ -765,13 +775,13 @@ _LANGUAGE = [
             "technique they add up to. Grounding the reading in measurements is "
             "what stops it becoming film-school vocabulary applied at random; "
             "every stylistic claim it makes has arithmetic sitting under it."),
-        model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
+        model=_VLM_ID, weights=_VLM, quant="nf4",
         device="gpu", vram_mb=6200, disk_mb=0, seconds=12.0, ram_mb=3072,
         needs=("describe", "colour", "motion", "cuts"),
         # The measurements are what ground the vocabulary, and the pass already
         # prints "not measured" for any of them that is absent.
         soft=("colour", "motion", "cuts"),
-        requires=("transformers", "torch"),
+        requires=("transformers", "torch", "bitsandbytes"),
         kinds=("technique", "lighting", "grade", "framing", "edit_style",
                "reference"),
     ),
@@ -794,21 +804,22 @@ _LANGUAGE = [
     Component(
         id="concepts", title="Concepts and entities", stage=STAGE_LANGUAGE,
         family="text", channel="concept",
-        summary="Qwen3 4B AWQ over the assembled text: entities, topics, techniques.",
+        summary="Qwen3 4B (4-bit) over the assembled text: entities, topics, techniques.",
         detail=(
             "Normalised concept names with the span of text that evidences "
             "each, which is what makes the knowledge graph traversable and its "
             "edges auditable. Only concepts that both this pass and the "
             "keyphrase extractor support become graph nodes; the rest are kept "
             "as claims but do not get to shape the structure."),
-        model="Qwen/Qwen3-4B-Instruct-AWQ", weights="qwen3-4b-awq", quant="awq",
+        model="unsloth/Qwen3-4B-Instruct-2507-bnb-4bit",
+        weights="qwen3-4b-nf4", quant="nf4",
         device="gpu", vram_mb=3400, disk_mb=3000, seconds=8.0,
         needs=("transcribe", "ocr", "caption", "keyphrase"),
         # Same three text sources, plus the statistical control it is scored
         # against. Without the control every concept simply lands unsupported,
         # which is a weaker claim rather than a missing one.
         soft=("transcribe", "ocr", "caption", "keyphrase"),
-        requires=("transformers", "torch"),
+        requires=("transformers", "torch", "bitsandbytes"),
         kinds=("entity", "topic", "technique", "claim_span", "unsupported"),
     ),
     Component(
@@ -1151,6 +1162,78 @@ def missing_dependencies(ids) -> dict:
         if gap:
             out[i] = gap
     return out
+
+
+def unresolvable_models(ids, timeout: float = 6.0) -> dict:
+    """Selected components whose model id the Hub says does not exist.
+
+    This function exists because of a specific and expensive failure. Three
+    passes named `Qwen/Qwen3-VL-8B-Instruct-AWQ`, which was never published, and
+    nothing checked. The engine's fault taxonomy has no room for "wrong id": a
+    load error is a per-video failure, so the run marked every video failed on
+    `describe`, `narrate` and `style-read`, retried each one, and finished with
+    an empty visual channel while reporting a completed sweep. A whole archive
+    was processed that way.
+
+    Asking the Hub costs one request per distinct id and happens once, before
+    anything loads. It reports rather than refuses, and network trouble is
+    explicitly not a verdict: an id that cannot be checked is left out of the
+    result, because a session on a machine with no outbound network and a warm
+    model cache is a legitimate thing that must still run.
+    """
+    seen, out = {}, {}
+    for cid in ids:
+        if cid in NOT_HUB_HOSTED:
+            continue
+        model = (BY_ID[cid].model or "").strip()
+        if not model or "/" not in model:      # local paths and bare names
+            continue
+        if model not in seen:
+            seen[model] = _hub_verdict(model, timeout)
+        if seen[model]:
+            out[cid] = f"{model} — {seen[model]}"
+    return out
+
+
+# Passes whose `model` field is attribution, not a Hub coordinate. Each one
+# fetches its weights from somewhere that is not huggingface.co, so asking the
+# Hub about them returns 404 for a model that is present and working — and a
+# preflight that cries wolf on three passes is worse than no preflight at all.
+#
+#   shots  — TransNetV2, a .pth pulled straight from the GitHub release
+#   ocr    — PP-OCRv5, downloaded by PaddleOCR from Paddle's own servers
+#   faces  — SCRFD/buffalo_l, downloaded by insightface from its model zoo
+#
+# Everything else here really does go through `from_pretrained`, including the
+# faster-whisper and pyannote passes, whose libraries fetch from the Hub even
+# though they are not transformers.
+NOT_HUB_HOSTED = frozenset({"shots", "ocr", "faces"})
+
+
+def _hub_verdict(model: str, timeout: float) -> str:
+    """"" if the repo is there or unknowable, else why it is not.
+
+    Only two answers count as absent: the Hub said 404, or it said the repo is
+    gated and this token cannot see it. Both are permanent for this session and
+    both are fixed by editing a line in this file or adding a secret. Everything
+    else — a timeout, a DNS failure, no `huggingface_hub` installed, an offline
+    flag — returns "", because being unable to ask is not the same as an answer.
+    """
+    try:
+        from huggingface_hub import model_info  # noqa: PLC0415
+        from huggingface_hub.utils import (       # noqa: PLC0415
+            GatedRepoError, RepositoryNotFoundError)
+    except Exception:                             # noqa: BLE001
+        return ""
+    try:
+        model_info(model, timeout=timeout)
+        return ""
+    except RepositoryNotFoundError:
+        return "no such repository on huggingface.co"
+    except GatedRepoError:
+        return "gated — needs an accepted licence and a token"
+    except Exception:                             # noqa: BLE001
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════

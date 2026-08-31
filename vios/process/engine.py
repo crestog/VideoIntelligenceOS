@@ -999,6 +999,25 @@ class ProcessEngine:
                      for mod, ids in absent.items()) if absent else
            "every selected pass can import what it needs")
 
+        # ── model ids ────────────────────────────────────────────────────
+        # One request per distinct id, before a single weight is fetched. The
+        # session this was added for spent its whole language stage failing on a
+        # model id nobody had published, once per video per card, because a load
+        # fault is a per-video failure and there was nowhere for "that id is
+        # wrong" to be said. Non-blocking on purpose: it cannot tell an id that
+        # is absent from one it merely could not reach, and a run with a warm
+        # cache and no network is a run that should still start.
+        try:
+            unresolved = registry.unresolvable_models(sel)
+        except Exception as exc:                               # noqa: BLE001
+            unresolved = {}
+            self._log(f"model id preflight skipped — {type(exc).__name__}: "
+                      f"{exc}", "warn")
+        ok("Model ids resolve", not unresolved,
+           "; ".join(f"{cid}: {why}" for cid, why in unresolved.items())
+           if unresolved else
+           "every selected pass names a model the Hub has")
+
         # ── telegram ─────────────────────────────────────────────────────
         if self._tg and self._tg.token:
             try:
