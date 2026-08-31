@@ -171,6 +171,63 @@ best = vsearch._resident_hits(space2, own, np, 1, "")
 eq((best[0][0], best[0][1]), ("near", 0), "a frame retrieves itself first")
 yes(best[0][2] > 0.999, "at a cosine of one")
 
+# ── One hit per moment ──────────────────────────────────────────────────────
+# Correct ranking and useful ranking are not the same list. Frames next to each
+# other in one reel are the same photograph, so the honest top twenty-four is
+# twenty-four views of one second. Measured on the live archive before this:
+# asking for twenty-four frames like a given frame returned twenty-four frames
+# from *one* reel spanning three to ten distinct seconds, and because the poster
+# cache is keyed per second, one file was served for ten of the tiles.
+#
+# `fps` is 30 here, so the 1.5 s default gap is 45 frames.
+FPS = {"a": 30.0, "b": 30.0}
+run = [("a", i, 0.9 - i * 0.0001) for i in range(200)]
+
+eq(len({i for _k, i, _s in run}), 200, "the fixture is one unbroken run")
+kept = vsearch._spread(run, FPS, 24)
+eq(len(kept), 5, "a 200-frame run at 30 fps yields five moments, not two dozen")
+eq([i for _k, i, _s in kept], [0, 45, 90, 135, 180],
+   "each kept frame is a gap clear of the last one kept")
+yes(all(a[2] >= b[2] for a, b in zip(kept, kept[1:])),
+    "and they stay in score order, so the page is still ranked")
+
+# Greedy from the top means the frame kept for a moment is that moment's best,
+# never a worse neighbour that happened to come first by index.
+humped = [("a", 60, 0.99), ("a", 61, 0.98), ("a", 62, 0.97)]
+eq(vsearch._spread(humped, FPS, 24), [("a", 60, 0.99)],
+   "three views of one instant collapse to the best of them")
+
+# The per-reel cap is what stops one reel owning the page even when its moments
+# are genuinely distinct — the same principle as `_coarse`, one level down.
+wide = [("a", i * 100, 0.9 - i * 0.01) for i in range(20)]
+eq(len(vsearch._spread(wide, FPS, 24)), 6,
+   "one reel contributes at most its share, however many moments it has")
+eq(len(vsearch._spread(wide, FPS, 24, per_video=0)), 20,
+   "and the cap can be lifted")
+
+# Two reels fill the page independently: a gap is a fact about one reel's own
+# timeline, so identical frame indices in different reels are different moments.
+mixed = []
+for i in range(200):
+    mixed.append(("a", i, 0.9 - i * 0.0001))
+    mixed.append(("b", i, 0.8 - i * 0.0001))
+both = vsearch._spread(mixed, FPS, 24)
+eq(sorted({k for k, _i, _s in both}), ["a", "b"], "both reels are represented")
+eq(len(both), 10, "five moments each, the cap not yet reached")
+
+# A reel with no frame rate on record still gets spread, on the assumed rate.
+# `_fps` refuses to guess 30 for a *timestamp* because a wrong `t` seeks the
+# player to the wrong moment; a wrong gap only spaces results differently.
+nofps = vsearch._spread(run, {}, 24)
+eq([i for _k, i, _s in nofps], [0, 45, 90, 135, 180],
+   "an unknown frame rate falls back to the assumed one rather than giving up")
+
+# Turning both rules off must return the ranking untouched, so that a caller
+# wanting raw frame order — a diagnostic, a test — can still get it.
+eq(vsearch._spread(run, FPS, 7, gap_s=0, per_video=0), run[:7],
+   "with the spread disabled the list passes straight through")
+eq(vsearch._spread([], FPS, 24), [], "an empty ranking spreads to nothing")
+
 with vsearch._LOCK:
     for s in ("t", "t2", "t3"):
         vsearch._RESIDENT.pop(s, None)

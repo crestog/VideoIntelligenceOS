@@ -80,6 +80,38 @@ _ENC_ERROR = ""
 
 _ITEMSIZE = {"f16": 2, "f32": 4}
 
+# How far apart two hits from one reel must sit, and how many one reel may own.
+#
+# Frames are extracted at the reel's own rate, so consecutive indices are the
+# same instant photographed twice. Ranking them honestly puts them side by side:
+# asking this archive for twenty-four frames like a given frame returned
+# twenty-four frames from *one* reel spanning three to ten distinct seconds —
+# the same picture repeated, because the poster cache is keyed per second and
+# literally served one file for ten of them.
+#
+# 1.5 s is chosen against the frame rate rather than against taste: at 30 fps it
+# is a 45-frame separation, wide enough that a hand has moved and a cut has
+# landed, narrow enough that a fast montage still contributes several moments.
+#
+# Shot boundaries were the obvious alternative and are not usable here. The
+# `shot` table covers all thirty reels but wildly unevenly — one reel is a single
+# shot spanning 0-73 s, so "one hit per shot" would return one frame for the
+# longest reel in the archive while giving a 41-shot reel forty-one.
+_SPREAD_S = float(os.environ.get("ATLAS_VSEARCH_SPREAD_S", "1.5"))
+_PER_VIDEO = int(os.environ.get("ATLAS_VSEARCH_PER_VIDEO", "6"))
+
+# Used only to convert `_SPREAD_S` into a frame gap for a reel whose `fps` is
+# unknown. `_fps` deliberately refuses to guess 30 for a *timestamp*, because a
+# wrong `t` seeks the player to the wrong moment. A wrong gap merely spaces the
+# results slightly differently, so a guess is affordable here and nowhere else.
+_SPREAD_FPS = 30.0
+
+# Candidates ranked before spreading. The spread discards near-duplicates, so it
+# needs more than `limit` to choose from; when it still comes up short the pool
+# widens once rather than returning a thin page.
+_POOL = 64
+_POOL_MIN = 4096
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # PATHS
@@ -628,8 +660,46 @@ def frame_for_time(conn, video_key: str, seconds: float):
     return int(round(max(float(seconds), 0.0) * fps)) if fps else None
 
 
-def _shape(conn, space: str, hits: list) -> list:
-    fps = _fps(conn, [h[0] for h in hits])
+def _spread(hits: list, fps: dict, limit: int,
+            gap_s: float = None, per_video: int = None) -> list:
+    """One hit per moment. Takes ranked `[(key, idx, score)]`, returns a subset.
+
+    Ranking by score alone is correct and unreadable. Frames next to each other
+    in one reel are the same photograph, so the honest top twenty-four is
+    twenty-four views of one second, and the interface shows the user a wall of
+    one answer — the failure the archive's own rule names: one answer per card.
+
+    Greedy from the top, so the best frame of any moment is the one kept and no
+    hit is ever replaced by a worse neighbour. A frame is dropped only when the
+    same reel already holds a hit within `gap_s` seconds of it, or when that reel
+    has already filled its share of the page.
+
+    The gap is per reel, because it is stated in seconds and frame indices are
+    not. `any()` runs over at most `per_video` accepted indices — six by default
+    — so this costs nothing next to the matmul that produced the scores.
+    """
+    gap_s = _SPREAD_S if gap_s is None else float(gap_s)
+    cap = _PER_VIDEO if per_video is None else int(per_video)
+    if gap_s <= 0 and cap <= 0:
+        return hits[:limit]
+    kept: list = []
+    taken: dict = {}
+    for key, idx, score in hits:
+        acc = taken.setdefault(key, [])
+        if cap > 0 and len(acc) >= cap:
+            continue
+        gap = max(1, int(round(gap_s * (fps.get(key) or _SPREAD_FPS))))
+        if any(abs(idx - a) < gap for a in acc):
+            continue
+        acc.append(idx)
+        kept.append((key, idx, score))
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def _shape(conn, space: str, hits: list, fps: dict = None) -> list:
+    fps = _fps(conn, [h[0] for h in hits]) if fps is None else fps
     out = []
     for key, idx, score in hits:
         f = fps.get(key)
@@ -652,6 +722,9 @@ def _resident_hits(space: str, q, np, limit: int, exclude_key: str):
     twenty-three took a query from 110 ms to 700 ms on this archive, and every
     one of those milliseconds re-read RAM-resident data. So an unstrided index
     answers from the matrix, and `_exact` keeps the job it was written for.
+
+    `limit` here is a *candidate* count, not a page size. The caller spreads the
+    result to one hit per moment and so needs more rows than it will show.
 
     Returns `None` — not `[]` — when this path does not apply, so that "the
     index is strided" stays distinguishable from "nothing matched".
@@ -695,20 +768,35 @@ def search_vector(conn: sqlite3.Connection, q, space: str,
     if n == 0:
         return {"hits": [], "reason": "the query vector is empty"}
     q = q / n
+    limit = max(int(limit), 1)
 
-    hits = _resident_hits(space, q, np, limit, exclude_key)
-    if hits is not None:
+    with _LOCK:
+        res = _RESIDENT.get(space) or {}
+    # `ids` is an ndarray, so `or ()` would ask it for a truth value and raise.
+    # `videos` is a plain list and is read that way below.
+    ids = res.get("ids")
+    total = 0 if ids is None else len(ids)
+    pool = min(total, max(limit * _POOL, _POOL_MIN)) or limit
+
+    cands = _resident_hits(space, q, np, pool, exclude_key)
+    if cands is not None:
         # Every reel in the index was compared frame by frame, so the count
         # reported is the truth and not the size of a shortlist.
-        with _LOCK:
-            res = _RESIDENT.get(space) or {}
         seen = len(res.get("videos") or ())
         if exclude_key and exclude_key in (res.get("videos") or ()):
             seen -= 1
+        fps = _fps(conn, [h[0] for h in cands])
+        hits = _spread(cands, fps, limit)
+        if len(hits) < limit and pool < total:
+            # The pool was all one shot. Widening is cheaper than showing a thin
+            # page, and it happens at most once.
+            cands = _resident_hits(space, q, np, total, exclude_key) or cands
+            fps = _fps(conn, [h[0] for h in cands])
+            hits = _spread(cands, fps, limit)
         if not hits:
             return {"hits": [], "space": space, "searched_videos": seen,
                     "reason": "nothing in this space resembles it"}
-        return {"hits": _shape(conn, space, hits), "space": space,
+        return {"hits": _shape(conn, space, hits, fps), "space": space,
                 "searched_videos": seen}
 
     shortlist = [k for k, _s in _coarse(space, q, np,
@@ -716,9 +804,12 @@ def search_vector(conn: sqlite3.Connection, q, space: str,
                  if k != exclude_key]
     if not shortlist:
         return {"hits": [], "reason": "nothing in this space resembles it"}
-    hits = [h for h in _exact(conn, space, q, np, shortlist, limit * 2)
-            if h[0] != exclude_key][:limit]
-    return {"hits": _shape(conn, space, hits), "space": space,
+    cands = [h for h in _exact(conn, space, q, np, shortlist,
+                               max(limit * _POOL, _POOL_MIN))
+             if h[0] != exclude_key]
+    fps = _fps(conn, [h[0] for h in cands])
+    hits = _spread(cands, fps, limit)
+    return {"hits": _shape(conn, space, hits, fps), "space": space,
             "searched_videos": len(shortlist)}
 
 
