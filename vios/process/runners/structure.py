@@ -17,7 +17,7 @@ import os
 
 from .. import frames as frames_module
 from .. import media
-from .base import Emission, Job, SkipPass
+from .base import Emission, Job, PassUnavailable, SkipPass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -67,7 +67,7 @@ def artifacts(job: Job) -> Emission:
     the proxy is what the site plays.
     """
     if not media.have_ffmpeg():
-        raise SkipPass("ffmpeg is not on PATH")
+        raise PassUnavailable("ffmpeg is not on PATH")
     meta = {k: job.video.get(k) for k in
             ("duration", "width", "height", "fps")}
     meta["has_audio"] = bool(job.video.get("has_audio"))

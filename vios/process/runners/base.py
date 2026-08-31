@@ -63,6 +63,42 @@ class SkipPass(Exception):
     """
 
 
+class PassUnavailable(SkipPass):
+    """The pass could not start here. Nothing about the video said no.
+
+    The distinction from `SkipPass` is a lifetime, and it is measured. A skip is
+    terminal by design — `coverage.TERMINAL` includes `skipped`, and `claim`,
+    `candidates`, `revive_failed` and `reconcile` all refuse to look at such a
+    row again — which is right for "this reel has no audio track", because that
+    will still be true next session. It is wrong for "paddleocr is not
+    installed", because that is a fact about the machine, and the next session
+    clones a different one.
+
+    What that cost: the OCR pass raised `SkipPass("paddleocr is not
+    installed")` for the whole archive in the 8–16 August sweeps, because
+    `paddlepaddle` is deliberately not in requirements.txt. The EasyOCR
+    fallback landed on 17 August and works — but by then twenty-eight of thirty
+    coverage rows were terminal, so it could only ever reach the two that were
+    still claimable. Those two are exactly the two videos in the archive that
+    have OCR evidence today. One string, chosen once, retired an entire
+    evidence channel with no way back: the Process tab's Requeue button posts
+    `state:'failed'` (process_ui.html:1451), so there is not even a manual
+    route to a skipped row.
+
+    Raised instead, this reaches `cov.fail`, which is the mechanism that was
+    already built for exactly this — three attempts spaced by `RETRY_BACKOFF`,
+    then up to six revivals four hours apart, and `revive_failed`'s own
+    docstring names the case: "a package that was missing until the next
+    session installed it". A permanently broken environment therefore costs 21
+    cheap load attempts per video and then stops, instead of one skip that
+    costs the channel.
+
+    The rule for choosing: if re-running this exact video on a *different*
+    machine, with a different key, or after a `pip install` could succeed, it is
+    unavailable, not declined.
+    """
+
+
 class DeferPass(Exception):
     """Not now — but nothing is wrong, and no attempt should be spent.
 

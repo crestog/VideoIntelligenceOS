@@ -31,7 +31,7 @@ import os
 import re
 
 from .. import media
-from .base import Emission, Job, SkipPass
+from .base import Emission, Job, PassUnavailable, SkipPass
 
 
 def _np():
@@ -749,7 +749,7 @@ def music(job: Job) -> Emission:
     try:
         import librosa  # noqa: PLC0415
     except ImportError:
-        raise SkipPass("librosa is not installed") from None
+        raise PassUnavailable("librosa is not installed") from None
 
     y, sr = librosa.load(wav_path, sr=22050, mono=True)
     if len(y) < sr:
@@ -843,8 +843,9 @@ def tag(job: Job) -> Emission:
     from .vision import label_matrix  # noqa: PLC0415 — needs the text tower
     matrix, names = label_matrix(job, LABELS)
     if matrix is None:
-        raise SkipPass("the visual model is not loaded, so labels cannot be "
-                       "embedded")
+        raise PassUnavailable(
+            "the visual model could not be loaded, so labels cannot be "
+            "embedded")
 
     top_k = int(job.params.get("top_k", 12))
     floor = float(job.params.get("min_similarity", 0.22))

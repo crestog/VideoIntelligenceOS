@@ -496,7 +496,8 @@ details.step .in{padding:15px 16px 18px}
           <div class="stat"><div class="n" id="kPasses">0</div><div class="k">passes</div></div>
           <div class="stat good"><div class="n" id="kClaims">0</div><div class="k">claims</div></div>
           <div class="stat concept"><div class="n" id="kVectors">0</div><div class="k">vectors</div></div>
-          <div class="stat warn"><div class="n" id="kSkipped">0</div><div class="k">skipped</div></div>
+          <div class="stat warn"><div class="n" id="kSkipped">0</div><div class="k">declined</div></div>
+          <div class="stat warn"><div class="n" id="kUnavail">0</div><div class="k">could not start</div></div>
           <div class="stat bad"><div class="n" id="kFailed">0</div><div class="k">failed</div></div>
           <div class="stat"><div class="n" id="kShards">0</div><div class="k">shards</div></div>
           <div class="stat"><div class="n" id="kUptime">—</div><div class="k">uptime</div></div>
@@ -1035,6 +1036,11 @@ function render(s){
   $('#kClaims').textContent = num(ses.claims);
   $('#kVectors').textContent = num(ses.vectors);
   $('#kSkipped').textContent = num(ses.skipped);
+  // "could not start" is not "failed" and not "declined": the pass never ran
+  // because a package, a model or a key was missing. It is on the retry ladder,
+  // so counting it under either of the neighbours would say something untrue
+  // about the archive — a declined video is finished, and this one is not.
+  $('#kUnavail').textContent = num(ses.unavailable);
   $('#kFailed').textContent = num(ses.failed);
   $('#kShards').textContent = num(ses.shards);
   $('#kUptime').textContent = s.uptime ? human(s.uptime) : '—';

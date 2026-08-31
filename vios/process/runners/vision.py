@@ -38,7 +38,8 @@ import hashlib
 import math
 
 from .. import registry
-from .base import (Emission, Job, SkipPass, cuda_ordinal, device_and_dtype,
+from .base import (Emission, Job, PassUnavailable, SkipPass, cuda_ordinal,
+                   device_and_dtype,
                    no_flash_attn, torch_dtype)
 
 
@@ -188,7 +189,7 @@ def visual_embed(job: Job) -> Emission:
         import torch  # noqa: PLC0415  (imported for the clear skip message)
         from PIL import Image  # noqa: PLC0415,F401
     except ImportError:
-        raise SkipPass("torch/Pillow are not installed") from None
+        raise PassUnavailable("torch/Pillow are not installed") from None
 
     bundle = _siglip(job)
     idxs, times, matrix = _embed_frames(job, bundle, "siglip2")
@@ -228,7 +229,7 @@ def clip_embed(job: Job) -> Emission:
         from PIL import Image  # noqa: PLC0415,F401
         from transformers import CLIPModel, CLIPProcessor  # noqa: PLC0415
     except ImportError:
-        raise SkipPass("transformers/torch/Pillow are not installed") from None
+        raise PassUnavailable("transformers/torch/Pillow are not installed") from None
 
     device, dtype = device_and_dtype(job.resources)
 
@@ -259,9 +260,11 @@ def label_matrix(job: Job, labels) -> tuple:
     """Embed a label vocabulary once, and cache the matrix for the cohort.
 
     Returns `(matrix, names)` or `(None, names)` when the tower cannot be
-    loaded — the tagger treats that as a skip rather than an error, because a
-    session that cannot reach Hugging Face should still produce a database from
-    everything else.
+    loaded — the tagger raises `PassUnavailable` on that, so a session that
+    cannot reach Hugging Face still produces a database from everything else and
+    the rows come back on the retry ladder once it can. It used to raise a plain
+    skip, which is terminal, and a terminal row for "the download failed" is a
+    label channel lost to one bad network.
 
     SigLIP's processor needs `padding="max_length"`; with ordinary padding the
     text tower silently produces degraded embeddings, and the symptom is not an
@@ -655,9 +658,10 @@ def ocr(job: Job) -> Emission:
     bundle = job.cache.get(job.component.load_key, loader)
     engines, which = bundle["engines"], bundle["which"]
     if not engines:
-        raise SkipPass("no OCR engine could be initialised: " +
-                       "; ".join(f"{k} → {v}"
-                                 for k, v in bundle["why"].items())[:400])
+        raise PassUnavailable(
+            "no OCR engine could be initialised: " +
+            "; ".join(f"{k} → {v}"
+                      for k, v in bundle["why"].items())[:400])
 
     em = Emission()
     readings: list = []              # (frame_idx, frame_t, canonical text)
@@ -784,7 +788,7 @@ def ocr_alt(job: Job) -> Emission:
         from transformers import (AutoModelForCausalLM,  # noqa: PLC0415
                                   AutoProcessor)
     except ImportError:
-        raise SkipPass("transformers/torch are not installed") from None
+        raise PassUnavailable("transformers/torch are not installed") from None
 
     device, dtype = device_and_dtype(job.resources)
     revision = str(job.params.get("hf_revision") or "").strip()
@@ -853,8 +857,9 @@ def ocr_alt(job: Job) -> Emission:
     try:
         bundle = job.cache.get(job.component.load_key, loader)
     except Exception as exc:
-        raise SkipPass(f"Florence-2 could not be loaded: "
-                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
+        raise PassUnavailable(
+            f"Florence-2 could not be loaded: "
+            f"{type(exc).__name__}: {str(exc)[:200]}") from None
     model, proc = bundle["model"], bundle["processor"]
     job.note(f"Florence-2 loaded with attention '{bundle.get('how')}'"
              + (", flash-attn stripped from the import check"
@@ -951,7 +956,7 @@ def detect(job: Job) -> Emission:
     try:
         model = job.cache.get(job.component.load_key, loader)
     except ImportError:
-        raise SkipPass("ultralytics is not installed") from None
+        raise PassUnavailable("ultralytics is not installed") from None
 
     em = Emission()
     idxs: list = []
@@ -1065,10 +1070,11 @@ def faces(job: Job) -> Emission:
     try:
         app = job.cache.get(job.component.load_key, loader)
     except ImportError:
-        raise SkipPass("insightface is not installed") from None
+        raise PassUnavailable("insightface is not installed") from None
     except Exception as exc:
-        raise SkipPass(f"insightface could not start: "
-                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
+        raise PassUnavailable(
+            f"insightface could not start: "
+            f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     em = Emission()
     tracks: list = []
@@ -1171,7 +1177,7 @@ def depth(job: Job) -> Emission:
         from transformers import (AutoImageProcessor,  # noqa: PLC0415
                                   AutoModelForDepthEstimation)
     except ImportError:
-        raise SkipPass("transformers/torch are not installed") from None
+        raise PassUnavailable("transformers/torch are not installed") from None
 
     device, dtype = device_and_dtype(job.resources)
 

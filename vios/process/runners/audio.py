@@ -24,7 +24,8 @@ import os
 import re
 
 from .. import media
-from .base import Emission, Job, SkipPass, device_and_dtype
+from .base import (Emission, Job, PassUnavailable, SkipPass,
+                   device_and_dtype)
 
 # Below this the language head is guessing. The transcript is still written —
 # it is often right — but it carries a flag, and the engine tab can list every
@@ -79,7 +80,7 @@ def _run_whisper(job: Job, *, alt: bool) -> Emission:
     try:
         model = _whisper(job)
     except ImportError:
-        raise SkipPass("faster-whisper is not installed") from None
+        raise PassUnavailable("faster-whisper is not installed") from None
 
     p = job.component.params
     job.heartbeat("decoding")
@@ -209,9 +210,10 @@ def diarize(job: Job) -> Emission:
     wav_path = job.artifact("audio.wav")
     token = _hf_token(job)
     if not token:
-        raise SkipPass("no Hugging Face token — store it in Kaggle Secrets as "
-                       "VIOS_HF_TOKEN (pyannote's weights are gated), then "
-                       "restart so the launcher bridges it into HF_TOKEN")
+        raise PassUnavailable(
+            "no Hugging Face token — store it in Kaggle Secrets as "
+            "VIOS_HF_TOKEN (pyannote's weights are gated), then "
+            "restart so the launcher bridges it into HF_TOKEN")
 
     def loader():
         import torch  # noqa: PLC0415
@@ -225,7 +227,7 @@ def diarize(job: Job) -> Emission:
     try:
         pipe = job.cache.get(job.component.load_key, loader)
     except ImportError:
-        raise SkipPass("pyannote.audio is not installed") from None
+        raise PassUnavailable("pyannote.audio is not installed") from None
 
     job.heartbeat("diarizing")
     annotation = pipe(wav_path)
@@ -326,7 +328,7 @@ def audio_tag(job: Job) -> Emission:
         import torch  # noqa: PLC0415
         from transformers import ClapModel, ClapProcessor  # noqa: PLC0415
     except ImportError:
-        raise SkipPass("transformers/torch are not installed") from None
+        raise PassUnavailable("transformers/torch are not installed") from None
 
     # CLAP is trained at 48 kHz and the pipeline's working wav is 16 kHz mono.
     # Upsampling 16→48 invents no detail but does put the spectrum where the

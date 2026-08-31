@@ -57,7 +57,8 @@ from .. import creds as _creds
 from .coverage import Coverage, worker_id
 from .runners import get as get_runner
 from .runners import missing as missing_runners
-from .runners.base import DeferPass, Job, ModelCache, SkipPass
+from .runners.base import (DeferPass, Job, ModelCache, PassUnavailable,
+                           SkipPass)
 from .store import Store
 from .store import observer_id as store_observer_id
 
@@ -189,6 +190,15 @@ IDLE_POLL_SECONDS = 90
 # database restored onto a machine that *can* run the pass starts it the same
 # working day rather than a month later.
 ELSEWHERE_SECONDS = 6 * 3600
+
+# The `meta` key that records that this database has already had its
+# environment-fault declines handed back. One repair per database, not one per
+# boot: the rows it fixes were written by a build in which a missing package and
+# a missing audio track were the same outcome, and after `PassUnavailable` the
+# engine stops creating them. Keyed by name and version so a future repair of a
+# different shape gets its own key instead of silently inheriting this one's
+# "already done".
+RECLAIM_MARKER = "reclaimed-unavailable-skips:1"
 
 # How recently the channel must have been scanned for the sweep to trust the
 # scan and not repeat it. The boot restore and `restore_on_start` do the same
@@ -496,8 +506,8 @@ class ProcessEngine:
         self.cohorts: list = []
         self.cohort_index = -1
         self.session = {"videos": 0, "passes": 0, "claims": 0, "vectors": 0,
-                        "skipped": 0, "failed": 0, "deferred": 0,
-                        "elsewhere": 0,
+                        "skipped": 0, "unavailable": 0, "failed": 0,
+                        "deferred": 0, "elsewhere": 0,
                         "seconds": 0.0, "downloaded": 0, "shards": 0}
         self.last_publish: float | None = None
         self.since_publish = 0
@@ -1138,9 +1148,9 @@ class ProcessEngine:
             self.message = "Starting."
             self.started_at = time.time()
             self.session = {"videos": 0, "passes": 0, "claims": 0,
-                            "vectors": 0, "skipped": 0, "failed": 0,
-                            "deferred": 0, "elsewhere": 0, "seconds": 0.0,
-                            "downloaded": 0, "shards": 0}
+                            "vectors": 0, "skipped": 0, "unavailable": 0,
+                            "failed": 0, "deferred": 0, "elsewhere": 0,
+                            "seconds": 0.0, "downloaded": 0, "shards": 0}
             self._elsewhere_logged = set()
             self._exit_flushed = False
             self._thread = threading.Thread(target=self._run, daemon=True,
@@ -1363,6 +1373,38 @@ class ProcessEngine:
             if revived["revived"]:
                 self._log(f"Auto-revived {revived['revived']} failed rows "
                           f"(exhausted: {revived['exhausted']})")
+
+            # Rows an earlier build declined for something the video never said.
+            # Once per database, because a skip is terminal on purpose and this
+            # does not change that rule — it repairs the rows written before
+            # `PassUnavailable` existed, when a missing backend and an absent
+            # audio track went to the same place. The marker lives in `meta`
+            # rather than in a config flag so a resumed session, a second worker
+            # and a fresh clone all agree it has already happened; the Kaggle
+            # cell clones from scratch with nobody watching, and the Process
+            # tab's Requeue button posts `state:'failed'` (process_ui.html:1451),
+            # so there is no interactive route to a skipped row at all.
+            if store.get_meta(RECLAIM_MARKER) != "1":
+                try:
+                    back = cov.reclaim_unavailable()
+                    store.set_meta(RECLAIM_MARKER, "1")
+                    if back["requeued"]:
+                        named = ", ".join(
+                            f"{c} ×{n}" for c, n in
+                            sorted(back["components"].items(),
+                                   key=lambda kv: -kv[1])[:4])
+                        self._log(f"Requeued {back['requeued']} rows that an "
+                                  f"earlier build declined for a missing "
+                                  f"package, model or key rather than for "
+                                  f"anything about the video — {named}")
+                    else:
+                        self._log("No rows were declined for a missing package, "
+                                  "model or key; nothing to hand back")
+                except Exception as exc:               # noqa: BLE001
+                    # Never a reason to refuse to process: the worst case is
+                    # that the repair is attempted again next boot.
+                    self._log(f"Could not reclaim declined rows, continuing: "
+                              f"{type(exc).__name__}: {exc}", "warn")
 
             # The restore above put evidence back without touching the work
             # table, and `plan` has just created a queued row for every pair it
@@ -2006,6 +2048,32 @@ class ProcessEngine:
                   if n not in comp.soft
                   and states.get(n) in ("failed", "skipped")]
         if broken:
+            # `failed` and `skipped` are not the same answer, and treating them
+            # as one is a second way this engine used to lose evidence
+            # permanently. A `skipped` need has declined: it will decline again
+            # next session, so retiring its consumer with it is correct. A
+            # `failed` need with revivals left has declined nothing — it is on
+            # the retry ladder and `revive_failed` hands it back in four hours.
+            # One OOM on `shots` therefore used to write a *terminal* skip for
+            # `keyframes`, `poster` and everything downstream of them; `shots`
+            # came back on the next revival and succeeded, and its consumers were
+            # already unreachable to `claim`, `candidates`, `revive_failed` and
+            # `reconcile` alike.
+            #
+            # So wait for the ones that are still coming, and wait exactly as
+            # long as they are waiting — `unsettled` returns their own
+            # `next_try_at`, which stops this from re-asking every sixty seconds
+            # for four hours. Only when every broken need has genuinely settled
+            # does the skip below become the truth.
+            waiting = cov.unsettled(key, broken)
+            if waiting:
+                due = max(waiting.values())
+                wait = max(60.0, min(due - time.time(), ELSEWHERE_SECONDS))
+                cov.defer(key, cid, f"waiting on "
+                                    f"{', '.join(sorted(waiting))}, which "
+                                    f"failed but has retries left", wait)
+                self._bump("deferred")
+                return "deferred"
             why = (f"depends on {', '.join(broken)}, which produced nothing "
                    f"for this video")
             cov.skip(key, cid, why)
@@ -2014,6 +2082,14 @@ class ProcessEngine:
 
         degraded = [n for n in comp.soft
                     if states.get(n) in ("failed", "skipped")]
+        # Which of the missing soft inputs might still arrive. Read once, here,
+        # because the `except SkipPass` handler needs it: a pass that declines
+        # *because* a source was empty has not declined the video, and marking
+        # that terminal is how a retired `ocr` took `keyphrase`, `concepts`,
+        # `text-embed` and `narrate` down with it — each of those raises its own
+        # skip naming every source it looked in, and every one of those skips is
+        # forever.
+        soft_waiting = cov.unsettled(key, degraded) if degraded else {}
         if degraded:
             # Recorded, not vetoed: the claim this pass writes carries a note
             # saying which inputs were missing, so a thinner answer is legible
@@ -2082,7 +2158,52 @@ class ProcessEngine:
             self._ensure_inputs(job, comp)
             fn = get_runner(cid)
             em = fn(job)
+        except PassUnavailable as exc:
+            # Before `except SkipPass`, because it is a subclass of it, and the
+            # ordering is the whole fix. A pass that could not *start* has said
+            # nothing about the video, so retiring the row is a lie that costs
+            # the channel: `cov.skip` writes a state `claim`, `candidates`,
+            # `revive_failed` and `reconcile` all refuse to reconsider, so one
+            # session without a library retired `ocr` for twenty-eight of thirty
+            # videos and the EasyOCR fallback that landed nine days later could
+            # never reach them. Routing it to `fail` puts it on the retry ladder
+            # that `revive_failed`'s docstring was written for — "a package that
+            # was missing until the next session installed it" — bounded at
+            # three attempts and six revivals, so a machine that will never have
+            # the library costs 21 fast load attempts and then stops.
+            #
+            # Logged as a warning, not an error: nothing here is a bug in the
+            # pass. The reason is carried into `last_error` exactly as a skip
+            # would have carried it, so the tab still says what is missing.
+            reason = f"unavailable: {exc}"
+            state = cov.fail(key, cid, reason)
+            self._bump("unavailable")
+            self._log(f"{key} · {cid}: could not start — {exc}"
+                      + (" (retrying later)" if state == "queued"
+                         else " (out of attempts; will be revived)"), "warn")
+            return state
         except SkipPass as exc:
+            # A decline is terminal — but only once the sources it read are
+            # settled. `soft_waiting` is the soft inputs that failed and still
+            # have revivals left, and a pass that raises "no transcript, caption
+            # or on-screen text for this video" while one of them is mid-ladder
+            # is reporting the state of the pipeline, not of the reel. Skipping
+            # it there is what made a retired `ocr` retire its six readers too.
+            # Waiting costs at most one extra execution per revival of the input,
+            # and it stops as soon as that input reaches a state that will not
+            # change; the skip below is then written with the same reason it
+            # would have been written with now.
+            if soft_waiting:
+                due = max(soft_waiting.values())
+                wait = max(60.0, min(due - time.time(), ELSEWHERE_SECONDS))
+                cov.defer(key, cid, f"{exc} — and "
+                                    f"{', '.join(sorted(soft_waiting))} may "
+                                    f"still produce some", wait)
+                self._bump("deferred")
+                self._log(f"{key} · {cid}: {exc} — waiting for "
+                          f"{', '.join(sorted(soft_waiting))} to finish "
+                          f"retrying before calling that final", "warn")
+                return "deferred"
             cov.skip(key, cid, str(exc))
             self._bump("skipped")
             self._log(f"{key} · {cid}: skipped — {exc}")

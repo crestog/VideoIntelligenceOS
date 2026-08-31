@@ -32,7 +32,8 @@ from __future__ import annotations
 import json
 import re
 
-from .base import Emission, Job, SkipPass, device_and_dtype, torch_dtype
+from .base import (Emission, Job, PassUnavailable, SkipPass,
+                   device_and_dtype, torch_dtype)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -740,8 +741,9 @@ def concepts(job: Job) -> Emission:
     try:
         pack = job.cache.get(comp.load_key, loader)
     except Exception as exc:                           # noqa: BLE001
-        raise SkipPass(f"{comp.model} could not be loaded: "
-                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
+        raise PassUnavailable(
+            f"{comp.model} could not be loaded: "
+            f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     import torch  # noqa: PLC0415
     model, tok = pack["model"], pack["tokenizer"]
@@ -859,8 +861,9 @@ def text_embed(job: Job) -> Emission:
     try:
         pack = job.cache.get(comp.load_key, loader)
     except Exception as exc:                           # noqa: BLE001
-        raise SkipPass(f"{comp.model} could not be loaded: "
-                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
+        raise PassUnavailable(
+            f"{comp.model} could not be loaded: "
+            f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     import torch  # noqa: PLC0415
     model, tok = pack["model"], pack["tokenizer"]
@@ -914,8 +917,9 @@ def narrate_deep(job: Job) -> Emission:
     comp = job.component
     device, dtype = device_and_dtype(job.resources)
     if device != "cuda" or int(job.resources.get("gpu_count", 0)) < comp.cards:
-        raise SkipPass(f"needs {comp.cards} GPUs; this machine has "
-                       f"{job.resources.get('gpu_count', 0)}")
+        raise PassUnavailable(
+            f"needs {comp.cards} GPUs; this machine has "
+            f"{job.resources.get('gpu_count', 0)}")
 
     def loader():
         import torch  # noqa: PLC0415
@@ -930,8 +934,9 @@ def narrate_deep(job: Job) -> Emission:
     try:
         pack = job.cache.get(comp.load_key, loader)
     except Exception as exc:                           # noqa: BLE001
-        raise SkipPass(f"{comp.model} could not be loaded: "
-                       f"{type(exc).__name__}: {str(exc)[:200]}") from None
+        raise PassUnavailable(
+            f"{comp.model} could not be loaded: "
+            f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
     frames = job.frames()
     picks = [frames[i] for i in

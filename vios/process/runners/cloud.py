@@ -49,7 +49,7 @@ import os
 import threading
 import time
 
-from .base import DeferPass, Emission, Job, SkipPass
+from .base import DeferPass, Emission, Job, PassUnavailable, SkipPass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -690,10 +690,18 @@ def narrate_cloud(job: Job) -> Emission:
 
     nim = client()
     if not nim.configured():
-        raise SkipPass("no NIM key — set VIOS_NIM_API_KEY in Kaggle Secrets")
+        raise PassUnavailable("no NIM key — set VIOS_NIM_API_KEY in Kaggle Secrets")
     flight = nim.preflight(job.log)
     if not flight.get("ok"):
-        raise SkipPass(flight.get("reason") or "NIM is not reachable")
+        # Prefixed rather than passed through, because the reason comes from the
+        # far end and a message this code did not write cannot be recognised
+        # later. `Coverage.UNAVAILABLE_LIKE` matches on the recorded reason to
+        # hand back rows an earlier build retired, and `_t_unavailable.py` checks
+        # that every string raised here is matchable — a bare
+        # `flight.get("reason")` would be the one that is not.
+        raise PassUnavailable(
+            "NIM is not reachable: "
+            + str(flight.get("reason") or "no reason given")[:200])
 
     ev = _evidence(job)
     if not ev["shots"]:
@@ -727,7 +735,7 @@ def narrate_cloud(job: Job) -> Emission:
         raise DeferPass(f"NIM rate limit: {str(exc)[:160]}",
                         retry_after=getattr(exc, "retry_after", 120.0)) from None
     except NotConfigured as exc:
-        raise SkipPass(f"NIM unusable: {str(exc)[:160]}") from None
+        raise PassUnavailable(f"NIM unusable: {str(exc)[:160]}") from None
     except Exception as exc:
         # Deliberately not a SkipPass. Skip is terminal, and this branch is
         # reached only by something `classify` did not recognise — which makes

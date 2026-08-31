@@ -509,7 +509,16 @@ _PERCEPTION = [
         model="PaddlePaddle/PP-OCRv5", weights="ppocr-v5", device="gpu",
         revision="2",
         vram_mb=1500, disk_mb=400, seconds=90.0,
-        needs=("allframes",), requires=("paddleocr",),
+        # `easyocr`, not `paddleocr`, and the distinction is the difference
+        # between a green preflight and a true one. `_missing_packages`
+        # (engine.py) requires *every* module named here, so declaring
+        # `paddleocr` reported this pass ready in exactly the configuration that
+        # cannot run — paddleocr importable, no paddlepaddle backend under it —
+        # and would have reported it broken on a machine that had only the
+        # fallback, which is the machine that actually reads text. The preferred
+        # engine is documented above; the required one is the one whose absence
+        # leaves nothing able to start.
+        needs=("allframes",), requires=("easyocr",),
         kinds=("text", "text_region", "text_density", "text_style"),
         params={"languages": ["en", "devanagari"], "min_confidence": 0.6,
                 "tier": "full", "batch": 8, "stride": 1},

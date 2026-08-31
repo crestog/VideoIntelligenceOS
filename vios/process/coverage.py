@@ -420,11 +420,24 @@ class Coverage:
               retry_after: float = 300.0) -> None:
         """Put the row back without spending an attempt.
 
-        The difference from `fail()` is the whole point: `attempts` is not
-        incremented and `MAX_ATTEMPTS` is never approached, because nothing
-        failed. A NIM account with forty requests a minute will defer thousands
-        of times across an archive, and every one of those is the system
-        working correctly — the pass is simply waiting for its turn.
+        The difference from `fail()` is the whole point: `MAX_ATTEMPTS` is never
+        approached, because nothing failed. A NIM account with forty requests a
+        minute will defer thousands of times across an archive, and every one of
+        those is the system working correctly — the pass is simply waiting for
+        its turn.
+
+        Which is why the attempt is handed *back* here rather than merely not
+        added. Every caller is inside `_run_pass`, and `claim_for` already
+        incremented `attempts` before the pass was reached — so a row deferred a
+        thousand times would arrive at `attempts=1000` and the docstring above
+        would be false. The visible cost was not that it becomes unclaimable
+        (`queued` rows are claimable at any `attempts`) but that the first real
+        failure afterwards reads `attempts >= MAX_ATTEMPTS` and skips the 10- and
+        45-minute backoff straight to the four-hour revival ladder, and that
+        `claim`'s `ORDER BY attempts` sends a much-deferred video to the back of
+        every queue it is in. `MAX(attempts - 1, 0)` returns the row to the count
+        it had before this claim, which is the number of times the pass has
+        actually run.
 
         `last_error` still carries the reason so the tab can say what is being
         waited on, and `deferred()` already reports rows with a future
@@ -432,7 +445,8 @@ class Coverage:
         """
         self.conn.execute(
             "UPDATE coverage SET state=?, last_error=?, lease_until=0, "
-            "next_try_at=?, worker=NULL, token=NULL "
+            "next_try_at=?, worker=NULL, token=NULL, "
+            "attempts=MAX(attempts - 1, 0) "
             "WHERE video_key=? AND component=?",
             (QUEUED, str(why)[:800], time.time() + max(5.0, float(retry_after)),
              video_key, component))
@@ -784,6 +798,43 @@ class Coverage:
             (video_key,))]
 
     # ── operator actions ────────────────────────────────────────────────
+    def unsettled(self, video_key: str, components) -> dict:
+        """Of these components, the ones whose answer for this video can still
+        change. Returns {component: when it may be claimed again}.
+
+        The dependency gate needs this to tell two situations apart that the
+        `state` column alone conflates. A need that is `skipped` has declined —
+        it will decline again next session, so a consumer that cannot run
+        without it should be retired with it. A need that is `failed` with
+        revivals left has not declined anything: it is on the retry ladder and
+        `revive_failed` will hand it back in four hours. Treating those the same
+        is what made one OOM on `shots` permanently retire `keyframes`, `poster`
+        and everything downstream for that video — the dependency came back and
+        succeeded, and its consumers were already terminal.
+
+        `next_try_at` comes back with it so the caller can wait exactly as long
+        as the dependency is going to wait, instead of guessing an interval and
+        re-asking the same question forty-eight times in between.
+        """
+        want = [c for c in (components or []) if c]
+        if not want:
+            return {}
+        qs = ",".join("?" * len(want))
+        out = {}
+        for r in self.conn.execute(
+                f"SELECT component, state, revivals, next_try_at FROM coverage "
+                f"WHERE video_key=? AND component IN ({qs})",
+                [video_key] + want):
+            if r["state"] in (QUEUED, RUNNING):
+                out[r["component"]] = float(r["next_try_at"] or 0)
+            elif (r["state"] == FAILED
+                    and (r["revivals"] or 0) < MAX_REVIVALS):
+                # `fail()` already set `next_try_at` to now + REVIVE_AFTER for a
+                # row it retired, so this is the revival moment itself, not an
+                # offset from it.
+                out[r["component"]] = float(r["next_try_at"] or 0)
+        return out
+
     def requeue(self, component: str = "", state: str = FAILED) -> int:
         """Reset rows to queued and clear their attempt count.
 
@@ -801,6 +852,83 @@ class Coverage:
         cur = self.conn.execute(sql, args)
         self.conn.commit()
         return max(cur.rowcount, 0)
+
+    # Skip reasons that were never about the video. Used once, on an existing
+    # database, to undo declines that a later build made wrong; new code does
+    # not create rows this has to match, because an environment fault raises
+    # `PassUnavailable` and lands in `failed` where the retry ladder can see it.
+    # That split matters: matching on a message is archaeology, and archaeology
+    # is the only tool available for rows already written — `state` and
+    # `last_error` are the entire record a skip leaves behind.
+    #
+    # Every pattern below is a string this codebase itself produces, quoted from
+    # the raise site, so the list is checkable rather than hopeful:
+    UNAVAILABLE_LIKE = (
+        "% is not installed%",          # faster-whisper, pyannote.audio, librosa,
+                                        #   ultralytics, insightface, paddleocr
+        "%are not installed%",          # transformers/torch, torch/Pillow
+        "%could be initialised%",       # "no OCR engine could be initialised" —
+                                        #   the negation is carried by "no …
+                                        #   engine", so this pattern cannot hold a
+                                        #   "not". Quoted from the raise site, and
+                                        #   `_t_unavailable.py` fails if either
+                                        #   side drifts from the other.
+        "%could not be loaded%",        # a language model, Florence-2
+        "%could not start%",            # insightface could not start
+        "%is not on PATH%",             # ffmpeg
+        "%no Hugging Face token%",      # pyannote's gated weights
+        "%no NIM key%",                 # the cloud narrator
+        "%NIM is not reachable%",
+        "%NIM unusable%",
+        "%needs % GPUs; this machine has %",
+    )
+
+    def reclaim_unavailable(self) -> dict:
+        """Hand back rows that were declined for something the video never said.
+
+        A one-shot repair for a database written by an earlier build, not a
+        recurring rule. The measured damage it exists to undo: before the
+        EasyOCR fallback landed on 17 August, the OCR pass raised
+        `SkipPass("paddleocr is not installed")` — `paddlepaddle` is deliberately
+        absent from requirements.txt — and every one of those became a `skipped`
+        row, which `claim`, `candidates`, `revive_failed` and `reconcile` all
+        refuse to reconsider. The fallback works; it could only ever reach the
+        two rows that had not been retired yet, and those two are exactly the two
+        videos in the archive with OCR evidence today. There is no manual escape
+        either: the Process tab's Requeue button posts `state:'failed'`
+        (process_ui.html:1451), and the Kaggle cell clones fresh with nobody
+        watching.
+
+        Only `skipped` rows are touched, and only those whose `last_error`
+        matches a string this codebase produces for an environment fault, so a
+        genuine decline — "no speech detected", "container reports zero
+        duration" — is left exactly where it is. `attempts` is cleared so the
+        retry is a real retry; `revivals` is deliberately *not*, so a row that
+        has already exhausted its ladder does not get a second full one.
+        `last_error` is kept for the same reason `revive_failed` keeps it: if
+        this row fails again, the operator needs to see what it said the first
+        time.
+
+        Returns {"requeued": n, "components": {cid: n}}. Reporting zero is a
+        result, not a silence: it says these rows were never skipped for a
+        missing backend, which is the one alternative a log this old cannot
+        otherwise rule out.
+        """
+        where = " OR ".join("last_error LIKE ?" for _ in self.UNAVAILABLE_LIKE)
+        args = list(self.UNAVAILABLE_LIKE)
+        by: dict = {}
+        for r in self.conn.execute(
+                f"SELECT component, COUNT(*) n FROM coverage "
+                f"WHERE state=? AND ({where}) GROUP BY component",
+                [SKIPPED] + args):
+            by[r["component"]] = r["n"]
+        cur = self.conn.execute(
+            f"UPDATE coverage SET state=?, attempts=0, next_try_at=0, "
+            f"worker=NULL, token=NULL, lease_until=0 "
+            f"WHERE state=? AND ({where})",
+            [QUEUED, SKIPPED] + args)
+        self.conn.commit()
+        return {"requeued": max(cur.rowcount, 0), "components": by}
 
     def reset_component(self, component: str) -> int:
         """Forget a component's coverage entirely, so it sweeps again.

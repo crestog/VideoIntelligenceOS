@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import importlib
 
-from .base import DeferPass, Emission, Job, ModelCache, SkipPass  # noqa: F401
+from .base import (DeferPass, Emission, Job, ModelCache,  # noqa: F401
+                   PassUnavailable, SkipPass)
 
 # component id → (module in this package, function name)
 RUNNERS: dict = {
