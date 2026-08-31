@@ -491,6 +491,14 @@ class Channel:
         self.ready = False
         self.reason = ""
         self.last_error = ""
+        # Set at `start()` when the channel resolved but reading it did not, and
+        # read by `_why()` so an oversize video says which of the two transports
+        # actually declined it. Distinct from `reason`, which is why there is no
+        # session at all.
+        self.peer_error = ""
+        # fault string → how many times it has happened, so a permanent refusal
+        # is logged once with a running count rather than once per attempt.
+        self._seen_errors: dict = {}
         self._loop = None
         self._thread = None
         self._app = None
@@ -540,13 +548,46 @@ class Channel:
                     in_memory=True, no_updates=True,
                     max_concurrent_transmissions=2)
                 await app.start()
-                return app
+
+                # One `get_chat` before anything asks for a message, and it is
+                # not a health check — it is the fix for a whole class of
+                # failure. `in_memory=True` means the session's peer cache is
+                # empty at every start, and `no_updates=True` means nothing will
+                # ever arrive to fill it. Pyrogram cannot address a channel it
+                # has not resolved, so `get_messages` answers
+                # `[400 PEER_ID_INVALID]` while the session itself reports
+                # perfectly healthy — which is exactly what the log showed:
+                # "MTProto session open" followed by every fetch refused. The
+                # call writes the channel into the cache and each later
+                # `get_messages` addresses it by the id it now knows.
+                #
+                # Failure here is recorded, not raised. A bot that cannot read
+                # the channel still uploads shards perfectly well, and the
+                # session is worth keeping for that.
+                try:
+                    chat = await app.get_chat(self.tg.channel)
+                    return app, getattr(chat, "title", "") or str(
+                        self.tg.channel), ""
+                except Exception as exc:            # noqa: BLE001
+                    return app, "", f"{type(exc).__name__}: {str(exc)[:160]}"
 
             try:
-                self._app = self._submit(_boot(), timeout=180)
+                self._app, title, peer_err = self._submit(_boot(), timeout=180)
                 self.ready = True
                 self.reason = ""
-                self.log("MTProto session open")
+                self.peer_error = peer_err
+                if peer_err:
+                    # Said once, at start, in the one place that can explain it
+                    # — rather than once per video per rotation with no cause
+                    # attached, which is how this arrived before.
+                    self.log(f"MTProto session open, but the channel could not "
+                             f"be resolved — {peer_err}. Every message fetch "
+                             f"will be refused; check the bot is a member of "
+                             f"the channel and that VIOS_TG_CHANNEL names it "
+                             f"correctly.")
+                else:
+                    self.log(f"MTProto session open — channel resolved"
+                             + (f" ({title})" if title else ""))
             except Exception as exc:
                 self.reason = f"{type(exc).__name__}: {str(exc)[:160]}"
                 self._shutdown_loop()
@@ -617,7 +658,20 @@ class Channel:
             # actually sees, and "could not download the original" with no
             # cause attached is what made this class of failure unreadable.
             self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-            self.log(f"message fetch failed: {self.last_error}")
+            # Said once per distinct fault, not once per attempt. This is the
+            # line that made a session log unreadable: `revive_failed` offers a
+            # failed video again every rotation, seventy-six rotations happened,
+            # and a permanent refusal like `PEER_ID_INVALID` printed the same
+            # sentence several times a second for the length of the run. The
+            # count is carried so the repetition is still visible as a number,
+            # which is the part worth knowing.
+            self._seen_errors[self.last_error] = n = \
+                self._seen_errors.get(self.last_error, 0) + 1
+            if n == 1:
+                self.log(f"message fetch failed: {self.last_error}")
+            elif n in (10, 100, 1000) or n % 5000 == 0:
+                self.log(f"message fetch failed ×{n} (same fault): "
+                         f"{self.last_error}")
             return {}
         return {int(m.id): m for m in msgs
                 if m is not None and not getattr(m, "empty", False)}
@@ -778,8 +832,23 @@ class Source:
         # Bot API fallback for the bytes. Nothing here can reach the record.
         if not have_source and self.tg and file_id:
             if size and size > BOT_DOWNLOAD_LIMIT:
+                # Which transport declined, truthfully. The previous wording said
+                # "MTProto is unavailable" whatever had happened, so a session
+                # that was open and had simply been refused the channel read as a
+                # session that was never there — and the log carried both
+                # sentences a few lines apart, each contradicting the other.
+                if self.channel is None or not self.channel.ready:
+                    why = "MTProto is unavailable"
+                elif getattr(self.channel, "peer_error", ""):
+                    why = ("MTProto is open but the channel never resolved "
+                           f"({self.channel.peer_error})")
+                else:
+                    why = ("MTProto is open but did not return the message "
+                           + (f"({self.channel.last_error})"
+                              if self.channel.last_error else
+                              "— it may have been deleted"))
                 self.log(f"{video.get('video_key')}: {size / 1048576:.0f} MB is "
-                         f"over the Bot API limit and MTProto is unavailable")
+                         f"over the Bot API limit and {why}")
             else:
                 try:
                     have_source = bool(self.tg.download(file_id, dest))
