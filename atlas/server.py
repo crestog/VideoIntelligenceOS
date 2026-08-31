@@ -32,7 +32,7 @@ import threading
 import time
 
 from fastapi import FastAPI, File, Query, Request, UploadFile
-from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+from fastapi.responses import (HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
 from . import (config, graph, identity, index, ingest, maps, media, reflect,
@@ -692,6 +692,45 @@ def api_vsearch_warm():
     return {"ok": ok, "encoder": vsearch.state()["encoder"]}
 
 
+def _jpeg_response(path: str):
+    """Serve a rendered poster from bytes rather than by path.
+
+    `FileResponse` stats the path to build Content-Length, sends the header
+    frame, and only *then* opens the same path again to read the body — two
+    filesystem touches with a gap between them (starlette sends
+    `http.response.start` at responses.py:385 and opens the file at :391).
+
+    Posters are rendered by ffmpeg writing `-y` straight into that same file,
+    and the cache filename keeps whole seconds (`media.poster`) while the URL
+    keeps decimals, so `?t=12.3` and `?t=12.4` are two different requests —
+    different browser cache entries, no dedup — that both render a
+    *different-sized* JPEG over one path. When one landed inside the gap,
+    uvicorn found the declared and delivered lengths disagreeing and raised
+    `RuntimeError: Response content longer than Content-Length`; when the
+    rewrite went the other way it raised `shorter`. Both were in the log,
+    several times each, because this is the most-requested route in the app.
+
+    Reading once makes Content-Length `len(raw)` by construction, so the two
+    numbers come out of the same read and cannot disagree whatever the
+    filesystem does underneath. A poster is a 480px-wide JPEG at `-q:v 5` —
+    tens of KB, immutable for a week — so buffering it costs nothing. What it
+    gives up is `Range` support and the stat-derived `last-modified`/`etag`,
+    none of which an `<img>` tag asks for.
+
+    The 204s are the same answer the callers already give for no poster at all,
+    which is the honest reply for a file that vanished or was caught truncated.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return Response(status_code=204)
+    if not raw:
+        return Response(status_code=204)
+    return Response(raw, media_type="image/jpeg", headers={
+        "Cache-Control": "public, max-age=604800, immutable"})
+
+
 @app.get("/api/frame/{video_key}")
 def api_frame(video_key: str, i: int = 0, t: float = None):
     """Render one frame of one video, for an image-search result thumbnail.
@@ -706,8 +745,7 @@ def api_frame(video_key: str, i: int = 0, t: float = None):
     path = media.poster(db(), key, at=at)
     if not path:
         return Response(status_code=204)
-    return FileResponse(path, media_type="image/jpeg", headers={
-        "Cache-Control": "public, max-age=604800, immutable"})
+    return _jpeg_response(path)
 
 
 # ── library ───────────────────────────────────────────────────────────────
@@ -1463,8 +1501,7 @@ def api_poster(video_key: str, t: float = None):
     path = media.poster(db(), key, at=t)
     if not path:
         return Response(status_code=204)
-    return FileResponse(path, media_type="image/jpeg", headers={
-        "Cache-Control": "public, max-age=604800, immutable"})
+    return _jpeg_response(path)
 
 
 @app.post("/api/cache/clear")
