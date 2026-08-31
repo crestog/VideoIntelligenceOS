@@ -678,8 +678,16 @@ def _ensure_shard_table(conn: sqlite3.Connection, table: str,
 #
 # The generic path keeps dropping them, deliberately: those columns are useless
 # *there*, as reflected TEXT in a browsable table. They land here instead, once,
-# as the bytes they always were. Two tables carry them and only two, so this is a
-# named lane rather than a rule inferred from values.
+# as the bytes they always were.
+#
+# What was wrong with the next sentence, which used to say "two tables carry them
+# and only two": `frame_metric` carries two of them as well — `frames` and
+# `values_` — and is not in this set, so the generic drop was the whole story for
+# it and the numbers went nowhere. 594 of this archive's 1,909 metric rows have
+# `values_ IS NULL`, `noise` and `exposure` at 30 of 30. The lane is still named
+# rather than inferred, because these two are the only tables whose bytes are
+# worth a second home; the generic loop now drops an opaque column only where
+# this set says something already kept it.
 _PAYLOAD_KINDS = {"vector", "frame_vector"}
 
 # `pooled` keeps one vector per shot and drops the per-frame rows, for a machine
@@ -863,8 +871,9 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
         if vk_rehomed:
             merged["identity:rehomed"] = vk_rehomed
         if vk_refused:
-            dropped.append(f"video ×{vk_refused} (key is not an identity and "
-                           f"nothing could resolve it)")
+            dropped.append(("lost", vk_refused,
+                            f"video row ×{vk_refused} (key is not an identity "
+                            f"and nothing could resolve it)"))
 
     # Payloads first, and by name rather than by shape. The generic loop below
     # still drops these columns as opaque — correctly, for what it is building —
@@ -879,8 +888,22 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
             merged[f"vec:{kind}"] = got["added"]
             vec_bytes += got["bytes"]
         if got["skipped"]:
-            dropped.append(f"{kind} payload ×{got['skipped']}"
-                           + (f" ({got['error']})" if got.get("error") else ""))
+            # `lost` when the insert itself failed, because the generic loop
+            # below then drops the same column as a payload that was rehomed —
+            # and it was not. It stays dropped: 120 MB of `frame_vector.data`
+            # kept as hex text is 240 MB, which is not a recovery this archive
+            # can afford on the chance that the next pass reads it. What it gets
+            # instead is a log line that says rows were lost and why, so the
+            # failing insert is fixable rather than invisible.
+            #
+            # `skip` when rows were merely undecodable or deliberately left
+            # behind: `ATLAS_VEC_KEEP=pooled` skips every `frame_vector` row on
+            # purpose, and that must not read the same as a SQLite error.
+            sev = "lost" if got.get("error") else "skip"
+            dropped.append((sev, got["skipped"],
+                            f"{kind} payload ×{got['skipped']}"
+                            + (f" ({got['error']})" if got.get("error")
+                               else " (undecodable or not kept)")))
 
     for table, rows in tables.items():
         if table == "video":
@@ -896,7 +919,8 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
             # Atlas's own tables are not a landing zone. A shard that happened
             # to carry a table called `moments` would otherwise overwrite the
             # index with the raw rows the index is built from.
-            dropped.append(f"{table} (reserved name)")
+            dropped.append(("skip", len(rows or ()),
+                            f"{table} (reserved name)"))
             continue
 
         order, values = [], {}
@@ -909,9 +933,48 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
             values[c] = [r.get(c) for r in rows]
 
         types = {}
+        # The same test the payload loop above used, on the same key, so the two
+        # can never disagree about whether a table's bytes were kept.
+        rehomed = table in _PAYLOAD_KINDS
         for c in order:
-            if _is_opaque(values[c]):
-                dropped.append(f"{table}.{c} (opaque)")
+            if _is_opaque(values[c]) and rehomed:
+                # Dropped only where something else already kept the bytes.
+                # `_import_payloads` ran above for exactly these two tables, so
+                # `vector.data` and `frame_vector.data`/`frames` are in
+                # `vec_payload` and a second copy as hex text would cost 240 MB
+                # of this archive to say nothing new.
+                #
+                # For every other table the drop was unconditional loss, and it
+                # happened: 594 of this archive's 1,909 `frame_metric` rows have
+                # `values_ IS NULL` — the row asserts that sharpness was
+                # measured across 32 frames and the numbers are not there, with
+                # `noise` and `exposure` at 30 of 30. `frame_metric` is not a
+                # payload kind, so nothing rehomed it.
+                #
+                # Which rows survived was decided by shard composition, not by
+                # anything about the metric: `_OPAQUE` needs 256 characters, a
+                # float32 array of 32 frames is exactly 256 hex characters, and
+                # `_is_opaque` drops a column only when *every* value in it is
+                # long — so one 20-frame metric sharing a shard saved every
+                # 32-frame metric beside it. That is why the same measurement is
+                # present for some videos and absent for others.
+                #
+                # Kept as TEXT is the state reflect.py is already written for:
+                # `prose_columns` names `frame_metric.values_` and
+                # `frame_metric.frames` as hex buffers to keep out of the index,
+                # having found 1,315 of them indexed as prose. The 1,315 are the
+                # rows that survived this drop.
+                #
+                # The 594 that did not are recoverable without reprocessing
+                # anything, because the shards carrying them are still in the
+                # channel and `_enrich` fills NULL columns of rows that already
+                # exist: clear those shards' `bundles` rows so `imported_seqs`
+                # stops matching them, and the next scan re-lands the numbers
+                # beside the rows that are already asserting them. Left as an
+                # operator step rather than run from here — it re-reads a
+                # channel, and nothing in an import should decide to do that.
+                dropped.append(("skip", len(rows), f"{table}.{c} (payload, "
+                                                   f"already in vec_payload)"))
                 continue
             t = _sql_type(values[c])
             if not t:
@@ -961,7 +1024,9 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
                 + (f", {got['messages']} message(s)" if got["messages"] else "")
                 + (f", {got['refused']} refused" if got["refused"] else ""))
         elif got["refused"]:
-            dropped.append(f"video ×{got['refused']} (key is not an identity)")
+            dropped.append(("lost", got["refused"],
+                            f"identity ×{got['refused']} (key is not an "
+                            f"identity)"))
 
     # `counts` is what the shard *holds*, not what this run happened to add.
     # A bundle's row records its manifest's counts for the same reason: the
@@ -981,7 +1046,7 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
          ("truncated — kept what was readable. "
           if header.get("_torn") else "")
          + (delta or "nothing new")
-         + (" · dropped " + ", ".join(dropped[:6]) if dropped else ""))[:400])
+         + _drop_note(dropped))[:400])
     conn.commit()
 
     try:
@@ -991,9 +1056,56 @@ def import_shard(info: dict, conn: sqlite3.Connection, work_dir: str) -> dict:
 
     log(f"{seq} imported — {delta or 'no new rows'}"
         + (f" · {vec_bytes / 1048576:.1f} MB of vectors" if vec_bytes else "")
-        + (f" · dropped {len(dropped)} opaque column(s)" if dropped else ""))
+        + _drop_note(dropped),
+        "WARN" if any(s == "lost" for s, _, _ in dropped) else "INFO")
     return {"ok": True, "seq": seq, "rows": merged, "shard": True,
-            "vec_bytes": vec_bytes}
+            "vec_bytes": vec_bytes,
+            "lost": sum(n for s, n, _ in dropped if s == "lost")}
+
+
+def _drop_note(dropped: list) -> str:
+    """What a shard did not keep, named by cause and counted in rows.
+
+    The line this replaces read `dropped {len(dropped)} opaque column(s)` for
+    all five causes that write to the list, and four of them are not columns.
+    Two consequences, both of them met in this archive's own logs:
+
+    The **name** was wrong. `dropped 1 opaque column(s)` was the message for a
+    shard that carried one table Atlas owns — nothing happened, no evidence
+    exists that did not before — and also for a shard whose entire vector
+    payload hit a SQLite error. Same words, opposite meanings, and the second
+    one is unrecoverable once the Kaggle session's disk is gone.
+
+    The **magnitude** was wrong, which is worse than a wrong name because it
+    does not look wrong. Each entry is one string however many rows it stands
+    for, so `{kind} payload ×12000 (OperationalError)` counted as 1. An operator
+    reading `dropped 2 opaque column(s)` was looking at twelve thousand lost
+    vectors and a rounding error, in that order, and could not tell.
+
+    So: rows, not entries, and `lost` before `skip`, because the ordering of the
+    old list was the order the code happened to run in and the truncation at six
+    silently cut whatever came last. Anything elided is counted rather than
+    dropped from the count — the number stays true even when the text does not
+    fit the 400 characters the `bundles` note allows.
+
+    Empty string when nothing was dropped, so the callers can concatenate it.
+    """
+    if not dropped:
+        return ""
+    out = []
+    for sev, label in (("lost", "lost"), ("skip", "skipped")):
+        items = [(n, t) for s, n, t in dropped if s == sev]
+        if not items:
+            continue
+        rows = sum(n for n, _ in items)
+        # Widest first: the biggest loss is the one worth reading, and it is not
+        # reliably the first one the import loop happened to notice.
+        items.sort(key=lambda x: -x[0])
+        shown = [t for _, t in items[:4]]
+        rest = len(items) - len(shown)
+        out.append(f" · {label} {rows} row(s): " + ", ".join(shown)
+                   + (f", and {rest} more cause(s)" if rest else ""))
+    return "".join(out)
 
 
 def _scalar(v):
