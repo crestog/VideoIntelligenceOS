@@ -259,5 +259,64 @@ yes(index._certainty(0.8) > index._certainty(0.57),
     "counted pixels outrank a zero-shot tag")
 yes(index._certainty(0.6) > index._certainty(0.0412),
     "and within the audio channel, the confident tag outranks the desperate one")
+# ── A fact that lost the timeline is not a fact about the reel ───────────
+# Video #8 in this archive is red for 17.4 of its 17.7 seconds and shows three
+# single frames of orange during a 0.2s flicker at 5.9s. The colour sampler emits
+# one row per frame where consecutive frames disagree, so those three frames
+# arrive as zero-length claims — 464 of this archive's 1,328 colour claims are
+# single frames. Written out and indexed, each became `the dominant colour is
+# orange` on a card, as a flat statement about a red reel.
+FLICKER = [
+    (0.000, 5.833, "the dominant colour is red", 0.8, "dominant_colour"),
+    (5.867, 5.867, "the dominant colour is orange", 0.8, "dominant_colour"),
+    (5.900, 5.900, "the dominant colour is red", 0.8, "dominant_colour"),
+    (5.933, 5.933, "the dominant colour is orange", 0.8, "dominant_colour"),
+    (5.967, 6.033, "the dominant colour is red", 0.8, "dominant_colour"),
+    (6.067, 6.067, "the dominant colour is orange", 0.8, "dominant_colour"),
+    (6.100, 17.633, "the dominant colour is red", 0.8, "dominant_colour"),
+]
+kept = index.refuse_slivers(FLICKER)
+eq(sorted({t for _a, _b, t, _c in kept}), ["the dominant colour is red"],
+   "three frames of orange lose to seventeen seconds of red")
+eq(len(kept[0]), 4, "and what comes back is what build_facts takes")
+
+# A shot has one dominant colour, so the values compete and the samples tile.
+yes(index._partitions([(a, b, t) for a, b, t, _c, _k in FLICKER]),
+    "a colour sampler partitions the reel")
+
+# Objects do not compete: a person and a dog and a bed are all true at once, and
+# a dog seen for one frame is still a dog. Nothing here may be dropped.
+objects = [(0.0, 10.0, "person", 0.9, "frame_notes.description"),
+           (0.0, 10.0, "bed", 0.8, "frame_notes.description"),
+           (4.0, 4.0, "dog", 0.7, "frame_notes.description"),
+           (5.0, 5.0, "cell phone", 0.6, "frame_notes.description")]
+yes(not index._partitions([(a, b, t) for a, b, t, _c, _k in objects]),
+    "labels sharing a frame accumulate, they do not partition")
+eq(len(index.refuse_slivers(objects)), 4, "so a one-frame dog survives")
+
+# Exclusivity alone is not enough. Silence spans never overlap each other and
+# cover 7% of a reel — a scattering of separate observations, not a partition.
+sparse = [(0.0, 0.4, "near-silent"), (30.0, 30.5, "near-silent"),
+          (60.0, 60.3, "near-silent"), (90.0, 90.4, "near-silent")]
+yes(not index._partitions(sparse), "sparse and exclusive is still not a partition")
+
+# Two sightings are not a pattern.
+yes(not index._partitions([(0.0, 5.0, "a"), (5.0, 9.0, "b")]),
+    "too few sightings to read")
+
+# An untimed rollup is about the whole reel by construction: no clock, no share.
+eq(index.refuse_slivers([(None, None, "music-led", 1.0, "music_presence")]),
+   [(None, None, "music-led", 1.0)], "an untimed fact keeps its place")
+
+# The gate is `phrase.FLOOR` on the other axis, and shares that constant so the
+# two readings of "below the floor is not a claim" cannot drift apart.
+tiled = [(0.0, 10.0, "medium shot", 0.6, "shot_scale"),
+         (10.0, 10.2, "close-up shot", 0.6, "shot_scale"),
+         (10.2, 20.0, "medium shot", 0.6, "shot_scale"),
+         (20.0, 30.0, "medium shot", 0.6, "shot_scale")]
+eq(sorted({t for _a, _b, t, _c in index.refuse_slivers(tiled)}), ["medium shot"],
+   "0.2s of close-up in a 30s reel is not a close-up shot")
+yes(0.2 / 30.0 < phrase.FLOOR <= 1.0, "and the floor is the one phrase uses")
+
 
 print(f"ok — {ok} assertions", file=sys.stderr)

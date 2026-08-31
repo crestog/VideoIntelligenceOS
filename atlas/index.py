@@ -432,6 +432,103 @@ def _union_seconds(spans) -> float:
             c_a, c_b = a, b
     return total + (c_b - c_a) if c_b is not None else 0.0
 
+# When a measurement partitions a timeline, its values compete: at every instant
+# exactly one of them is true, so a value that held almost none of the reel did
+# not merely appear less — it *lost*. `_TILE_SHARE` is how completely a kind's
+# sightings must account for the stretch they cover before Atlas will believe
+# they are a partition rather than a scattering of separate observations.
+_TILE_SHARE = 0.8
+
+# Below this many sightings there is no pattern to read, and a kind seen twice
+# would be called a partition on the strength of not having contradicted itself.
+_PARTITION_MIN = 4
+
+
+def _partitions(sightings) -> bool:
+    """Do these sightings divide one timeline between values that compete?
+
+    Two shapes of measurement arrive in the same table and the same tuple.
+    `dominant_colour` **partitions**: a shot has exactly one dominant colour, the
+    samples tile the reel end to end, and `orange` is true here only because `red`
+    is false here. `object` **accumulates**: a person and a bed and a dog are all
+    in the frame at once, and each is true on its own terms.
+
+    The difference decides whether a share of the reel means anything. Two frames
+    of orange in a red reel is a fact that lost; two frames of a dog is a dog. So
+    the test is made of the data and not of a list of kind names — a pass added
+    upstream next month is classified by how its rows lie in time, exactly as
+    `_label_column` classifies a column by the company its cells keep.
+
+    Both halves are required. Values that never overlap could still be a sparse
+    scattering — `silence` spans do not overlap each other and cover 7% of a reel
+    — so the sightings must also tile the stretch they span.
+    """
+    if len(sightings) < _PARTITION_MIN:
+        return False
+    lo = min(a for a, _b, _t in sightings)
+    hi = max(b for _a, b, _t in sightings)
+    if hi <= lo:
+        return False
+    if _union_seconds([(a, b) for a, b, _t in sightings]) / (hi - lo) < _TILE_SHARE:
+        return False
+    ordered = sorted(sightings)
+    for i, (_a, b, text) in enumerate(ordered):
+        for a2, _b2, other in ordered[i + 1:]:
+            if a2 >= b:
+                break                      # sorted, so nothing later overlaps
+            if other != text:
+                return False               # two values true at one instant
+    return True
+
+
+def refuse_slivers(facts: list) -> list:
+    """Drop facts that lost the timeline they were competing for.
+
+    Takes `(t0, t1, text, conf, kind)` and returns `build_facts`'s own
+    `(t0, t1, text, conf)`, minus the values that a partitioning measurement
+    recorded for a sliver of its own span.
+
+    This is `phrase.FLOOR` again, on the other axis. There the question was
+    whether the pass was sure enough to be making a claim at all; here it is
+    whether what it saw lasted long enough to be a fact about the reel. One reel
+    in this archive is red for 17.4 of its 17.7 seconds and shows three single
+    frames of orange during a two-tenths-of-a-second flicker at 5.9s. `the
+    dominant colour is orange` is not a partly-true statement about that reel, it
+    is a false one — and a false answer is worse than a missing one, because the
+    person reading it has no way to tell. The claim stays in `claim`, where the
+    Data tab and the numeric filters read it; what it loses is the right to
+    answer a search.
+
+    Untimed facts are exempt and not merely tolerated: a rollup with no clock is
+    a statement about the whole reel by construction, so it has no share to fall
+    below. `music-led` is one of these.
+    """
+    timed = {}
+    for t0, t1, text, _conf, kind in facts:
+        a, b = _as_float(t0), _as_float(t1)
+        if a is None or b is None or not kind:
+            continue
+        timed.setdefault(kind, []).append((a, max(a, b), text))
+
+    lost = set()
+    for kind, sightings in timed.items():
+        if not _partitions(sightings):
+            continue
+        whole = _union_seconds([(a, b) for a, b, _t in sightings])
+        if whole <= 0:
+            # Every sighting of this kind is instantaneous, so there is no
+            # timeline to hold a share of and nothing to compare against.
+            continue
+        held = {}
+        for a, b, text in sightings:
+            held.setdefault(text, []).append((a, b))
+        for text, spans in held.items():
+            if _union_seconds(spans) / whole < phrase.FLOOR:
+                lost.add((kind, text))
+
+    return [(t0, t1, text, conf) for t0, t1, text, conf, kind in facts
+            if (kind, text) not in lost]
+
 
 def build_facts(rows: list) -> list:
     """Shape written measurements into moments. Returns [(t0, t1, text, span, conf)].
@@ -930,6 +1027,11 @@ def _collect(conn: sqlite3.Connection) -> dict:
                     continue
                 if measured:
                     conf = _as_float(row[5])
+                    # The measurement's own name, kept before `kind` below is
+                    # rebound to the *form* the phrase came out in. `refuse_slivers`
+                    # needs it: a share of a reel only means something within one
+                    # kind, because only one kind's values compete for one instant.
+                    measure = (row[4] or "").strip().lower()
                     form = phrase.written(row[4], raw, conf)
                     if form is None:
                         refused += 1     # structure, a number, a bare guess
@@ -942,6 +1044,10 @@ def _collect(conn: sqlite3.Connection) -> dict:
                     facts = ([(lab, c) for lab, c in _labels(raw)
                               if c is None or c >= phrase.FLOOR]
                              if as_labels else [])
+                    # A label column has no kind column, so the column itself is
+                    # the measurement. Several labels share one frame, which is
+                    # what tells `_partitions` this kind accumulates.
+                    measure = f"{spec['table']}.{spec['text']}"
                     conf, kind, text = None, "prose", "" if facts else raw
                     if text and phrase.is_absence(text):
                         # `no salient objects or text detected`. Indexed, it puts
@@ -954,7 +1060,7 @@ def _collect(conn: sqlite3.Connection) -> dict:
                                            {"rows": [], "facts": [],
                                             "table": spec["table"]})
                     for lab, c in facts:
-                        b["facts"].append((t0, t1, lab, c))
+                        b["facts"].append((t0, t1, lab, c, measure))
                         n += 1
                     continue
                 if not text:
@@ -962,7 +1068,7 @@ def _collect(conn: sqlite3.Connection) -> dict:
                 b = buckets.setdefault((vk, source), {"rows": [], "facts": [],
                                                       "table": spec["table"]})
                 if kind == "fact":
-                    b["facts"].append((t0, t1, text, conf))
+                    b["facts"].append((t0, t1, text, conf, measure))
                 else:
                     # Prose keeps no confidence. A passage is several rows merged
                     # and they did not agree on one, and a transcript's own
@@ -1155,7 +1261,7 @@ def rebuild(conn: sqlite3.Connection, embed: bool = True) -> dict:
             shaped += [(t0, t1, text,
                         w * _prominence(span, dur) * _certainty(conf))
                        for t0, t1, text, span, conf in
-                       build_facts(bucket["facts"])]
+                       build_facts(refuse_slivers(bucket["facts"]))]
             for t0, t1, text, weight in shaped:
                 rows_out.append((vk, t0, t1, source, bucket["table"], weight,
                                  text, _hash(text)))
