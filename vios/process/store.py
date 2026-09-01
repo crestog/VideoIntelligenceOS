@@ -115,9 +115,16 @@ _STATE_RANK = {"queued": 0, "running": 1, "failed": 2, "skipped": 3, "done": 4}
 # state that means nothing anywhere else: `worker` and `token` name a lease
 # holder, `lease_until`/`next_try_at` are clocks on a machine that has stopped,
 # and `checkpoint` is a resume cursor into files that are gone.
+#
+# `degraded` travels because it is the opposite of session state: it says what a
+# completed pass did *not* have when it ran, which is a property of the answer
+# and stays true in every database the answer reaches. Dropping it here would
+# make a thin reading arrive somewhere else looking complete, which is the whole
+# defect the column exists to end.
 _COVERAGE_COLS = ("video_key", "component", "state", "attempts", "revivals",
                   "seconds", "claims", "vectors", "observer_id", "last_error",
-                  "started_at", "done_at")
+                  "started_at", "done_at", "degraded")
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -1479,8 +1486,26 @@ class Store:
         and until it does the target simply re-derives a `queued` row it will
         satisfy from the evidence that did arrive. Over-exclusion is therefore
         self-correcting, and under-exclusion is not.
+
+        The column list is intersected with what the table actually has, not taken
+        from `_COVERAGE_COLS` directly, and that is a correctness fix rather than
+        defensiveness. `coverage` grows by migration — `next_try_at`, `revivals`
+        and now `degraded` were all added to a schema already in the field — and a
+        database whose table predates one of them raises `no such column` on a
+        SELECT that names it. The `except` below would then swallow it as "no
+        coverage table" and the shard would ship with *no coverage at all*, which
+        is silent, total, and looks exactly like a database that had never run a
+        pass. Naming only the columns present ships what that database can say.
         """
-        cols = ",".join(_COVERAGE_COLS)
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(coverage)")}
+        names = [c for c in _COVERAGE_COLS if c in have]
+        if "video_key" not in have or "component" not in have:
+            # No `coverage` table at all (an empty PRAGMA), or one too old to
+            # identify a row. Nothing has been *done* here, so there is nothing to
+            # ship. Not created — an export is a read, and a store that only ever
+            # exported should not grow a table because it did.
+            return []
+        cols = ",".join(names)
         rows = []
         try:
             cur = self.conn.execute(
@@ -1488,10 +1513,8 @@ class Store:
                 f"WHERE state IN ('done','skipped','failed') "
                 f"AND video_key IN {keys} ORDER BY component, video_key", span)
         except sqlite3.OperationalError:
-            # No `coverage` table: this database has never had a `Coverage` on
-            # it, so nothing has been *done* and there is nothing to ship. Not
-            # created here — an export is a read, and a store that only ever
-            # exported should not grow a table because it did.
+            # Kept for the race: another connection can drop or rebuild the table
+            # between the PRAGMA above and this statement.
             return rows
         spilled = self._spilled_keys(spill_from) if spill_from else frozenset()
         for r in cur:
@@ -1733,6 +1756,18 @@ class Store:
         `lease_until`, `next_try_at`, `worker`, `token` and `checkpoint` are left
         at their defaults on insert and untouched on update. A lease belongs to
         the machine holding it.
+
+        `degraded` is taken from the arriving row whenever the arriving row wins
+        the rank test, which is the only case this statement updates anything at
+        all — and that is what makes it correct rather than merely consistent. The
+        rank test is over `state`, so the row that wins is the better *state*, and
+        a `done` row is a `done` row whether it read the video's on-screen text or
+        not. Coalescing instead — keeping whichever value was already there —
+        would let a complete row arrive over a thin one and leave the thin marker
+        in place, re-offering a pass that has nothing left to gain; and it would
+        let a thin row arrive over a `failed` one and claim, by the absence of a
+        marker, to have had everything. The marker has to travel with the answer
+        it describes.
         """
         state = str(rec.get("state") or "")
         rank = _STATE_RANK.get(state)
@@ -1757,6 +1792,7 @@ class Store:
             f"  vectors     = COALESCE(excluded.vectors, coverage.vectors),"
             f"  observer_id = COALESCE(excluded.observer_id, coverage.observer_id),"
             f"  last_error  = excluded.last_error,"
+            f"  degraded    = excluded.degraded,"
             f"  started_at  = COALESCE(coverage.started_at, excluded.started_at),"
             f"  done_at     = COALESCE(excluded.done_at, coverage.done_at) "
             f"WHERE ? > (CASE coverage.state"
@@ -1766,7 +1802,8 @@ class Store:
             [rec.get(c) for c in _COVERAGE_COLS] + [rank])
 
     def _ensure_coverage_table(self) -> None:
-        """Create `coverage` if this database has never had a `Coverage` on it.
+        """Create `coverage` if this database has never had a `Coverage` on it,
+        and bring an older one up to the shape a shard expects.
 
         `coverage` is owned by `coverage.py` and normally created when a
         `Coverage` is constructed over the store's connection — but the restore
@@ -1776,15 +1813,30 @@ class Store:
         `except sqlite3.Error` arm as `skipped`, which is exactly the silent loss
         the section was added to prevent.
 
-        Idempotent, memoised, and using coverage.py's own DDL rather than a copy
-        of it — a second definition of the table is a second chance for the two to
-        drift.
+        The migration matters for the same reason and in the harder case: a table
+        created by an *earlier* build already exists, so the DDL below is a no-op,
+        and the upsert then names a column — `revivals`, `degraded` — that the
+        table has never had. `no such column` is a `sqlite3.Error`, so it lands in
+        that same arm: the shard is accepted, every coverage row in it is dropped,
+        and the target reports a successful restore. Applying `coverage.py`'s own
+        `MIGRATIONS` here means the table can always hold what a shard carries.
+
+        Idempotent, memoised, and using coverage.py's own DDL and migration list
+        rather than a copy of either — a second definition of the table is a
+        second chance for the two to drift.
         """
         if getattr(self, "_cov_table", False):
             return
+        from .coverage import MIGRATIONS as COVERAGE_MIGRATIONS  # noqa: PLC0415
         from .coverage import SCHEMA as COVERAGE_SCHEMA  # noqa: PLC0415
         self.conn.executescript(COVERAGE_SCHEMA)
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(coverage)")}
+        for name, spec in COVERAGE_MIGRATIONS:
+            if name not in have:
+                self.conn.execute(
+                    f"ALTER TABLE coverage ADD COLUMN {name} {spec}")
         self._cov_table = True
+
 
     def note_shard(self, shard_id: str, component: str, msg_id: int | None,
                    stats: dict) -> None:

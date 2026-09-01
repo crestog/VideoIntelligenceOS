@@ -44,6 +44,7 @@ mid-sweep, the next one re-reads the shards and continues.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 import re
@@ -326,6 +327,37 @@ def _safe(key: str) -> str:
     """A video key as a directory name. Keys are shortcodes, but never trust
     a string that came from a URL with a path join."""
     return "".join(c if (c.isalnum() or c in "-_") else "_" for c in key)[:64]
+
+
+def _observer_params(params: dict | None, without=()) -> dict:
+    """The parameters an observer id is derived from, given what the run lacked.
+
+    The observer id is documented as derived from "everything that can change the
+    output — model, revision, and the parameters", and a soft input that produced
+    nothing changes the output as surely as a prompt edit does. So the absence
+    goes in the hash, and the two readings become two observers with two ids.
+
+    That is not bookkeeping. A claim's uid is
+    `(video, observer, channel, kind, shot, ordinal)` — deliberately not the value,
+    so a shard can be replayed twice without doubling anything — and both the
+    writer and the shard importer insert with `OR IGNORE`. Under one id the better
+    answer from a re-run is therefore *dropped*: silently on the machine that
+    earned it, and again in every database the shard reaches. Splitting the id is
+    what makes re-running a thin pass worth the GPU time at all.
+
+    An empty `without` returns exactly the dict passed in, so every observer id in
+    every archive written before this existed is unchanged, and a complete run
+    keeps producing the id `expected_observers` names.
+
+    One definition, used by the writer in `_run_pass` and by the reconcile step
+    that has to recognise what the writer produced — the same discipline, and for
+    the same reason, as `store.observer_id` beside `Store.observer`.
+    """
+    out = dict(params or {})
+    named = sorted({str(n) for n in (without or ()) if n})
+    if named:
+        out["without"] = named
+    return out
 
 
 _ENV_UNKNOWN: dict = {}
@@ -617,6 +649,11 @@ class ProcessEngine:
         # five minutes, and so the log says it once rather than once per video.
         self._elsewhere: set = set()
         self._elsewhere_logged: set = set()
+
+        # `(component, missing-set)` pairs already announced. A pass running
+        # without an input is worth saying once; saying it per video is 224 lines
+        # in an archive this size, and the row itself now carries the record.
+        self._thin_logged: set = set()
 
         # The component ids this rotation planned. Set once per sweep; read by
         # the dependency gate to tell "not run yet" from "never selected".
@@ -1211,6 +1248,7 @@ class ProcessEngine:
                             "failed": 0, "deferred": 0, "elsewhere": 0,
                             "seconds": 0.0, "downloaded": 0, "shards": 0}
             self._elsewhere_logged = set()
+            self._thin_logged = set()
             self._exit_flushed = False
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="vios-process")
@@ -1490,6 +1528,33 @@ class ProcessEngine:
                     self._reconciled = {
                         **self._reconciled, "at": time.time(),
                         "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+            # After reconcile, and that order is the whole of it. A pass that ran
+            # without its on-screen text carries the names of what it lacked, and
+            # this hands the row back once one of those inputs has finished *and*
+            # written something. Reconcile is what turns restored evidence into a
+            # `done` row with a claim count — so running this first would ask
+            # whether OCR had arrived while OCR's row still said `queued`, and
+            # answer no on exactly the rotation where the answer was yes.
+            #
+            # Scoped to `runnable`: this converts a usable answer into a queued
+            # row, and doing that for a pass the session will not claim would
+            # leave a stage pending with nothing able to finish it.
+            try:
+                again = cov.reoffer_degraded(runnable)
+                if again["reoffered"]:
+                    named = ", ".join(
+                        f"{c} ×{n}" for c, n in
+                        sorted(again["components"].items(),
+                               key=lambda kv: -kv[1])[:4])
+                    self._log(f"Re-offering {again['reoffered']} completed rows "
+                              f"that answered without an input which has since "
+                              f"produced evidence — {named}")
+            except Exception as exc:               # noqa: BLE001
+                # The row already holds a usable answer; the worst case of this
+                # failing is that it stays the thinner one until next rotation.
+                self._log(f"Could not re-offer thin rows, continuing: "
+                          f"{type(exc).__name__}: {exc}", "warn")
 
             budget = max(res.get("usable_vram_mb", 0) - self.vram_headroom_mb,
                          512)
@@ -2141,6 +2206,23 @@ class ProcessEngine:
 
         degraded = [n for n in comp.soft
                     if states.get(n) in ("failed", "skipped")]
+        # Everything this pass will not have, which is a wider question than the
+        # one above and a different one. `degraded` is the *veto* list: soft
+        # inputs that reached a terminal state, which is what decides whether to
+        # wait for them. This is the *provenance* list: soft inputs that have not
+        # produced anything, terminal or not — a need still queued behind a wave
+        # boundary (`wave_leaks` warns about exactly this at startup), one still
+        # running in another lane, one deferred against a rate limit, and one that
+        # was never selected this session at all, which `states.get` returns None
+        # for and the veto list therefore cannot see.
+        #
+        # That last case is the common one and the reason this is not just
+        # `degraded`: a session that runs the language passes without `ocr` in its
+        # selection produces the same thin answer as one where `ocr` failed, and
+        # only this list notices. It is what `cov.done` records and what the
+        # observer id below is derived from, so the row and the evidence agree on
+        # what the answer was made of.
+        thin = [n for n in comp.soft if states.get(n) != "done"]
         # Which of the missing soft inputs might still arrive. Read once, here,
         # because the `except SkipPass` handler needs it: a pass that declines
         # *because* a source was empty has not declined the video, and marking
@@ -2155,6 +2237,17 @@ class ProcessEngine:
             # as thinner rather than passed off as complete.
             self._log(f"{key} {cid}: running without {', '.join(degraded)} "
                       f"— soft input, the pass reports what it had", "warn")
+        if thin:
+            # The wider set, said once per (pass, missing-set) rather than once
+            # per video, and it names the mechanism because the mechanism is new:
+            # the row keeps this list, and `reoffer_degraded` hands the row back
+            # when one of these inputs finally writes something.
+            seen = (cid, ",".join(sorted(thin)))
+            if seen not in self._thin_logged:
+                self._thin_logged.add(seen)
+                self._log(f"{cid}: answering without {', '.join(sorted(thin))} "
+                          f"for now — recorded on each row, and re-offered if "
+                          f"that evidence arrives later")
 
         # A hard need that has not run yet. The serial cohort barrier means this
         # cannot fire today: `topo_sort` puts every need ahead of its consumer
@@ -2313,8 +2406,8 @@ class ProcessEngine:
         # ── accept the emission ──────────────────────────────────────────
         try:
             observer = store.observer(
-                cid, comp.model or comp.family, comp.revision, comp.params,
-                comp.device)
+                cid, comp.model or comp.family, comp.revision,
+                _observer_params(comp.params, thin), comp.device)
             n_claims = store.add_claims(key, observer, em.claims) if em.claims else 0
             n_vectors = 0
             for v in em.vectors:
@@ -2383,7 +2476,12 @@ class ProcessEngine:
             return state
 
         seconds = time.time() - t0
-        cov.done(key, cid, seconds, n_claims, n_vectors, observer)
+        # `thin` travels into the row. It is the same list the observer id above
+        # was derived from, so the coverage row and the evidence agree on what this
+        # answer was made of — and it is what lets `reoffer_degraded` find the row
+        # again if one of those inputs eventually writes something.
+        cov.done(key, cid, seconds, n_claims, n_vectors, observer, thin)
+
         lane.passes += 1
         self._bump("passes")
         self._bump("claims", n_claims)
@@ -4352,6 +4450,13 @@ class ProcessEngine:
             running = self.coverage.running()
             retry = self.coverage.retry_state()
             shards = self.store.shards()
+            # Completed passes that answered without one of their soft inputs,
+            # and how many of those are already fixable. Nothing else on the panel
+            # can say it: those rows are `done`, so they count as done in the
+            # matrix, in every cohort total and in every stage's "complete" — and
+            # for 28 of this archive's 30 videos that word covered a reading taken
+            # with no on-screen text at all.
+            thin = self.coverage.thin()
             # Per-stage standing, including each stage's last channel bundle.
             # Cheap enough for the two-second cache: it is the same GROUP BY the
             # matrix already runs, sliced four ways rather than thirty-four.
@@ -4372,6 +4477,7 @@ class ProcessEngine:
             stats, matrix, counts, failures, running, shards = (
                 {}, [], {}, [], [], [])
             retry = {}
+            thin = {"rows": 0, "per_component": {}, "waiting": 0}
             self._log(f"status: {type(exc).__name__}: {exc}", "warn")
 
         by_id = {m["component"]: m for m in matrix}
@@ -4428,6 +4534,12 @@ class ProcessEngine:
             # two are one story: the channel gave the evidence back, and this is
             # how much of the work table that evidence already answered.
             "reconciled": dict(self._reconciled),
+            # …and what the archive is still short of. `rows` is how many completed
+            # passes hold a thinner answer than they could; `waiting` is how many of
+            # those the next rotation will hand back, because the input they went
+            # without has since written something. The difference is the honest one:
+            # the rest are waiting on evidence that does not exist yet.
+            "thin": thin,
             "telegram": {
                 "configured": bool(self._tg and self._tg.token),
                 "mtproto": bool(self._channel and self._channel.ready),
@@ -4594,6 +4706,12 @@ class ProcessEngine:
         Derived, never registered: `Store.observer` bumps a run counter, and
         asking "has this already been done" must not leave a fingerprint saying
         it was done here.
+
+        The complete reading only. A pass that ran without a soft input writes
+        under a different id by design — see `_observer_params` — and those ids
+        are enumerated separately by `degraded_observers`, because this dict also
+        answers "what should the next run produce", and the answer to that is
+        always the complete one.
         """
         out = {}
         for cid in (components if components is not None else self.selected):
@@ -4603,6 +4721,65 @@ class ProcessEngine:
             out[cid] = store_observer_id(
                 cid, comp.model or comp.family, comp.revision, comp.params)
         return out
+
+    def degraded_observers(self, components=None) -> dict:
+        """`{observer_id: (component, [missing inputs])}` for every thin reading.
+
+        The other half of `expected_observers`, and reconcile needs both. A pass
+        that ran without one of its soft inputs registered its observer with that
+        absence in the hashed params, so its claims carry an id that
+        `expected_observers` does not name — and reconcile treats evidence under
+        an unnamed id as a superseded revision and ignores it. After a restore
+        that means the row stays `queued`, the pass runs again, and every claim it
+        writes collides with one already there on its uid: full GPU cost, zero new
+        rows, and `done(claims=0)` overwriting the count that was true.
+
+        Enumerated from the registry rather than read out of the local coverage
+        table, because the case that matters most is the one where there is no
+        local coverage table to read: the Kaggle container starts empty, restores
+        shards into the evidence tables, and asks this question with nothing else
+        to go on. Every non-empty subset of a pass's soft inputs, which the
+        registry bounds at four — 72 ids across the eight soft-consuming passes,
+        one `IN` clause, once per rotation.
+
+        `Coverage.degraded_variants()` supplements it for absences the current
+        registry can no longer express: a soft edge that was removed after some
+        run had already gone without it leaves claims under an id no subset of
+        today's declaration can reproduce, and the coverage row is then the only
+        record of it.
+        """
+        sel = list(components if components is not None else self.selected)
+        out: dict = {}
+
+        def add(cid, comp, names):
+            names = sorted({n for n in names if n})
+            if not names:
+                return
+            oid = store_observer_id(cid, comp.model or comp.family,
+                                    comp.revision,
+                                    _observer_params(comp.params, names))
+            out.setdefault(oid, (cid, names))
+
+        for cid in sel:
+            comp = registry.BY_ID.get(cid)
+            if comp is None or not comp.soft:
+                continue
+            soft = sorted(comp.soft)
+            for k in range(1, len(soft) + 1):
+                for combo in itertools.combinations(soft, k):
+                    add(cid, comp, combo)
+        try:
+            for cid, without in self.coverage.degraded_variants():
+                comp = registry.BY_ID.get(cid)
+                if comp is not None and cid in set(sel):
+                    add(cid, comp, str(without or "").split(","))
+        except Exception:                          # noqa: BLE001
+            # The enumeration above is the load-bearing half and it has already
+            # run. A missing `degraded` column on an old database is not a reason
+            # to refuse to reconcile.
+            pass
+        return out
+
 
     def reconcile_now(self, components=None) -> dict:
         """Mark done every selected pass whose evidence is already here.
@@ -4650,6 +4827,16 @@ class ProcessEngine:
                        & set(registry.BY_ID[cid].produces)}
         by_observer = {expected[cid]: cid for cid in writes_rows
                        if expected.get(cid)}
+        # And the thin readings of the same passes, under the ids that record what
+        # they went without. `degraded_observers` says why they cannot be left out:
+        # unnamed here, their claims read as a superseded revision, the row stays
+        # queued, and the pass re-runs to write uids that already exist.
+        thin_of: dict = {}
+        for oid, (cid, names) in self.degraded_observers(sel).items():
+            if cid in writes_rows and oid not in by_observer:
+                by_observer[oid] = cid
+                thin_of[oid] = names
+
 
         evidence = store.evidence_by_observer(set(by_observer))
         if not evidence:
@@ -4681,19 +4868,32 @@ class ProcessEngine:
         rows = []
         for video_key, seen in evidence.items():
             proved = set()
+            # Best reading per pass, not every reading. A video can hold both a
+            # thin set of claims and a complete one — that is exactly what a
+            # re-offer produces, and both stay, because the archive is append-only
+            # — and the coverage row has to describe the *best* answer now held.
+            # Without this collapse the row would take whichever id `evidence`
+            # happened to yield last, so a video that was repaired could reconcile
+            # back to thin and be re-offered forever.
+            best: dict = {}
             for oid, counts in seen.items():
                 cid = by_observer.get(oid)
                 if not cid:
                     continue                      # a superseded revision
-                rows.append((video_key, cid, oid,
-                             counts.get("claims", 0), counts.get("vectors", 0),
-                             0.0))
+                names = thin_of.get(oid) or []
+                got = (counts.get("claims", 0), counts.get("vectors", 0))
+                rank = (len(names), -(got[0] + got[1]))
+                if cid not in best or rank < best[cid][0]:
+                    best[cid] = (rank, oid, got, names)
                 proved.update(implied.get(cid, ()))
+            for cid, (_, oid, got, names) in best.items():
+                rows.append((video_key, cid, oid, got[0], got[1], 0.0, names))
             for cid in proved:
                 # Zero seconds and zero counts: this row was inferred, not run,
                 # and the coverage matrix should not claim a duration for work
                 # that happened on another machine on another day.
-                rows.append((video_key, cid, expected.get(cid, ""), 0, 0, 0.0))
+                rows.append((video_key, cid, expected.get(cid, ""), 0, 0, 0.0, ()))
+
 
         out = cov.reconcile(rows)
         with self._lock:

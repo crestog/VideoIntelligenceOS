@@ -88,6 +88,8 @@ CREATE TABLE IF NOT EXISTS coverage (
     observer_id TEXT,
     last_error  TEXT,
     checkpoint  TEXT,          -- JSON: how far a long job got
+    degraded    TEXT,          -- soft inputs this run did not have, comma-joined.
+                               --   NULL/'' = it had everything it wanted.
     PRIMARY KEY (video_key, component)
 );
 """
@@ -102,6 +104,8 @@ CREATE INDEX IF NOT EXISTS ix_cov_claim ON coverage(component, state, lease_unti
 CREATE INDEX IF NOT EXISTS ix_cov_state ON coverage(state, component);
 CREATE INDEX IF NOT EXISTS ix_cov_token ON coverage(token);
 CREATE INDEX IF NOT EXISTS ix_cov_retry ON coverage(state, next_try_at);
+CREATE INDEX IF NOT EXISTS ix_cov_thin  ON coverage(component, video_key)
+    WHERE degraded IS NOT NULL AND degraded <> '';
 """
 
 # Columns added after the first release. A database written by an earlier build
@@ -110,7 +114,36 @@ CREATE INDEX IF NOT EXISTS ix_cov_retry ON coverage(state, next_try_at);
 MIGRATIONS = (
     ("next_try_at", "REAL DEFAULT 0"),
     ("revivals", "INTEGER DEFAULT 0"),
+    # What this pass did not have when it ran. Nothing else in the table can
+    # express it: `state` has one word for "ran and produced evidence", and a
+    # pass that ran without its on-screen text wrote that word too. The engine
+    # logged the difference — "running without ocr — soft input" — and the log
+    # died with the session, so a thin answer became indistinguishable from a
+    # complete one the moment the notebook stopped.
+    #
+    # Measured in this archive: `keyphrase` ran on all 30 videos and 28 of them
+    # had no OCR evidence at all; on the two that did, OCR's 230 claims landed
+    # 6.5 days *after* `keyphrase` and `hook` had already read the video and
+    # been recorded as done. Nothing in the engine would ever offer those rows
+    # again — `revive_failed` looks at `failed`, `reclaim_unavailable` at
+    # `skipped`, and `reconcile` refuses to touch `done` — so the thin reading
+    # was permanent and silent. `reoffer_degraded` is the ladder this column
+    # gives `done` rows, and it is the only one they have.
+    ("degraded", "TEXT"),
 )
+
+
+def marker(names) -> str:
+    """The `degraded` column's value for a set of missing inputs.
+
+    Sorted so the same absence produces the same string on every worker — the
+    column is compared, shipped in shards and used to derive an observer id, and
+    a set that stringified in claim order would make two identical runs look
+    different. Commas are stripped because the column is a comma-joined list and
+    a component id containing one would make the membership test below wrong;
+    none does today, and this is what keeps that from being load-bearing.
+    """
+    return ",".join(sorted(str(n).replace(",", "") for n in (names or ()) if n))
 
 
 def worker_id() -> str:
@@ -321,13 +354,23 @@ class Coverage:
 
     # ── finishing ───────────────────────────────────────────────────────
     def done(self, video_key: str, component: str, seconds: float,
-             claims: int = 0, vectors: int = 0, observer_id: str = "") -> None:
+             claims: int = 0, vectors: int = 0, observer_id: str = "",
+             degraded=()) -> None:
+        """Mark a pass complete, and record what it did not have.
+
+        `degraded` is the soft inputs that had produced nothing when this pass
+        ran. It is written on every completion, including the empty case, because
+        the useful direction is the clearing one: a row that was thin and has
+        since re-run with everything must stop reading as thin, and a marker that
+        only ever accumulated would keep re-offering a row that is now complete.
+        """
         self.conn.execute(
             "UPDATE coverage SET state=?, done_at=?, seconds=?, claims=?, "
             "vectors=?, observer_id=?, lease_until=0, token=NULL, "
-            "last_error=NULL, checkpoint=NULL WHERE video_key=? AND component=?",
+            "last_error=NULL, checkpoint=NULL, degraded=? "
+            "WHERE video_key=? AND component=?",
             (DONE, time.time(), seconds, claims, vectors, observer_id,
-             video_key, component))
+             marker(degraded) or None, video_key, component))
         self.conn.commit()
 
     def reconcile(self, rows: list) -> dict:
@@ -340,8 +383,8 @@ class Coverage:
         with the GPU what the channel already had.
 
         `rows` is `(video_key, component, observer_id, claims, vectors,
-        seconds)` — already decided by the caller, because deciding *what
-        counts as evidence* needs the registry and this module deliberately
+        seconds[, degraded])` — already decided by the caller, because deciding
+        *what counts as evidence* needs the registry and this module deliberately
         does not import it. What belongs here is the write, and its rules:
 
         Rows already `done` are left exactly as they are — their `claims` and
@@ -350,6 +393,14 @@ class Coverage:
         because another worker holds that lease and stealing it would let two
         workers believe they own the same pass. `skipped` rows are left because
         a decline is terminal and was made for a stated reason.
+
+        The seventh field is the soft inputs the matched evidence was written
+        without, and it is the reason a restore no longer erases that fact. The
+        laptop archive is the proof it is needed: restored from shards written
+        before coverage travelled, it has no coverage table at all, so every row
+        in it would come back through this method — and a thin reading that came
+        back as an unqualified `done` would be exactly as invisible as it was
+        before the column existed.
 
         Returns per-component counts: "reconciled 4 118 rows" is a number an
         operator has to trust, and a breakdown is what makes it checkable
@@ -362,18 +413,22 @@ class Coverage:
         now = time.time()
         per, vids = {}, set()
         payload = []
-        for video_key, component, oid, claims, vectors, seconds in rows:
+        for row in rows:
+            video_key, component, oid, claims, vectors, seconds = row[:6]
             payload.append((now, float(seconds or 0.0), int(claims or 0),
-                            int(vectors or 0), oid or "", video_key, component))
+                            int(vectors or 0), oid or "",
+                            (marker(row[6]) if len(row) > 6 else "") or None,
+                            video_key, component))
             per[component] = per.get(component, 0) + 1
             vids.add(video_key)
 
         cur = self.conn.executemany(
             "UPDATE coverage SET state=?, done_at=?, seconds=?, "
-            "claims=?, vectors=?, observer_id=?, lease_until=0, token=NULL, "
-            "next_try_at=0, last_error=NULL, checkpoint=NULL "
+            "claims=?, vectors=?, observer_id=?, degraded=?, lease_until=0, "
+            "token=NULL, next_try_at=0, last_error=NULL, checkpoint=NULL "
             "WHERE video_key=? AND component=? AND state IN (?,?)",
             [(DONE,) + p + (QUEUED, FAILED) for p in payload])
+
         self.conn.commit()
         changed = max(cur.rowcount, 0)
         # `executemany` reports one total across every statement, so the
@@ -512,14 +567,16 @@ class Coverage:
         rows = []
         for r in self.conn.execute(
                 "SELECT component, state, COUNT(*) n, AVG(seconds) s, "
-                "SUM(claims) c, SUM(vectors) v FROM coverage "
+                "SUM(claims) c, SUM(vectors) v, "
+                "SUM(CASE WHEN degraded IS NOT NULL AND degraded<>'' "
+                "         THEN 1 ELSE 0 END) t FROM coverage "
                 "GROUP BY component, state"):
             rows.append(dict(r))
         by: dict = {}
         for r in rows:
             e = by.setdefault(r["component"], {
                 "component": r["component"], "total": 0, "claims": 0,
-                "vectors": 0, "seconds": 0.0,
+                "vectors": 0, "seconds": 0.0, "thin": 0,
                 QUEUED: 0, RUNNING: 0, DONE: 0, FAILED: 0, SKIPPED: 0})
             e[r["state"]] = r["n"]
             e["total"] += r["n"]
@@ -527,6 +584,12 @@ class Coverage:
             e["vectors"] += r["v"] or 0
             if r["state"] == DONE and r["s"]:
                 e["seconds"] = round(r["s"], 2)
+            if r["state"] == DONE:
+                # Only on the `done` bucket. A queued row can carry a marker too
+                # — `reoffer_degraded` leaves it there on purpose — and counting
+                # that would report a thin *answer* for a row whose answer is
+                # currently being re-earned.
+                e["thin"] += r["t"] or 0
         for e in by.values():
             left = e[QUEUED] + e[RUNNING] + e[FAILED]
             e["remaining"] = left
@@ -561,6 +624,9 @@ class Coverage:
             "videos": 0,
             "counts": {s: 0 for s in (QUEUED, RUNNING, DONE, FAILED, SKIPPED)},
             "claims": 0, "vectors": 0, "seconds": 0.0,
+            # How many of the completed rows ran without a soft input. A stage
+            # can be `complete` and thin at the same time, and only this says so.
+            "thin": 0,
             "per_component": [], "errors": [], "observers": {},
             "started": None, "ended": None, "complete": False,
         }
@@ -574,17 +640,28 @@ class Coverage:
         for r in self.conn.execute(
                 f"SELECT component, state, COUNT(*) n, SUM(claims) c, "
                 f"SUM(vectors) v, SUM(seconds) s, MIN(started_at) t0, "
-                f"MAX(done_at) t1 FROM coverage WHERE component IN ({marks})"
+                f"MAX(done_at) t1, "
+                f"SUM(CASE WHEN degraded IS NOT NULL AND degraded<>'' "
+                f"         THEN 1 ELSE 0 END) thin "
+                f"FROM coverage WHERE component IN ({marks})"
                 + mine + " GROUP BY component, state", comps):
             e = per.setdefault(r["component"], {
                 "component": r["component"], "total": 0,
                 QUEUED: 0, RUNNING: 0, DONE: 0, FAILED: 0, SKIPPED: 0,
-                "claims": 0, "vectors": 0, "seconds": 0.0})
+                "claims": 0, "vectors": 0, "seconds": 0.0, "thin": 0})
             e[r["state"]] = r["n"]
             e["total"] += r["n"]
             e["claims"] += r["c"] or 0
             e["vectors"] += r["v"] or 0
             e["seconds"] += round(r["s"] or 0.0, 2)
+            if r["state"] == DONE:
+                # In the bundle because the bundle is what gets read months later
+                # by someone who no longer has the session: a stage that reports
+                # `complete` with 28 of 30 answers taken without their on-screen
+                # text is a different result from one that reports `complete`, and
+                # the difference is not recoverable from any other column here.
+                e["thin"] += r["thin"] or 0
+                out["thin"] += r["thin"] or 0
             out["counts"][r["state"]] = out["counts"].get(r["state"], 0) + r["n"]
             out["counts"]["total"] += r["n"]
             out["claims"] += r["c"] or 0
@@ -797,6 +874,49 @@ class Coverage:
             "SELECT * FROM coverage WHERE video_key=? ORDER BY component",
             (video_key,))]
 
+    def thin(self) -> dict:
+        """Completed passes that ran without one of their soft inputs.
+
+        `{"rows": n, "per_component": {cid: n}, "waiting": n}` — `waiting` being
+        the subset whose missing input has since produced evidence, which is what
+        `reoffer_degraded` will hand back on the next rotation. Both numbers are
+        needed and they mean different things: the first is how much of the
+        archive is a thinner answer than it could have been, the second is how
+        much of that is already fixable.
+        """
+        out: dict = {"rows": 0, "per_component": {}, "waiting": 0}
+        for r in self.conn.execute(
+                "SELECT component, COUNT(*) n FROM coverage "
+                "WHERE state=? AND degraded IS NOT NULL AND degraded<>''"
+                + self._mine() + " GROUP BY component", (DONE,)):
+            out["per_component"][r["component"]] = r["n"]
+            out["rows"] += r["n"]
+        out["waiting"] = self.conn.execute(
+            "SELECT COUNT(*) FROM coverage WHERE state=? AND degraded IS NOT NULL "
+            "AND degraded<>'' AND " + self._ARRIVED + self._mine(), (DONE,)
+        ).fetchone()[0]
+        return out
+
+    def degraded_variants(self) -> list:
+        """`[(component, "ocr,transcribe"), …]` — every thin run this database
+        holds, as its component and the inputs it lacked.
+
+        A supplement to the reconcile step's own enumeration, for the absences it
+        cannot reach. A pass that ran without an input wrote its evidence under an
+        observer id derived from that absence, and reconcile reproduces those ids
+        by enumerating the subsets of each pass's declared soft inputs. That
+        covers everything the current registry can express — but a soft edge
+        removed *after* some run had already gone without it leaves claims under
+        an id no subset of today's declaration reproduces, and then this column is
+        the only surviving record of what that run was missing.
+
+        Distinct pairs only, so the result is bounded by how many different
+        absences actually occurred, not by the size of the archive.
+        """
+        return [(r["component"], r["degraded"]) for r in self.conn.execute(
+            "SELECT DISTINCT component, degraded FROM coverage "
+            "WHERE degraded IS NOT NULL AND degraded<>''")]
+
     # ── operator actions ────────────────────────────────────────────────
     def unsettled(self, video_key: str, components) -> dict:
         """Of these components, the ones whose answer for this video can still
@@ -996,3 +1116,85 @@ class Coverage:
             "SELECT COUNT(*) FROM coverage WHERE state=? AND revivals >= ?"
             + self._mine(), (FAILED, MAX_REVIVALS)).fetchone()[0]
         return {"revived": revived, "exhausted": exhausted}
+
+    # One of the inputs this row went without has since finished and written
+    # something. Defined once because `thin()` counts what this clause selects
+    # and `reoffer_degraded` acts on it, and a count that disagreed with the
+    # action would be the more confusing of the two bugs.
+    #
+    # `INSTR` over a comma-wrapped list rather than `LIKE`: `LIKE` would read `_`
+    # in a component id as a wildcard, and the membership test has to be exact —
+    # it decides whether to spend a GPU pass again.
+    #
+    # `claims + vectors > 0` is the load-bearing half. An input that reached
+    # `done` having written *nothing* has answered the question: there was no
+    # on-screen text, no speech, nothing to have. Re-running its readers would
+    # produce the identical thin answer at full cost, so the trigger is evidence
+    # arriving, not a state changing.
+    _ARRIVED = (
+        "EXISTS (SELECT 1 FROM coverage d "
+        "        WHERE d.video_key = coverage.video_key "
+        "          AND d.state = 'done' "
+        "          AND COALESCE(d.claims,0) + COALESCE(d.vectors,0) > 0 "
+        "          AND INSTR(',' || coverage.degraded || ',', "
+        "                    ',' || d.component || ',') > 0)")
+
+    def reoffer_degraded(self, components=None) -> dict:
+        """Hand back completed passes whose missing input has since arrived.
+
+        The retry ladder for `done`, which is the one state that never had one.
+        `revive_failed` reconsiders `failed`, `reclaim_unavailable` reconsiders
+        `skipped`, and `reconcile` explicitly refuses to touch `done` — so a pass
+        that ran without its on-screen text was recorded exactly like one that had
+        it, and no mechanism in the engine would ever look at it again. Measured in
+        this archive: `keyphrase` ran on all 30 videos with OCR evidence on 2 of
+        them, and on those 2 the 230 OCR claims were written 6.5 days after
+        `keyphrase` and `hook` had already been marked done. Reclaiming OCR — which
+        `reclaim_unavailable` now does — produced text that nothing was ever going
+        to read.
+
+        Only `done` rows, and only when a named input has finished *and* written
+        evidence; `_ARRIVED` says why that second condition is the one that
+        matters. `degraded` is left on the row: `done()` rewrites it at the end of
+        the re-run, which is also what makes this terminate. The re-run sees the
+        arrived input in `done`, so it no longer names it, so the marker shrinks
+        and this stops selecting the row. A second re-offer needs a *second* input
+        to arrive, and there are at most four soft inputs on any pass in the
+        registry.
+
+        `components` restricts it to the passes this session can actually run, and
+        unlike `revive_failed` that restriction is not optional in practice. A
+        `failed` row is an unfinished obligation, and leaving it queued for a
+        component nobody enabled costs nothing but honesty. A thin `done` row is a
+        *usable answer*: downgrading it to `queued` for a pass this session will
+        never claim would turn a complete stage into a permanently pending one,
+        with no route back. Re-offer only what can be re-earned.
+
+        Deliberately not `skipped`: a pass that declined said something about the
+        video, and an input arriving does not retract it. Deliberately not
+        clearing `claims`/`vectors` either — until the re-run finishes they are
+        still the record of what this row actually produced.
+
+        Returns {"reoffered": n, "components": {cid: n}}.
+        """
+        only, args = "", []
+        if components is not None:
+            names = sorted({str(c) for c in components})
+            if not names:
+                return {"reoffered": 0, "components": {}}
+            only = " AND component IN (%s)" % ",".join("?" * len(names))
+            args = names
+        where = ("WHERE state=? AND degraded IS NOT NULL AND degraded<>'' AND "
+                 + self._ARRIVED + self._mine() + only)
+        by: dict = {}
+        for r in self.conn.execute(
+                "SELECT component, COUNT(*) n FROM coverage " + where
+                + " GROUP BY component", [DONE] + args):
+            by[r["component"]] = r["n"]
+        cur = self.conn.execute(
+            "UPDATE coverage SET state=?, attempts=0, next_try_at=0, "
+            "worker=NULL, token=NULL, lease_until=0 " + where,
+            [QUEUED, DONE] + args)
+        self.conn.commit()
+        return {"reoffered": max(cur.rowcount, 0), "components": by}
+

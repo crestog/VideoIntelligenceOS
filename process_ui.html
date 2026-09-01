@@ -663,6 +663,13 @@ details.step .in{padding:15px 16px 18px}
              a line rather than a table because there is exactly one number that
              matters: how much of the archive is genuinely still to do. -->
         <div class="lede" id="dReconcile" style="margin-top:10px">Reconcile has not run yet.</div>
+        <!-- Completed passes that answered without one of their soft inputs. It
+             belongs beside reconcile rather than beside the failures, because
+             nothing here failed: these rows are `done`, they count as done in the
+             matrix and in every stage's "complete", and the only thing wrong with
+             them is that the answer is thinner than the archive can now support.
+             Hidden when there are none, so a healthy run says nothing. -->
+        <div class="lede" id="dThin" style="margin-top:10px" hidden></div>
         <div class="result" id="dbResult"></div>
       </div>
 
@@ -1068,6 +1075,7 @@ function render(s){
     held && heldMb ? 'held locally · ' + heldMb + ' MB' : 'held locally';
   $('#dHeld').parentElement.className = held ? 'stat bad' : 'stat';
   renderReconcile(s);
+  renderThin(s);
   $('#dDisk').textContent = s.disk_free_mb ? (s.disk_free_mb/1024).toFixed(0) + ' GB' : '—';
   const src = s.source || {};
   $('#dFetch').textContent = src.downloaded ? src.downloaded + ' / ' + src.mb + ' MB' : '—';
@@ -1105,6 +1113,32 @@ function renderReconcile(s){
     + `were already done and will not run again — `
     + top.map(c => `${esc(c)} ${num(per[c])}`).join(', ')
     + (Object.keys(per).length > top.length ? ' …' : '');
+}
+
+function renderThin(s){
+  // Two numbers, and they are not the same number. `rows` is how many completed
+  // passes hold a thinner answer than the archive can now support. `waiting` is
+  // how many of those the next rotation hands back on its own, because the input
+  // they went without has since finished *and* written something. The remainder
+  // is not a backlog: it is waiting on evidence that does not exist yet, and
+  // presenting it as work to do would be asking for a re-run that produces the
+  // identical answer at full GPU cost.
+  const el = $('#dThin'); if(!el) return;
+  const t = s.thin || {}, rows = t.rows || 0;
+  if(!rows){ el.hidden = true; el.innerHTML = ''; return; }
+  const per = t.per_component || {};
+  const top = Object.keys(per).sort((a,b) => per[b] - per[a]).slice(0, 8);
+  const waiting = t.waiting || 0;
+  el.hidden = false;
+  el.innerHTML = `<b>${num(rows)}</b> completed ${rows === 1 ? 'pass' : 'passes'} `
+    + `answered without an input ${rows === 1 ? 'it' : 'they'} wanted — `
+    + top.map(c => `${esc(c)} ${num(per[c])}`).join(', ')
+    + (Object.keys(per).length > top.length ? ' …' : '')
+    + (waiting
+        ? `. <b>${num(waiting)}</b> of ${rows === 1 ? 'them' : 'those'} will be `
+          + `re-offered on the next rotation now that the missing evidence exists.`
+        : `. None can improve yet: the evidence they went without still does not `
+          + `exist, so re-running them would produce the same answer.`);
 }
 
 function renderSpectrum(s){
@@ -1235,10 +1269,16 @@ function renderStages(s){
               (b.parts || 1) === 1 ? '' : 's'} · ${mb(b.bytes)}</span>`
           : '<span class="tag">no bundle yet</span>';
     const errs = r.error_count || 0;
+    // A stage can read `complete` and still be thin, and those two words are not
+    // in tension — every row finished. The tag is what stops "complete" from
+    // being the whole sentence, because for 28 of this archive's 30 videos the
+    // finished reading was taken with no on-screen text at all.
+    const thin = r.thin || 0;
     return `<div class="s ${r.complete ? 'done' : on ? 'on' : ''}">
       <div class="hd"><b>${esc(r.stage)}</b>
         <span>${(r.components || []).length} passes</span>
         ${tag}
+        ${thin ? `<span class="tag wait" title="These passes finished, but ran without a soft input. They are re-offered automatically once that evidence arrives.">${num(thin)} answered thin</span>` : ''}
         ${errs ? `<span class="tag bad">${num(errs)} error${errs === 1 ? '' : 's'}</span>` : ''}
         <span class="rt">${num(dn)} / ${num(tot)} · ${pct}%</span></div>
       <div class="ln">${num(r.videos)} videos · ${num(r.claims)} claims ·
