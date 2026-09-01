@@ -417,13 +417,21 @@ try:
 finally:
     vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, False, ""
 
-# Every cause the interface branches on must be one this module can actually
-# produce. A switch arm for a token nothing emits is dead copy nobody will ever
-# see, and a token with no arm falls through to "no frames matched" — which is
-# how a missing model got described as an empty archive.
+# Every cause the interface branches on must be one the server can actually
+# produce, and every cause the server produces must have an arm. A switch arm for
+# a token nothing emits is dead copy nobody will ever see; a token with no arm
+# falls through to "no frames matched" — which is how a missing model got
+# described as an empty archive, and how a frame reference that does not parse
+# got described as an archive holding nothing like it.
+#
+# The route is read as well as this module, because `bad_query` lives there:
+# four refusals in `api_vsearch` that are not searches at all.
 _CAUSES = {"no_numpy", "no_index", "no_vectors", "empty_query", "no_match",
-           "no_encoder", "encode_failed", "no_vision_tower", "bad_image"}
-_src = pathlib.Path(vsearch.__file__).read_text(encoding="utf-8")
+           "no_encoder", "encode_failed", "no_vision_tower", "bad_image",
+           "bad_query"}
+_here = pathlib.Path(vsearch.__file__)
+_src = (_here.read_text(encoding="utf-8")
+        + _here.with_name("server.py").read_text(encoding="utf-8"))
 _emitted = set(re.findall(r'"cause":\s*"([a-z_]+)"', _src))
 eq(_emitted - _CAUSES, set(), "no cause is emitted that the vocabulary omits")
 eq(_CAUSES - _emitted, set(), "and no documented cause is unreachable")

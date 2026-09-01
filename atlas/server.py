@@ -718,6 +718,12 @@ def api_vsearch(q: str = Query("", description="text, into the image space"),
     the interface has a playhead, not a frame number, and `fps` is a column
     Atlas holds and the browser does not. Converting here keeps the one piece of
     arithmetic that can be wrong in the place that has the data for it.
+
+    The four refusals below carry `cause: bad_query`, and that token exists for
+    them: they are not "the search found nothing", they are "that was not a
+    search". Sent without a cause they fell through to the frames lane's default
+    arm, which is headed *No frames matched* — so a stale bookmark naming a reel
+    that no longer exists was reported as an archive containing nothing like it.
     """
     t0 = time.time()
     limit = max(1, min(int(limit or 40), 200))
@@ -730,6 +736,7 @@ def api_vsearch(q: str = Query("", description="text, into the image space"),
             idx = vsearch.frame_for_time(db(), key, t)
             if idx is None:
                 return {"ok": False, "count": 0, "hits": [],
+                        "cause": "bad_query",
                         "reason": f"{key} has no frame rate on record, so a "
                                   f"timestamp cannot name a frame — pass "
                                   f"frame={key}:<frame_idx>"}
@@ -738,6 +745,7 @@ def api_vsearch(q: str = Query("", description="text, into the image space"),
                 idx = int(raw or 0)
             except ValueError:
                 return {"ok": False, "count": 0, "hits": [],
+                        "cause": "bad_query",
                         "reason": f"'{frame}' is not <video_key>:<frame_idx>"}
         sp = space or config.VSEARCH_SPACES[0]
         got = vsearch.similar_to_frame(db(), key, idx, space=sp, limit=limit,
@@ -745,11 +753,13 @@ def api_vsearch(q: str = Query("", description="text, into the image space"),
     elif q.strip():
         if space and space != "clip":
             return {"ok": False, "count": 0, "hits": [],
+                    "cause": "bad_query",
                     "reason": "text and image queries are encoded by CLIP, so "
                               "they can only be searched in the clip space"}
         got = vsearch.search_text(db(), q.strip(), limit=limit)
     else:
         return {"ok": False, "count": 0, "hits": [],
+                "cause": "bad_query",
                 "reason": "pass ?q=<text> or ?frame=<video_key>:<frame_idx>"}
     return _vsearch_reply(got, time.time() - t0)
 

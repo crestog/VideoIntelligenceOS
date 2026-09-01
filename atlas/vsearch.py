@@ -952,6 +952,12 @@ def _resident_hits(space: str, q, np, limit: int, exclude_key: str):
 #                    not a missing install, and it needs a traceback not a download
 #   no_vision_tower  the text tower is present and the vision tower is not
 #   bad_image        the upload is not a decodable image
+#
+# A tenth, `bad_query`, belongs to the vocabulary but is emitted by the route in
+# `atlas/server.py` rather than by anything here: it means the request was never
+# a search — a frame reference that does not parse, a space that cannot hold a
+# CLIP vector — and it is separate from `no_match` because "that was not a
+# question" and "the answer is nothing" are different sentences.
 def search_vector(conn: sqlite3.Connection, q, space: str,
                   limit: int = 40, exclude_key: str = "") -> dict:
     """Rank frames against a query vector already in `space`."""
