@@ -17,6 +17,8 @@ Run with `python _t_vsearch.py` from the repo root. No database and no network �
 the resident index is injected directly, because that is the state the ranking
 functions actually read.
 """
+import pathlib
+import re
 import sys
 
 import numpy as np
@@ -328,6 +330,103 @@ vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, False, ""
 with vsearch._LOCK:
     for s in ("t", "t2", "t3"):
         vsearch._RESIDENT.pop(s, None)
+
+# ── The picture query, and the two failures that arrive at the same except ──
+#
+# `search_image` used to report every exception out of the encoder as
+# `bad_image`. Two things can raise in there and they need opposite fixes: the
+# bytes are not a picture (send a different file), or the vision tower raised
+# (read a traceback). Told the second as the first, the interface asks somebody
+# to re-export a screenshot that was always fine — the same shape of wrong
+# answer as reading `BaseModelOutputWithPooling` and concluding a model was
+# missing. So the decode step raises `BadImage` and nothing else does.
+#
+# The model is deliberately `None` below. Decoding happens before the processor
+# is ever touched, so the whole split is provable without 1.7 GB of weights.
+def _image_outcome(data):
+    """`bad_image`, `raised`, or `returned` — which of the three happened."""
+    try:
+        vsearch._Clip(None, None, "cpu").image(data)
+    except vsearch.BadImage:
+        return "bad_image"
+    except Exception:                                  # noqa: BLE001
+        return "raised"
+    return "returned"
+
+
+eq(_image_outcome(b"not a picture at all"), "bad_image",
+   "bytes that are not an image are refused at the decode, as BadImage")
+
+_png = b""
+try:
+    import io as _io
+
+    from PIL import Image as _Image
+    _buf = _io.BytesIO()
+    _Image.new("RGB", (8, 8), (200, 40, 40)).save(_buf, format="PNG")
+    _png = _buf.getvalue()
+    # A real picture and a processor that cannot possibly encode it. `raised`,
+    # never `bad_image`: the file decoded, so blaming the file is a wrong answer.
+    eq(_image_outcome(_png), "raised",
+       "a decodable PNG the tower cannot encode is not an unreadable image")
+except ImportError:
+    pass
+
+
+class _RaisingEnc:
+    """An encoder that is loaded and fails. Both ways."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def text(self, query):
+        raise self._exc
+
+    def image(self, data):
+        raise self._exc
+
+
+try:
+    vsearch._ENC_TRIED = True
+    vsearch._ENCODER = _RaisingEnc(vsearch.BadImage("cannot identify image"))
+    got = vsearch.search_image(None, b"\x00\x01\x02", limit=4)
+    eq(got["cause"], "bad_image", "an undecodable upload is the upload's fault")
+
+    vsearch._ENCODER = _RaisingEnc(RuntimeError("shape mismatch in the tower"))
+    got = vsearch.search_image(None, b"\x00\x01\x02", limit=4)
+    eq(got["cause"], "encode_failed",
+       "a tower that raises is this build's fault, not the picture's")
+    yes("shape mismatch" in got["reason"],
+        "and the reason carries what actually raised, for the log")
+
+    # An empty part is its own sentence. `FormData.append('file', blob)` with no
+    # filename sends exactly this, and "could not read the image" would send
+    # somebody to inspect a picture that never left the browser.
+    got = vsearch.search_image(None, b"", limit=4)
+    eq(got["cause"], "bad_image", "an empty upload is refused before the model")
+    yes("empty" in got["reason"], "and says the bytes never arrived")
+
+    vsearch._ENCODER = onnx
+    got = vsearch.search_image(None, _png or b"\x89PNG", limit=4)
+    eq(got["cause"], "no_vision_tower",
+       "a text-only route says the tower is absent, not that the file is bad")
+
+    vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, True, "none"
+    got = vsearch.search_image(None, _png or b"\x89PNG", limit=4)
+    eq(got["cause"], "no_encoder", "and no encoder at all is its own cause")
+finally:
+    vsearch._ENCODER, vsearch._ENC_TRIED, vsearch._ENC_ERROR = None, False, ""
+
+# Every cause the interface branches on must be one this module can actually
+# produce. A switch arm for a token nothing emits is dead copy nobody will ever
+# see, and a token with no arm falls through to "no frames matched" — which is
+# how a missing model got described as an empty archive.
+_CAUSES = {"no_numpy", "no_index", "no_vectors", "empty_query", "no_match",
+           "no_encoder", "encode_failed", "no_vision_tower", "bad_image"}
+_src = pathlib.Path(vsearch.__file__).read_text(encoding="utf-8")
+_emitted = set(re.findall(r'"cause":\s*"([a-z_]+)"', _src))
+eq(_emitted - _CAUSES, set(), "no cause is emitted that the vocabulary omits")
+eq(_CAUSES - _emitted, set(), "and no documented cause is unreachable")
 
 print(f"ok — {ok} assertions")
 sys.exit(0)

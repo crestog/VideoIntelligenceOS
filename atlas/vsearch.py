@@ -57,6 +57,7 @@ import threading
 import time
 
 from . import config
+from .hfcompat import projected
 from .tgchannel import log
 
 # One resident entry per space: {"vecs", "ids", "dim", "stride", "videos"}.
@@ -446,6 +447,19 @@ def state() -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 # THE QUERY ENCODER — CLIP, through torch where it runs and ONNX where it cannot
 # ══════════════════════════════════════════════════════════════════════════
+class BadImage(ValueError):
+    """The bytes are not a picture — as distinct from the tower having raised.
+
+    Exists so `search_image` can tell two failures apart that arrive at the same
+    `except` and mean opposite things. Decoding is the caller's fault and the fix
+    is a different file; the model call raising is *this build's* fault and the
+    fix is a traceback. Reported as one, the interface tells somebody their
+    screenshot is corrupt when the encoder is what broke — the same shape of lie
+    as reading a class name called `BaseModelOutputWithPooling` and concluding a
+    model was missing. So the decode step raises this, and nothing else does.
+    """
+
+
 class _Onnx:
     """CLIP's text tower, as a graph, with no torch anywhere beneath it.
 
@@ -501,7 +515,13 @@ class _Onnx:
 
 
 class _Clip:
-    """CLIP's two towers behind one object. Returns L2-normalised float32."""
+    """CLIP's two towers behind one object. Returns L2-normalised float32.
+
+    Both towers go through `hfcompat.projected`, which is the whole of what makes
+    this work on transformers 5.x — see that module. The two calls must use it or
+    neither: a query read one way and frames read the other are not in the same
+    space, and nothing about that failure looks like a failure.
+    """
 
     def __init__(self, model, processor, device):
         self.model, self.processor, self.device = model, processor, device
@@ -515,20 +535,28 @@ class _Clip:
             batch = self.processor(text=[query], return_tensors="pt",
                                    padding=True, truncation=True,
                                    max_length=77).to(self.device)
-            return self._norm(self.model.get_text_features(**batch))[0] \
-                .cpu().float().numpy()
+            got = projected(self.model.get_text_features(**batch),
+                            "text features")
+            return self._norm(got)[0].cpu().float().numpy()
 
     def image(self, data: bytes):
         import io
 
         import torch
         from PIL import Image
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        # Decode alone, in its own guard, so that `BadImage` means the upload and
+        # nothing else. Everything after this line is the model, and if it raises
+        # the caller must not describe it as an unreadable picture.
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception as exc:                       # noqa: BLE001
+            raise BadImage(f"{type(exc).__name__}: {exc}") from exc
         with torch.no_grad():
             batch = self.processor(images=[img], return_tensors="pt") \
                 .to(self.device)
-            return self._norm(self.model.get_image_features(**batch))[0] \
-                .cpu().float().numpy()
+            got = projected(self.model.get_image_features(**batch),
+                            "image features")
+            return self._norm(got)[0].cpu().float().numpy()
 
 
 def _load_torch():
@@ -904,19 +932,41 @@ def _resident_hits(space: str, q, np, limit: int, exclude_key: str):
             for i in top]
 
 
+# Every empty result carries a `cause` beside its `reason`. The prose is for a
+# person and changes freely; the cause is a fixed token an interface may branch
+# on, and it exists because branching on the prose does not work. The frames lane
+# decided "that search needs a model, and it is not installed here" by testing
+# the reason against /torch|transformers|module|encoder|model/i — which matched
+# `AttributeError: 'BaseModelOutputWithPooling' object has no attribute 'norm'`
+# on the word *Model* inside a class name, and told somebody to install a model
+# that was already loaded and working. Nine causes, and only one of them means
+# anything is missing:
+#
+#   no_numpy         numpy is not importable
+#   no_index         nothing resident in that space — the index is not built
+#   no_vectors       that reel has no frame vectors in that space
+#   empty_query      the query vector normalises to zero
+#   no_match         the archive was compared, and nothing in it resembles this
+#   no_encoder       no query encoder could be loaded at all
+#   encode_failed    an encoder *is* loaded and the call raised — a defect here,
+#                    not a missing install, and it needs a traceback not a download
+#   no_vision_tower  the text tower is present and the vision tower is not
+#   bad_image        the upload is not a decodable image
 def search_vector(conn: sqlite3.Connection, q, space: str,
                   limit: int = 40, exclude_key: str = "") -> dict:
     """Rank frames against a query vector already in `space`."""
     try:
         import numpy as np
     except ImportError:
-        return {"hits": [], "reason": "numpy missing"}
+        return {"hits": [], "cause": "no_numpy", "reason": "numpy missing"}
     if not ready(space):
-        return {"hits": [], "reason": f"no resident index for {space}"}
+        return {"hits": [], "cause": "no_index",
+                "reason": f"no resident index for {space}"}
     q = np.asarray(q, dtype=np.float32).reshape(-1)
     n = float(np.linalg.norm(q))
     if n == 0:
-        return {"hits": [], "reason": "the query vector is empty"}
+        return {"hits": [], "cause": "empty_query",
+                "reason": "the query vector is empty"}
     q = q / n
     limit = max(int(limit), 1)
 
@@ -945,6 +995,7 @@ def search_vector(conn: sqlite3.Connection, q, space: str,
             hits = _spread(cands, fps, limit)
         if not hits:
             return {"hits": [], "space": space, "searched_videos": seen,
+                    "cause": "no_match",
                     "reason": "nothing in this space resembles it"}
         return {"hits": _shape(conn, space, hits, fps), "space": space,
                 "searched_videos": seen}
@@ -953,7 +1004,8 @@ def search_vector(conn: sqlite3.Connection, q, space: str,
                                         config.VSEARCH_CANDIDATES)
                  if k != exclude_key]
     if not shortlist:
-        return {"hits": [], "reason": "nothing in this space resembles it"}
+        return {"hits": [], "cause": "no_match",
+                "reason": "nothing in this space resembles it"}
     cands = [h for h in _exact(conn, space, q, np, shortlist,
                                max(limit * _POOL, _POOL_MIN))
              if h[0] != exclude_key]
@@ -975,7 +1027,7 @@ def similar_to_frame(conn: sqlite3.Connection, video_key: str, frame_idx: int,
     try:
         import numpy as np
     except ImportError:
-        return {"hits": [], "reason": "numpy missing"}
+        return {"hits": [], "cause": "no_numpy", "reason": "numpy missing"}
     q, used = None, int(frame_idx)
     for r in frame_rows(conn, space, video_key):
         idx, mat = _unpack(r, np)
@@ -994,7 +1046,7 @@ def similar_to_frame(conn: sqlite3.Connection, video_key: str, frame_idx: int,
             near = int(np.argmin(np.abs(idx - int(frame_idx))))
             q, used = mat[near], int(idx[near])
     if q is None:
-        return {"hits": [],
+        return {"hits": [], "cause": "no_vectors",
                 "reason": f"{video_key} has no {space} frame vectors"}
     out = search_vector(conn, q, space, limit,
                         exclude_key="" if same_video else video_key)
@@ -1008,11 +1060,17 @@ def search_text(conn: sqlite3.Connection, query: str,
     """Mode 3 — text into the image space, through CLIP's text tower."""
     enc = get_encoder()
     if enc is None:
-        return {"hits": [], "reason": _ENC_ERROR or "no query encoder"}
+        return {"hits": [], "cause": "no_encoder",
+                "reason": _ENC_ERROR or "no query encoder"}
     try:
         q = enc.text(query)
     except Exception as exc:                           # noqa: BLE001
-        return {"hits": [],
+        # `encode_failed`, never `no_encoder`: the encoder above loaded, so
+        # nothing is missing and no download fixes this. It is a fault in the
+        # encode path — the shape transformers hands back changed once already,
+        # which is what `hfcompat` is for — and the interface must send somebody
+        # to a traceback rather than to a model registry.
+        return {"hits": [], "cause": "encode_failed",
                 "reason": f"encode failed: {type(exc).__name__}: "
                           f"{str(exc)[:120]}"}
     out = search_vector(conn, q, "clip", limit)
@@ -1025,20 +1083,35 @@ def search_image(conn: sqlite3.Connection, data: bytes,
     """Mode 2 — an uploaded screenshot, through CLIP's image tower."""
     enc = get_encoder()
     if enc is None:
-        return {"hits": [], "reason": _ENC_ERROR or "no query encoder"}
+        return {"hits": [], "cause": "no_encoder",
+                "reason": _ENC_ERROR or "no query encoder"}
     if isinstance(enc, _Onnx):
         # An encoder is loaded and this mode still cannot run, which no wording
         # about reading the image would convey. The text tower is 472 MB and the
         # vision tower 1.16 GB; only the first is fetched.
-        return {"hits": [], "reason": "this host has the text tower only — "
-                                      "searching by an uploaded image needs "
-                                      "torch, which cannot run here"}
+        return {"hits": [], "cause": "no_vision_tower",
+                "reason": "this host has the text tower only — "
+                          "searching by an uploaded image needs "
+                          "torch, which cannot run here"}
+    if not data:
+        # Reached when a multipart part arrives with no filename, which is what
+        # `FormData.append('file', blob)` sends for a pasted screenshot if the
+        # third argument is omitted. Worth its own sentence: "could not read the
+        # image" sends somebody to look at a picture that was never uploaded.
+        return {"hits": [], "cause": "bad_image",
+                "reason": "the upload was empty — no image bytes arrived"}
     try:
         q = enc.image(data)
+    except BadImage as exc:
+        return {"hits": [], "cause": "bad_image",
+                "reason": f"could not read the image: {str(exc)[:120]}"}
     except Exception as exc:                           # noqa: BLE001
-        return {"hits": [],
-                "reason": f"could not read the image: {type(exc).__name__}: "
-                          f"{str(exc)[:120]}"}
+        # The vision tower is loaded and it raised. Not `bad_image`: the picture
+        # decoded, so blaming the file is a wrong answer, and one that costs
+        # somebody a round of re-exporting a screenshot that was always fine.
+        return {"hits": [], "cause": "encode_failed",
+                "reason": f"encoding the picture failed: "
+                          f"{type(exc).__name__}: {str(exc)[:120]}"}
     out = search_vector(conn, q, "clip", limit)
     out["query"] = {"image_bytes": len(data), "space": "clip"}
     return out

@@ -692,10 +692,12 @@ def _vsearch_reply(got: dict, took: float) -> dict:
             "hits": hits, "space": got.get("space", ""),
             "query": got.get("query") or {},
             "searched_videos": got.get("searched_videos", 0),
-            # Present only when there is nothing to show. Four different causes
-            # produce an empty list — no payloads imported, no numpy, no
-            # encoder, or a genuinely unlike archive — and a caller cannot tell
-            # them apart from the list alone.
+            # Both present only when there is nothing to show. `reason` is the
+            # sentence to put on screen; `cause` is the fixed token to branch on,
+            # and the two are separate because an interface that branched on the
+            # sentence read "no attribute 'norm'" as a missing install. The
+            # vocabulary is listed above `vsearch.search_vector`.
+            "cause": got.get("cause", ""),
             "reason": got.get("reason", "")}
 
 
@@ -759,12 +761,17 @@ async def api_vsearch_image(file: UploadFile = File(...), limit: int = 40):
     Read with a ceiling rather than `await file.read()` unbounded: this is a
     public-facing multipart endpoint and the file only has to survive being
     decoded to 224x224. Eight megabytes is a generous screenshot.
+
+    An empty part gets no early return, and that is deliberate. It used to,
+    answering `{ok: False, reason: "the upload was empty"}` — a shape with no
+    `cause`, no `took_ms` and no `space`, so the frames lane fell through to its
+    "no frames matched" arm and told somebody the archive held nothing like
+    their picture when the picture had never left the browser. `search_image`
+    answers that case itself now, with a cause, so every outcome of this route
+    leaves through `_vsearch_reply` and carries a token to branch on.
     """
     t0 = time.time()
     data = await file.read(8 * 1024 * 1024)
-    if not data:
-        return {"ok": False, "count": 0, "hits": [],
-                "reason": "the upload was empty"}
     got = vsearch.search_image(db(), data,
                                limit=max(1, min(int(limit or 40), 200)))
     return _vsearch_reply(got, time.time() - t0)

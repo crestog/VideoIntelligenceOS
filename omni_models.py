@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import cv2
 
+from atlas.hfcompat import projected
 from logger import vios_log
 
 MODELS = {}
@@ -180,7 +181,12 @@ def extract_img_features(model, processor, device, pil_imgs):
     inputs = processor(images=pil_imgs, return_tensors="pt").to(device)
     inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
     with torch.no_grad():
-        features = model.get_image_features(**inputs)
+        # `projected`: on transformers 5.x these two methods return the whole
+        # model output and the embedding is `.pooler_output`. This is the side
+        # that *writes* the index, so getting it wrong does not raise — it fills
+        # `frame_vector` with vectors no query can ever match. See atlas/hfcompat.
+        features = projected(model.get_image_features(**inputs),
+                             "image features")
         if features.ndim == 3:
             features = features.mean(dim=1)
         features = features / features.norm(p=2, dim=-1, keepdim=True)
@@ -190,7 +196,8 @@ def extract_img_features(model, processor, device, pil_imgs):
 def extract_txt_features(model, processor, device, text):
     inputs = processor(text=text, padding=True, truncation=True, return_tensors="pt").to(device)
     with torch.no_grad():
-        features = model.get_text_features(**inputs)
+        features = projected(model.get_text_features(**inputs),
+                             "text features")
         if features.ndim == 3:
             features = features.mean(dim=1)
         features = features / features.norm(p=2, dim=-1, keepdim=True)
