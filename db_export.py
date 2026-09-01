@@ -70,6 +70,7 @@ import time
 from config import (BASE_DIR, LAKE_DIR, DB_PATH, SQLITE_TIMEOUT,
                     missing_telegram_secrets,
                     OMNI_PG_DB, OMNI_PG_USER, OMNI_PG_PASSWORD, OMNI_PG_HOST)
+from atlas.subproc import BACKGROUND, FOREGROUND
 from logger import vios_log
 
 # Derived here rather than imported: ui_server owns the harvester's session path
@@ -223,7 +224,8 @@ def _dump_postgres(dest: str) -> bool:
     cmd = ["pg_dump", "-h", OMNI_PG_HOST, "-U", OMNI_PG_USER, "-d", OMNI_PG_DB,
            "--no-owner", "--no-acl", "-f", dest]
     try:
-        p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=1800)
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                           timeout=1800, creationflags=BACKGROUND)
     except (subprocess.SubprocessError, OSError) as e:
         vios_log(f"pg_dump failed to launch: {e}", "EXPORT", "WARN")
         return False
@@ -362,7 +364,8 @@ def _git_commit() -> str:
     try:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, timeout=10,
-                             cwd=os.path.dirname(os.path.abspath(__file__)))
+                             cwd=os.path.dirname(os.path.abspath(__file__)),
+                             creationflags=FOREGROUND)
         return out.stdout.strip() or "unknown"
     except (subprocess.SubprocessError, OSError):
         return "unknown"

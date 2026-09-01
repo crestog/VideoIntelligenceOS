@@ -45,6 +45,7 @@ import threading
 import time
 
 from . import config
+from . import subproc
 from .tgchannel import log
 
 _LOCK = threading.RLock()
@@ -782,6 +783,26 @@ def artifact_file(conn: sqlite3.Connection, video_key: str, kind: str,
         ev.set()
 
 
+# How many frame renders may run at once, and the only bound on them. The three
+# semaphores above cover downloads — `_SLOTS` the proxy fetch, `_WARM_SLOTS` the
+# warm-ahead, `_FILL_SLOTS` the cache fill — and none of them is on this path:
+# rendering a frame from a file already on disk was unbounded.
+#
+# What that means in a browser is one ffmpeg per poster on the page, concurrently.
+# Both callers are sync `def` routes, so starlette runs them in its threadpool,
+# whose default is 40 threads — a results grid can therefore have tens of ffmpeg
+# processes alive at once, each 30-40 MB of RSS and each wanting a core. The
+# renders do not get faster for being simultaneous; they get slower, and they take
+# the interface down with them, because the same cores are drawing it.
+#
+# Four rather than one: a page's posters should still overlap, and the point is a
+# ceiling, not a queue. Four keeps the transient cost near 150 MB and leaves the
+# rest of the machine to the window, while a page of twelve posters still renders
+# in three waves of ~25 ms rather than twelve serial ones.
+_RENDER_SLOTS = threading.Semaphore(
+    max(1, int(os.environ.get("ATLAS_RENDER_JOBS", "4"))))
+
+
 def _render_frame(src: str, seek: float, dest: str) -> str:
     """Cut one frame to `dest`, atomically. Returns `dest` or "".
 
@@ -815,13 +836,31 @@ def _render_frame(src: str, seek: float, dest: str) -> str:
     -ss before -i seeks by keyframe without decoding the file up to that point:
     milliseconds instead of seconds on a long clip. The frame may land slightly
     early, which does not matter for a thumbnail.
+
+    `FOREGROUND`, not `BACKGROUND`: this is the one ffmpeg the user is waiting
+    on. It is also the spawn that produced the reported console windows — under
+    `pythonw` there is no console to inherit, so each of a page's posters
+    allocated its own — see `subproc.py` for why that is one flag and the
+    priority is another.
     """
     tmp = f"{dest}.{os.getpid()}.{threading.get_ident()}.part.jpg"
     cmd = [_FFMPEG, "-nostdin", "-loglevel", "error", "-ss", f"{seek:.2f}",
            "-i", src, "-frames:v", "1", "-vf", "scale=480:-2",
            "-q:v", "5", "-y", tmp]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=25)
+        # Re-checked under the semaphore, and this is the larger half of what the
+        # bound buys. A page of twelve posters is twelve threads that all passed
+        # the callers' `getsize > 0` test at the same instant, before any of them
+        # had written anything; without this, four render and eight more render
+        # the same frames again as slots free up. With it, the first wave
+        # publishes with `os.replace` and the rest find the finished file and
+        # never spawn ffmpeg at all. Cheap where the callers' check is cheap, for
+        # the same reason: the rename means a nonzero size is a whole file.
+        with _RENDER_SLOTS:
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                return dest
+            r = subprocess.run(cmd, capture_output=True, timeout=25,
+                               creationflags=subproc.FOREGROUND)
         if r.returncode == 0 and os.path.exists(tmp) \
                 and os.path.getsize(tmp) > 0:
             try:

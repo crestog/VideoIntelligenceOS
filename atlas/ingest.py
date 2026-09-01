@@ -53,7 +53,7 @@ import sqlite3
 import threading
 import time
 
-from . import config, identity, pgdump, reflect, tgchannel
+from . import config, identity, pgdump, reflect, subproc, tgchannel
 from .tgchannel import log
 
 # ── Progress, readable from the API while a scan is running ───────────────
@@ -287,7 +287,8 @@ def _decompress(src: str, dst: str) -> str:
         return "no zstd: neither the python module nor the binary is available"
     try:
         r = subprocess.run([exe, "-d", "-f", "-o", dst, src],
-                           capture_output=True, text=True, timeout=1800)
+                           capture_output=True, text=True, timeout=1800,
+                           creationflags=subproc.BACKGROUND)
         if r.returncode != 0:
             return f"zstd exit {r.returncode}: {(r.stderr or '')[:200]}"
         return ""

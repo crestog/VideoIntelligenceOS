@@ -75,6 +75,7 @@ from config import (SCRATCH_DIR, DB_PATH, SQLITE_TIMEOUT,
                     missing_telegram_secrets,
                     OMNI_PG_DB, OMNI_PG_USER, OMNI_PG_PASSWORD, OMNI_PG_HOST)
 from db_export import BUNDLE_SCHEMA, EXPORT_SESSION, _sha256, _CHUNK, _mb
+from atlas.subproc import BACKGROUND
 from logger import vios_log
 
 RESTORE_DIR = os.path.join(SCRATCH_DIR, "restore")
@@ -641,13 +642,15 @@ def _load_postgres(dump: str) -> str:
         # beats hanging the restore for an hour.
         wipe = subprocess.run(
             base + ["-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"],
-            env=env, capture_output=True, text=True, timeout=300)
+            env=env, capture_output=True, text=True, timeout=300,
+            creationflags=BACKGROUND)
         if wipe.returncode != 0:
             vios_log(f"could not clear Postgres schema: "
                      f"{(wipe.stderr or '')[:200]}", "RESTORE", "WARN")
             return "existing schema would not drop"
         load = subprocess.run(base + ["-f", dump], env=env,
-                              capture_output=True, text=True, timeout=3600)
+                              capture_output=True, text=True, timeout=3600,
+                              creationflags=BACKGROUND)
     except subprocess.TimeoutExpired:
         vios_log("psql timed out — another connection is holding a lock on the "
                  "Omniscient tables", "RESTORE", "WARN")
