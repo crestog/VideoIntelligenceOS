@@ -816,6 +816,14 @@ def _jpeg_response(path: str):
 
     The 204s are the same answer the callers already give for no poster at all,
     which is the honest reply for a file that vanished or was caught truncated.
+
+    A blocking `open().read()` inside an ASGI app is normally the wrong shape,
+    and it is only correct here because both callers — `api_frame` and
+    `api_poster` — are declared `def`, not `async def`. Starlette runs a sync
+    endpoint in a threadpool, so this read blocks a worker thread and never the
+    event loop. Making either route `async` would move this call onto the loop,
+    where tens of KB off a cold cache disk would stall every other request in the
+    process; the fix then would be `run_in_threadpool`, not a smaller read.
     """
     try:
         with open(path, "rb") as fh:

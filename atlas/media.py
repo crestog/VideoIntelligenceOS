@@ -888,6 +888,20 @@ def poster(conn: sqlite3.Connection, video_key: str, at: float = None) -> str:
 
     stamp = f"{pos:.0f}"
     dest = os.path.join(config.POSTER_CACHE, f"{_safe(key)}_{stamp}.jpg")
+    # No in-flight Event here, unlike `artifact_file` and `clip_fetch`, and this
+    # early return is the whole reason one is not needed: a duplicate render is
+    # 25 ms of ffmpeg over a file already on disk, so two writers racing cost
+    # duplicated work and nothing else — where a duplicate *download* would cost
+    # the same bytes twice over Telegram.
+    #
+    # What makes that trade sound rather than merely cheap is that `_render_frame`
+    # publishes with `os.replace`. `getsize > 0` cannot tell a finished JPEG from
+    # one still being written: ffmpeg's image2 muxer grows the file as it encodes,
+    # so a reader arriving mid-render would find a nonzero size, return this path,
+    # and serve a truncated image. Rendering to a private temp name means every
+    # byte at `dest` was complete before the name existed, and this test is
+    # therefore reading a whole file or no file. It is only in the "cost" column
+    # because of the line it depends on.
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         return dest
     return _render_frame(found["path"], pos, dest)
@@ -1000,6 +1014,11 @@ def clip_poster(conn: sqlite3.Connection, video_key: str, at: float) -> str:
     pos = max(0.0, float(at))
     dest = os.path.join(config.POSTER_CACHE,
                         f"{_safe(video_key)}_{pos:.0f}.jpg")
+    # The same file `poster()` names for the same second, on purpose — whichever
+    # route reaches it first, the answer is the frame at this second — and so the
+    # same reasoning: unguarded because a duplicate render is cheap, and safe to
+    # read on `getsize > 0` only because `_render_frame` renames a finished file
+    # into place instead of growing this one.
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         return dest
     got = clip_fetch(conn, video_key, pos)
