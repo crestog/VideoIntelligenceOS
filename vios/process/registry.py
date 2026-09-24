@@ -1395,12 +1395,24 @@ def estimate(ids, videos: int, gpu_count: int = 1) -> dict:
     order = topo_sort(ids)
     per_video = sum(BY_ID[i].seconds for i in order)
     parallel = max(gpu_count, 1)
+    # Weights are downloaded once per `load_key` — three components that share a
+    # 6 GB VLM pull it once. Deduping by load_key is right; taking the *last*
+    # component's `disk_mb` for that key was not. Siblings that share weights do
+    # not all declare the same size — a sibling that assumes the primary owns the
+    # download declares 0 — so `{load_key: disk_mb}` kept whichever value the dict
+    # comprehension wrote last, which undercounted the sweep by ~29 % (a shared
+    # key that resolved to a 0 or a partial figure). The true on-disk cost of a
+    # shared model is the largest figure any of its siblings declares.
+    download_by_key: dict = {}
+    for i in order:
+        c = BY_ID[i]
+        download_by_key[c.load_key] = max(download_by_key.get(c.load_key, 0),
+                                          c.disk_mb)
     return {
         "components": len(order),
         "videos": videos,
         "seconds_per_video": round(per_video, 1),
         "gpu_hours": round(per_video * videos / 3600.0, 1),
         "wall_hours": round(per_video * videos / 3600.0 / parallel, 1),
-        "download_mb": sum({BY_ID[i].load_key: BY_ID[i].disk_mb
-                            for i in order}.values()),
+        "download_mb": sum(download_by_key.values()),
     }
