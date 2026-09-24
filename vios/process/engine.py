@@ -2294,6 +2294,15 @@ class ProcessEngine:
         # whichever pass happened to be running when the log was read.
         lane.cache.context = cid
 
+        # This copy carries the Hugging Face token so a gated download can
+        # authenticate. It is the *job's* params and it must never become the
+        # observer's: the observer params blob is written to the `observer`
+        # table (store.observer) and emitted into every published shard, which
+        # rides to the Telegram channel and into every restored database,
+        # append-only and unremovable. The observer below is derived from
+        # `comp.params` — the static, secret-free registry values — precisely so
+        # a token injected here cannot reach that blob. Keep the two apart: put
+        # nothing secret in `comp.params`, and derive no observer from `params`.
         params = dict(comp.params)
         if self._hf_token:
             params.setdefault("hf_token", self._hf_token)
@@ -2405,6 +2414,13 @@ class ProcessEngine:
 
         # ── accept the emission ──────────────────────────────────────────
         try:
+            # Derive the observer from `comp.params`, NOT the job's `params`.
+            # `params` (built above) has the Hugging Face token merged in;
+            # `comp.params` is the static registry dict and is secret-free. This
+            # blob is stored in the `observer` table and published into every
+            # shard, so `comp.params` here is the one line standing between the
+            # token and the Telegram channel + every restored database. See the
+            # token-injection comment above; the two must never be swapped.
             observer = store.observer(
                 cid, comp.model or comp.family, comp.revision,
                 _observer_params(comp.params, thin), comp.device)
