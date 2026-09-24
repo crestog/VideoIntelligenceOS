@@ -360,6 +360,26 @@ def _observer_params(params: dict | None, without=()) -> dict:
     return out
 
 
+def _observer_model(comp) -> str:
+    """The model string that identifies a component's observer.
+
+    For every local pass this is `comp.model`, or `comp.family` when the pass
+    declares no weights of its own — identical to the plain `comp.model or
+    comp.family` it replaced, so no local observer id moves. narrate-cloud is the
+    exception the register calls D-205: it declares `model=""`, `family="cloud"`,
+    yet the model it actually calls is chosen at runtime from VIOS_NIM_MODEL, so
+    hashing the literal "cloud" filed two different hosted models under one
+    observer id. Resolve the real name here — from the same function the runner
+    calls, so the runtime derivation and the reconciler's static prediction in
+    `expected_observers`/`degraded_observers` cannot disagree — and the identity
+    moves when the operator repoints the model.
+    """
+    if comp.family == "cloud":
+        from .runners.cloud import resolved_model  # noqa: PLC0415
+        return resolved_model()
+    return comp.model or comp.family
+
+
 _ENV_UNKNOWN: dict = {}
 
 
@@ -2422,7 +2442,7 @@ class ProcessEngine:
             # token and the Telegram channel + every restored database. See the
             # token-injection comment above; the two must never be swapped.
             observer = store.observer(
-                cid, comp.model or comp.family, comp.revision,
+                cid, _observer_model(comp), comp.revision,
                 _observer_params(comp.params, thin), comp.device)
             n_claims = store.add_claims(key, observer, em.claims) if em.claims else 0
             n_vectors = 0
@@ -4735,7 +4755,7 @@ class ProcessEngine:
             if comp is None:
                 continue
             out[cid] = store_observer_id(
-                cid, comp.model or comp.family, comp.revision, comp.params)
+                cid, _observer_model(comp), comp.revision, comp.params)
         return out
 
     def degraded_observers(self, components=None) -> dict:
@@ -4771,7 +4791,7 @@ class ProcessEngine:
             names = sorted({n for n in names if n})
             if not names:
                 return
-            oid = store_observer_id(cid, comp.model or comp.family,
+            oid = store_observer_id(cid, _observer_model(comp),
                                     comp.revision,
                                     _observer_params(comp.params, names))
             out.setdefault(oid, (cid, names))

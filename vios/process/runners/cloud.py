@@ -339,6 +339,26 @@ def classify(exc: Exception) -> Exception:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# The model this pass actually calls
+# ══════════════════════════════════════════════════════════════════════════
+# The default is a mid-size model rather than the 550B the v1 config pointed at:
+# on a forty-per-minute, credit-metered account the largest model is affordable
+# for a curated subset and ruinous for an archive, and this pass runs on every
+# video. Module-level and not a NimClient detail because a second caller depends
+# on it — the engine derives narrate-cloud's *observer identity* from this
+# (doc 19 D-205). The pass declares model="" family="cloud", but the model it
+# actually calls is whatever VIOS_NIM_MODEL names; hashing the literal "cloud"
+# put two different hosted models under one observer id, so the runtime call and
+# the identity derivation must read the same resolved name from one function.
+_DEFAULT_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"
+
+
+def resolved_model() -> str:
+    """The hosted model narrate-cloud will call: VIOS_NIM_MODEL, or the default."""
+    return os.environ.get("VIOS_NIM_MODEL", "").strip() or _DEFAULT_MODEL
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The client
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -381,15 +401,8 @@ class NimClient:
 
     @staticmethod
     def model() -> str:
-        """The model to call.
-
-        The default is a mid-size model rather than the 550B the v1 config
-        points at. On a forty-per-minute, credit-metered account the largest
-        model in the catalogue is affordable for a curated subset and ruinous
-        for an archive, and this pass runs on every video.
-        """
-        return (os.environ.get("VIOS_NIM_MODEL", "").strip()
-                or "nvidia/llama-3.1-nemotron-70b-instruct")
+        """The model to call — see `resolved_model` for the choice of default."""
+        return resolved_model()
 
     def configured(self) -> bool:
         return bool(self._key())

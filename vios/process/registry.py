@@ -40,9 +40,35 @@ Anything needing more than one card says so and is off by default.
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field, asdict
 
 from . import CHANNELS
+
+# ── the prompt is part of the observer's identity (doc 19 D-208) ────────────
+# A generative pass's output is decided as much by its prompt as by its model,
+# yet the prompt is a module constant in the runner, not a value the component
+# declares — so editing it changed every claim and moved nothing in the observer
+# hash, and the better re-run was dropped on its uid. Fix it where it cannot be
+# forgotten: import the live constants and fold a short digest of each into the
+# component's params below. All three observer-derivation sites (engine runtime,
+# expected_observers, degraded_observers) read comp.params, so the digest reaches
+# every one of them and static prediction stays in step with what ran.
+#
+# Safe to import here: neither language nor cloud imports registry (the edge runs
+# the other way, resolved lazily), and cloud defers openai — so this reads two
+# source files at import and pulls in nothing heavy. Change a prompt and its
+# sha — and the observer id — move on their own; that is the whole point.
+from .runners.language import (
+    _DESCRIBE_PROMPT, _NARRATE_PROMPT, _STYLE_PROMPT, _CONCEPT_PROMPT,
+)
+from .runners.cloud import _PROMPT as _CLOUD_PROMPT
+
+
+def _prompt_sha(text: str) -> str:
+    """A short, stable fingerprint of a prompt constant, for the observer hash."""
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=8).hexdigest()
 
 # What a component can write. Used by the tab to show, per pass, whether it
 # contributed evidence, geometry, files, or vectors.
@@ -748,7 +774,8 @@ _LANGUAGE = [
         requires=("transformers", "torch", "bitsandbytes"),
         kinds=("shot_description", "subject", "setting", "action"),
         params={"max_shots_per_call": 6, "max_new_tokens": 320,
-                "temperature": 0.2},
+                "temperature": 0.2,
+                "prompt_sha": _prompt_sha(_DESCRIBE_PROMPT)},
     ),
     Component(
         id="narrate", title="Narrative", stage=STAGE_LANGUAGE, family="vlm",
@@ -772,7 +799,8 @@ _LANGUAGE = [
         requires=("transformers", "torch", "bitsandbytes"),
         kinds=("hook", "beat", "turn", "payoff", "premise", "why_it_works",
                "weakness"),
-        params={"max_new_tokens": 700, "temperature": 0.3},
+        params={"max_new_tokens": 700, "temperature": 0.3,
+                "prompt_sha": _prompt_sha(_NARRATE_PROMPT)},
     ),
     Component(
         id="style-read", title="Craft", stage=STAGE_LANGUAGE, family="vlm",
@@ -793,6 +821,7 @@ _LANGUAGE = [
         requires=("transformers", "torch", "bitsandbytes"),
         kinds=("technique", "lighting", "grade", "framing", "edit_style",
                "reference"),
+        params={"prompt_sha": _prompt_sha(_STYLE_PROMPT)},
     ),
     Component(
         id="keyphrase", title="Keyphrases", stage=STAGE_LANGUAGE, family="text",
@@ -830,6 +859,7 @@ _LANGUAGE = [
         soft=("transcribe", "ocr", "caption", "keyphrase"),
         requires=("transformers", "torch", "bitsandbytes"),
         kinds=("entity", "topic", "technique", "claim_span", "unsupported"),
+        params={"prompt_sha": _prompt_sha(_CONCEPT_PROMPT)},
     ),
     Component(
         id="text-embed", title="Text embedding", stage=STAGE_LANGUAGE,
@@ -890,6 +920,7 @@ _LANGUAGE = [
         requires=("transformers", "torch"),
         kinds=("hook", "beat", "turn", "payoff", "why_it_works", "critique"),
         tier="deep", default_on=False,
+        params={"prompt_sha": _prompt_sha(_NARRATE_PROMPT)},
         notes="Two cards. Nothing else can be resident while this runs.",
     ),
 
@@ -924,7 +955,8 @@ _LANGUAGE = [
         kinds=("premise", "hook", "hook_why", "beat", "turn", "payoff",
                "why_it_works", "assertion", "answers", "audience", "subject",
                "critique"),
-        params={"temperature": 0.2, "max_tokens": 2048},
+        params={"temperature": 0.2, "max_tokens": 2048,
+                "prompt_sha": _prompt_sha(_CLOUD_PROMPT)},
         tier="deep", default_on=True,
         notes=("Needs VIOS_NIM_API_KEY in Kaggle Secrets. VIOS_NIM_MODEL "
                "picks the model; VIOS_NIM_RPM caps the request rate. "

@@ -363,9 +363,19 @@ def observer_id_from(model: str, revision: str = "",
                      component: str = "") -> str:
     """Pure derivation, split out so both the writer and the reconciler use it.
 
-    `component` is only a prefix in the id, not part of the hash: a component
-    edits its prompt and the id changes, and the same model read by two
-    components produces two ids because the prefix differs.
+    `component` is only a prefix in the id, not part of the hash: the same model
+    read by two components produces two ids because the prefix differs.
+
+    The hash is over exactly three things — model, revision, params — and nothing
+    else. No runner *code* enters it, so a change to a pass's logic or its prompt
+    moves the id only when it is reflected in one of those three. That boundary is
+    deliberate, and it is why the registry folds a `prompt_sha` into a generative
+    pass's params (doc 19 D-208): the prompt is the part of a pass most likely to
+    change its output, and hashing its fingerprint into params is what makes
+    "edit the prompt, re-mint the observer" true here rather than only intended.
+    Anything else that decides the output — the model actually called behind
+    family "cloud" (D-205), a runtime-chosen backend (D-196) — has to reach
+    `model`/`params` by that same route, or it stays invisible to this id.
     """
     blob = json.dumps(params or {}, sort_keys=True, ensure_ascii=False)
     return f"{component}@{_uid(model, revision, blob)[:12]}"
