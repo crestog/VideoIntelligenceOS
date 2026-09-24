@@ -378,6 +378,10 @@ def observer_id_from(model: str, revision: str = "",
     `model`/`params` by that same route, or it stays invisible to this id.
     """
     blob = json.dumps(params or {}, sort_keys=True, ensure_ascii=False)
+    # The 12-hex suffix is not itself an identifier: components sharing a
+    # (model, revision, params) collide on it — caption/cuts/music hash to one
+    # value, perframe/motion to another (doc 19 D-204). The `component@` prefix
+    # is what separates them, so never key on the suffix alone.
     return f"{component}@{_uid(model, revision, blob)[:12]}"
 
 

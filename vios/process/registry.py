@@ -781,6 +781,9 @@ _LANGUAGE = [
         device="gpu", vram_mb=6200, disk_mb=7400, seconds=18.0, ram_mb=3072,
         needs=("keyframes", "shots"),
         requires=("transformers", "torch", "bitsandbytes"),
+        # `subject` here is literal on-screen contents; narrate-cloud emits the
+        # same kind for "what the video is about" (doc 19 D-200) — the two cross
+        # a channel boundary and only the observer id tells them apart.
         kinds=("shot_description", "subject", "setting", "action"),
         params={"max_shots_per_call": 6, "max_new_tokens": 320,
                 "temperature": 0.2,
@@ -825,9 +828,14 @@ _LANGUAGE = [
         device="gpu", vram_mb=6200, disk_mb=0, seconds=12.0, ram_mb=3072,
         needs=("describe", "colour", "motion", "cuts"),
         # The measurements are what ground the vocabulary, and the pass already
-        # prints "not measured" for any of them that is absent.
+        # prints "not measured" for any of them that is absent. Because they are
+        # soft, `grade` and `lighting` can still be emitted with none of the
+        # three present (doc 19 D-197); the degraded observer id is the record
+        # that they were, so an ungrounded reading is marked, not prevented.
         soft=("colour", "motion", "cuts"),
         requires=("transformers", "torch", "bitsandbytes"),
+        # `technique` here is craft; concepts emits the same kind for a
+        # rhetorical device (doc 19 D-200) — again separated only by observer id.
         kinds=("technique", "lighting", "grade", "framing", "edit_style",
                "reference"),
         params={"prompt_sha": _prompt_sha(_STYLE_PROMPT)},
