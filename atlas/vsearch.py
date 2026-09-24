@@ -167,30 +167,54 @@ def _l2(mat, np):
     return mat / norm
 
 
+# Within one space a video may carry frame vectors from more than one observer.
+# Whenever a frame embedder re-mints — a revision bump, a model or param change —
+# the append-only store keeps the old packed matrix beside the new one, and each
+# (video_key, space, observer) is exactly one row. Reading both would enter that
+# video's frames into the resident matrix twice: it would self-match as a wall of
+# near-duplicates, double the frame count the stride is chosen against, and — if
+# the two observers embedded with different checkpoints under one space name —
+# mix two geometries that have no relation. So every frame-vector read keeps only
+# the newest row per video (greatest created_at, uid as the deterministic
+# tie-break), which collapses a re-mint to "the latest embedding wins" without
+# blacking out a video a partial re-mint never reached. Correlates on
+# (space, video_key), which `ix_vecpay_space` already covers.
+_CURRENT_OBSERVER = (
+    " AND NOT EXISTS (SELECT 1 FROM vec_payload q "
+    "WHERE q.kind='frame_vector' AND q.space=p.space "
+    "AND q.video_key=p.video_key AND ("
+    "COALESCE(q.created_at,0) > COALESCE(p.created_at,0) OR "
+    "(COALESCE(q.created_at,0) = COALESCE(p.created_at,0) AND q.uid > p.uid)))")
+
+
 def frame_rows(conn: sqlite3.Connection, space: str,
                video_key: str = "") -> list:
-    """`vec_payload` frame rows for one space, optionally one video.
+    """`vec_payload` frame rows for one space, optionally one video — one row per
+    video, from its current (newest) observer only; see `_CURRENT_OBSERVER`.
 
     The row factory is set on the *cursor*, not the connection: this takes a
     connection Atlas hands round to every other reader, and flipping its
     `row_factory` under them is a side effect nothing here needs.
     """
-    sql = ("SELECT uid, video_key, dim, n, dtype, frames, data "
-           "FROM vec_payload WHERE kind='frame_vector' AND space=?")
+    sql = ("SELECT uid, video_key, observer_id, dim, n, dtype, frames, data "
+           "FROM vec_payload p WHERE p.kind='frame_vector' AND p.space=?"
+           + _CURRENT_OBSERVER)
     args = [space]
     if video_key:
-        sql += " AND video_key=?"
+        sql += " AND p.video_key=?"
         args.append(video_key)
     try:
         cur = conn.cursor()
         cur.row_factory = sqlite3.Row
-        return cur.execute(sql + " ORDER BY video_key", args).fetchall()
+        return cur.execute(sql + " ORDER BY p.video_key", args).fetchall()
     except sqlite3.Error:
         return []
 
 
 def _space_shape(conn: sqlite3.Connection, space: str) -> tuple:
-    """`(videos, frames, dim)` held for a space, without decoding anything.
+    """`(videos, frames, dim)` held for a space, without decoding anything, and
+    counting each video's current observer only — so the stride is chosen against
+    the frames the build will actually keep, not a re-mint's doubled rows.
 
     Cheap, because the stride has to be chosen *before* any buffer is read — a
     build that decoded everything first to decide how much to keep would need the
@@ -198,9 +222,9 @@ def _space_shape(conn: sqlite3.Connection, space: str) -> tuple:
     """
     try:
         row = conn.execute(
-            "SELECT COUNT(DISTINCT video_key), COALESCE(SUM(n),0), "
-            "COALESCE(MAX(dim),0) FROM vec_payload "
-            "WHERE kind='frame_vector' AND space=?", (space,)).fetchone()
+            "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(MAX(dim),0) "
+            "FROM vec_payload p WHERE p.kind='frame_vector' AND p.space=?"
+            + _CURRENT_OBSERVER, (space,)).fetchone()
     except sqlite3.Error:
         return 0, 0, 0
     return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
@@ -265,6 +289,7 @@ def _build_space(conn: sqlite3.Connection, space: str, np) -> dict:
     rows = frame_rows(conn, space)
     keep_v, keep_i, assumed, bad = [], [], 0, 0
     ordinals: dict = {}
+    seen_obs: set = set()
     for r in rows:
         idx, mat = _unpack(r, np)
         if idx is None:
@@ -273,6 +298,8 @@ def _build_space(conn: sqlite3.Connection, space: str, np) -> dict:
         if r["frames"] is None:
             assumed += 1
         key = r["video_key"]
+        if r["observer_id"]:
+            seen_obs.add(r["observer_id"])
         if key not in ordinals:
             ordinals[key] = len(ordinals)
         ordv = ordinals[key]
@@ -307,6 +334,7 @@ def _build_space(conn: sqlite3.Connection, space: str, np) -> dict:
             "stride": int(stride), "videos": order,
             "frames_total": int(frames), "videos_total": int(videos),
             "assumed_frame_ids": int(assumed), "unreadable_rows": int(bad),
+            "observers": sorted(seen_obs),
             "resident_mb": round(mat.nbytes / 1048576, 1),
             "built_at": time.time()}
     try:

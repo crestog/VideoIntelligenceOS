@@ -129,6 +129,7 @@ _META_DDL = (
     " dtype TEXT NOT NULL,"         # f16 | f32
     " shot_idx INTEGER,"
     " created_at REAL,"
+    " observer_id TEXT,"            # who embedded it; NULL on pre-observer rows
     " frames BLOB,"                 # int32×n frame indices; NULL when pooled
     " data BLOB NOT NULL)",
     "CREATE INDEX IF NOT EXISTS ix_vecpay_space "
@@ -157,6 +158,18 @@ def connect(path: str = None) -> sqlite3.Connection:
 def ensure_meta(conn: sqlite3.Connection) -> None:
     for ddl in _META_DDL:
         conn.execute(ddl)
+    # `CREATE TABLE IF NOT EXISTS` cannot widen a table that already exists, so an
+    # atlas.db written before `vec_payload.observer_id` existed keeps its old
+    # shape and every frame-vector read would see a NULL where the embedding's
+    # provenance should be. Add the column in place — idempotent, one PRAGMA per
+    # open — so the newest-observer dedup in `vsearch` has the field it filters
+    # on rather than silently treating a re-mint as a second video.
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(vec_payload)")}
+        if have and "observer_id" not in have:
+            conn.execute("ALTER TABLE vec_payload ADD COLUMN observer_id TEXT")
+    except sqlite3.Error:
+        pass
     conn.commit()
 
 
@@ -749,7 +762,8 @@ def _import_payloads(conn: sqlite3.Connection, kind: str, rows: list) -> dict:
         else:
             n, dtype, frames = 1, "f32", None
         batch.append((uid, kind, r["video_key"], r["space"], dim, n, dtype,
-                      r.get("shot_idx"), r.get("created_at"), frames, data))
+                      r.get("shot_idx"), r.get("created_at"),
+                      r.get("observer_id"), frames, data))
         out["bytes"] += len(data)
     if not batch:
         return out
@@ -763,8 +777,8 @@ def _import_payloads(conn: sqlite3.Connection, kind: str, rows: list) -> dict:
         before = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO vec_payload(uid, kind, video_key, space, "
-            "dim, n, dtype, shot_idx, created_at, frames, data) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", batch)
+            "dim, n, dtype, shot_idx, created_at, observer_id, frames, data) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", batch)
         out["added"] = conn.total_changes - before
     except sqlite3.Error as exc:
         out["skipped"] += len(batch)
