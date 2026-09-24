@@ -35,7 +35,9 @@ evidence, and this is the layer where that rule is enforced by construction.
 from __future__ import annotations
 
 import hashlib
+import difflib
 import math
+import re
 
 from .. import registry
 from .base import (Emission, Job, PassUnavailable, SkipPass, cuda_ordinal,
@@ -70,6 +72,10 @@ def _coverage(job: Job, read: int) -> dict:
     if total and read < total:
         note["incomplete"] = total - read
     return note
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^\w\s]", " ", (text or "").lower()).strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -920,6 +926,34 @@ def ocr_alt(job: Job) -> Emission:
     rows = em.frame_runs("ocr", "text", readings, confidence=0.7)
     if not rows:
         raise SkipPass("Florence-2 read no text in any frame")
+
+    # The second reader earns its 110 seconds by disagreeing measurably with
+    # the first — the same bargain transcribe-alt strikes with transcribe. A
+    # detector-plus-recogniser drops stylised type; an end-to-end VLM
+    # hallucinates plausible words; agreement between them is a stronger signal
+    # than either one's own confidence. Token-set overlap, not a sequence
+    # ratio: the two engines segment the frame differently and emit strings in
+    # different orders, so *which words both saw* is the honest question, not
+    # whether they serialised them in the same order. Guarded like the audio
+    # side — a reel with no primary text records nothing to agree about rather
+    # than failing (D-201).
+    primary = " ".join(
+        c["value"] for c in job.claims("ocr", "text")
+        if c.get("value")
+        and str(c.get("observer_id", "")).split("@")[0] == "ocr")
+    theirs, mine = set(_norm(primary).split()), set(
+        _norm(" ".join(t for _, _, t in readings if t)).split())
+    if theirs and mine:
+        overlap = len(theirs & mine) / len(theirs | mine)
+        em.claim("ocr", "agreement",
+                 f"{overlap * 100:.0f}% word overlap with the primary reader",
+                 num=round(overlap, 4), confidence=round(overlap, 4))
+        if overlap < 0.4:
+            em.claim("ocr", "contested",
+                     "the two on-screen-text readers largely disagree; both "
+                     "readings are stored under their own observer",
+                     num=round(overlap, 4))
+
     covered = sum(1 for _, _, v in readings if v)
     em.notes = {**_coverage(job, read), "runs": rows,
                 "frames_with_text": covered, "failures": failures,

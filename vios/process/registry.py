@@ -566,9 +566,14 @@ _PERCEPTION = [
             "today' is not a version."),
         model="microsoft/Florence-2-large", weights="florence-2-large",
         quant="fp16", device="gpu", vram_mb=1700, disk_mb=1600, seconds=110.0,
-        revision="3",
-        needs=("allframes",), requires=("transformers", "torch", "timm"),
-        kinds=("text",),
+        revision="4",
+        # `ocr` in needs (and soft) so it is scheduled after the primary reader
+        # within the wave and can measure agreement against it; soft because a
+        # reel with no primary text is survivable — this reader still records
+        # what it saw, it just has nothing to agree or disagree with.
+        needs=("allframes", "ocr"), soft=("ocr",),
+        requires=("transformers", "torch", "timm"),
+        kinds=("text", "agreement", "contested"),
         params={"tier": "full", "batch": 4, "stride": 1,
                 "hf_revision": "21a599d414c4d928c9032694c424fb94458e3594"},
     ),
@@ -880,7 +885,7 @@ _LANGUAGE = [
     ),
     Component(
         id="text-embed", title="Text embedding", stage=STAGE_LANGUAGE,
-        wave=WAVE_SPINE,
+        wave=WAVE_FULL,
         family="text", channel="concept",
         summary="BGE-M3 over transcript, caption, OCR and narration.",
         detail=(
@@ -890,11 +895,17 @@ _LANGUAGE = [
             "whole, so a semantic hit lands on a moment instead of on a "
             "twenty-thousand-character blur."),
         model="BAAI/bge-m3", weights="bge-m3", quant="fp16", device="gpu",
-        vram_mb=2400, disk_mb=2300, seconds=2.0,
-        needs=("transcribe", "caption"), produces=("vectors",),
+        vram_mb=2400, disk_mb=2300, seconds=2.0, revision="2",
+        needs=("transcribe", "caption", "ocr", "narrate"),
+        produces=("vectors",),
         # It embeds whatever passages exist — speech, caption, on-screen text,
-        # narrative beats — and skips itself when there are none.
-        soft=("transcribe", "caption"),
+        # narrative beats — and skips itself when there are none. It sits in
+        # wave 2, not the spine, because ocr and narrate are wave-2 passes: on
+        # the spine their claims do not exist yet, so a spine-time embedding
+        # silently omitted the on-screen text and narration this pass names in
+        # its own summary. needs+soft here so it is ordered after them within
+        # the wave while surviving their absence (D-198).
+        soft=("transcribe", "caption", "ocr", "narrate"),
         requires=("transformers", "torch"), kinds=(),
     ),
     Component(
