@@ -1166,8 +1166,15 @@ class ProcessEngine:
                "no bot token — the engine will run and write locally, but "
                "nothing will be published and no source video can be fetched")
 
-        needs_hf = [c for c in sel if "pyannote" in
-                    " ".join(registry.get(c).requires)]
+        # Hugging Face gates some weights behind an accepted licence, so a token
+        # is required or the pass is skipped. pyannote (diarize) is the only
+        # gated package today; naming the markers here — rather than the bare
+        # `"pyannote" in ...` this replaced — is what lets a second gated model
+        # be caught at preflight instead of discovered per-video (D-211).
+        HF_GATED = ("pyannote",)
+        needs_hf = [c for c in sel
+                    if any(g in " ".join(registry.get(c).requires)
+                           for g in HF_GATED)]
         if needs_hf:
             ok("Hugging Face token", bool(self._hf_token),
                "present" if self._hf_token else

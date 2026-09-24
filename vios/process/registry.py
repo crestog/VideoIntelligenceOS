@@ -19,8 +19,8 @@ Four rules govern what goes in this list.
 **Mathematics before models.** Cut rate, loudness, colour, motion, tempo and
 shot scale are computed, not asked. A model that is asked "how fast is this
 cut?" produces a plausible sentence; `numpy.diff` over the shot table produces
-the number. Nine of the components below never load a neural network at all, and
-they carry the parts of the database that must be exactly right.
+the number. Thirteen of the components below never load a neural network at all,
+and they carry the parts of the database that must be exactly right.
 
 **Time is never claimed.** Every component that speaks about *when* speaks in
 shot indices. The shot table maps an index to seconds by arithmetic we control.
@@ -572,6 +572,15 @@ _PERCEPTION = [
         params={"tier": "full", "batch": 4, "stride": 1,
                 "hf_revision": "21a599d414c4d928c9032694c424fb94458e3594"},
     ),
+    # ocr-alt is the *only* component that pins its upstream weights (the
+    # `hf_revision` above, alongside `revision="3"`). Twelve other model-backed
+    # components name a Hugging Face repo and pin nothing, so an upstream
+    # re-upload changes what the pass reads while its observer id does not move
+    # (D-207): the id hashes `revision`, and for those twelve that is "", not the
+    # commit actually fetched. Pinning each — capturing today's commit into
+    # params the way this one does — is the fix, and it re-mints that pass by
+    # design. Until then the observer id promises less than it appears to for
+    # every model-backed pass but this one.
 
     # ── what is in frame ────────────────────────────────────────────────
     Component(
@@ -900,6 +909,14 @@ _LANGUAGE = [
         params={"window_seconds": 3.0},
     ),
 
+    # The narrative ladder — `narrate`, then `narrate-deep` and `narrate-cloud`
+    # — is not three independent readers. Both deep passes take `narrate` as a
+    # HARD need and are handed its reading, so the hook/turn/payoff claims across
+    # the three are a revision chain, not corroboration: an agreement metric over
+    # them overstates independence, because the later readers saw the first
+    # (D-202). Unlike the speech/OCR/concept pairs, which read the audio or the
+    # frames afresh.
+
     # ── the deep pass, off by default ───────────────────────────────────
     Component(
         id="narrate-deep", title="Narrative (38B)", stage=STAGE_LANGUAGE,
@@ -925,6 +942,12 @@ _LANGUAGE = [
     ),
 
     # ── the same quality tier, on someone else's hardware ───────────────
+    # narrate-cloud is the one pass whose claims the archive cannot reproduce:
+    # they came from a hosted model at a moment in time behind VIOS_NIM_MODEL, so
+    # if the endpoint changes they can only be replaced, never regenerated —
+    # different in kind from the other thirty-three, which re-run deterministically
+    # from local weights (D-199). D-205's fix at least records which model
+    # answered, in the observer id.
     Component(
         id="narrate-cloud", title="Narrative (cloud)", stage=STAGE_LANGUAGE,
         family="cloud", channel="narrative",
@@ -1327,6 +1350,16 @@ def plan_cohorts(ids, vram_budget_mb: int, gpu_count: int = 1,
     A component needing two cards gets a cohort to itself. Sharding a 38B model
     across both T4s leaves nothing to share with.
     """
+    # VRAM is the only budget this packer enforces. Two others are declared and
+    # not consumed here, documented so the gap is deliberate, not forgotten:
+    #   * `disk_budget_mb` (D-212) — accepted for a disk-aware pack that was
+    #     never written; `disk` appears nowhere else in this function. Kept in
+    #     the signature so the caller that already passes it need not change if
+    #     the pack ever learns to read it.
+    #   * `ram_mb` (D-213) — every component declares it (34,688 MB catalogue-
+    #     wide) and `resources.probe()` reports `usable_ram_mb`, but nothing
+    #     compares the two: no packer term, no `unrunnable` test, no preflight.
+    #     A cohort that fits VRAM but not host RAM is not caught here.
     order = topo_sort(ids)
     cohorts, cur = [], Cohort(index=0)
     cur_loads: dict = {}
