@@ -50,6 +50,7 @@ instead of the next one.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 import time
@@ -79,6 +80,22 @@ REARM_EVERY = float(os.environ.get("VIOS_BACKFILL_EVERY", "1800"))
 SESSION_ATTEMPTS = max(int(os.environ.get("VIOS_BACKFILL_TRIES", "2") or 2), 1)
 
 
+# A bot token is "<digits>:<35+ url-safe chars>" and rides inside every Bot API
+# URL as .../bot<token>/..., so a requests transport error stringified into a log
+# line carries it. This console is the Kaggle cell output — a pasted log is a
+# leaked token. Redact the token *shape* (rotated/future tokens too), not one
+# value. Duplicated on purpose from logger.py / atlas/tgchannel.py so vios.capture
+# has no new cross-package dependency — keep the three copies in step.
+_SECRET_RE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+def _redact(text) -> str:
+    try:
+        return _SECRET_RE.sub("<redacted>", str(text))
+    except Exception:
+        return "<unprintable>"
+
+
 def log(msg: str) -> None:
     """Say it on the console.
 
@@ -90,6 +107,7 @@ def log(msg: str) -> None:
     The ascii retry is not decoration: Kaggle's console is not always utf-8, and
     a UnicodeEncodeError raised out of a log line would take the caller with it.
     """
+    msg = _redact(msg)
     try:
         print(f"🎞️ [CAPTURE] {msg}", flush=True)
     except Exception:                                  # noqa: BLE001

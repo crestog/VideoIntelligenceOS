@@ -5,11 +5,40 @@ All subsystems use this logger for consistent, professional Kaggle output.
 Logs are also stored in a Redis list for real-time UI access (Admin panel).
 """
 
+import re
 import time
 import redis
 import json
 import socket
 from collections import deque
+
+# ═══════════════════════════════════════════════════════════
+# REDACTION — secrets must never reach a log buffer
+# ═══════════════════════════════════════════════════════════
+# The buffers this module fills (LOG_BUFFER, Redis VIOS_LOGS) are served
+# verbatim to the browser by the Admin panel and the V17 workstation
+# (get_recent_logs → /api/logs). A Telegram bot token is "<digits>:<35+
+# url-safe chars>" and rides inside every Bot API URL as .../bot<token>/...,
+# so any exception string that carries a request URL would otherwise be stored
+# and displayed as-is. Redact the token *shape*, not one configured value, so a
+# rotated or future token is caught too — the register calls for treating any
+# /api/log output as containing a live-shaped token.
+#
+# The same function is duplicated, on purpose, in the other two log sinks that
+# reach a browser — atlas/tgchannel.py and vios/capture/backfill.py — because
+# the atlas package must stay importable standalone (atlas_boot.py) and cannot
+# depend on this root module. Keep the three copies in step.
+_SECRET_RE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+def redact(text):
+    """Mask secret-shaped substrings before a line is stored, printed or served."""
+    if text is None:
+        return text
+    try:
+        return _SECRET_RE.sub("<redacted>", str(text))
+    except Exception:
+        return "<unprintable>"
 
 # ═══════════════════════════════════════════════════════════
 # SUBSYSTEM PREFIXES
@@ -112,6 +141,7 @@ def vios_log(message, subsystem="SYS", level="INFO"):
         subsystem: One of SYS, UI, CV, AI, ADMIN, QUEUE
         level: One of INFO, SUCCESS, WARN, ERROR
     """
+    message = redact(message)
     ts = time.strftime('%H:%M:%S')
     prefix = SUBSYSTEMS.get(subsystem, f"[{subsystem}]")
     level_icon = LEVELS.get(level, "")

@@ -40,7 +40,26 @@ _LOG = []
 _LOG_LOCK = threading.Lock()
 
 
+# Secrets must never reach the log buffer or an API error string: recent_log()
+# is served to the browser at /api/log, and probe()'s error is shown in the UI.
+# A Telegram bot token is "<digits>:<35+ url-safe chars>" and rides inside every
+# Bot API URL as .../bot<token>/..., so a requests transport error (whose text
+# quotes the failing URL) would otherwise leak it verbatim. Redact the token
+# *shape*, not one configured value, so a rotated or future token is caught too.
+# Duplicated on purpose in logger.py and vios/capture/backfill.py — the atlas
+# package must import standalone (atlas_boot.py) — keep the three copies in step.
+_SECRET_RE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+def _redact(text) -> str:
+    try:
+        return _SECRET_RE.sub("<redacted>", str(text))
+    except Exception:
+        return "<unprintable>"
+
+
 def log(msg: str, level: str = "INFO") -> None:
+    msg = _redact(msg)
     line = f"{time.strftime('%H:%M:%S')} · {level} · {msg}"
     with _LOG_LOCK:
         _LOG.append(line)
@@ -115,7 +134,7 @@ def probe() -> dict:
             "mtproto": bool(config.API_ID and config.API_HASH),
         }
     except Exception as exc:
-        return {"ok": False, "missing": missing, "error": str(exc)[:240]}
+        return {"ok": False, "missing": missing, "error": _redact(str(exc))[:240]}
 
 
 def pinned_message() -> dict:
