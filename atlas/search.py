@@ -127,6 +127,24 @@ def reload_vectors(expect: str = "") -> bool:
                 f"encoder produces {config.EMBED_DIM}d; rebuild the index to "
                 f"use it")
             return False
+        # Width is necessary but not sufficient. bge-m3, bge-large-en and
+        # multilingual-e5-large are all 1024d, so a file written by any one of
+        # them reshapes perfectly against any other and the dim guard waves it
+        # through — and then every query is matmul'd against passages that live
+        # in a different coordinate space, so ranking rots quietly without ever
+        # raising. That is the precise failure the model profiles exist to
+        # prevent, and the width check alone cannot see it. The metadata records
+        # the model that wrote the file, so a definite disagreement — both sides
+        # naming a model, and naming different ones — is refused here. Silence on
+        # either side is accepted, exactly like the build_id check above: an
+        # archive built before this stamp existed keeps dense search, and its
+        # next rebuild stamps the name.
+        have_model = str(meta.get("model") or "")
+        if have_model and have_model != config.EMBED_MODEL:
+            log(f"dense index ignored — its vectors are from {have_model} but "
+                f"this encoder is {config.EMBED_MODEL}; rebuild the index to "
+                f"use it")
+            return False
     except (OSError, ValueError) as e:
         log(f"could not load vectors — {type(e).__name__}: {e}")
         return False

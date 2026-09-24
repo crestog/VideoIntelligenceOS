@@ -12,23 +12,33 @@ range — and materially worse at ranking. The sentence-transformers config for
 this model sets `pooling_mode_cls_token: true`, so the manual fallback path
 below takes `last_hidden_state[:, 0]`.
 
-**Queries and passages are encoded differently.** BGE is trained asymmetrically:
-queries get the instruction prefix "Represent this sentence for searching
-relevant passages: " and passages get nothing. Skipping the prefix costs a few
-points of recall; adding it to passages too costs more.
+**Queries and passages may be encoded differently, per model.** The prefixes
+come from the model profile in config, not from this file: bge-v1.5 wants an
+asymmetric query-only instruction, e5 wants "query:"/"passage:" on both sides,
+and bge-m3 (the default) wants neither. Applying the wrong prefix, or none where
+one is due, costs recall silently — so both `EMBED_QUERY_PREFIX` and
+`EMBED_PASSAGE_PREFIX` travel with the model and are applied on the right side
+here.
 
 **Vectors are L2-normalised on the way out.** Once every vector is unit length,
 cosine similarity is a plain dot product, so the whole search reduces to one
 matrix multiply. That is what makes exhaustive search fast enough to skip an ANN
 index entirely.
 
-Model choice: `bge-small-en-v1.5`, 33M parameters, 384 dimensions. The
-Omniscient layer uses `bge-large` (1024-d) for its own Qdrant collections, and
-large is a slightly better encoder — but it is 12× the parameters and 2.7× the
-vector width, and Atlas re-encodes its whole corpus on a cold start where the
-harvester encodes incrementally on a warm GPU. Small keeps a cold start to
-seconds, keeps the resident matrix under a few hundred MB, and the accuracy gap
-is largely closed by fusing with BM25 anyway.
+Model choice is a *profile*, not a lone string — see the retrieval section of
+config.py, where vector width and both prefixes move together. The default is
+`bge-m3`: 568M parameters, 1024 dimensions, multilingual by construction,
+because this archive holds English, Hindi and Hinglish and the old English-only
+default (`bge-small-en`) could not place a Hindi query near the Hindi passage
+that answers it — search was structurally blind to two of the three languages
+it indexes. bge-m3 is also CLS-pooled, so the manual fallback above stays
+correct; the e5 profiles are *mean*-pooled, so a host that dropped to the
+hand-rolled `_TransformersEncoder` with an e5 model would pool the wrong token.
+e5 must therefore go through the sentence-transformers path, which reads the
+model's own pooling config. The cost of the bge-m3 default is a cold start that
+re-encodes the whole corpus with a 568M model instead of a 33M one — minutes,
+not seconds — the deliberate trade of cold-start speed for answering the query
+at all.
 
 Everything degrades rather than fails: if torch is missing, if torch is present
 but the host refuses to load it, if the weights will not download, if there is no
@@ -67,8 +77,10 @@ class _SentenceTransformerEncoder:
         self.device = device
 
     def encode_passages(self, texts):
+        pre = config.EMBED_PASSAGE_PREFIX
+        items = [pre + t for t in texts] if pre else list(texts)
         return self.model.encode(
-            list(texts), batch_size=config.EMBED_BATCH,
+            items, batch_size=config.EMBED_BATCH,
             normalize_embeddings=True, convert_to_numpy=True,
             show_progress_bar=False)
 
@@ -111,7 +123,9 @@ class _TransformersEncoder:
                                                    dtype="float32")
 
     def encode_passages(self, texts):
-        return self._encode(list(texts)).astype("float32")
+        pre = config.EMBED_PASSAGE_PREFIX
+        items = [pre + t for t in texts] if pre else list(texts)
+        return self._encode(items).astype("float32")
 
     def encode_query(self, text: str):
         return self._encode([config.EMBED_QUERY_PREFIX + text])[0].astype("float32")
@@ -132,8 +146,8 @@ def _pick_device(torch):
         return "cpu", None
     try:
         free, _total = torch.cuda.mem_get_info(0)
-        if free < 1_500_000_000:            # need ~1.5 GB of headroom
-            log("encoder staying on CPU — GPU has under 1.5 GB free")
+        if free < 2_500_000_000:            # bge-m3 fp16 is ~1.1 GB of weights
+            log("encoder staying on CPU — GPU has under 2.5 GB free")
             return "cpu", None
     except Exception:
         return "cpu", None

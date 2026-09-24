@@ -139,14 +139,42 @@ def telegram_ready() -> bool:
 
 
 # ── Retrieval ─────────────────────────────────────────────────────────────
-# bge-small-en-v1.5: 33M params, 384 dimensions, and the smallest model that is
-# still genuinely good at retrieval. The whole matrix for 200k moments is
-# 200k x 384 x 4B = 307 MB, which stays resident in RAM — so a query is one
-# matmul against memory, not a trip to a vector database. At this corpus size
-# exhaustive search beats an ANN index on both latency and recall, and it
-# removes a service from the deployment.
-EMBED_MODEL = os.environ.get("ATLAS_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-EMBED_DIM   = int(os.environ.get("ATLAS_EMBED_DIM", "384"))
+# The dense index re-encodes every moment's text and searches it exhaustively —
+# one matmul against a resident matrix (see search.py), no ANN service. Model
+# choice is a *profile*, not a lone string, because three things move together
+# and getting any one wrong quietly wrecks ranking without ever raising: the
+# vector WIDTH, whether QUERIES take an instruction prefix, and whether PASSAGES
+# do. bge-* are asymmetric (query prefix only); e5-* prefix both sides; bge-m3
+# prefixes neither. Keeping them in one table means a model swap is one variable,
+# not four kept in sync by hand.
+#
+# Default is bge-m3. The archive holds English, Hindi and Hinglish, and the old
+# default (bge-small-en, English-only) cannot place a Hindi query near the Hindi
+# passage that answers it — search was structurally blind to two of the three
+# languages it indexes. bge-m3 is multilingual by construction, 1024-d, and
+# CLS-pooled (so the manual encoder fallback stays correct), and the processing
+# plane already downloads it. The cost is a cold start that re-encodes the whole
+# corpus with a 560M model instead of a 33M one — minutes, not seconds — which
+# is the deliberate trade of cold-start speed for answering the query at all.
+_MODEL_PROFILES = {
+    "BAAI/bge-m3":              {"dim": 1024, "query": "", "passage": ""},
+    "BAAI/bge-small-en-v1.5":   {"dim": 384, "passage": "",
+        "query": "Represent this sentence for searching relevant passages: "},
+    "BAAI/bge-large-en-v1.5":   {"dim": 1024, "passage": "",
+        "query": "Represent this sentence for searching relevant passages: "},
+    "intfloat/multilingual-e5-large": {"dim": 1024,
+        "query": "query: ", "passage": "passage: "},
+    "intfloat/multilingual-e5-base":  {"dim": 768,
+        "query": "query: ", "passage": "passage: "},
+}
+EMBED_MODEL = os.environ.get("ATLAS_EMBED_MODEL", "BAAI/bge-m3")
+# Env still wins for a model this table has never heard of; the profile only
+# supplies defaults for the ones it knows. An unknown model defaults to 1024-d
+# and no prefixes, and the reader's width guard (search.py) refuses the index if
+# that guess is wrong, so the failure is "lexical only", never a bad ranking.
+_PROFILE    = _MODEL_PROFILES.get(
+    EMBED_MODEL, {"dim": 1024, "query": "", "passage": ""})
+EMBED_DIM   = int(os.environ.get("ATLAS_EMBED_DIM", str(_PROFILE["dim"])))
 EMBED_BATCH = int(os.environ.get("ATLAS_EMBED_BATCH", "128"))
 # "auto" takes the GPU only when it has room to spare; "cpu" never does. Atlas
 # can share a machine with the harvester's Qwen shards, and a second process
@@ -161,10 +189,14 @@ HF_CACHE = os.environ.get("HF_HOME") or os.path.join(
     _SCRATCH, "model_cache", "huggingface")
 ST_CACHE = os.environ.get("SENTENCE_TRANSFORMERS_HOME") or os.path.join(
     _SCRATCH, "model_cache", "sentence_transformers")
-# bge-v1.5 was trained with an asymmetric instruction on the query side only.
-# Dropping it costs a few points of recall, so it is not optional.
-EMBED_QUERY_PREFIX = ("Represent this sentence for searching relevant "
-                      "passages: ")
+# Instruction prefixes come from the model profile: bge-v1.5 wants an asymmetric
+# query-only instruction, e5 wants "query:"/"passage:" on both sides, bge-m3
+# wants neither. Applying the wrong one (or none) costs recall silently, so it
+# travels with the model rather than being hard-coded to one family.
+EMBED_QUERY_PREFIX   = os.environ.get(
+    "ATLAS_EMBED_QUERY_PREFIX",   _PROFILE["query"])
+EMBED_PASSAGE_PREFIX = os.environ.get(
+    "ATLAS_EMBED_PASSAGE_PREFIX", _PROFILE["passage"])
 
 # Candidate depth per retriever before fusion. 200 is past the point where
 # deeper retrieval changes the top 20, and keeps the fuse itself trivial.
