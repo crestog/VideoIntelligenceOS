@@ -802,6 +802,7 @@ class Source:
         record_id = head.get("record_msg_id")
         file_id = head.get("file_id") or ""
         size = int(video.get("bytes") or 0)
+        from_network = False  # set when the bytes arrive over MTProto / Bot API
 
         # On disk already? Then nothing else needs to happen for the bytes.
         if not have_source:
@@ -825,6 +826,7 @@ class Source:
             if not have_source and msg_id and int(msg_id) in msgs:
                 if self.channel.download(msgs[int(msg_id)], dest):
                     have_source = True
+                    from_network = True
             if not have_record and record_id and int(record_id) in msgs:
                 if self.channel.download(msgs[int(record_id)], record):
                     have_record = True
@@ -852,6 +854,7 @@ class Source:
             else:
                 try:
                     have_source = bool(self.tg.download(file_id, dest))
+                    from_network = from_network or have_source
                 except Exception as exc:
                     self.log(f"bot download failed: {type(exc).__name__}: "
                              f"{str(exc)[:120]}")
@@ -866,6 +869,22 @@ class Source:
             except OSError:
                 pass
             raise SourceError(f"downloaded file is {got} bytes — not a video")
+        # A transfer that drops mid-stream can still leave a file far past the
+        # 4 KB floor, and Telegram is a write-once archive: a truncated original
+        # accepted here is processed as the real thing and, because capture is
+        # one-time and resumable, never re-fetched. The message's own `bytes` is
+        # the authoritative length, so when the bytes came off the network and
+        # that length is known, the file on disk must reach it. The on-disk path
+        # is exempt on purpose — an operator's local copy may legitimately differ
+        # from the ledger's recorded size, and we did not truncate it.
+        if from_network and size > 0 and got < size:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise SourceError(
+                f"downloaded {got} of {size} bytes — the transfer was cut "
+                "short; it will be retried on the next run")
         self.downloaded += 1
         self.bytes += got
         return dest
