@@ -394,6 +394,38 @@ def _rrf(rank_lists: list, k: int = None) -> dict:
     return fused
 
 
+def _rerank(query: str, fused: dict, rows: dict) -> list:
+    """Cross-encoder rerank of the fused shortlist. Returns [(moment_id, rank)].
+
+    Only the fused top-N (by RRF score) are scored — a cross-encoder is a forward
+    pass per pair, affordable over a shortlist and never over the corpus. Each
+    pair is (query, that moment's text), truncated because the text is a merged
+    blob sharing the model's short window with the query. Returns [] — a no-op in
+    fusion — whenever the reranker cannot run or scores nothing, so a host with no
+    model, no torch or no GPU headroom simply keeps the fast hybrid order.
+    """
+    from . import rerank as _reranker
+    order = sorted(fused, key=lambda m: -fused[m])[:config.RERANK_TOP]
+    pairs, mids = [], []
+    cap = config.RERANK_MAX_CHARS
+    for mid in order:
+        row = rows.get(mid)
+        if not row:
+            continue
+        text = (row[6] or "").strip()      # moments.text; column order as fetched
+        if not text:
+            continue
+        pairs.append(text[:cap])
+        mids.append(mid)
+    if not pairs:
+        return []
+    scores = _reranker.score(query, pairs)
+    if not scores or len(scores) != len(mids):
+        return []
+    ranked = sorted(range(len(mids)), key=lambda i: -scores[i])
+    return [(mids[i], rank + 1) for rank, i in enumerate(ranked)]
+
+
 def _phrase_bonus(text: str, query: str) -> float:
     """A small, honest boost for containing the query as written.
 
@@ -521,6 +553,20 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
              f"FROM moments WHERE id IN ({','.join('?' * len(part))})")
         for r in conn.execute(q, part):
             rows[int(r[0])] = r
+
+    # The cross-encoder rereads the query against each shortlisted passage as one
+    # input and its order folds back in as a third, higher-trust ranker. It needs
+    # the passage text, so it runs here, after the row fetch, over the fused
+    # top-N only. It re-orders the contenders; it never changes which moments
+    # contend (its ids are a subset of the fuse, so `rows` still covers them all),
+    # and it yields nothing if the model will not load — so search is exactly the
+    # hybrid it was before whenever the reranker is absent.
+    reranked = []
+    if config.RERANK and fused:
+        reranked = _rerank(query, fused, rows)
+        if reranked:
+            fused = _rrf([(1.0, lex), (1.0, den),
+                          (config.RERANK_WEIGHT, reranked)])
 
     lex_rank = dict(lex)
     den_rank = dict(den)
@@ -709,7 +755,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 24,
                     "min_hits": min_hits,
                     "sources": list(sources or ())},
         "candidates": {"lexical": len(lex), "dense": len(den),
-                       "fused": len(fused)},
+                       "fused": len(fused), "reranked": len(reranked)},
         "took_ms": round((time.perf_counter() - t0) * 1000, 1),
     }
     with _CACHE_LOCK:

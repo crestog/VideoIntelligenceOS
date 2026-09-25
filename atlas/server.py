@@ -307,12 +307,20 @@ def _boot() -> None:
     conn.close()
 
     # Last, because it competes for the same CPU as the index build and nobody
-    # is typing yet.
+    # is typing yet. The reranker warms right after the encoder, for the same
+    # reason and with the same indifference to failure: if it will not load,
+    # search silently keeps its fused order.
     try:
         from .encoder import warm
         warm()
     except Exception:
         pass
+    if config.RERANK:
+        try:
+            from .rerank import warm as warm_reranker
+            warm_reranker()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════

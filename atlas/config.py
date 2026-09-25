@@ -205,6 +205,38 @@ RRF_K        = 60      # the constant from the original RRF paper
 MOMENT_GAP_S = 6.0     # hits closer than this in one video are one moment
 QUERY_CACHE  = 256     # LRU entries
 
+# ── Reranking ───────────────────────────────────────────────────────────────
+# A bi-encoder scores the query and every passage independently and never sees
+# them together; a cross-encoder reads (query, passage) as one input and attends
+# across it — the largest ranking gain left after hybrid fusion, and far too
+# costly to run over more than a shortlist. So the fused top-N go through it and
+# its order re-enters the fuse as a third, higher-trust ranker (see search.py):
+# the fast hybrid still decides *which* moments compete; the cross-encoder only
+# reorders the ones already in contention.
+#
+# bge-reranker-v2-m3 is the reranker that matches the bge-m3 encoder default —
+# the same multilingual backbone, so Hindi and Hinglish rerank as well as
+# English, and the processing plane already caches its weights. It degrades like
+# the encoder: if it will not load, rerank is skipped and the fused order stands.
+RERANK        = os.environ.get("ATLAS_RERANK", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+RERANK_MODEL  = os.environ.get("ATLAS_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+# One forward pass per candidate; 50 is deep enough that the true answer is
+# almost always inside it, shallow enough to stay ~50–100 ms on a GPU, and well
+# under CANDIDATES so it is always a re-ordering of the head, never a new search.
+RERANK_TOP    = int(os.environ.get("ATLAS_RERANK_TOP", "50"))
+# The reranked order enters fusion with this RRF weight — above the retrievers'
+# 1.0 because the cross-encoder is the more discerning judge, but *fused, not
+# substituted*, so a moment both retrievers rank highly is not buried by one the
+# cross-encoder happens to dislike.
+RERANK_WEIGHT = float(os.environ.get("ATLAS_RERANK_WEIGHT", "2.0"))
+# A moment's text is a merged blob and the pair shares a 512-token window with
+# the query; this bounds the characters tokenised per passage so a pathological
+# blob cannot blow up the batch. The head carries the matchable content.
+RERANK_MAX_CHARS = int(os.environ.get("ATLAS_RERANK_MAX_CHARS", "2048"))
+# Same "take the GPU only when it is free" policy as the encoder; "cpu" pins it.
+RERANK_DEVICE = os.environ.get("ATLAS_RERANK_DEVICE", "auto").lower()
+
 # ── Image search ──────────────────────────────────────────────────────────
 # The frame vectors the processing plane writes, searched in their own spaces.
 # `siglip2` and `clip` are two different geometries; a query is only ever
