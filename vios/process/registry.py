@@ -1335,6 +1335,7 @@ class Cohort:
     index: int = 0
     components: list = field(default_factory=list)
     vram_mb: int = 0
+    ram_mb: int = 0
     cards: int = 1
     loads: list = field(default_factory=list)   # distinct weights to fetch
 
@@ -1345,6 +1346,7 @@ class Cohort:
             "components": list(self.components),
             "titles": [BY_ID[c].title for c in self.components],
             "vram_mb": self.vram_mb,
+            "ram_mb": self.ram_mb,
             "cards": self.cards,
             "loads": list(self.loads),
             "seconds_per_video": round(seconds, 1),
@@ -1353,8 +1355,8 @@ class Cohort:
 
 
 def plan_cohorts(ids, vram_budget_mb: int, gpu_count: int = 1,
-                 disk_budget_mb: int = 0) -> list:
-    """Pack components into cohorts that fit the measured VRAM.
+                 disk_budget_mb: int = 0, ram_budget_mb: int = 0) -> list:
+    """Pack components into cohorts that fit the measured VRAM and host RAM.
 
     First-fit over the dependency order, not best-fit, and the difference is
     deliberate. Best-fit would pack denser and reorder passes to do it, which
@@ -1368,28 +1370,42 @@ def plan_cohorts(ids, vram_budget_mb: int, gpu_count: int = 1,
 
     A component needing two cards gets a cohort to itself. Sharding a 38B model
     across both T4s leaves nothing to share with.
+
+    Host RAM is the second budget, bin-packed the same way as VRAM (D-213): a
+    cohort whose resident weights fit VRAM but not system RAM is OOM-killed
+    mid-pass, and the loss is identical to running out of VRAM — one cohort of
+    work gone. So `ram_budget_mb` (the caller passes `usable_ram_mb`) closes a
+    cohort exactly as `vram_budget_mb` does, weights sharing a `load_key` paying
+    RAM once just as they pay VRAM once, and the term counts CPU passes too
+    because their decode buffers and the interpreter live in RAM, not VRAM. A
+    budget of 0 means "not measured" (see `resources.probe`, which reports 0 for
+    unknown rather than none-free), so RAM then imposes no constraint at all,
+    never a false split.
+
+    Disk is deliberately *not* a per-cohort term (D-212). Downloaded weights
+    land in a session-persistent cache and are not freed when a cohort unloads,
+    so the disk high-water mark is the whole plan's distinct-`load_key` download
+    total regardless of how it is packed — repacking cannot lower it, and a
+    per-cohort disk budget would only fragment cohorts without changing what the
+    disk must hold. The honest check is therefore a plan-level preflight (does
+    the selected passes' total download fit `disk_free_mb`), which belongs beside
+    the engine's scratch-disk check, not in this packer. `disk_budget_mb` is kept
+    in the signature so that preflight has one place to read the free figure the
+    caller already measures.
     """
-    # VRAM is the only budget this packer enforces. Two others are declared and
-    # not consumed here, documented so the gap is deliberate, not forgotten:
-    #   * `disk_budget_mb` (D-212) — accepted for a disk-aware pack that was
-    #     never written; `disk` appears nowhere else in this function. Kept in
-    #     the signature so the caller that already passes it need not change if
-    #     the pack ever learns to read it.
-    #   * `ram_mb` (D-213) — every component declares it (34,688 MB catalogue-
-    #     wide) and `resources.probe()` reports `usable_ram_mb`, but nothing
-    #     compares the two: no packer term, no `unrunnable` test, no preflight.
-    #     A cohort that fits VRAM but not host RAM is not caught here.
     order = topo_sort(ids)
     cohorts, cur = [], Cohort(index=0)
-    cur_loads: dict = {}
+    cur_loads: dict = {}          # load_key -> vram_mb, resident weights (GPU)
+    cur_ram: dict = {}            # load_key -> ram_mb, resident this cohort (all)
 
     def close():
-        nonlocal cur, cur_loads
+        nonlocal cur, cur_loads, cur_ram
         if cur.components:
             cur.loads = list(cur_loads)
             cohorts.append(cur)
         cur = Cohort(index=len(cohorts))
         cur_loads = {}
+        cur_ram = {}
 
     for cid in order:
         c = BY_ID[cid]
@@ -1403,20 +1419,34 @@ def plan_cohorts(ids, vram_budget_mb: int, gpu_count: int = 1,
             close()
             cur.components.append(cid)
             cur_loads[c.load_key] = c.vram_mb
+            cur_ram[c.load_key] = c.ram_mb
             cur.vram_mb = c.vram_mb
+            cur.ram_mb = c.ram_mb
             cur.cards = c.cards
             close()
             continue
 
-        cost = 0 if c.load_key in cur_loads else c.vram_mb
-        if c.device == "gpu" and cur.vram_mb + cost > vram_budget_mb:
+        # Cost of admitting this component to the current cohort: 0 for a
+        # resource whose weights are already resident (same load_key), else the
+        # declared figure. VRAM counts GPU passes only; RAM counts every pass.
+        v_cost = 0 if c.load_key in cur_loads else c.vram_mb
+        r_cost = 0 if c.load_key in cur_ram else c.ram_mb
+        over_vram = c.device == "gpu" and cur.vram_mb + v_cost > vram_budget_mb
+        over_ram = bool(ram_budget_mb) and cur.ram_mb + r_cost > ram_budget_mb
+        if over_vram or over_ram:
+            # A fresh cohort pays the full cost of the weights it will load; the
+            # component still lands even if it alone exceeds a budget (placed
+            # solo, and `unrunnable` reports it), so the loop always advances.
             close()
-            cost = c.vram_mb
+            v_cost = c.vram_mb
+            r_cost = c.ram_mb
 
         cur.components.append(cid)
         if c.device == "gpu":
             cur_loads[c.load_key] = c.vram_mb
-            cur.vram_mb += cost
+            cur.vram_mb += v_cost
+        cur_ram[c.load_key] = c.ram_mb
+        cur.ram_mb += r_cost
 
     close()
     return [c for c in cohorts if c.components]
@@ -1433,11 +1463,19 @@ def unrunnable(ids, res: dict) -> dict:
     that flag is a statement about the whole machine rather than about VRAM — a
     CPU pass can be flagged as well. It is the plan's way of saying the same
     thing the coverage row will say per video: not broken, not here.
+
+    Host RAM (D-213) is reported the same way, and also across the device line:
+    a pass whose declared `ram_mb` exceeds the measured `usable_ram_mb` is held
+    whether it runs on the GPU or the CPU. For a GPU pass a VRAM or card
+    shortfall is named first — it is the more specific blocker — and RAM only
+    when VRAM fits. A `usable_ram_mb` of 0 means "not measured" (see
+    `resources.probe`), so the check is skipped rather than flagging everything.
     """
     out = {}
     per_card = res.get("usable_vram_mb", 0)
     total = res.get("usable_vram_total_mb", 0)
     gpus = res.get("gpu_count", 0)
+    usable_ram = res.get("usable_ram_mb", 0)   # 0 = not measured, no constraint
     kaggle = res.get("host") == "kaggle"
     for cid in ids:
         c = BY_ID.get(cid)
@@ -1447,6 +1485,9 @@ def unrunnable(ids, res: dict) -> dict:
             out[cid] = "flagged as not runnable on Kaggle — held for another machine"
             continue
         if c.device != "gpu":
+            # No VRAM to weigh, but a CPU pass still needs its host RAM.
+            if usable_ram and c.ram_mb > usable_ram:
+                out[cid] = f"needs {c.ram_mb} MB RAM, {usable_ram} MB usable"
             continue
         if not gpus:
             out[cid] = "no GPU in this session"
@@ -1456,6 +1497,8 @@ def unrunnable(ids, res: dict) -> dict:
             out[cid] = f"needs {c.vram_mb} MB across cards, {total} MB usable"
         elif c.cards == 1 and c.vram_mb > per_card:
             out[cid] = f"needs {c.vram_mb} MB on one card, {per_card} MB usable"
+        elif usable_ram and c.ram_mb > usable_ram:
+            out[cid] = f"needs {c.ram_mb} MB RAM, {usable_ram} MB usable"
     return out
 
 

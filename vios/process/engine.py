@@ -1215,7 +1215,7 @@ class ProcessEngine:
         budget = max(res.get("usable_vram_mb", 0) - self.vram_headroom_mb, 512)
         cohorts = registry.plan_cohorts(
             runnable, budget, max(res.get("gpu_count", 0), 1),
-            res.get("disk_free_mb", 0))
+            res.get("disk_free_mb", 0), res.get("usable_ram_mb", 0))
         try:
             videos = len(self.store.video_keys())
         except Exception:
@@ -1600,7 +1600,7 @@ class ProcessEngine:
             for wv, group in registry.waves(runnable, spine):
                 cs = registry.plan_cohorts(
                     group, budget, max(res.get("gpu_count", 0), 1),
-                    res.get("disk_free_mb", 0))
+                    res.get("disk_free_mb", 0), res.get("usable_ram_mb", 0))
                 for c in cs:
                     c.index += sum(len(p[2]) for p in plan)
                 plan.append((wv, group, cs))
