@@ -245,17 +245,20 @@ class CaptureEngine:
     def _write_cookies(self, text: str):
         """Persist the cookie jar for the length of the process only.
 
-        yt-dlp needs a file, so one is written — into scratch, mode 0600, and
-        removed on stop. A session cookie is as good as a password: it does not
-        go near the repo directory and it is never included in a snapshot.
+        yt-dlp needs a file, so one is written — into scratch, locked to this
+        account (`chmod 0600` on POSIX, an owner-only ACL on Windows, where a
+        bare chmod would not restrict anyone), and removed on stop. A session
+        cookie is as good as a password: it does not go near the repo directory
+        and it is never included in a snapshot.
         """
         path = os.path.join(self.scratch, ".ig_cookies.txt")
         body = text if text.lstrip().startswith("#") else "# Netscape HTTP Cookie File\n" + text
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(body if body.endswith("\n") else body + "\n")
         try:
-            os.chmod(path, 0o600)
-        except OSError:
+            from vios.creds import restrict_to_owner  # noqa: PLC0415
+            restrict_to_owner(path)
+        except Exception:
             pass
         self._cookies_path = path
 

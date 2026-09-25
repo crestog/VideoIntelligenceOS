@@ -358,6 +358,59 @@ def on_kaggle() -> bool:
                 or os.path.isdir("/kaggle/input"))
 
 
+def restrict_to_owner(path: str) -> str:
+    """Make a secrets file readable only by the account that wrote it.
+
+    On POSIX `chmod 0600` is the whole story. On Windows it is not: `os.chmod`
+    there can only toggle the read-only bit, so a bare `0o600` leaves the file
+    readable by every other local account — the one thing a credential or cookie
+    file must not be, and precisely what the old "mode 0600" comment on this path
+    silently failed to deliver. So on Windows the file's ACL is rewritten with
+    the built-in `icacls`: grant Full control to this user, then drop inherited
+    entries so no other ordinary account keeps access. SYSTEM and Administrators
+    stay — that is true of every file on Windows and cannot be helped — but a
+    second, non-admin user of the machine can no longer read it, which is what
+    0600 buys in practice. The grant is done first and inheritance removed only
+    after, so a half-applied change can never lock the owner out of their file.
+
+    Best-effort: a file that could not be locked down further is still usable,
+    so failures are swallowed. Returns a word for what was actually applied
+    ("posix-0600", "windows-acl", or "none") so a caller never claims more than
+    happened.
+    """
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+            return "posix-0600"
+        except OSError:
+            return "none"
+    user = os.environ.get("USERNAME") or ""
+    domain = os.environ.get("USERDOMAIN") or ""
+    who = f"{domain}\\{user}" if domain and user else user
+    if who:
+        import subprocess  # noqa: PLC0415 — Windows-only, off the hot path
+        try:
+            granted = subprocess.run(
+                ["icacls", path, "/grant:r", f"{who}:F"],
+                capture_output=True, text=True, timeout=15)
+            if granted.returncode == 0:
+                # Only now is it safe to sever inheritance: the owner-only ACE
+                # already exists, so worst case here leaves user:F + inherited.
+                subprocess.run(
+                    ["icacls", path, "/inheritance:r"],
+                    capture_output=True, text=True, timeout=15)
+                return "windows-acl"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # The read-only bit is the one thing os.chmod can set on Windows. It is not
+    # access control, so this returns "none" and never pretends otherwise.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return "none"
+
+
 # ── the four sources ──────────────────────────────────────────────────────
 # Every sweep this process has done, keyed by the `skip` it was given. Values
 # live here in memory only — the same place `os.environ` keeps them — and never
@@ -1388,12 +1441,9 @@ def save_local(values: dict) -> dict:
     tmp = path + ".part"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2, sort_keys=True)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
+    protection = restrict_to_owner(tmp)
     os.replace(tmp, path)
-    return {"path": path, "fields": sorted(existing)}
+    return {"path": path, "fields": sorted(existing), "protection": protection}
 
 
 def forget_local() -> dict:
